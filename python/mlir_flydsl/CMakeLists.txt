@@ -78,6 +78,7 @@ declare_mlir_python_extension(FlyPythonSources.RegisterEverything
     MLIRCAPIIR
     MLIRCPIFly
     MLIRCPIFlyROCDL
+    MLIRCPIFlyIXDL
     MLIRCAPIArith
     MLIRCAPIGPU
     MLIRCAPILLVM
@@ -228,23 +229,46 @@ add_dependencies(CopyFlyPythonSources FlyPythonModules)
 # FlyJitRuntime — thin ROCm runtime with GPU module caching
 ################################################################################
 
-file(GLOB _ROCM_SEARCH_PATHS LIST_DIRECTORIES true "/opt/rocm*")
-list(SORT _ROCM_SEARCH_PATHS ORDER DESCENDING)
-find_package(hip REQUIRED CONFIG PATHS ${_ROCM_SEARCH_PATHS})
-
-add_library(FlyJitRuntime SHARED
-  ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
-)
-target_include_directories(FlyJitRuntime PRIVATE
-  ${LLVM_INCLUDE_DIRS}
-  ${MLIR_INCLUDE_DIRS}
-)
-target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
-target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
-set_target_properties(FlyJitRuntime PROPERTIES
-  OUTPUT_NAME "fly_jit_runtime"
-  LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
-)
-add_dependencies(FlyPythonCAPI FlyJitRuntime)
-
-
+# 1. 定义一个开关，默认如果是 AMD 环境就开启，否则可以手动关闭
+option(FLYDSL_ENABLE_ROCM "Enable ROCm/HIP JIT runtime" ON)
+ 
+# 2. 只有在开启且找到相关路径时才进行
+if(FLYDSL_ENABLE_ROCM)
+    file(GLOB _ROCM_SEARCH_PATHS LIST_DIRECTORIES true "/opt/rocm*")
+    list(SORT _ROCM_SEARCH_PATHS ORDER DESCENDING)
+     
+    # 移除 REQUIRED，改为 QUIET，避免找不到时报错
+    find_package(hip QUIET CONFIG PATHS ${_ROCM_SEARCH_PATHS})
+ 
+    if(hip_FOUND)
+        message(STATUS "ROCm/HIP found. Building FlyJitRuntime...")
+         
+        add_library(FlyJitRuntime SHARED
+          ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
+        )
+        target_include_directories(FlyJitRuntime PRIVATE
+          ${LLVM_INCLUDE_DIRS}
+          ${MLIR_INCLUDE_DIRS}
+        )
+        target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
+        target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
+        set_target_properties(FlyJitRuntime PROPERTIES
+          OUTPUT_NAME "fly_jit_runtime"
+          LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
+        )
+        add_dependencies(FlyPythonCAPI FlyJitRuntime)
+         
+        # 传递宏定义给 C++ 源码，告知 ROCM 已启用
+        target_compile_definitions(FlyJitRuntime PRIVATE FLYDSL_HAS_ROCM=1)
+    else()
+        message(WARNING "ROCm/HIP not found. Skipping FlyJitRuntime.")
+        set(FLYDSL_ENABLE_ROCM OFF)
+    endif()
+endif()
+ 
+# 3. 如果没启用 ROCm，确保 FlyPythonCAPI 不会去链接不存在的库
+if(NOT FLYDSL_ENABLE_ROCM)
+    message(STATUS "Building without ROCm support.")
+    # 如果有其他地方引用了 FlyJitRuntime，可能需要在这里定义一些空操作或宏
+    add_definitions(-DFLYDSL_DISABLE_ROCM)
+endif()

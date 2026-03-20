@@ -88,3 +88,31 @@ def is_rdna_arch(arch: Optional[str] = None) -> bool:
     if arch.startswith("gfx120"):
         return True
     return False
+
+
+def is_iluvatar_arch(arch: Optional[str] = None) -> bool:
+    """Check if architecture is Iluvatar Corex-based."""
+    if arch is None:
+        arch = get_target_arch()
+    if not arch:
+        return False
+    arch = arch.lower()
+    return (
+        arch.startswith("iluvatar")
+        or arch.startswith("sm_71")
+        or arch.startswith("sm_bi")
+        or arch.startswith("ivcore")
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def get_target_arch() -> str:
+    """Consolidated architecture string for compile backends (ROCm vs Iluvatar)."""
+    env_arch = os.environ.get("ARCH") or os.environ.get("FLYDSL_GPU_ARCH")
+    if env_arch:
+        return env_arch.lower()
+
+    if os.environ.get("SW_HOME") or os.path.exists("/usr/local/corex"):
+        return "ivcore11"
+
+    return get_rocm_arch()

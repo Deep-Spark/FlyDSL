@@ -7,6 +7,7 @@
 
 #include "flydsl-c/FlyDialect.h"
 #include "flydsl-c/FlyROCDLDialect.h"
+#include "flydsl-c/FlyIXDLDialect.h"
 
 NB_MODULE(_mlirRegisterEverything, m) {
   m.doc() = "MLIR All Upstream Dialects, Translations and Passes Registration";
@@ -26,4 +27,5 @@ NB_MODULE(_mlirRegisterEverything, m) {
   mlirRegisterFlyPasses();
   mlirRegisterFlyToROCDLConversionPass();
   mlirRegisterFlyROCDLClusterAttrPass();
+  mlirRegisterFlyToIXDLConversionPass();
 }

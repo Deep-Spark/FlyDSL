@@ -32,4 +32,15 @@ def FlyROCDLClusterAttrPass : Pass<"fly-rocdl-cluster-attr"> {
   ];
 }
 
+def FlyToIXDLConversionPass : Pass<"convert-fly-to-ixdl"> {
+  let summary = "Lower Fly to MLIR upstream and ixdl dialects ";
+  let constructor = "mlir::fly::createFlyToIXDLConversionPass()";
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "scf::SCFDialect",
+    "vector::VectorDialect",
+    "LLVM::LLVMDialect"
+  ];
+}
+
 #endif // FLYDSL_CONVERSION_PASSES

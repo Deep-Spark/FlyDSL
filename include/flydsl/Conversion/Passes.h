@@ -6,6 +6,7 @@
 #define FLYDSL_CONVERSION_PASSES_H
 
 #include "flydsl/Conversion/FlyToROCDL/FlyToROCDL.h"
+#include "flydsl/Conversion/FlyToIXDL/FlyToIXDL.h"
 
 namespace mlir {
 

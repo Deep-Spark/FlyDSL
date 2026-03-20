@@ -90,9 +90,11 @@ def get_backend(name: Optional[str] = None, *, arch: str = "") -> BaseBackend:
 
 
 # -- auto-register built-in backends ------------------------------------
+from .iluvatar import IluvatarBackend  # noqa: E402
 from .rocm import RocmBackend  # noqa: E402
 
 register_backend("rocm", RocmBackend)
+register_backend("iluvatar", IluvatarBackend)
 
 __all__ = [
     "BaseBackend",

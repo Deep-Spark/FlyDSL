@@ -434,7 +434,7 @@ class MlirCompiler:
             pipeline = f"builtin.module({','.join(fragments)})"
             pm = PassManager.parse(pipeline)
             pm.enable_verifier(env.debug.enable_verifier)
-            pm.enable_ir_printing(print_after_all=env.debug.print_after_all)
+            pm.enable_ir_printing()
             pm.run(module.operation)
 
         return module
