@@ -223,26 +223,96 @@ add_dependencies(CopyFlyPythonSources FlyPythonModules)
 
 
 ################################################################################
-# FlyJitRuntime — thin ROCm runtime with GPU module caching
+# FlyJitRuntime — GPU runtime wrappers
 ################################################################################
 
-file(GLOB _ROCM_SEARCH_PATHS LIST_DIRECTORIES true "/opt/rocm*")
-list(SORT _ROCM_SEARCH_PATHS ORDER DESCENDING)
-find_package(hip REQUIRED CONFIG PATHS ${_ROCM_SEARCH_PATHS})
+option(FLYDSL_ENABLE_ROCM "Enable ROCm/HIP JIT runtime" ON)
+option(FLYDSL_ENABLE_COREX "Enable Iluvatar COREX (CUDA Driver API) JIT runtime" OFF)
 
-add_library(FlyJitRuntime SHARED
-  ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
-)
-target_include_directories(FlyJitRuntime PRIVATE
-  ${LLVM_INCLUDE_DIRS}
-  ${MLIR_INCLUDE_DIRS}
-)
-target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
-target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
-set_target_properties(FlyJitRuntime PROPERTIES
-  OUTPUT_NAME "fly_jit_runtime"
-  LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
-)
-add_dependencies(FlyPythonCAPI FlyJitRuntime)
+set(_FLY_RUNTIME_BUILT OFF)
+
+# --- Iluvatar COREX (CUDA Driver API compatible) ---
+if(FLYDSL_ENABLE_COREX AND NOT _FLY_RUNTIME_BUILT)
+    set(_COREX_SEARCH_PATHS
+        "$ENV{COREX_PATH}"
+        "$ENV{CUDA_PATH}"
+        "/home/wenhui-liang/sw_home/local/corex"
+        "/usr/local/corex"
+    )
+    set(_COREX_INCLUDE_DIR "")
+    set(_COREX_LIB_DIR "")
+    foreach(_p ${_COREX_SEARCH_PATHS})
+        if(EXISTS "${_p}/include/cuda.h")
+            set(_COREX_INCLUDE_DIR "${_p}/include")
+            if(EXISTS "${_p}/lib64/libcuda.so")
+                set(_COREX_LIB_DIR "${_p}/lib64")
+            elseif(EXISTS "${_p}/lib/libcuda.so")
+                set(_COREX_LIB_DIR "${_p}/lib")
+            endif()
+            break()
+        endif()
+    endforeach()
+
+    if(_COREX_INCLUDE_DIR AND _COREX_LIB_DIR)
+        message(STATUS "COREX SDK found: ${_COREX_INCLUDE_DIR} / ${_COREX_LIB_DIR}")
+        message(STATUS "Building FlyJitRuntime with CUDA Driver API (COREX)...")
+
+        add_library(FlyJitRuntime SHARED
+          ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyCorexRuntimeWrappers.cpp
+        )
+        target_include_directories(FlyJitRuntime PRIVATE
+          ${LLVM_INCLUDE_DIRS}
+          ${MLIR_INCLUDE_DIRS}
+          ${_COREX_INCLUDE_DIR}
+        )
+        target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
+        target_link_libraries(FlyJitRuntime PRIVATE
+          "${_COREX_LIB_DIR}/libcuda.so"
+        )
+        set_target_properties(FlyJitRuntime PROPERTIES
+          OUTPUT_NAME "fly_jit_runtime"
+          LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
+        )
+        add_dependencies(FlyPythonCAPI FlyJitRuntime)
+        set(_FLY_RUNTIME_BUILT ON)
+    else()
+        message(WARNING "COREX SDK not found. Skipping FlyJitRuntime (COREX).")
+    endif()
+endif()
+
+# --- ROCm/HIP (AMD hardware) ---
+if(FLYDSL_ENABLE_ROCM AND NOT _FLY_RUNTIME_BUILT)
+    file(GLOB _ROCM_SEARCH_PATHS LIST_DIRECTORIES true "/opt/rocm*")
+    list(SORT _ROCM_SEARCH_PATHS ORDER DESCENDING)
+    find_package(hip QUIET CONFIG PATHS ${_ROCM_SEARCH_PATHS})
+
+    if(hip_FOUND)
+        message(STATUS "ROCm/HIP found. Building FlyJitRuntime...")
+        add_library(FlyJitRuntime SHARED
+          ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
+        )
+        target_include_directories(FlyJitRuntime PRIVATE
+          ${LLVM_INCLUDE_DIRS}
+          ${MLIR_INCLUDE_DIRS}
+        )
+        target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
+        target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
+        set_target_properties(FlyJitRuntime PROPERTIES
+          OUTPUT_NAME "fly_jit_runtime"
+          LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
+        )
+        add_dependencies(FlyPythonCAPI FlyJitRuntime)
+        target_compile_definitions(FlyJitRuntime PRIVATE FLYDSL_HAS_ROCM=1)
+        set(_FLY_RUNTIME_BUILT ON)
+    else()
+        message(WARNING "ROCm/HIP not found. Skipping FlyJitRuntime.")
+        set(FLYDSL_ENABLE_ROCM OFF)
+    endif()
+endif()
+
+if(NOT _FLY_RUNTIME_BUILT)
+    message(STATUS "Building without GPU runtime support.")
+    add_definitions(-DFLYDSL_DISABLE_ROCM)
+endif()
 
 

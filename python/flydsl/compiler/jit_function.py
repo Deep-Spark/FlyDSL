@@ -290,28 +290,57 @@ def _sanitize_path_component(s: str) -> str:
     return _re.sub(r"[^A-Za-z0-9_.-]+", "_", s) if s else "unknown"
 
 
+def _is_iluvatar_arch(chip: str) -> bool:
+    return chip.startswith("ivcore")
+
+
+def _gpu_target_attr(chip: str) -> str:
+    if _is_iluvatar_arch(chip):
+        return f'#ixdl.target<chip = "{chip}">'
+    return f'#rocdl.target<chip = "{chip}">'
+
+
 class MlirCompiler:
     @staticmethod
     def _pipeline_fragments(*, chip: str) -> list:
-        wave64 = "false" if is_rdna_arch(chip) else "true"
-        return [
+        if _is_iluvatar_arch(chip):
+            gpu_to_backend = (
+                "gpu.module(convert-scf-to-cf,cse,"
+                "convert-gpu-to-ixdl{index-bitwidth=32})"
+            )
+            binary_format = "binary"
+        else:
+            wave64 = "false" if is_rdna_arch(chip) else "true"
+            gpu_to_backend = (
+                f"gpu.module(convert-scf-to-cf,cse,"
+                f"convert-gpu-to-rocdl{{chipset={chip} index-bitwidth=0 runtime=HIP "
+                f"use-bare-ptr-memref-call-conv=true}})"
+            )
+            binary_format = "fatbin"
+
+        fragments = [
             "gpu-kernel-outlining{data-layout-str=}",
             "fly-canonicalize",
             "fly-layout-lowering",
             "convert-fly-to-rocdl",
             "canonicalize",
-            f"gpu.module(convert-scf-to-cf,cse,"
-            f"convert-gpu-to-rocdl{{chipset={chip} index-bitwidth=0 runtime=HIP use-bare-ptr-memref-call-conv=true}})",
-            f"rocdl-attach-target{{O=2 abi=600 chip={chip} correct-sqrt=true daz=false fast=false features= "
-            f"finite-only=false module= triple=amdgcn-amd-amdhsa unsafe-math=false wave64={wave64}}}",
+            gpu_to_backend,
+        ]
+        if not _is_iluvatar_arch(chip):
+            fragments.append(
+                f"rocdl-attach-target{{O=2 abi=600 chip={chip} correct-sqrt=true daz=false fast=false features= "
+                f"finite-only=false module= triple=amdgcn-amd-amdhsa unsafe-math=false wave64={wave64}}}"
+            )
+        fragments.extend([
             "convert-scf-to-cf",
             "convert-cf-to-llvm",
             "gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}",
             "convert-arith-to-llvm",
             "convert-func-to-llvm",
             "reconcile-unrealized-casts",
-            "gpu-module-to-binary{format=fatbin}",
-        ]
+            f"gpu-module-to-binary{{format={binary_format}}}",
+        ])
+        return fragments
 
     @classmethod
     def compile(cls, module: ir.Module, *, chip: str = None, func_name: str = "") -> ir.Module:
@@ -523,7 +552,7 @@ class JitFunction:
 
             with ir.InsertionPoint(module.body), loc:
                 chip = env.compile.arch or get_rocm_arch()
-                gpu_module = create_gpu_module("kernels", targets=[f'#rocdl.target<chip = "{chip}">'])
+                gpu_module = create_gpu_module("kernels", targets=[_gpu_target_attr(chip)])
 
                 func_op = func.FuncOp(self.func.__name__, (ir_types, []))
                 func_op.attributes["llvm.emit_c_interface"] = ir.UnitAttr.get()

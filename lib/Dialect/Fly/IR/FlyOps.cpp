@@ -1611,9 +1611,8 @@ FLY_INFER_RETURN_TYPES(MmaMakeFragmentOp) {
     elemTy = mmaAtom.getValTypeD();
     break;
   default:
-    return emitOptionalError(location,
-                             "MmaMakeFragmentOp: invalid operand_id value: ",
-                             operandId);
+    return emitOptionalError(
+        location, "MmaMakeFragmentOp: invalid operand_id value: ", static_cast<int>(operandId));
   }
 
   LayoutAttr inputLayout = GetLayoutAttrFromLayoutLikeType(memrefTy);

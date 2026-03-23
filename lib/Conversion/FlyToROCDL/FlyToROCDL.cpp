@@ -724,15 +724,7 @@ private:
   LogicalResult emitMfma(MmaAtomCall op, ConversionPatternRewriter &rewriter, Location loc,
                          Type abTyA, Type abTyB, VectorType accTy, Value aPtr, Value bPtr,
                          Value cPtr, Value dPtr) const {
-    Value a = LLVM::LoadOp::create(rewriter, loc, abTyA, aPtr);
-    Value b = LLVM::LoadOp::create(rewriter, loc, abTyB, bPtr);
-    Value c = LLVM::LoadOp::create(rewriter, loc, accTy, cPtr);
-    auto zeroAttr = rewriter.getI32IntegerAttr(0);
-    Value res =
-        MfmaOp::create(rewriter, loc, accTy, a, b, c, zeroAttr, zeroAttr, zeroAttr).getResult();
-    LLVM::StoreOp::create(rewriter, loc, res, dPtr);
-    rewriter.eraseOp(op);
-    return success();
+    return op.emitOpError("MFMA lowering not available in Iluvatar port"), failure();
   }
 
   LogicalResult lowerCDNA3MFMA(MmaAtomCall op, ConversionPatternRewriter &rewriter, Location loc,

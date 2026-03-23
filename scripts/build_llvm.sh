@@ -57,7 +57,7 @@ echo "Configuring LLVM..."
 
 # Install dependencies for Python bindings
 echo "Installing Python dependencies..."
-pip install nanobind numpy pybind11
+uv pip install nanobind numpy pybind11
 
 # Check for ninja
 GENERATOR="Unix Makefiles"
@@ -83,7 +83,7 @@ cmake -G "$GENERATOR" \
     -DLLVM_ENABLE_ASSERTIONS=ON \
     -DLLVM_INSTALL_UTILS=ON \
     -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
-    -DMLIR_ENABLE_ROCM_RUNNER=ON \
+    -DMLIR_ENABLE_ROCM_RUNNER=OFF \
     -DMLIR_BINDINGS_PYTHON_NB_DOMAIN=mlir \
     -DPython3_EXECUTABLE=$(which python3) \
     -Dnanobind_DIR="$NANOBIND_DIR" \
