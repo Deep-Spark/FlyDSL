@@ -228,21 +228,26 @@ add_dependencies(CopyFlyPythonSources FlyPythonModules)
 
 file(GLOB _ROCM_SEARCH_PATHS LIST_DIRECTORIES true "/opt/rocm*")
 list(SORT _ROCM_SEARCH_PATHS ORDER DESCENDING)
-find_package(hip REQUIRED CONFIG PATHS ${_ROCM_SEARCH_PATHS})
+find_package(hip QUIET CONFIG PATHS ${_ROCM_SEARCH_PATHS})
 
-add_library(FlyJitRuntime SHARED
-  ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
-)
-target_include_directories(FlyJitRuntime PRIVATE
-  ${LLVM_INCLUDE_DIRS}
-  ${MLIR_INCLUDE_DIRS}
-)
-target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
-target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
-set_target_properties(FlyJitRuntime PROPERTIES
-  OUTPUT_NAME "fly_jit_runtime"
-  LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
-)
-add_dependencies(FlyPythonCAPI FlyJitRuntime)
+if(hip_FOUND)
+  add_library(FlyJitRuntime SHARED
+    ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
+  )
+  target_include_directories(FlyJitRuntime PRIVATE
+    ${LLVM_INCLUDE_DIRS}
+    ${MLIR_INCLUDE_DIRS}
+  )
+  target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
+  target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
+  set_target_properties(FlyJitRuntime PROPERTIES
+    OUTPUT_NAME "fly_jit_runtime"
+    LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
+  )
+  add_dependencies(FlyPythonCAPI FlyJitRuntime)
+  message(STATUS "FlyJitRuntime: ROCm/HIP found - GPU runtime will be built")
+else()
+  message(STATUS "FlyJitRuntime: ROCm/HIP not found - skipping GPU runtime (MLIR-only mode)")
+endif()
 
 

@@ -670,8 +670,8 @@ private:
     Value a = LLVM::LoadOp::create(rewriter, loc, abTyA, aPtr);
     Value b = LLVM::LoadOp::create(rewriter, loc, abTyB, bPtr);
     Value c = LLVM::LoadOp::create(rewriter, loc, accTy, cPtr);
-    auto zeroAttr = rewriter.getI32IntegerAttr(0);
-    Value res = MfmaOp::create(rewriter, loc, accTy, a, b, c, zeroAttr, zeroAttr, zeroAttr);
+    Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32).getResult();
+    Value res = MfmaOp::create(rewriter, loc, accTy, ValueRange{a, b, c, zero, zero, zero}).getResult();
     LLVM::StoreOp::create(rewriter, loc, res, dPtr);
     rewriter.eraseOp(op);
     return success();

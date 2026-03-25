@@ -1720,7 +1720,7 @@ FLY_INFER_RETURN_TYPES(PtrToIntOp) {
     break;
   default:
     return emitOptionalError(location, "PtrToIntOp: expected Shared or Global address space, got ",
-                             addrSpace);
+                             static_cast<int>(addrSpace));
   }
 
   inferredReturnTypes.assign({IntegerType::get(context, width)});

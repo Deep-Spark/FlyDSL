@@ -2,6 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 
 import ctypes
+import os
 import threading
 from functools import lru_cache
 from pathlib import Path
@@ -12,20 +13,41 @@ from .._mlir.execution_engine import ExecutionEngine
 from .protocol import fly_pointers
 
 
+def _resolve_shared_lib(basename: str, *, extra_dirs: List[Path] | None = None) -> str:
+    mlir_libs_dir = Path(__file__).resolve().parent.parent / "_mlir" / "_mlir_libs"
+    search_dirs = [mlir_libs_dir]
+    search_dirs.extend(extra_dirs or [])
+
+    ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+    for raw_dir in ld_library_path.split(":"):
+        if raw_dir:
+            search_dirs.append(Path(raw_dir))
+
+    # Common default install location for ixcc/corex.
+    search_dirs.append(Path.home() / "new/sw_home/local/corex/lib64")
+
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        exact = directory / basename
+        if exact.exists():
+            return str(exact)
+        matches = sorted(directory.glob(f"{basename}*"))
+        if matches:
+            return str(matches[0])
+
+    raise FileNotFoundError(
+        f"Required shared library not found: {basename}\n"
+        f"Looked in: {[str(d) for d in search_dirs]}"
+    )
+
+
 @lru_cache(maxsize=1)
 def _resolve_runtime_libs() -> List[str]:
     from .backends import get_backend
 
     backend = get_backend()
-    mlir_libs_dir = Path(__file__).resolve().parent.parent / "_mlir" / "_mlir_libs"
-    libs = [mlir_libs_dir / name for name in backend.jit_runtime_lib_basenames()]
-    for lib in libs:
-        if not lib.exists():
-            raise FileNotFoundError(
-                f"Required JIT runtime library not found: {lib}\n"
-                f"Please rebuild the project."
-            )
-    return [str(p) for p in libs]
+    return [_resolve_shared_lib(name) for name in backend.jit_runtime_lib_basenames()]
 
 
 class _ArgPacker:
