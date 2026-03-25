@@ -272,3 +272,39 @@ if(NOT FLYDSL_ENABLE_ROCM)
     # 如果有其他地方引用了 FlyJitRuntime，可能需要在这里定义一些空操作或宏
     add_definitions(-DFLYDSL_DISABLE_ROCM)
 endif()
+
+################################################################################
+# FlyIXJitRuntime — thin Iluvatar Corex runtime (CUDA-compatible)
+################################################################################
+
+option(FLYDSL_ENABLE_ILUVATAR "Enable Iluvatar Corex JIT runtime" ON)
+
+if(FLYDSL_ENABLE_ILUVATAR)
+    set(ILUVATAR_ROOT "$ENV{SW_HOME}/local/corex")
+    
+    find_path(IXDL_INCLUDE_DIR NAMES cuda.h PATHS "${ILUVATAR_ROOT}/include")
+    find_library(IXDL_LIBRARY NAMES cuda PATHS "${ILUVATAR_ROOT}/lib64")
+
+    if(IXDL_INCLUDE_DIR AND IXDL_LIBRARY)
+        message(STATUS "Iluvatar Corex SDK found at ${ILUVATAR_ROOT}. Building FlyIXJitRuntime...")
+        
+        add_library(FlyIXJitRuntime SHARED
+          ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyIXDLRuntimeWrappers.cpp
+        )
+        target_include_directories(FlyIXJitRuntime PRIVATE
+          ${IXDL_INCLUDE_DIR}
+          ${LLVM_INCLUDE_DIRS}
+          ${MLIR_INCLUDE_DIRS}
+        )
+        target_compile_features(FlyIXJitRuntime PRIVATE cxx_std_17)
+        target_link_libraries(FlyIXJitRuntime PRIVATE ${IXDL_LIBRARY})
+        set_target_properties(FlyIXJitRuntime PROPERTIES
+          OUTPUT_NAME "fly_ix_jit_runtime"
+          LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
+        )
+        add_dependencies(FlyPythonCAPI FlyIXJitRuntime)
+    else()
+        message(WARNING "Iluvatar Corex SDK not found. Skipping FlyIXJitRuntime. (IXDL_INCLUDE_DIR=${IXDL_INCLUDE_DIR}, IXDL_LIBRARY=${IXDL_LIBRARY})")
+        set(FLYDSL_ENABLE_ILUVATAR OFF)
+    endif()
+endif()

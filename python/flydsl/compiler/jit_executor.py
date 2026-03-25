@@ -23,7 +23,7 @@ def _resolve_runtime_libs() -> List[str]:
         if not lib.exists():
             raise FileNotFoundError(
                 f"Required JIT runtime library not found: {lib}\n"
-                f"Please rebuild the project."
+                f"Please rebuild the project with the correct backend enabled."
             )
     return [str(p) for p in libs]
 

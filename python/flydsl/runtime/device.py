@@ -31,12 +31,12 @@ def _arch_from_rocm_agent_enumerator() -> Optional[str]:
 @functools.lru_cache(maxsize=None)
 def get_rocm_arch() -> str:
     """Best-effort ROCm GPU arch string (e.g. 'gfx942')."""
-    env = os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("HSA_OVERRIDE_GFX_VERSION")
-    if env:
-        if env.startswith("gfx"):
-            return env
-        if env.count(".") == 2:
-            parts = env.split(".")
+    env_v = os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("HSA_OVERRIDE_GFX_VERSION")
+    if env_v:
+        if env_v.startswith("gfx"):
+            return env_v
+        if env_v.count(".") == 2:
+            parts = env_v.split(".")
             return f"gfx{parts[0]}{parts[1]}{parts[2]}"
 
     arch = _arch_from_rocm_agent_enumerator()
@@ -71,15 +71,9 @@ def get_rocm_device_count() -> int:
 
 
 def is_rdna_arch(arch: Optional[str] = None) -> bool:
-    """Check if architecture is RDNA-based (gfx10/11/12, wave32).
-
-    This is the single source of truth for CDNA vs RDNA classification.
-    RDNA architectures use wave32 and have different buffer descriptor flags.
-
-    If arch is None, the current GPU arch is auto-detected.
-    """
+    """Check if architecture is RDNA-based (gfx10/11/12, wave32)."""
     if arch is None:
-        arch = get_rocm_arch()
+        arch = get_target_arch()
     if not arch:
         return False
     arch = arch.lower()
@@ -107,7 +101,7 @@ def is_iluvatar_arch(arch: Optional[str] = None) -> bool:
 
 @functools.lru_cache(maxsize=None)
 def get_target_arch() -> str:
-    """Consolidated architecture string for compile backends (ROCm vs Iluvatar)."""
+    """Target arch for compile backends: env override, then Iluvatar SDK heuristic, else ROCm."""
     env_arch = os.environ.get("ARCH") or os.environ.get("FLYDSL_GPU_ARCH")
     if env_arch:
         return env_arch.lower()

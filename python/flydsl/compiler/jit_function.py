@@ -768,12 +768,17 @@ class JitFunction:
             if not hasattr(self, "_cached_ctx"):
                 self._cached_ctx = ir.Context()
                 self._cached_ctx.load_all_available_dialects()
+                from .._mlir._mlir_libs import _mlirRegisterEverything
+                _mlirRegisterEverything.register_llvm_translations(self._cached_ctx)
             with self._cached_ctx:
                 _, jit_args, _, _ = convert_to_jit_arguments(sig, bound)
                 _ensure_stream_arg(jit_args)
                 return cached_func(*jit_args)
 
         with ir.Context() as ctx:
+            ctx.load_all_available_dialects()
+            from .._mlir._mlir_libs import _mlirRegisterEverything
+            _mlirRegisterEverything.register_llvm_translations(ctx)
             param_names, jit_args, dsl_types, constexpr_values = convert_to_jit_arguments(sig, bound)
             has_user_stream = _ensure_stream_arg(jit_args)
             ir_types = fly_types(jit_args)
