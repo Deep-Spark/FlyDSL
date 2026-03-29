@@ -287,4 +287,27 @@ def Fly_MmaAtomUniversalFMA : Fly_Type<"MmaAtomUniversalFMA", "universal_fma", [
   let hasCustomAssemblyFormat = 1;
 }
 
+def Fly_MmaAtomIXDLMMAD : Fly_Type<"MmaAtomIXDLMMAD", "ixdl_mmad", [
+  DeclareTypeInterfaceMethods<Fly_MayStaticTypeInterface>,
+  DeclareTypeInterfaceMethods<Fly_MmaAtomTypeInterface>
+]> {
+  let parameters = (ins
+    "int32_t":$m,
+    "int32_t":$n,
+    "int32_t":$k,
+    "Type":$elemTyA,
+    "Type":$elemTyB,
+    "Type":$elemTyAcc
+  );
+
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "int32_t":$m, "int32_t":$n, "int32_t":$k,
+                                        "Type":$elemTyA, "Type":$elemTyB, "Type":$elemTyAcc), [{
+      return $_get(elemTyA.getContext(), m, n, k, elemTyA, elemTyB, elemTyAcc);
+    }]>
+  ];
+  let genVerifyDecl = 1;
+  let hasCustomAssemblyFormat = 1;
+}
+
 #endif // FLY_TYPEDEFS

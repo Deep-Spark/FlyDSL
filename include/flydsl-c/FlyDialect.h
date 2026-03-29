@@ -139,6 +139,26 @@ MLIR_CAPI_EXPORTED MlirType mlirFlyMmaAtomUniversalFMATypeGet(MlirContext ctx, M
 MLIR_CAPI_EXPORTED MlirType mlirFlyMmaAtomUniversalFMATypeGetElemTy(MlirType type);
 
 //===----------------------------------------------------------------------===//
+// MmaAtomIXDLMMADType
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool mlirTypeIsAFlyMmaAtomIXDLMMADType(MlirType type);
+MLIR_CAPI_EXPORTED MlirTypeID mlirFlyMmaAtomIXDLMMADTypeGetTypeID(void);
+
+// Constructor
+MLIR_CAPI_EXPORTED MlirType mlirFlyMmaAtomIXDLMMADTypeGet(int32_t m, int32_t n, int32_t k,
+                                                          MlirType elemTyA, MlirType elemTyB,
+                                                          MlirType elemTyAcc);
+
+// Accessors
+MLIR_CAPI_EXPORTED int32_t mlirFlyMmaAtomIXDLMMADTypeGetM(MlirType type);
+MLIR_CAPI_EXPORTED int32_t mlirFlyMmaAtomIXDLMMADTypeGetN(MlirType type);
+MLIR_CAPI_EXPORTED int32_t mlirFlyMmaAtomIXDLMMADTypeGetK(MlirType type);
+MLIR_CAPI_EXPORTED MlirType mlirFlyMmaAtomIXDLMMADTypeGetElemTyA(MlirType type);
+MLIR_CAPI_EXPORTED MlirType mlirFlyMmaAtomIXDLMMADTypeGetElemTyB(MlirType type);
+MLIR_CAPI_EXPORTED MlirType mlirFlyMmaAtomIXDLMMADTypeGetElemTyAcc(MlirType type);
+
+//===----------------------------------------------------------------------===//
 // TiledCopyType
 //===----------------------------------------------------------------------===//
 

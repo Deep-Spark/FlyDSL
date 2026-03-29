@@ -14,6 +14,7 @@ from .._mlir.dialects.fly import (
     IntTupleType,
     LayoutType,
     MemRefType,
+    MmaAtomIXDLMMADType,
     MmaAtomUniversalFMAType,
     PointerType,
     SwizzleType,
@@ -28,6 +29,37 @@ UniversalCopy64b = lambda: CopyOpUniversalCopyType.get(64)  # noqa: E731
 UniversalCopy128b = lambda: CopyOpUniversalCopyType.get(128)  # noqa: E731
 
 UniversalFMA = lambda ty: MmaAtomUniversalFMAType.get(ty.ir_type)  # noqa: E731
+IXDLMMAD = lambda m, n, k, elem_ty_a, elem_ty_b, elem_ty_acc: MmaAtomIXDLMMADType.get(  # noqa: E731
+    m,
+    n,
+    k,
+    elem_ty_a.ir_type if hasattr(elem_ty_a, "ir_type") else elem_ty_a,
+    elem_ty_b.ir_type if hasattr(elem_ty_b, "ir_type") else elem_ty_b,
+    elem_ty_acc.ir_type if hasattr(elem_ty_acc, "ir_type") else elem_ty_acc,
+)
+
+
+def MMA(m, n, k, elem_type, elem_type_b=None, elem_type_acc=None, backend=None):
+    """Construct a backend-appropriate MMA atom type.
+
+    Defaults to the active compile backend. For ROCm it returns ``rocdl.MFMA``;
+    for IXDL it returns ``ixdl.MMAD``.
+    """
+    if backend is None:
+        from ..compiler import compile_backend_name
+
+        backend = compile_backend_name()
+    backend = backend.lower()
+
+    if backend in ("rocm", "rocdl"):
+        from . import rocdl
+
+        return rocdl.MFMA(m, n, k, elem_type, elem_type_b=elem_type_b, elem_type_acc=elem_type_acc)
+    if backend == "ixdl":
+        from . import ixdl
+
+        return ixdl.MMAD(m, n, k, elem_type, elem_type_b=elem_type_b, elem_type_acc=elem_type_acc)
+    raise ValueError(f"Unsupported MMA backend '{backend}'")
 
 # __all__ = [
 #     # Maybe remove it in the future

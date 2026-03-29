@@ -274,6 +274,48 @@ MlirType mlirFlyMmaAtomUniversalFMATypeGetElemTy(MlirType type) {
 }
 
 //===----------------------------------------------------------------------===//
+// MmaAtomIXDLMMADType
+//===----------------------------------------------------------------------===//
+
+bool mlirTypeIsAFlyMmaAtomIXDLMMADType(MlirType type) {
+  return isa<MmaAtomIXDLMMADType>(unwrap(type));
+}
+
+MlirTypeID mlirFlyMmaAtomIXDLMMADTypeGetTypeID(void) {
+  return wrap(MmaAtomIXDLMMADType::getTypeID());
+}
+
+MlirType mlirFlyMmaAtomIXDLMMADTypeGet(int32_t m, int32_t n, int32_t k, MlirType elemTyA,
+                                       MlirType elemTyB, MlirType elemTyAcc) {
+  return wrap(MmaAtomIXDLMMADType::get(m, n, k, unwrap(elemTyA), unwrap(elemTyB),
+                                       unwrap(elemTyAcc)));
+}
+
+int32_t mlirFlyMmaAtomIXDLMMADTypeGetM(MlirType type) {
+  return cast<MmaAtomIXDLMMADType>(unwrap(type)).getM();
+}
+
+int32_t mlirFlyMmaAtomIXDLMMADTypeGetN(MlirType type) {
+  return cast<MmaAtomIXDLMMADType>(unwrap(type)).getN();
+}
+
+int32_t mlirFlyMmaAtomIXDLMMADTypeGetK(MlirType type) {
+  return cast<MmaAtomIXDLMMADType>(unwrap(type)).getK();
+}
+
+MlirType mlirFlyMmaAtomIXDLMMADTypeGetElemTyA(MlirType type) {
+  return wrap(cast<MmaAtomIXDLMMADType>(unwrap(type)).getElemTyA());
+}
+
+MlirType mlirFlyMmaAtomIXDLMMADTypeGetElemTyB(MlirType type) {
+  return wrap(cast<MmaAtomIXDLMMADType>(unwrap(type)).getElemTyB());
+}
+
+MlirType mlirFlyMmaAtomIXDLMMADTypeGetElemTyAcc(MlirType type) {
+  return wrap(cast<MmaAtomIXDLMMADType>(unwrap(type)).getElemTyAcc());
+}
+
+//===----------------------------------------------------------------------===//
 // TiledCopyType
 //===----------------------------------------------------------------------===//
 

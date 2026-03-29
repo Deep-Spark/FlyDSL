@@ -459,6 +459,91 @@ Attribute MmaAtomUniversalFMAType::getThrValLayoutC() const {
   return FxLayout(FxShape(FxC(1), FxC(1)), FxStride(FxC(1), FxC(1)));
 }
 
+bool MmaAtomIXDLMMADType::isStatic() const { return true; }
+
+Value MmaAtomIXDLMMADType::rebuildStaticValue(OpBuilder &builder, Location loc,
+                                             Value currentValue) const {
+  if (currentValue && isa<MakeMmaAtomOp>(currentValue.getDefiningOp()))
+    return nullptr;
+  return MakeMmaAtomOp::create(builder, loc, Type(*this));
+}
+
+Attribute MmaAtomIXDLMMADType::getShapeMNK() const {
+  return IntTupleAttr::get(ArrayAttr::get(getContext(), {FxC(getM()), FxC(getN()), FxC(getK())}));
+}
+
+Attribute MmaAtomIXDLMMADType::getThrLayout() const { return FxLayout(FxC(64), FxC(1)); }
+
+Type MmaAtomIXDLMMADType::getValTypeA() const { return getElemTyA(); }
+Type MmaAtomIXDLMMADType::getValTypeB() const { return getElemTyB(); }
+Type MmaAtomIXDLMMADType::getValTypeC() const { return getElemTyAcc(); }
+Type MmaAtomIXDLMMADType::getValTypeD() const { return getElemTyAcc(); }
+
+Attribute MmaAtomIXDLMMADType::getThrValLayoutA() const {
+  assert(getM() == 16 && getN() == 16 && getK() == 16 &&
+         "IXDL MMAD layout currently only implemented for 16x16x16");
+  auto getContext = [&]() { return this->getContext(); };
+  // Match CUTLASS IX11::Layout_16x16_16b_A.
+  // Logical A coordinates are (row, k).
+  return FxLayout(FxShape(FxThr(16, 4), FxVal(2, 2)),
+                  FxStride(FxThr(16, 2), FxVal(1, 8)));
+}
+
+Attribute MmaAtomIXDLMMADType::getThrValLayoutB() const {
+  assert(getM() == 16 && getN() == 16 && getK() == 16 &&
+         "IXDL MMAD layout currently only implemented for 16x16x16");
+  auto getContext = [&]() { return this->getContext(); };
+  // Match CUTLASS IX11::Layout_16x16_16b_B.
+  // Logical B coordinates are (k, col).
+  return FxLayout(FxShape(FxThr(16, 4), FxVal(2, 2)),
+                  FxStride(FxThr(1, 32), FxVal(16, 128)));
+}
+
+Attribute MmaAtomIXDLMMADType::getThrValLayoutC() const {
+  assert(getM() == 16 && getN() == 16 && getK() == 16 &&
+         "IXDL MMAD layout currently only implemented for 16x16x16");
+  auto getContext = [&]() { return this->getContext(); };
+  // Match CUTLASS IX11::Layout_16x16_32b_AC.
+  // Logical C/D coordinates are (row, col).
+  return FxLayout(FxShape(FxThr(16, 4), FxVal(4)),
+                  FxStride(FxThr(16, 1), FxVal(4)));
+}
+
+LogicalResult MmaAtomIXDLMMADType::verify(function_ref<InFlightDiagnostic()> emitError, int32_t m,
+                                          int32_t n, int32_t k, Type elemTyA, Type elemTyB,
+                                          Type elemTyAcc) {
+  if (m != 16 || n != 16 || k != 16)
+    return emitError() << "IXDL MMAD PoC currently only supports 16x16x16, got " << m << "x"
+                       << n << "x" << k;
+  if (!elemTyA.isF16() || !elemTyB.isF16())
+    return emitError() << "IXDL MMAD PoC currently only supports f16 multiplicands, got ("
+                       << elemTyA << ", " << elemTyB << ")";
+  if (!elemTyAcc.isF32())
+    return emitError() << "IXDL MMAD PoC currently only supports f32 accumulators, got "
+                       << elemTyAcc;
+  return success();
+}
+
+Type MmaAtomIXDLMMADType::parse(AsmParser &parser) {
+  Type elemTyA, elemTyB, elemTyC;
+  if (parser.parseLess())
+    return {};
+  int32_t m, n, k;
+  if (parseMNKDimensionList(parser, m, n, k))
+    return {};
+  if (parser.parseComma() || parser.parseLParen() || parser.parseType(elemTyA) ||
+      parser.parseComma() || parser.parseType(elemTyB) || parser.parseRParen() ||
+      parser.parseArrow() || parser.parseType(elemTyC) || parser.parseGreater())
+    return {};
+  return get(parser.getContext(), m, n, k, elemTyA, elemTyB, elemTyC);
+}
+
+void MmaAtomIXDLMMADType::print(AsmPrinter &printer) const {
+  printer << "<";
+  printMNKDimensionList(printer, getM(), getN(), getK());
+  printer << ", (" << getElemTyA() << ", " << getElemTyB() << ") -> " << getElemTyAcc() << ">";
+}
+
 Type MmaAtomUniversalFMAType::parse(AsmParser &parser) {
   Type elemTyA, elemTyB, elemTyC;
   if (parser.parseLess())

@@ -24,6 +24,11 @@
 
 #include "./BufferFatPtr.h"
 
+#if __has_include("mlir/Dialect/LLVMIR/IXDLDialect.h")
+#define FLYDSL_HAS_IXDL 1
+#include "mlir/Dialect/LLVMIR/IXDLDialect.h"
+#endif
+
 namespace mlir {
 #define GEN_PASS_DEF_FLYTOROCDLCONVERSIONPASS
 #include "flydsl/Conversion/Passes.h.inc"
@@ -479,6 +484,24 @@ public:
   }
 
 private:
+  static LayoutAttr getMemRefLayoutAttr(fly::MemRefType memRefTy) {
+    Attribute layout = memRefTy.getLayout();
+    if (auto direct = dyn_cast<LayoutAttr>(layout))
+      return direct;
+    return cast<ComposedLayoutAttr>(layout).getOuter();
+  }
+
+  static std::optional<std::pair<int64_t, int64_t>> getStaticLeafShapeStride(fly::MemRefType memRefTy) {
+    LayoutAttr layout = getMemRefLayoutAttr(memRefTy);
+    if (layout.rank() != 1 || !layout.getShape().isLeaf() || !layout.getStride().isLeaf())
+      return std::nullopt;
+    auto shape = layout.getShape().getLeafAsInt();
+    auto stride = layout.getStride().getLeafAsInt();
+    if (!shape.isStatic() || !stride.isStatic())
+      return std::nullopt;
+    return std::pair<int64_t, int64_t>{shape.getValue(), stride.getValue()};
+  }
+
   LogicalResult lowerUniversalCopy(CopyAtomCall op, ConversionPatternRewriter &rewriter,
                                    Location loc, CopyAtomType copyAtomTy, fly::MemRefType srcFlyTy,
                                    fly::MemRefType dstFlyTy, Value src, Value dst) const {
@@ -495,8 +518,33 @@ private:
     Value srcPtr = applySwizzleOnPtr(rewriter, loc, src, srcFlyTy.getSwizzle());
     Value dstPtr = applySwizzleOnPtr(rewriter, loc, dst, dstFlyTy.getSwizzle());
     int32_t copyBytes = numValSrc * elemBits / 8;
-    Value len = arith::ConstantIntOp::create(rewriter, loc, copyBytes, /*width=*/32).getResult();
-    LLVM::MemcpyOp::create(rewriter, loc, dstPtr, srcPtr, len, /*isVolatile=*/false);
+
+    auto srcShapeStride = getStaticLeafShapeStride(srcFlyTy);
+    auto dstShapeStride = getStaticLeafShapeStride(dstFlyTy);
+    if (srcShapeStride && dstShapeStride && srcShapeStride->first == numValSrc &&
+        dstShapeStride->first == numValSrc) {
+      int64_t srcStride = srcShapeStride->second;
+      int64_t dstStride = dstShapeStride->second;
+      if (srcStride == 1 && dstStride == 1) {
+        Value len = arith::ConstantIntOp::create(rewriter, loc, copyBytes, /*width=*/32).getResult();
+        LLVM::MemcpyOp::create(rewriter, loc, dstPtr, srcPtr, len, /*isVolatile=*/false);
+      } else {
+        auto ptrTy = cast<LLVM::LLVMPointerType>(srcPtr.getType());
+        for (int64_t i = 0; i < numValSrc; ++i) {
+          Value srcIdx = arith::ConstantIntOp::create(rewriter, loc, i * srcStride, /*width=*/32);
+          Value dstIdx = arith::ConstantIntOp::create(rewriter, loc, i * dstStride, /*width=*/32);
+          Value srcElemPtr =
+              LLVM::GEPOp::create(rewriter, loc, ptrTy, elemTy, srcPtr, ValueRange{srcIdx});
+          Value dstElemPtr =
+              LLVM::GEPOp::create(rewriter, loc, ptrTy, elemTy, dstPtr, ValueRange{dstIdx});
+          Value elem = LLVM::LoadOp::create(rewriter, loc, elemTy, srcElemPtr);
+          LLVM::StoreOp::create(rewriter, loc, elem, dstElemPtr);
+        }
+      }
+    } else {
+      Value len = arith::ConstantIntOp::create(rewriter, loc, copyBytes, /*width=*/32).getResult();
+      LLVM::MemcpyOp::create(rewriter, loc, dstPtr, srcPtr, len, /*isVolatile=*/false);
+    }
 
     rewriter.eraseOp(op);
     return success();
@@ -579,6 +627,8 @@ public:
       return lowerUniversalFMA(op, rewriter, loc, universalFma, dPtr, aPtr, bPtr, cPtr);
     else if (auto cdna3Mfma = dyn_cast<fly_rocdl::MmaAtomCDNA3_MFMAType>(mmaAtomType))
       return lowerCDNA3MFMA(op, rewriter, loc, cdna3Mfma, dPtr, aPtr, bPtr, cPtr);
+    else if (auto ixdlMmad = dyn_cast<MmaAtomIXDLMMADType>(mmaAtomType))
+      return lowerIXDLMMAD(op, rewriter, loc, ixdlMmad, dPtr, aPtr, bPtr, cPtr);
 
     return rewriter.notifyMatchFailure(op, "unsupported MmaAtom type");
   }
@@ -734,6 +784,39 @@ private:
 
     return rewriter.notifyMatchFailure(op, "no matching ROCDL MFMA intrinsic");
   }
+
+  LogicalResult lowerIXDLMMAD(MmaAtomCall op, ConversionPatternRewriter &rewriter, Location loc,
+                              MmaAtomIXDLMMADType atomTy, Value dPtr, Value aPtr, Value bPtr,
+                              Value cPtr) const {
+#if FLYDSL_HAS_IXDL
+    if (atomTy.getM() != 16 || atomTy.getN() != 16 || atomTy.getK() != 16)
+      return rewriter.notifyMatchFailure(op, "IXDL MMAD lowering currently expects 16x16x16");
+    if (!atomTy.getElemTyA().isF16() || !atomTy.getElemTyB().isF16() || !atomTy.getElemTyAcc().isF32())
+      return rewriter.notifyMatchFailure(op, "IXDL MMAD lowering currently expects (f16, f16) -> f32");
+
+    auto aTy = VectorType::get({4}, rewriter.getF16Type());
+    auto bTy = VectorType::get({4}, rewriter.getF16Type());
+    auto accTy = VectorType::get({4}, rewriter.getF32Type());
+
+    Value a = LLVM::LoadOp::create(rewriter, loc, aTy, aPtr);
+    Value b = LLVM::LoadOp::create(rewriter, loc, bTy, bPtr);
+    Value c = LLVM::LoadOp::create(rewriter, loc, accTy, cPtr);
+
+    auto res = IXDL::MmadOp::create(
+                   rewriter, loc, accTy, ValueRange{a}, ValueRange{b}, ValueRange{c},
+                   ArrayRef<int64_t>{atomTy.getM(), atomTy.getN(), atomTy.getK()},
+                   std::optional<std::array<IXDL::MMADTypes, 2>>(
+                       {IXDL::MMADTypes::f16, IXDL::MMADTypes::f16}),
+                   std::optional<std::array<IXDL::MMADLayout, 2>>(
+                       {IXDL::MMADLayout::row, IXDL::MMADLayout::col}))
+                   .getResult();
+    LLVM::StoreOp::create(rewriter, loc, res, dPtr);
+    rewriter.eraseOp(op);
+    return success();
+#else
+    return rewriter.notifyMatchFailure(op, "IXDL headers are unavailable in this build");
+#endif
+  }
 };
 
 /// Lower `gpu.launch_func` kernel operands so that any `!fly.memref` values are
@@ -832,6 +915,15 @@ public:
   using mlir::impl::FlyToROCDLConversionPassBase<
       FlyToROCDLConversionPass>::FlyToROCDLConversionPassBase;
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect, scf::SCFDialect, vector::VectorDialect, gpu::GPUDialect,
+                    func::FuncDialect, LLVM::LLVMDialect, ROCDL::ROCDLDialect,
+                    fly_rocdl::FlyROCDLDialect>();
+#if FLYDSL_HAS_IXDL
+    registry.insert<IXDL::IXDLDialect>();
+#endif
+  }
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
@@ -841,6 +933,9 @@ public:
     target.addLegalDialect<arith::ArithDialect, scf::SCFDialect, vector::VectorDialect,
                            gpu::GPUDialect, func::FuncDialect, LLVM::LLVMDialect,
                            ROCDL::ROCDLDialect>();
+#if FLYDSL_HAS_IXDL
+    target.addLegalDialect<IXDL::IXDLDialect>();
+#endif
     target.addIllegalDialect<fly::FlyDialect, fly_rocdl::FlyROCDLDialect>();
 
     // Constructors

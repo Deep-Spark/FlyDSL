@@ -18,3 +18,7 @@ add_mlir_conversion_library(MLIRFlyToROCDL
   MLIRTransforms
   MLIRVectorDialect
 )
+
+if(TARGET MLIRIXDLDialect)
+  target_link_libraries(MLIRFlyToROCDL PUBLIC MLIRIXDLDialect)
+endif()

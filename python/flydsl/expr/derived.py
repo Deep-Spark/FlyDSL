@@ -21,6 +21,7 @@ Typical usage::
 """
 
 from .._mlir import ir
+from .._mlir.dialects.fly import MmaAtomIXDLMMADType
 from .._mlir.dialects._fly_enum_gen import MmaOperand
 from .primitive import *
 from .typing import Layout, Tensor
@@ -39,6 +40,10 @@ __all__ = [
     "make_tiled_copy_B",
     "make_tiled_copy_C",
 ]
+
+
+def _is_ixdl_tiled_mma(tiled_mma):
+    return isinstance(tiled_mma.tiled_mma_ty.mma_atom, MmaAtomIXDLMMADType)
 
 
 class Atom:

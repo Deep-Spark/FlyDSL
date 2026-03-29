@@ -461,6 +461,79 @@ struct PyMmaAtomUniversalFMAType : PyConcreteType<PyMmaAtomUniversalFMAType> {
   }
 };
 
+struct PyMmaAtomIXDLMMADType : PyConcreteType<PyMmaAtomIXDLMMADType> {
+  static constexpr IsAFunctionTy isaFunction = mlirTypeIsAFlyMmaAtomIXDLMMADType;
+  static constexpr GetTypeIDFunctionTy getTypeIdFunction = mlirFlyMmaAtomIXDLMMADTypeGetTypeID;
+  static constexpr const char *pyClassName = "MmaAtomIXDLMMADType";
+  using Base::Base;
+
+  static void bindDerived(ClassTy &c) {
+    c.def_static(
+        "get",
+        [](int32_t m, int32_t n, int32_t k, PyType &elemTyA, PyType &elemTyB, PyType &elemTyAcc,
+           DefaultingPyMlirContext context) {
+          return PyMmaAtomIXDLMMADType(
+              context->getRef(),
+              mlirFlyMmaAtomIXDLMMADTypeGet(m, n, k, static_cast<MlirType>(elemTyA),
+                                            static_cast<MlirType>(elemTyB),
+                                            static_cast<MlirType>(elemTyAcc)));
+        },
+        "m"_a, "n"_a, "k"_a, "elem_ty_a"_a, "elem_ty_b"_a, "elem_ty_acc"_a, nb::kw_only(),
+        "context"_a = nb::none(),
+        "Create an IXDL MMAD MmaAtom type with m, n, k dimensions and element types");
+
+    c.def_prop_ro("m", [](PyMmaAtomIXDLMMADType &self) -> int32_t {
+      return mlirFlyMmaAtomIXDLMMADTypeGetM(self);
+    });
+    c.def_prop_ro("n", [](PyMmaAtomIXDLMMADType &self) -> int32_t {
+      return mlirFlyMmaAtomIXDLMMADTypeGetN(self);
+    });
+    c.def_prop_ro("k", [](PyMmaAtomIXDLMMADType &self) -> int32_t {
+      return mlirFlyMmaAtomIXDLMMADTypeGetK(self);
+    });
+    c.def_prop_ro("elem_ty_a", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      return mlirFlyMmaAtomIXDLMMADTypeGetElemTyA(self);
+    });
+    c.def_prop_ro("elem_ty_b", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      return mlirFlyMmaAtomIXDLMMADTypeGetElemTyB(self);
+    });
+    c.def_prop_ro("elem_ty_acc", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      return mlirFlyMmaAtomIXDLMMADTypeGetElemTyAcc(self);
+    });
+
+    c.def_prop_ro("thr_layout", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      auto ty =
+          ::mlir::cast<::mlir::fly::MmaAtomTypeInterface>(unwrap(static_cast<MlirType>(self)));
+      auto attr = ::mlir::cast<::mlir::fly::LayoutAttr>(ty.getThrLayout());
+      return wrap(::mlir::fly::LayoutType::get(attr));
+    });
+    c.def_prop_ro("shape_mnk", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      auto ty =
+          ::mlir::cast<::mlir::fly::MmaAtomTypeInterface>(unwrap(static_cast<MlirType>(self)));
+      auto attr = ::mlir::cast<::mlir::fly::IntTupleAttr>(ty.getShapeMNK());
+      return wrap(::mlir::fly::IntTupleType::get(attr));
+    });
+    c.def_prop_ro("tv_layout_a", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      auto ty =
+          ::mlir::cast<::mlir::fly::MmaAtomTypeInterface>(unwrap(static_cast<MlirType>(self)));
+      auto attr = ::mlir::cast<::mlir::fly::LayoutAttr>(ty.getThrValLayoutA());
+      return wrap(::mlir::fly::LayoutType::get(attr));
+    });
+    c.def_prop_ro("tv_layout_b", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      auto ty =
+          ::mlir::cast<::mlir::fly::MmaAtomTypeInterface>(unwrap(static_cast<MlirType>(self)));
+      auto attr = ::mlir::cast<::mlir::fly::LayoutAttr>(ty.getThrValLayoutB());
+      return wrap(::mlir::fly::LayoutType::get(attr));
+    });
+    c.def_prop_ro("tv_layout_c", [](PyMmaAtomIXDLMMADType &self) -> MlirType {
+      auto ty =
+          ::mlir::cast<::mlir::fly::MmaAtomTypeInterface>(unwrap(static_cast<MlirType>(self)));
+      auto attr = ::mlir::cast<::mlir::fly::LayoutAttr>(ty.getThrValLayoutC());
+      return wrap(::mlir::fly::LayoutType::get(attr));
+    });
+  }
+};
+
 struct PyTiledCopyType : PyConcreteType<PyTiledCopyType> {
   static constexpr IsAFunctionTy isaFunction = mlirTypeIsAFlyTiledCopyType;
   static constexpr GetTypeIDFunctionTy getTypeIdFunction = mlirFlyTiledCopyTypeGetTypeID;
@@ -592,6 +665,7 @@ NB_MODULE(_fly, m) {
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyCopyOpUniversalCopyType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyCopyAtomType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyMmaAtomUniversalFMAType::bind(m);
+  ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyMmaAtomIXDLMMADType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyTiledCopyType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyTiledMmaType::bind(m);
 }
