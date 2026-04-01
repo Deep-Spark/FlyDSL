@@ -188,6 +188,7 @@ jobs:
         run: |
           export MLIR_PATH="$GITHUB_WORKSPACE/llvm-project/mlir_install"
           export FLY_BUILD_DIR="$GITHUB_WORKSPACE/flydsl-test/build-fly-${BUILD_SUFFIX}"
+          export FLY_ENABLE_ROCM=OFF
           cd flydsl-test && python3 -m pip install -e . --use-pep517
 
       # ================================================================

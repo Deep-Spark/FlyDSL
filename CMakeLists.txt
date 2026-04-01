@@ -7,6 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 
 option(FLY_UNITTEST "Build Fly Unit Tests" OFF)
+option(FLY_ENABLE_ROCM "Build ROCm GPU runtime (requires HIP SDK)" ON)
 
 find_package(MLIR REQUIRED CONFIG)
 

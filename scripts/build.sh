@@ -92,6 +92,9 @@ cmake_args=(
 if [ -n "${NANOBIND_DIR}" ]; then
   cmake_args+=(-Dnanobind_DIR="${NANOBIND_DIR}")
 fi
+if [ -n "${FLY_ENABLE_ROCM+x}" ]; then
+  cmake_args+=(-DFLY_ENABLE_ROCM="${FLY_ENABLE_ROCM}")
+fi
 
 echo "Configuring CMake..."
 cmake "${cmake_args[@]}"
