@@ -6,6 +6,7 @@
 #
 # Local (default): skips large_shape tests for fast iteration.
 # CI:              RUN_TESTS_FULL=1 bash scripts/run_tests.sh
+# MLIR only:       RUN_MLIR_TESTS_ONLY=1 bash scripts/run_tests.sh
 
 set -euo pipefail
 
@@ -40,6 +41,8 @@ pytest_args=(-v --no-header --tb=short)
 if [ "${RUN_TESTS_FULL:-0}" != "1" ]; then
     pytest_args+=(-m "not large_shape")
 fi
+
+if [ "${RUN_MLIR_TESTS_ONLY:-0}" != "1" ]; then
 
 # ---------------------------------------------------------------------------
 # 1. All pytest-based tests (kernels + unit + examples)
@@ -80,6 +83,8 @@ for example in "${REPO_ROOT}"/examples/*.py; do
     fi
     echo "  PASS  ${name}"
 done
+
+fi  # RUN_MLIR_TESTS_ONLY
 
 # ---------------------------------------------------------------------------
 # 3. MLIR FileCheck tests
