@@ -176,6 +176,8 @@ jobs:
           set -ex
           export LLVM_COMMIT=$(cat "flydsl-test/${{ matrix.llvm_hash_file }}" | tr -d '[:space:]')
           export LLVM_REMOTE='${{ matrix.llvm_remote }}'
+          export LLVM_TARGETS="X86"
+          export MLIR_ROCM_RUNNER="OFF"
           cd flydsl-test && bash scripts/build_llvm.sh
           cp "$GITHUB_WORKSPACE/llvm-project/mlir_install.tgz" \
              "$GITHUB_WORKSPACE/mlir_install-${BUILD_SUFFIX}.tgz" || true

@@ -74,18 +74,21 @@ fi
 # Explicitly set nanobind directory if found to help CMake locate it
 NANOBIND_DIR=$(python3 -c "import nanobind; import os; print(os.path.dirname(nanobind.__file__) + '/cmake')")
 
+LLVM_TARGETS="${LLVM_TARGETS:-X86;NVPTX;AMDGPU}"
+MLIR_ROCM_RUNNER="${MLIR_ROCM_RUNNER:-ON}"
+
 cmake -G "$GENERATOR" \
     -S "$LLVM_SRC_DIR/llvm" \
     -B "$LLVM_BUILD_DIR" \
     -DLLVM_ENABLE_PROJECTS="mlir;clang" \
-    -DLLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU" \
+    -DLLVM_TARGETS_TO_BUILD="$LLVM_TARGETS" \
     -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_STANDARD=17 \
     -DLLVM_ENABLE_ASSERTIONS=ON \
     -DLLVM_INSTALL_UTILS=ON \
     -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
-    -DMLIR_ENABLE_ROCM_RUNNER=ON \
+    -DMLIR_ENABLE_ROCM_RUNNER="$MLIR_ROCM_RUNNER" \
     -DMLIR_BINDINGS_PYTHON_NB_DOMAIN=mlir \
     -DPython3_EXECUTABLE=$(which python3) \
     -Dnanobind_DIR="$NANOBIND_DIR" \
