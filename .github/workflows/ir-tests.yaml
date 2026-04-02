@@ -204,8 +204,10 @@ jobs:
             export LD_LIBRARY_PATH="${BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
             python3 -m pytest \
               tests/unit/test_layout_algebra.py \
-              tests/unit/test_rocir_print.py \
               tests/unit/test_static_vs_dynamic.py \
+              tests/unit/test_async_object_vs_deps.py \
+              tests/unit/test_device_runtime.py \
+              tests/unit/test_rocir_print.py \
               -v --no-header --tb=short
           '
         env:
@@ -230,8 +232,9 @@ jobs:
           export LD_LIBRARY_PATH="${BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
           python3 -m pytest \
             tests/unit/test_layout_algebra.py \
-            tests/unit/test_rocir_print.py \
             tests/unit/test_static_vs_dynamic.py \
+            tests/unit/test_async_object_vs_deps.py \
+            tests/unit/test_device_runtime.py \
             -v --no-header --tb=short
 
       - name: Run mlir FileCheck tests (native)
