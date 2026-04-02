@@ -7,6 +7,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BASE_DIR="$(cd "${REPO_ROOT}/.." && pwd)"
+
+# Source repo: reuse LLVM_SRC_CACHE for persistent shared clone, or fall back
+if [ -n "${LLVM_SRC_CACHE:-}" ] && [ -z "${LLVM_SRC_DIR:-}" ]; then
+    LLVM_SRC_DIR="${LLVM_SRC_CACHE}"
+fi
 LLVM_SRC_DIR="${LLVM_SRC_DIR:-$BASE_DIR/llvm-project}"
 LLVM_BUILD_DIR="${LLVM_BUILD_DIR:-$LLVM_SRC_DIR/build-flydsl}"
 LLVM_INSTALL_DIR="${LLVM_INSTALL_DIR:-$LLVM_SRC_DIR/mlir_install}"
@@ -31,7 +36,7 @@ echo "LLVM Install:   $LLVM_INSTALL_DIR"
 echo "LLVM Tarball:   $LLVM_INSTALL_TGZ"
 echo "LLVM Commit:    $LLVM_COMMIT"
 
-# 1. Clone LLVM
+# 1. Clone / fetch LLVM source
 LLVM_REMOTE="${LLVM_REMOTE:-https://github.com/llvm/llvm-project.git}"
 
 if [ ! -d "$LLVM_SRC_DIR" ]; then
@@ -41,6 +46,9 @@ if [ ! -d "$LLVM_SRC_DIR" ]; then
     git remote add origin "$LLVM_REMOTE"
 else
     pushd "$LLVM_SRC_DIR"
+    # Ensure remote URL is up-to-date (shared repo may serve multiple remotes)
+    git remote set-url origin "$LLVM_REMOTE" 2>/dev/null \
+        || git remote add origin "$LLVM_REMOTE" 2>/dev/null || true
 fi
 
 if ! git cat-file -e "${LLVM_COMMIT}^{commit}" 2>/dev/null; then
@@ -129,6 +137,18 @@ if [[ "${LLVM_PACKAGE_INSTALL}" == "1" ]]; then
   tar --warning=no-file-changed --warning=no-file-removed --ignore-failed-read \
       -C "$(dirname "${LLVM_INSTALL_DIR}")" \
       -czf "${LLVM_INSTALL_TGZ}" "$(basename "${LLVM_INSTALL_DIR}")"
+
+  # Record build metadata alongside the install for cache auditing
+  cat > "${LLVM_INSTALL_DIR}/../meta.env" <<METAEOF
+LLVM_COMMIT=${LLVM_COMMIT}
+LLVM_REMOTE=${LLVM_REMOTE}
+LLVM_TARGETS=${LLVM_TARGETS}
+MLIR_ROCM_RUNNER=${MLIR_ROCM_RUNNER}
+CMAKE_BUILD_TYPE=Release
+CMAKE_GENERATOR=${GENERATOR}
+BUILD_DATE=$(date -Iseconds)
+BUILDER=$(whoami)@$(hostname)
+METAEOF
 fi
 
 echo "=============================================="

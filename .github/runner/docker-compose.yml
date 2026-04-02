@@ -1,0 +1,56 @@
+## GitHub Actions Self-hosted Runner (containerized)
+##
+## Usage:
+##   # First time: get a registration token from
+##   #   https://github.com/Deep-Spark/FlyDSL/settings/actions/runners/new
+##
+##   export RUNNER_TOKEN="AXXXX..."
+##   docker compose up -d --build
+##
+##   # Check logs
+##   docker compose logs -f
+##
+##   # Stop & deregister
+##   docker compose down          # sends SIGTERM → runner auto-deregisters
+
+services:
+  runner:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+        PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+        RUNNER_VERSION: "2.322.0"
+    container_name: flydsl-runner
+    restart: unless-stopped
+    environment:
+      GITHUB_REPO_URL: https://github.com/Deep-Spark/FlyDSL
+      RUNNER_TOKEN: ${RUNNER_TOKEN}
+      RUNNER_NAME: linux-flydsl-iluvatar
+      RUNNER_LABELS: self-hosted,linux,x64
+    volumes:
+      # Persist runner work directory across restarts
+      - runner-work:/actions-runner/_work
+      # Shared LLVM build cache (host ↔ container)
+      - /opt/flydsl/llvm-cache:/opt/flydsl/llvm-cache
+
+    ## ── GPU passthrough (uncomment the section matching your hardware) ──
+    ##
+    ## NVIDIA (requires nvidia-container-toolkit on host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    ##
+    ## Iluvatar (requires Iluvatar runtime on host):
+    # devices:
+    #   - /dev/bi_ctl0:/dev/bi_ctl0
+    #   - /dev/bi0:/dev/bi0
+    # volumes:
+    #   - /usr/local/corex:/usr/local/corex:ro
+
+volumes:
+  runner-work:

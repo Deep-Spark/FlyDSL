@@ -9,8 +9,16 @@
 #   source scripts/activate_backend.sh iluvatar      # Iluvatar backend
 #   source scripts/activate_backend.sh rocdl -j32    # pass -j32 to build_llvm.sh
 #
-# LLVM install directories are cached under:
-#   <cache_base>/<commit>/mlir_install/
+# Cache layout:
+#   <cache_base>/
+#   ├── src/llvm-project/              # Shared LLVM source (all commits)
+#   └── <commit_short>-<param_hash>/
+#       ├── mlir_install/              # Installed MLIR/LLVM
+#       ├── mlir_install.tgz           # Tarball (CI compatible)
+#       └── meta.env                   # Build parameters record
+#
+# The <param_hash> ensures that the same LLVM commit built with different
+# flags (e.g. X86 vs X86;AMDGPU) gets separate cache entries.
 #
 # Cache location (checked in order):
 #   1. $LLVM_CACHE_DIR          — explicit override
@@ -20,10 +28,6 @@
 # To set up the shared cache (one-time, needs sudo):
 #   sudo mkdir -p /opt/flydsl/llvm-cache
 #   sudo chmod 2777 /opt/flydsl/llvm-cache
-#
-# If a cached install exists for the backend's LLVM commit, it is reused
-# immediately (no build). Otherwise build_llvm.sh is invoked once and the
-# result is stored in the cache for future activations.
 #
 # After sourcing, the following environment variables are set:
 #   MLIR_PATH       — points to the cached LLVM/MLIR install
@@ -43,7 +47,7 @@ shift  # remaining args forwarded to build_llvm.sh on cache miss
 _fly_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _fly_repo_root="$(cd "${_fly_script_dir}/.." && pwd)"
 
-# Resolve hash file: rocdl uses llvm-hash.txt, others use llvm-hash-<backend>.txt
+# ── Resolve hash file ─────────────────────────────────────────────────
 if [ "$_fly_backend" = "rocdl" ]; then
     _fly_hash_file="${_fly_repo_root}/thirdparty/llvm-hash.txt"
 else
@@ -57,6 +61,30 @@ if [ ! -f "$_fly_hash_file" ]; then
 fi
 
 _fly_commit=$(tr -d '[:space:]' < "$_fly_hash_file")
+
+# ── Backend-specific build parameters (overridable via env) ───────────
+case "$_fly_backend" in
+    rocdl)
+        LLVM_TARGETS="${LLVM_TARGETS:-X86;NVPTX;AMDGPU}"
+        MLIR_ROCM_RUNNER="${MLIR_ROCM_RUNNER:-ON}"
+        ;;
+    iluvatar)
+        LLVM_TARGETS="${LLVM_TARGETS:-X86;NVPTX}"
+        MLIR_ROCM_RUNNER="${MLIR_ROCM_RUNNER:-OFF}"
+        ;;
+    *)
+        LLVM_TARGETS="${LLVM_TARGETS:-X86}"
+        MLIR_ROCM_RUNNER="${MLIR_ROCM_RUNNER:-OFF}"
+        ;;
+esac
+export LLVM_TARGETS MLIR_ROCM_RUNNER
+
+# ── Compute param-aware cache key ─────────────────────────────────────
+_fly_param_str="TARGETS=${LLVM_TARGETS};ROCM=${MLIR_ROCM_RUNNER}"
+_fly_param_hash=$(echo -n "$_fly_param_str" | sha256sum | cut -c1-8)
+_fly_cache_key="${_fly_commit:0:12}-${_fly_param_hash}"
+
+# ── Resolve cache base directory ──────────────────────────────────────
 if [ -n "${LLVM_CACHE_DIR:-}" ]; then
     _fly_cache_base="$LLVM_CACHE_DIR"
 elif [ -d "/opt/flydsl/llvm-cache" ] && [ -w "/opt/flydsl/llvm-cache" ]; then
@@ -64,26 +92,38 @@ elif [ -d "/opt/flydsl/llvm-cache" ] && [ -w "/opt/flydsl/llvm-cache" ]; then
 else
     _fly_cache_base="$HOME/.cache/flydsl/llvm"
 fi
-_fly_cached_install="${_fly_cache_base}/${_fly_commit}/mlir_install"
+_fly_cached_install="${_fly_cache_base}/${_fly_cache_key}/mlir_install"
 
 echo "=============================================="
 echo "Activating backend: $_fly_backend"
 echo "  LLVM commit:  ${_fly_commit:0:12}…"
-echo "  Hash file:    $_fly_hash_file"
-echo "  Cache dir:    ${_fly_cache_base}/${_fly_commit:0:12}…"
+echo "  Build params: ${_fly_param_str}"
+echo "  Cache key:    ${_fly_cache_key}"
+echo "  Cache dir:    ${_fly_cache_base}/${_fly_cache_key}"
 echo "=============================================="
 
+# ── Check cache & display metadata ────────────────────────────────────
 if [ -d "${_fly_cached_install}/lib/cmake/mlir" ]; then
     echo "✓ Cache hit — reusing existing LLVM install"
+    if [ -f "${_fly_cache_base}/${_fly_cache_key}/meta.env" ]; then
+        echo "  Build metadata:"
+        while IFS='=' read -r key value; do
+            [[ -z "$key" || "$key" == \#* ]] && continue
+            printf "    %-20s = %s\n" "$key" "$value"
+        done < "${_fly_cache_base}/${_fly_cache_key}/meta.env"
+    fi
 else
     echo "✗ Cache miss — building LLVM (this may take 30+ minutes)…"
     echo ""
-    mkdir -p "${_fly_cache_base}/${_fly_commit}"
+    mkdir -p "${_fly_cache_base}/${_fly_cache_key}"
 
     (
         export LLVM_COMMIT="$_fly_commit"
+        # Shared source repo: all backends share one clone
+        export LLVM_SRC_CACHE="${_fly_cache_base}/src/llvm-project"
+        export LLVM_BUILD_DIR="${_fly_cache_base}/${_fly_cache_key}/build"
         export LLVM_INSTALL_DIR="$_fly_cached_install"
-        export LLVM_INSTALL_TGZ="${_fly_cache_base}/${_fly_commit}/mlir_install.tgz"
+        export LLVM_INSTALL_TGZ="${_fly_cache_base}/${_fly_cache_key}/mlir_install.tgz"
         bash "${_fly_repo_root}/scripts/build_llvm.sh" "$@"
     )
 
@@ -95,6 +135,7 @@ else
     echo "✓ LLVM built and cached successfully"
 fi
 
+# ── Set environment variables ─────────────────────────────────────────
 export MLIR_PATH="$_fly_cached_install"
 export FLY_BUILD_DIR="${_fly_repo_root}/build-fly-${_fly_backend}"
 export FLY_BACKEND="$_fly_backend"
@@ -107,9 +148,11 @@ echo "  FLY_BACKEND    = ${FLY_BACKEND}"
 echo ""
 echo "Next steps:"
 echo "  pip install -e . --use-pep517          # build FlyDSL"
-echo "  python3 -m pytest tests/pyir/ -v       # run pyir tests"
+echo "  python3 -m pytest tests/unit/ -v       # run unit tests"
 echo "  RUN_MLIR_TESTS_ONLY=1 bash scripts/run_tests.sh  # run mlir tests"
 echo "=============================================="
 
+# ── Cleanup local variables ───────────────────────────────────────────
 unset _fly_backend _fly_script_dir _fly_repo_root _fly_hash_file
 unset _fly_commit _fly_cache_base _fly_cached_install
+unset _fly_param_str _fly_param_hash _fly_cache_key

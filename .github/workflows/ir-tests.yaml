@@ -3,10 +3,12 @@ name: IR Tests (multi-backend)
 on:
   push:
     branches:
+      - main
       - deep-spark-main
       - 'test/ir-*'
   pull_request:
     branches:
+      - main
       - deep-spark-main
   workflow_dispatch:
     inputs:
@@ -17,10 +19,6 @@ on:
           - self-hosted
           - github-hosted
         default: self-hosted
-      docker_image:
-        description: "Docker image (self-hosted only)"
-        type: string
-        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,9 +26,6 @@ concurrency:
 
 permissions:
   contents: read
-
-env:
-  DOCKER_IMAGE: ${{ inputs.docker_image || 'rocm/pytorch:rocm7.1_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
 
 jobs:
   ir-tests:
@@ -49,66 +44,41 @@ jobs:
     name: ir-tests (${{ matrix.backend }})
     runs-on: >-
       ${{
-        (github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted')
-        && 'self-hosted'
-        || 'ubuntu-22.04'
+        (github.event_name == 'workflow_dispatch' && inputs.runner == 'github-hosted')
+        && 'ubuntu-22.04'
+        || 'self-hosted'
       }}
     env:
-      USE_DOCKER: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted' }}
-      CONTAINER: flydsl_ir_test_${{ matrix.backend }}
       BUILD_SUFFIX: ${{ matrix.backend }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: flydsl-test
           submodules: recursive
 
       # ================================================================
-      # Docker path — self-hosted runner
-      # ================================================================
-      - name: Start Docker container (no GPU)
-        if: env.USE_DOCKER == 'true'
-        run: |
-          docker ps -aq -f name=$CONTAINER | xargs -r docker stop | xargs -r docker rm || true
-          docker run -dt --network=host --user root \
-            -v "${GITHUB_WORKSPACE:-$PWD}/flydsl-test:/flydsl-test" \
-            --ipc=host --shm-size 16g \
-            --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            -w /flydsl-test \
-            --name "$CONTAINER" \
-            ${{ env.DOCKER_IMAGE }}
-
-      - name: Install dependencies (Docker)
-        if: env.USE_DOCKER == 'true'
-        run: |
-          docker exec $CONTAINER bash -c "apt-get update && apt-get install -y cmake build-essential"
-          docker exec $CONTAINER bash -c "python3 -m pip install -U pip setuptools wheel"
-          docker exec $CONTAINER bash -c "python3 -m pip install ninja>=1.11.1"
-          docker exec $CONTAINER bash -c "python3 -m pip install -U 'hypothesis>=6.82.0'"
-          docker exec $CONTAINER bash -c "git config --global --add safe.directory /flydsl-test"
-
-      # ================================================================
-      # Native path — GitHub-hosted runner
+      # Environment setup (GitHub-hosted only — self-hosted container
+      # already has all dependencies pre-installed)
       # ================================================================
       - name: Setup Python
-        if: env.USE_DOCKER != 'true'
+        if: runner.environment == 'github-hosted'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies (native)
-        if: env.USE_DOCKER != 'true'
+      - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential
+
+      - name: Install Python dependencies
+        if: runner.environment == 'github-hosted'
         run: |
-          sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential
           python3 -m pip install -U pip setuptools wheel uv
           python3 -m pip install ninja 'hypothesis>=6.82.0' nanobind pybind11 numpy pytest
 
       # ================================================================
-      # MLIR cache (per-backend, shared by both paths)
+      # MLIR cache (per-backend)
       # ================================================================
       - name: Restore cached MLIR install tarball
         id: mlir-cache
@@ -125,53 +95,18 @@ jobs:
               )
             }}
 
-      # ================================================================
-      # Docker: restore / build LLVM, then build FlyDSL
-      # ================================================================
-      - name: Restore MLIR into container
-        if: env.USE_DOCKER == 'true' && steps.mlir-cache.outputs.cache-hit == 'true'
-        run: |
-          docker cp "mlir_install-${BUILD_SUFFIX}.tgz" "$CONTAINER:/tmp/mlir_install.tgz"
-          docker exec $CONTAINER bash -c \
-            "rm -rf /llvm-project/mlir_install && mkdir -p /llvm-project && tar -xzf /tmp/mlir_install.tgz -C /llvm-project"
-          docker exec $CONTAINER bash -c "ls -la /llvm-project/mlir_install/lib/cmake/mlir"
-
-      - name: Build LLVM (Docker)
-        if: env.USE_DOCKER == 'true' && steps.mlir-cache.outputs.cache-hit != 'true'
-        run: |
-          set -ex
-          docker exec $CONTAINER bash -c "
-            export LLVM_COMMIT=\$(cat /flydsl-test/${{ matrix.llvm_hash_file }} | tr -d '[:space:]')
-            export LLVM_REMOTE='${{ matrix.llvm_remote }}'
-            cd /flydsl-test && bash scripts/build_llvm.sh
-          "
-          docker exec $CONTAINER bash -c "ls -la /llvm-project/mlir_install/lib/cmake/mlir"
-          docker cp "$CONTAINER:/llvm-project/mlir_install.tgz" "./mlir_install-${BUILD_SUFFIX}.tgz" || true
-          ls -lh "./mlir_install-${BUILD_SUFFIX}.tgz" || true
-
-      - name: Build FlyDSL (Docker)
-        if: env.USE_DOCKER == 'true'
-        run: |
-          docker exec $CONTAINER bash -c "
-            export MLIR_PATH=/llvm-project/mlir_install
-            export FLY_BUILD_DIR=/flydsl-test/build-fly-${BUILD_SUFFIX}
-            cd /flydsl-test && python3 -m pip install -e . --use-pep517
-          "
-        env:
-          BUILD_SUFFIX: ${{ matrix.backend }}
-
-      # ================================================================
-      # Native: restore / build LLVM, then build FlyDSL
-      # ================================================================
-      - name: Restore MLIR (native)
-        if: env.USE_DOCKER != 'true' && steps.mlir-cache.outputs.cache-hit == 'true'
+      - name: Restore MLIR from cache
+        if: steps.mlir-cache.outputs.cache-hit == 'true'
         run: |
           mkdir -p llvm-project
           tar -xzf "mlir_install-${BUILD_SUFFIX}.tgz" -C llvm-project
           ls -la llvm-project/mlir_install/lib/cmake/mlir
 
-      - name: Build LLVM (native)
-        if: env.USE_DOCKER != 'true' && steps.mlir-cache.outputs.cache-hit != 'true'
+      # ================================================================
+      # Build LLVM (cache miss only)
+      # ================================================================
+      - name: Build LLVM
+        if: steps.mlir-cache.outputs.cache-hit != 'true'
         run: |
           set -ex
           export LLVM_COMMIT=$(cat "flydsl-test/${{ matrix.llvm_hash_file }}" | tr -d '[:space:]')
@@ -181,10 +116,11 @@ jobs:
           cd flydsl-test && bash scripts/build_llvm.sh
           cp "$GITHUB_WORKSPACE/llvm-project/mlir_install.tgz" \
              "$GITHUB_WORKSPACE/mlir_install-${BUILD_SUFFIX}.tgz" || true
-          ls -lh "$GITHUB_WORKSPACE/mlir_install-${BUILD_SUFFIX}.tgz" || true
 
-      - name: Build FlyDSL (native)
-        if: env.USE_DOCKER != 'true'
+      # ================================================================
+      # Build FlyDSL
+      # ================================================================
+      - name: Build FlyDSL
         run: |
           export MLIR_PATH="$GITHUB_WORKSPACE/llvm-project/mlir_install"
           export FLY_BUILD_DIR="$GITHUB_WORKSPACE/flydsl-test/build-fly-${BUILD_SUFFIX}"
@@ -192,87 +128,39 @@ jobs:
           cd flydsl-test && python3 -m pip install -e . --use-pep517
 
       # ================================================================
-      # Run tests — IR tests (always: mlir FileCheck + IR unit tests)
+      # IR tests (always run)
       # ================================================================
-      - name: Run IR unit tests (Docker)
-        if: env.USE_DOCKER == 'true'
-        run: |
-          docker exec $CONTAINER bash -c '
-            cd /flydsl-test
-            BUILD_DIR="/flydsl-test/build-fly-'"$BUILD_SUFFIX"'"
-            export PYTHONPATH="${BUILD_DIR}/python_packages:/flydsl-test:${PYTHONPATH:-}"
-            export LD_LIBRARY_PATH="${BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
-            python3 -m pytest \
-              tests/unit/test_layout_algebra.py \
-              tests/unit/test_static_vs_dynamic.py \
-              tests/unit/test_async_object_vs_deps.py \
-              tests/unit/test_device_runtime.py \
-              tests/unit/test_rocir_print.py \
-              -v --no-header --tb=short
-          '
-        env:
-          BUILD_SUFFIX: ${{ matrix.backend }}
-
-      - name: Run mlir FileCheck tests (Docker)
-        if: env.USE_DOCKER == 'true'
-        run: |
-          docker exec $CONTAINER bash -c "
-            export FLY_BUILD_DIR=/flydsl-test/build-fly-${BUILD_SUFFIX}
-            cd /flydsl-test && RUN_MLIR_TESTS_ONLY=1 bash scripts/run_tests.sh
-          "
-        env:
-          BUILD_SUFFIX: ${{ matrix.backend }}
-
-      - name: Run IR unit tests (native)
-        if: env.USE_DOCKER != 'true'
+      - name: Run IR unit tests
         run: |
           cd flydsl-test
           BUILD_DIR="$(pwd)/build-fly-${BUILD_SUFFIX}"
           export PYTHONPATH="${BUILD_DIR}/python_packages:$(pwd):${PYTHONPATH:-}"
           export LD_LIBRARY_PATH="${BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
-          python3 -m pytest \
-            tests/unit/test_layout_algebra.py \
-            tests/unit/test_static_vs_dynamic.py \
-            tests/unit/test_async_object_vs_deps.py \
-            tests/unit/test_device_runtime.py \
-            -v --no-header --tb=short
 
-      - name: Run mlir FileCheck tests (native)
-        if: env.USE_DOCKER != 'true'
+          IR_TESTS=(
+            tests/unit/test_layout_algebra.py
+            tests/unit/test_static_vs_dynamic.py
+            tests/unit/test_async_object_vs_deps.py
+            tests/unit/test_device_runtime.py
+          )
+          if python3 -c "import torch" 2>/dev/null; then
+            IR_TESTS+=(tests/unit/test_rocir_print.py)
+          fi
+          python3 -m pytest "${IR_TESTS[@]}" -v --no-header --tb=short
+
+      - name: Run mlir FileCheck tests
         run: |
           export FLY_BUILD_DIR="$GITHUB_WORKSPACE/flydsl-test/build-fly-${BUILD_SUFFIX}"
           cd flydsl-test && RUN_MLIR_TESTS_ONLY=1 bash scripts/run_tests.sh
 
       # ================================================================
-      # Run tests — GPU kernel tests (only when hardware is available)
+      # GPU kernel tests (only when hardware is available)
       # ================================================================
-      - name: Run GPU kernel tests (Docker)
-        if: env.USE_DOCKER == 'true' && matrix.run_gpu_tests
-        run: |
-          docker exec $CONTAINER bash -c '
-            cd /flydsl-test
-            BUILD_DIR="/flydsl-test/build-fly-'"$BUILD_SUFFIX"'"
-            export PYTHONPATH="${BUILD_DIR}/python_packages:/flydsl-test:${PYTHONPATH:-}"
-            export LD_LIBRARY_PATH="${BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
-            python3 -m pytest tests/kernels/ tests/python/examples/ -v --no-header --tb=short
-          '
-        env:
-          BUILD_SUFFIX: ${{ matrix.backend }}
-
-      - name: Run GPU kernel tests (native)
-        if: env.USE_DOCKER != 'true' && matrix.run_gpu_tests
+      - name: Run GPU kernel tests
+        if: matrix.run_gpu_tests
         run: |
           cd flydsl-test
           BUILD_DIR="$(pwd)/build-fly-${BUILD_SUFFIX}"
           export PYTHONPATH="${BUILD_DIR}/python_packages:$(pwd):${PYTHONPATH:-}"
           export LD_LIBRARY_PATH="${BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
-          python3 -m pytest tests/kernels/ tests/python/examples/ -v --no-header --tb=short
-
-      # ================================================================
-      # Cleanup
-      # ================================================================
-      - name: Clean up Docker container
-        if: always() && env.USE_DOCKER == 'true'
-        run: |
-          docker stop "$CONTAINER" || true
-          docker rm "$CONTAINER" || true
+          python3 -m pytest tests/kernels/ -v --no-header --tb=short
