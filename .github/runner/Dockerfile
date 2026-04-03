@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl wget ca-certificates \
         python3 python3-pip python3-dev \
         libssl-dev zlib1g-dev libffi-dev \
+        patchelf \
         jq sudo lsb-release \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,10 +32,10 @@ RUN pip3 install --break-system-packages \
         torch --index-url https://download.pytorch.org/whl/cpu
 
 # ── GitHub Actions runner ─────────────────────────────────────────────
+# Copy pre-downloaded tarball from build context to avoid slow GitHub downloads
+COPY actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz /tmp/runner.tar.gz
 RUN mkdir -p /actions-runner && cd /actions-runner \
-    && curl --http1.1 --retry 3 -o runner.tar.gz -L \
-       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
-    && tar xzf runner.tar.gz && rm runner.tar.gz \
+    && tar xzf /tmp/runner.tar.gz && rm /tmp/runner.tar.gz \
     && ./bin/installdependencies.sh \
     && rm -rf /var/lib/apt/lists/*
 

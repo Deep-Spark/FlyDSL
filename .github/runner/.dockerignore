@@ -1,0 +1,4 @@
+*
+!Dockerfile
+!start.sh
+!actions-runner-linux-x64-*.tar.gz
