@@ -25,7 +25,9 @@ RUN pip3 install --break-system-packages \
         pytest 'hypothesis>=6.82.0' nanobind pybind11 numpy pybind11
 
 # torch CPU-only (needed by tests that import flydsl.compiler)
+# Extended timeout for large download in slow-network environments
 RUN pip3 install --break-system-packages \
+        --default-timeout=600 --retries=3 \
         torch --index-url https://download.pytorch.org/whl/cpu
 
 # ── GitHub Actions runner ─────────────────────────────────────────────
