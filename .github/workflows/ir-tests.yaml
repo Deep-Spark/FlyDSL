@@ -36,7 +36,7 @@ jobs:
             llvm_hash_file: thirdparty/llvm-hash.txt
             llvm_remote: "https://github.com/llvm/llvm-project.git"
             llvm_targets: "X86;NVPTX;AMDGPU"
-            mlir_rocm_runner: "ON"
+            mlir_rocm_runner: "OFF"
             fly_enable_rocm: "OFF"
             pytest_markers: "l0_backend_agnostic or l1a_compile_no_target_dialect or l1b_target_dialect"
             run_l2_device: false
