@@ -13,8 +13,8 @@ LLVM_INSTALL_DIR="${LLVM_INSTALL_DIR:-$LLVM_SRC_DIR/mlir_install}"
 LLVM_INSTALL_TGZ="${LLVM_INSTALL_TGZ:-$LLVM_SRC_DIR/mlir_install.tgz}"
 LLVM_PACKAGE_INSTALL="${LLVM_PACKAGE_INSTALL:-1}"
 
-# Read LLVM commit hash from thirdparty/llvm-hash.txt
-LLVM_HASH_FILE="${REPO_ROOT}/thirdparty/llvm-hash.txt"
+# Read LLVM commit hash (overridable via LLVM_HASH_FILE env var)
+LLVM_HASH_FILE="${LLVM_HASH_FILE:-${REPO_ROOT}/thirdparty/llvm-hash.txt}"
 LLVM_COMMIT_DEFAULT=$(cat "${LLVM_HASH_FILE}" | tr -d '[:space:]')
 LLVM_COMMIT="${LLVM_COMMIT:-$LLVM_COMMIT_DEFAULT}"
 
@@ -78,14 +78,14 @@ cmake -G "$GENERATOR" \
     -S "$LLVM_SRC_DIR/llvm" \
     -B "$LLVM_BUILD_DIR" \
     -DLLVM_ENABLE_PROJECTS="mlir;clang" \
-    -DLLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU" \
+    -DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS:-X86;NVPTX;AMDGPU}" \
     -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_STANDARD=17 \
     -DLLVM_ENABLE_ASSERTIONS=ON \
     -DLLVM_INSTALL_UTILS=ON \
     -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
-    -DMLIR_ENABLE_ROCM_RUNNER=ON \
+    -DMLIR_ENABLE_ROCM_RUNNER="${MLIR_ROCM_RUNNER:-ON}" \
     -DMLIR_BINDINGS_PYTHON_NB_DOMAIN=mlir \
     -DPython3_EXECUTABLE=$(which python3) \
     -Dnanobind_DIR="$NANOBIND_DIR" \

@@ -14,16 +14,23 @@ import pytest
 
 _repo_root = Path(__file__).resolve().parents[1]
 
-# New Fly dialect build
-_fly_pkg_dir = _repo_root / "build-fly" / "python_packages"
-if _fly_pkg_dir.exists():
-    _p = str(_fly_pkg_dir)
-    _already = _p in sys.path or any(
-        os.path.isdir(ep) and os.path.samefile(ep, _p)
-        for ep in sys.path if ep
-    )
-    if not _already:
-        sys.path.insert(0, _p)
+# New Fly dialect build — honour FLY_BUILD_DIR, then fall back to build-fly/
+_fly_build_dir = os.environ.get("FLY_BUILD_DIR", "")
+_fly_pkg_candidates = []
+if _fly_build_dir:
+    _fly_pkg_candidates.append(Path(_fly_build_dir) / "python_packages")
+_fly_pkg_candidates.append(_repo_root / "build-fly" / "python_packages")
+
+for _fly_pkg_dir in _fly_pkg_candidates:
+    if _fly_pkg_dir.exists():
+        _p = str(_fly_pkg_dir)
+        _already = _p in sys.path or any(
+            os.path.isdir(ep) and os.path.samefile(ep, _p)
+            for ep in sys.path if ep
+        )
+        if not _already:
+            sys.path.insert(0, _p)
+        break
 
 # Legacy: .flydsl/build or build/
 for _legacy in [

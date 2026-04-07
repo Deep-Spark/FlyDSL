@@ -1,0 +1,230 @@
+name: IR Tests (multi-backend)
+
+on:
+  push:
+    branches:
+      - main
+      - 'test/ir-*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner type"
+        type: choice
+        options:
+          - self-hosted
+          - github-hosted
+        default: self-hosted
+      run_iluvatar_l2:
+        description: "Run Iluvatar L2 device tests (requires GPU hardware)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ir-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ir-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: rocdl
+            llvm_hash_file: thirdparty/llvm-hash.txt
+            llvm_remote: "https://github.com/llvm/llvm-project.git"
+            llvm_targets: "X86;NVPTX;AMDGPU"
+            mlir_rocm_runner: "ON"
+            fly_enable_rocm: "OFF"
+            pytest_markers: "l0_backend_agnostic or l1a_compile_no_target_dialect or l1b_target_dialect"
+            run_l2_device: false
+
+          - backend: iluvatar
+            llvm_hash_file: thirdparty/llvm-hash-iluvatar.txt
+            llvm_remote: "https://github.com/llvm/llvm-project.git"
+            llvm_targets: "X86;NVPTX"
+            mlir_rocm_runner: "OFF"
+            fly_enable_rocm: "OFF"
+            pytest_markers: "l0_backend_agnostic or l1a_compile_no_target_dialect or l1b_target_dialect"
+            run_l2_device: false
+
+    name: ir-tests (${{ matrix.backend }})
+
+    runs-on: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && inputs.runner == 'github-hosted')
+        && 'ubuntu-22.04'
+        || 'self-hosted'
+      }}
+
+    env:
+      BUILD_SUFFIX: ${{ matrix.backend }}
+
+    steps:
+      # ==============================================================
+      # Checkout
+      # ==============================================================
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: flydsl-src
+          submodules: recursive
+
+      # ==============================================================
+      # Environment setup (GitHub-hosted only — self-hosted runners
+      # are expected to have all dependencies pre-installed)
+      # ==============================================================
+      - name: Setup Python
+        if: runner.environment == 'github-hosted'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential patchelf
+
+      - name: Install Python dependencies
+        if: runner.environment == 'github-hosted'
+        run: |
+          python3 -m pip install -U pip setuptools wheel
+          python3 -m pip install ninja 'hypothesis>=6.82.0' nanobind pybind11 numpy pytest
+
+      # ==============================================================
+      # LLVM/MLIR — restore from cache or build from source
+      # ==============================================================
+      - name: Read LLVM commit hash
+        id: llvm-hash
+        run: |
+          HASH=$(cat "flydsl-src/${{ matrix.llvm_hash_file }}" | tr -d '[:space:]')
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "LLVM commit: ${HASH}"
+
+      - name: Restore cached MLIR install tarball
+        id: mlir-cache
+        uses: actions/cache@v4
+        with:
+          path: mlir_install.tgz
+          key: >-
+            mlir-${{ matrix.backend }}-${{ steps.llvm-hash.outputs.hash }}-${{
+              hashFiles(
+                format('flydsl-src/{0}', matrix.llvm_hash_file),
+                'flydsl-src/scripts/build_llvm.sh'
+              )
+            }}
+
+      - name: Use cached MLIR install
+        if: steps.mlir-cache.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p /tmp/llvm-project
+          tar -xzf mlir_install.tgz -C /tmp/llvm-project
+          echo "MLIR_PATH=/tmp/llvm-project/mlir_install" >> "$GITHUB_ENV"
+
+      - name: Build LLVM/MLIR
+        if: steps.mlir-cache.outputs.cache-hit != 'true'
+        run: |
+          cd flydsl-src
+          export LLVM_HASH_FILE="${GITHUB_WORKSPACE}/flydsl-src/${{ matrix.llvm_hash_file }}"
+          export LLVM_REMOTE="${{ matrix.llvm_remote }}"
+          export LLVM_TARGETS="${{ matrix.llvm_targets }}"
+          export MLIR_ROCM_RUNNER="${{ matrix.mlir_rocm_runner }}"
+          export LLVM_INSTALL_DIR="/tmp/llvm-project/mlir_install"
+          export LLVM_INSTALL_TGZ="${GITHUB_WORKSPACE}/mlir_install.tgz"
+          bash scripts/build_llvm.sh
+          echo "MLIR_PATH=/tmp/llvm-project/mlir_install" >> "$GITHUB_ENV"
+
+      # ==============================================================
+      # Build FlyDSL
+      # ==============================================================
+      - name: Build FlyDSL
+        run: |
+          cd flydsl-src
+          export FLY_BUILD_DIR="${GITHUB_WORKSPACE}/build-fly-${BUILD_SUFFIX}"
+          export FLY_ENABLE_ROCM="${{ matrix.fly_enable_rocm }}"
+          bash scripts/build.sh
+
+          echo "FLY_BUILD_DIR=${FLY_BUILD_DIR}" >> "$GITHUB_ENV"
+
+      # ==============================================================
+      # L0 + L1a + L1b: pytest unit tests
+      # ==============================================================
+      - name: Run pytest unit tests (L0 + L1a + L1b)
+        run: |
+          cd flydsl-src
+          export PYTHONPATH="${FLY_BUILD_DIR}/python_packages:$(pwd):${PYTHONPATH:-}"
+          export LD_LIBRARY_PATH="${FLY_BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
+
+          python3 -m pytest tests/unit/ \
+            -c tests/pytest.ini \
+            -m "${{ matrix.pytest_markers }}" \
+            -v --no-header --tb=short \
+            --continue-on-collection-errors
+
+      # ==============================================================
+      # L1a + L1b: MLIR FileCheck tests
+      # ==============================================================
+      - name: Run MLIR FileCheck tests
+        run: |
+          cd flydsl-src
+          FLY_OPT="${FLY_BUILD_DIR}/bin/fly-opt"
+          FILECHECK="${MLIR_PATH}/bin/FileCheck"
+
+          if [ ! -x "$FLY_OPT" ]; then
+            echo "::error::fly-opt not found at ${FLY_OPT}"
+            exit 1
+          fi
+          if [ ! -x "$FILECHECK" ]; then
+            echo "::warning::FileCheck not found — skipping MLIR lit tests"
+            exit 0
+          fi
+
+          PASS=0; FAIL=0; SKIP=0; ERRORS=""
+          for f in $(find tests/mlir -name '*.mlir' | sort); do
+            RUN_LINE=$(grep '// RUN:' "$f" | head -1)
+            if [ -z "$RUN_LINE" ]; then
+              SKIP=$((SKIP+1))
+              continue
+            fi
+            CMD=$(echo "$RUN_LINE" \
+              | sed 's|// RUN: ||' \
+              | sed "s|%fly-opt|${FLY_OPT}|g" \
+              | sed "s|%s|${f}|g" \
+              | sed "s|FileCheck|${FILECHECK}|g")
+            if eval "$CMD" > /tmp/fc_out.txt 2>&1; then
+              echo "PASS: $f"
+              PASS=$((PASS+1))
+            else
+              echo "::error file=${f}::FileCheck FAILED"
+              cat /tmp/fc_out.txt
+              FAIL=$((FAIL+1))
+            fi
+          done
+
+          echo ""
+          echo "=============================="
+          echo "FileCheck: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
+          echo "=============================="
+          [ "$FAIL" -eq 0 ]
+
+      # ==============================================================
+      # L2: Device tests (gated — default OFF)
+      # ==============================================================
+      - name: Run L2 device tests (Iluvatar)
+        if: >-
+          matrix.backend == 'iluvatar'
+          && (
+            matrix.run_l2_device == true
+            || (github.event_name == 'workflow_dispatch' && inputs.run_iluvatar_l2 == true)
+          )
+        run: |
+          cd flydsl-src
+          export PYTHONPATH="${FLY_BUILD_DIR}/python_packages:$(pwd):${PYTHONPATH:-}"
+          export LD_LIBRARY_PATH="${FLY_BUILD_DIR}/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
+
+          python3 -m pytest tests/unit/ tests/kernels/ \
+            -c tests/pytest.ini \
+            -m "l2_device" \
+            -v --no-header --tb=short \
+            --continue-on-collection-errors
