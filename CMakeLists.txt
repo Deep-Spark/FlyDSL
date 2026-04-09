@@ -7,6 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 
 option(FLY_UNITTEST "Build Fly Unit Tests" OFF)
+option(FLYDSL_ENABLE_PYTHON "Build FlyDSL MLIR Python bindings" ON)
 
 find_package(MLIR REQUIRED CONFIG)
 
@@ -25,8 +26,10 @@ include(AddLLVM)
 include(AddMLIR)
 include(HandleLLVMOptions)
 string(REPLACE "-Wl,-z,defs" "" CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
-include(MLIRDetectPythonEnv)
-mlir_configure_python_dev_packages()
+if(FLYDSL_ENABLE_PYTHON)
+  include(MLIRDetectPythonEnv)
+  mlir_configure_python_dev_packages()
+endif()
 
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
@@ -39,13 +42,15 @@ include_directories(${PROJECT_SOURCE_DIR}/thirdparty/tvm-ffi/include)
 link_directories(${LLVM_BUILD_LIBRARY_DIR})
 add_definitions(${LLVM_DEFINITIONS})
 
-
-set(MLIR_PYTHON_PACKAGE_PREFIX "_mlir" CACHE STRING "" FORCE)
-set(MLIR_BINDINGS_PYTHON_INSTALL_PREFIX "python_packages/flydsl/${MLIR_PYTHON_PACKAGE_PREFIX}" CACHE STRING "" FORCE)
-
+if(FLYDSL_ENABLE_PYTHON)
+  set(MLIR_PYTHON_PACKAGE_PREFIX "_mlir" CACHE STRING "" FORCE)
+  set(MLIR_BINDINGS_PYTHON_INSTALL_PREFIX "python_packages/flydsl/${MLIR_PYTHON_PACKAGE_PREFIX}" CACHE STRING "" FORCE)
+endif()
 
 add_subdirectory(include/flydsl)
 add_subdirectory(lib)
 add_subdirectory(tools)
 
-add_subdirectory(python/mlir_flydsl)
+if(FLYDSL_ENABLE_PYTHON)
+  add_subdirectory(python/mlir_flydsl)
+endif()

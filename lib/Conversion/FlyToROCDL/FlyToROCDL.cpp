@@ -14,6 +14,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringSet.h"
 
 #include "flydsl/Conversion/FlyToROCDL/FlyToROCDL.h"
@@ -675,8 +676,13 @@ private:
     Value a = LLVM::LoadOp::create(rewriter, loc, abTyA, aPtr);
     Value b = LLVM::LoadOp::create(rewriter, loc, abTyB, bPtr);
     Value c = LLVM::LoadOp::create(rewriter, loc, accTy, cPtr);
-    auto zeroAttr = rewriter.getI32IntegerAttr(0);
-    Value res = MfmaOp::create(rewriter, loc, accTy, a, b, c, zeroAttr, zeroAttr, zeroAttr);
+    // ROCDL MFMA ops use variadic LLVM operands; immediate args are i32 SSA values.
+    Type i32Ty = IntegerType::get(rewriter.getContext(), 32);
+    SmallVector<Value, 6> mfmaOperands = {a, b, c};
+    for (unsigned i = 0; i < 3; ++i)
+      mfmaOperands.push_back(
+          LLVM::ConstantOp::create(rewriter, loc, i32Ty, llvm::APInt(32, 0)));
+    Value res = MfmaOp::create(rewriter, loc, accTy, mfmaOperands);
     LLVM::StoreOp::create(rewriter, loc, res, dPtr);
     rewriter.eraseOp(op);
     return success();
