@@ -401,6 +401,29 @@ Attribute CopyOpUniversalCopyType::getThrBitLayoutRef() const {
   return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
 }
 
+bool CopyOpIXDLSMELoadType::isStatic() const { return true; }
+
+Value CopyOpIXDLSMELoadType::rebuildStaticValue(OpBuilder &builder, Location loc,
+                                                Value currentValue) const {
+  if (currentValue && isa<MakeCopyAtomOp>(currentValue.getDefiningOp()))
+    return nullptr;
+  return MakeCopyAtomOp::create(builder, loc, CopyAtomType::get(*this, getBitSize()), getBitSize());
+}
+
+Attribute CopyOpIXDLSMELoadType::getThrLayout() const { return FxLayout(FxC(1), FxC(1)); }
+
+Attribute CopyOpIXDLSMELoadType::getThrBitLayoutSrc() const {
+  return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
+}
+
+Attribute CopyOpIXDLSMELoadType::getThrBitLayoutDst() const {
+  return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
+}
+
+Attribute CopyOpIXDLSMELoadType::getThrBitLayoutRef() const {
+  return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
+}
+
 bool CopyAtomType::isStatic() const {
   auto copyOp = dyn_cast<CopyOpTypeInterface>(getCopyOp());
   if (!copyOp)

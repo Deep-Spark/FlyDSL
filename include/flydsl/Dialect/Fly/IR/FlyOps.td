@@ -343,6 +343,14 @@ def Fly_MakeCopyAtomOp : Fly_Op<"make_copy_atom", [Pure]> {
 def Fly_CopyAtomCall : Fly_Op<"copy_atom_call"> {
   let arguments = (ins Fly_CopyAtom:$copyAtom, Fly_MemRef:$src, Fly_MemRef:$dst, Optional<Fly_MemRef>:$pred);
 }
+def Fly_IXDLCpAsyncCommitGroupOp : Fly_Op<"ixdl.cp_async.commit_group"> {
+  let arguments = (ins);
+  let assemblyFormat = "attr-dict";
+}
+def Fly_IXDLCpAsyncWaitGroupOp : Fly_Op<"ixdl.cp_async.wait_group"> {
+  let arguments = (ins I32Attr:$numGroups);
+  let assemblyFormat = "$numGroups attr-dict";
+}
 def Fly_MmaAtomCall : Fly_Op<"mma_atom_call"> {
   let arguments = (ins AnyType:$mmaAtom, Fly_MemRef:$d, Fly_MemRef:$a, Fly_MemRef:$b, Fly_MemRef:$c);
 }

@@ -464,6 +464,11 @@ public:
             !isa<LLVM::LLVMPointerType>(dst.getType()))
           return rewriter.notifyMatchFailure(op, "src/dst are not llvm.ptr for universal copy");
         return lowerUniversalCopy(op, rewriter, loc, copyAtom, srcFlyTy, dstFlyTy, src, dst);
+      } else if (isa<CopyOpIXDLSMELoadType>(copyOpType)) {
+        if (!isa<LLVM::LLVMPointerType>(src.getType()) ||
+            !isa<LLVM::LLVMPointerType>(dst.getType()))
+          return rewriter.notifyMatchFailure(op, "src/dst are not llvm.ptr for IXDL SME load");
+        return lowerIXDLSMELoad(op, rewriter, loc, copyAtom, srcFlyTy, dstFlyTy, src, dst);
       } else if (isa<fly_rocdl::CopyOpCDNA3BufferCopyType>(copyOpType))
         return lowerCDNA3BufferCopy(op, rewriter, loc, copyAtom, srcFlyTy, dstFlyTy, src, dst);
       return rewriter.notifyMatchFailure(op, "unsupported CopyOp type");
@@ -491,6 +496,29 @@ private:
     return cast<ComposedLayoutAttr>(layout).getOuter();
   }
 
+  static std::optional<SmallVector<int64_t>> getStaticTopLevelLeafs(IntTupleAttr tuple) {
+    SmallVector<int64_t> values;
+    if (tuple.isLeaf()) {
+      auto leaf = tuple.getLeafAsInt();
+      if (!leaf.isStatic())
+        return std::nullopt;
+      values.push_back(leaf.getValue());
+      return values;
+    }
+
+    values.reserve(tuple.rank());
+    for (int32_t i = 0; i < tuple.rank(); ++i) {
+      auto leaf = tuple.at(i);
+      if (!leaf.isLeaf())
+        return std::nullopt;
+      auto intVal = leaf.getLeafAsInt();
+      if (!intVal.isStatic())
+        return std::nullopt;
+      values.push_back(intVal.getValue());
+    }
+    return values;
+  }
+
   static std::optional<std::pair<int64_t, int64_t>> getStaticLeafShapeStride(fly::MemRefType memRefTy) {
     LayoutAttr layout = getMemRefLayoutAttr(memRefTy);
     if (layout.rank() != 1 || !layout.getShape().isLeaf() || !layout.getStride().isLeaf())
@@ -500,6 +528,16 @@ private:
     if (!shape.isStatic() || !stride.isStatic())
       return std::nullopt;
     return std::pair<int64_t, int64_t>{shape.getValue(), stride.getValue()};
+  }
+
+  static std::optional<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
+  getStaticShapeAndStride(fly::MemRefType memRefTy) {
+    LayoutAttr layout = getMemRefLayoutAttr(memRefTy);
+    auto shape = getStaticTopLevelLeafs(layout.getShape());
+    auto stride = getStaticTopLevelLeafs(layout.getStride());
+    if (!shape || !stride || shape->size() != stride->size())
+      return std::nullopt;
+    return std::pair<SmallVector<int64_t>, SmallVector<int64_t>>{*shape, *stride};
   }
 
   LogicalResult lowerUniversalCopy(CopyAtomCall op, ConversionPatternRewriter &rewriter,
@@ -550,6 +588,84 @@ private:
     return success();
   }
 
+  LogicalResult lowerIXDLSMELoad(CopyAtomCall op, ConversionPatternRewriter &rewriter,
+                                 Location loc, CopyAtomType copyAtomTy, fly::MemRefType srcFlyTy,
+                                 fly::MemRefType dstFlyTy, Value src, Value dst) const {
+#if FLYDSL_HAS_IXDL
+    auto smeLoadTy = cast<CopyOpIXDLSMELoadType>(copyAtomTy.getCopyOp());
+    if (srcFlyTy.getAddressSpace().getValue() != AddressSpace::Global)
+      return rewriter.notifyMatchFailure(op, "IXDL SME load expects a global-memory source");
+    if (dstFlyTy.getAddressSpace().getValue() != AddressSpace::Shared)
+      return rewriter.notifyMatchFailure(op, "IXDL SME load expects a shared-memory destination");
+    if (!srcFlyTy.getSwizzle().isTrivialSwizzle() || !dstFlyTy.getSwizzle().isTrivialSwizzle())
+      return rewriter.notifyMatchFailure(op, "IXDL SME load currently requires trivial swizzle");
+
+    SmallVector<int64_t> shape;
+    shape.reserve(smeLoadTy.getShape().size());
+    int64_t numElems = 1;
+    for (Attribute attr : smeLoadTy.getShape()) {
+      auto intAttr = dyn_cast<IntegerAttr>(attr);
+      if (!intAttr)
+        return rewriter.notifyMatchFailure(op, "IXDL SME load shape must be an integer array");
+      int64_t dim = intAttr.getInt();
+      if (dim <= 0)
+        return rewriter.notifyMatchFailure(op, "IXDL SME load shape must be positive");
+      shape.push_back(dim);
+      numElems *= dim;
+    }
+
+    int32_t elemBits = copyAtomTy.getValBits();
+    if (elemBits % 8 != 0)
+      return rewriter.notifyMatchFailure(op, "IXDL SME load currently requires byte-sized elements");
+    if (numElems * elemBits != smeLoadTy.getBitSize())
+      return rewriter.notifyMatchFailure(
+          op, "IXDL SME load bit_size must equal product(shape) * copy atom val bits");
+
+    auto srcShapeStride = getStaticShapeAndStride(srcFlyTy);
+    if (!srcShapeStride)
+      return rewriter.notifyMatchFailure(
+          op, "IXDL SME load currently requires a statically-shaped source layout");
+
+    int64_t rowStrideElems =
+        srcShapeStride->second.size() >= 2 ? srcShapeStride->second.front() : srcShapeStride->first.back();
+    int64_t elemBytes = elemBits / 8;
+    auto i32Ty = rewriter.getI32Type();
+    auto i64Ty = rewriter.getI64Type();
+
+    Value sOffset = LLVM::PtrToIntOp::create(rewriter, loc, i32Ty, dst);
+    Value gAddr = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, src);
+    Value gAddrLow32 = arith::TruncIOp::create(rewriter, loc, i32Ty, gAddr);
+    Value c32 = arith::ConstantOp::create(rewriter, loc, rewriter.getI64IntegerAttr(32));
+    Value gAddrHigh32 = arith::ShRUIOp::create(rewriter, loc, gAddr, c32);
+    gAddrHigh32 = arith::TruncIOp::create(rewriter, loc, i32Ty, gAddrHigh32);
+    Value minusOne =
+        arith::ConstantOp::create(rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(0xFFFFFFFF));
+    Value stride = arith::ConstantOp::create(rewriter, loc, i32Ty,
+                                             rewriter.getI32IntegerAttr(rowStrideElems * elemBytes));
+
+    VectorType gBaseTy = VectorType::get({4}, i32Ty);
+    Value gBase = LLVM::PoisonOp::create(rewriter, loc, gBaseTy);
+    Value index0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value index1 = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    Value index2 = arith::ConstantIndexOp::create(rewriter, loc, 2);
+    Value index3 = arith::ConstantIndexOp::create(rewriter, loc, 3);
+    gBase = vector::InsertOp::create(rewriter, loc, gAddrLow32, gBase, index0);
+    gBase = vector::InsertOp::create(rewriter, loc, gAddrHigh32, gBase, index1);
+    gBase = vector::InsertOp::create(rewriter, loc, minusOne, gBase, index2);
+    gBase = vector::InsertOp::create(rewriter, loc, stride, gBase, index3);
+
+    Value gOffset = LLVM::ConstantOp::create(rewriter, loc, i32Ty, 0);
+    Value kop = LLVM::ConstantOp::create(rewriter, loc, i32Ty, 1);
+    IXDL::CpAsyncOp::create(rewriter, loc, sOffset, gBase, gOffset, kop, smeLoadTy.getShape(),
+                            rewriter.getI32IntegerAttr(elemBits),
+                            rewriter.getBoolAttr(smeLoadTy.getTranspose()));
+    rewriter.eraseOp(op);
+    return success();
+#else
+    return rewriter.notifyMatchFailure(op, "IXDL headers are unavailable in this build");
+#endif
+  }
+
   LogicalResult lowerCDNA3BufferCopy(CopyAtomCall op, ConversionPatternRewriter &rewriter,
                                      Location loc, CopyAtomType copyAtomTy,
                                      fly::MemRefType srcFlyTy, fly::MemRefType dstFlyTy, Value src,
@@ -597,6 +713,40 @@ private:
     }
     rewriter.eraseOp(op);
     return success();
+  }
+};
+
+class IXDLCpAsyncCommitGroupLowering : public OpConversionPattern<IXDLCpAsyncCommitGroupOp> {
+public:
+  using OpConversionPattern<IXDLCpAsyncCommitGroupOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(IXDLCpAsyncCommitGroupOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+#if FLYDSL_HAS_IXDL
+    (void)adaptor;
+    IXDL::CpAsyncCommitGroupOp::create(rewriter, op.getLoc());
+    rewriter.eraseOp(op);
+    return success();
+#else
+    return rewriter.notifyMatchFailure(op, "IXDL headers are unavailable in this build");
+#endif
+  }
+};
+
+class IXDLCpAsyncWaitGroupLowering : public OpConversionPattern<IXDLCpAsyncWaitGroupOp> {
+public:
+  using OpConversionPattern<IXDLCpAsyncWaitGroupOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(IXDLCpAsyncWaitGroupOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+#if FLYDSL_HAS_IXDL
+    (void)adaptor;
+    IXDL::CpAsyncWaitGroupOp::create(rewriter, op.getLoc(), op.getNumGroupsAttr());
+    rewriter.eraseOp(op);
+    return success();
+#else
+    return rewriter.notifyMatchFailure(op, "IXDL headers are unavailable in this build");
+#endif
   }
 };
 
@@ -988,7 +1138,8 @@ public:
     patterns.add<MakeViewOpLowering>(typeConverter, context);
     patterns.add<MemRefLoadVecOpLowering, MemRefStoreVecOpLowering>(typeConverter, context);
     patterns.add<PtrLoadOpLowering, PtrStoreOpLowering>(typeConverter, context);
-    patterns.add<CopyAtomCallLowering, MmaAtomCallLowering>(typeConverter, context);
+    patterns.add<CopyAtomCallLowering, IXDLCpAsyncCommitGroupLowering,
+                 IXDLCpAsyncWaitGroupLowering, MmaAtomCallLowering>(typeConverter, context);
     patterns.add<GpuLaunchFuncOpLowering>(typeConverter, context);
 
     // TODO: deprecated in the future

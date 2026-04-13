@@ -110,6 +110,22 @@ MLIR_CAPI_EXPORTED MlirType mlirFlyCopyOpUniversalCopyTypeGet(MlirContext ctx, i
 MLIR_CAPI_EXPORTED int32_t mlirFlyCopyOpUniversalCopyTypeGetBitSize(MlirType type);
 
 //===----------------------------------------------------------------------===//
+// CopyOpIXDLSMELoadType
+//===----------------------------------------------------------------------===//
+
+MLIR_CAPI_EXPORTED bool mlirTypeIsAFlyCopyOpIXDLSMELoadType(MlirType type);
+MLIR_CAPI_EXPORTED MlirTypeID mlirFlyCopyOpIXDLSMELoadTypeGetTypeID(void);
+
+MLIR_CAPI_EXPORTED MlirType mlirFlyCopyOpIXDLSMELoadTypeGet(MlirContext ctx, intptr_t shapeSize,
+                                                            const int64_t *shape, int32_t bitSize,
+                                                            bool transpose);
+
+MLIR_CAPI_EXPORTED int32_t mlirFlyCopyOpIXDLSMELoadTypeGetBitSize(MlirType type);
+MLIR_CAPI_EXPORTED bool mlirFlyCopyOpIXDLSMELoadTypeGetTranspose(MlirType type);
+MLIR_CAPI_EXPORTED intptr_t mlirFlyCopyOpIXDLSMELoadTypeGetShapeSize(MlirType type);
+MLIR_CAPI_EXPORTED int64_t mlirFlyCopyOpIXDLSMELoadTypeGetShapeElem(MlirType type, intptr_t pos);
+
+//===----------------------------------------------------------------------===//
 // CopyAtomType
 //===----------------------------------------------------------------------===//
 

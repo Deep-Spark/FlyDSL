@@ -273,6 +273,18 @@ def Fly_CopyOpUniversalCopy : Fly_Type<"CopyOpUniversalCopy", "universal_copy", 
   let assemblyFormat = "`<` $bitSize `>`";
 }
 
+def Fly_CopyOpIXDLSMELoad : Fly_Type<"CopyOpIXDLSMELoad", "ixdl_sme_load", [
+  DeclareTypeInterfaceMethods<Fly_MayStaticTypeInterface>,
+  DeclareTypeInterfaceMethods<Fly_CopyOpTypeInterface>
+]> {
+  let parameters = (ins
+    "ArrayAttr":$shape,
+    "int32_t":$bitSize,
+    DefaultValuedParameter<"bool", "false">:$transpose
+  );
+  let assemblyFormat = "`<` $shape `,` $bitSize (`,` $transpose^)? `>`";
+}
+
 def Fly_MmaAtomUniversalFMA : Fly_Type<"MmaAtomUniversalFMA", "universal_fma", [
   DeclareTypeInterfaceMethods<Fly_MayStaticTypeInterface>,
   DeclareTypeInterfaceMethods<Fly_MmaAtomTypeInterface>

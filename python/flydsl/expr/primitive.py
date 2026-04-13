@@ -624,6 +624,16 @@ def copy_atom_call(copy_atom, src, dst, *, pred=None, loc=None, ip=None):
 
 
 @traced_op
+def ixdl_cp_async_commit_group(loc=None, ip=None):
+    return fly.ixdl_cp_async_commit_group(loc=loc, ip=ip)
+
+
+@traced_op
+def ixdl_cp_async_wait_group(num_groups=0, loc=None, ip=None):
+    return fly.ixdl_cp_async_wait_group(num_groups=num_groups, loc=loc, ip=ip)
+
+
+@traced_op
 def mma_atom_call(mma_atom, d, a, b, c, loc=None, ip=None):
     return fly.mma_atom_call(mma_atom, d, a, b, c, loc=loc, ip=ip)
 

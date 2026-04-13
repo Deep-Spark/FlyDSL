@@ -210,6 +210,46 @@ int32_t mlirFlyCopyOpUniversalCopyTypeGetBitSize(MlirType type) {
 }
 
 //===----------------------------------------------------------------------===//
+// CopyOpIXDLSMELoadType
+//===----------------------------------------------------------------------===//
+
+bool mlirTypeIsAFlyCopyOpIXDLSMELoadType(MlirType type) {
+  return isa<CopyOpIXDLSMELoadType>(unwrap(type));
+}
+
+MlirTypeID mlirFlyCopyOpIXDLSMELoadTypeGetTypeID(void) {
+  return wrap(CopyOpIXDLSMELoadType::getTypeID());
+}
+
+MlirType mlirFlyCopyOpIXDLSMELoadTypeGet(MlirContext ctx, intptr_t shapeSize,
+                                         const int64_t *shape, int32_t bitSize, bool transpose) {
+  MLIRContext *context = unwrap(ctx);
+  SmallVector<Attribute> shapeAttrs;
+  shapeAttrs.reserve(shapeSize);
+  for (intptr_t i = 0; i < shapeSize; ++i)
+    shapeAttrs.push_back(IntegerAttr::get(IntegerType::get(context, 64), shape[i]));
+  return wrap(CopyOpIXDLSMELoadType::get(context, ArrayAttr::get(context, shapeAttrs), bitSize,
+                                         transpose));
+}
+
+int32_t mlirFlyCopyOpIXDLSMELoadTypeGetBitSize(MlirType type) {
+  return cast<CopyOpIXDLSMELoadType>(unwrap(type)).getBitSize();
+}
+
+bool mlirFlyCopyOpIXDLSMELoadTypeGetTranspose(MlirType type) {
+  return cast<CopyOpIXDLSMELoadType>(unwrap(type)).getTranspose();
+}
+
+intptr_t mlirFlyCopyOpIXDLSMELoadTypeGetShapeSize(MlirType type) {
+  return cast<CopyOpIXDLSMELoadType>(unwrap(type)).getShape().size();
+}
+
+int64_t mlirFlyCopyOpIXDLSMELoadTypeGetShapeElem(MlirType type, intptr_t pos) {
+  auto shape = cast<CopyOpIXDLSMELoadType>(unwrap(type)).getShape();
+  return cast<IntegerAttr>(shape[pos]).getInt();
+}
+
+//===----------------------------------------------------------------------===//
 // CopyAtomType
 //===----------------------------------------------------------------------===//
 

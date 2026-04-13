@@ -367,6 +367,45 @@ struct PyCopyOpUniversalCopyType : PyConcreteType<PyCopyOpUniversalCopyType> {
 };
 
 // ---------------------------------------------------------------------------
+// CopyOpIXDLSMELoadType
+// ---------------------------------------------------------------------------
+struct PyCopyOpIXDLSMELoadType : PyConcreteType<PyCopyOpIXDLSMELoadType> {
+  static constexpr IsAFunctionTy isaFunction = mlirTypeIsAFlyCopyOpIXDLSMELoadType;
+  static constexpr GetTypeIDFunctionTy getTypeIdFunction = mlirFlyCopyOpIXDLSMELoadTypeGetTypeID;
+  static constexpr const char *pyClassName = "CopyOpIXDLSMELoadType";
+  using Base::Base;
+
+  static void bindDerived(ClassTy &c) {
+    c.def_static(
+        "get",
+        [](std::vector<int64_t> shape, int32_t bitSize, bool transpose,
+           DefaultingPyMlirContext context) {
+          ::mlir::MLIRContext *ctx = unwrap(context.get()->get());
+          return PyCopyOpIXDLSMELoadType(context->getRef(),
+                                         mlirFlyCopyOpIXDLSMELoadTypeGet(
+                                             wrap(ctx), shape.size(), shape.data(), bitSize,
+                                             transpose));
+        },
+        "shape"_a, "bit_size"_a, "transpose"_a = false, nb::kw_only(), "context"_a = nb::none(),
+        "Create a CopyOpIXDLSMELoadType.");
+
+    c.def_prop_ro("shape", [](PyCopyOpIXDLSMELoadType &self) -> std::vector<int64_t> {
+      intptr_t rank = mlirFlyCopyOpIXDLSMELoadTypeGetShapeSize(self);
+      std::vector<int64_t> shape(rank);
+      for (intptr_t i = 0; i < rank; ++i)
+        shape[i] = mlirFlyCopyOpIXDLSMELoadTypeGetShapeElem(self, i);
+      return shape;
+    });
+    c.def_prop_ro("bit_size", [](PyCopyOpIXDLSMELoadType &self) -> int32_t {
+      return mlirFlyCopyOpIXDLSMELoadTypeGetBitSize(self);
+    });
+    c.def_prop_ro("transpose", [](PyCopyOpIXDLSMELoadType &self) -> bool {
+      return mlirFlyCopyOpIXDLSMELoadTypeGetTranspose(self);
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
 // CopyAtomType
 // ---------------------------------------------------------------------------
 struct PyCopyAtomType : PyConcreteType<PyCopyAtomType> {
@@ -663,6 +702,7 @@ NB_MODULE(_fly, m) {
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyPointerType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyMemRefType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyCopyOpUniversalCopyType::bind(m);
+  ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyCopyOpIXDLSMELoadType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyCopyAtomType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyMmaAtomUniversalFMAType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyMmaAtomIXDLMMADType::bind(m);
