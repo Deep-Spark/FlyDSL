@@ -104,7 +104,7 @@ else
 for f in $(find "${REPO_ROOT}/tests/mlir" -name "*.mlir" -type f 2>/dev/null | sort); do
     run_line=$(grep '^// RUN:' "$f" | head -1 | sed 's|^// RUN: *||')
     [ -z "$run_line" ] && continue
-    cmd=$(echo "$run_line" | sed "s|%fly-opt|${FLY_OPT}|g; s|%FileCheck|${FILECHECK}|g; s|%s|${f}|g; s|FileCheck|${FILECHECK}|g")
+    cmd=$(echo "$run_line" | sed "s|%fly-opt|${FLY_OPT}|g; s|%fly-cq-opt|${FLY_OPT}|g; s|%FileCheck|${FILECHECK}|g; s|%s|${f}|g; s|FileCheck|${FILECHECK}|g")
     if eval "$cmd" > /tmp/filecheck_out.log 2>&1; then
         echo "  PASS  ${f#${REPO_ROOT}/tests/mlir/}"
     else

@@ -14,6 +14,7 @@
 #include "flydsl/Conversion/Passes.h"
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
 #include "flydsl/Dialect/Fly/Transforms/Passes.h"
+#include "flydsl/Dialect/FlyCQ/IR/Dialect.h"
 #include "flydsl/Dialect/FlyROCDL/IR/Dialect.h"
 
 int main(int argc, char **argv) {
@@ -21,12 +22,14 @@ int main(int argc, char **argv) {
   mlir::fly::registerFlyPasses();
   mlir::registerFlyToROCDLConversionPass();
   mlir::registerFlyROCDLClusterAttrPass();
+  mlir::registerFlyToCQConversionPass();
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
   registry.insert<mlir::fly::FlyDialect>();
   registry.insert<mlir::fly_rocdl::FlyROCDLDialect>();
+  registry.insert<mlir::fly_cq::FlyCQDialect>();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "Fly Optimizer Driver\n", registry));

@@ -25,6 +25,16 @@ declare_mlir_dialect_python_bindings(
   GEN_ENUM_BINDINGS
 )
 
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT FlyPythonSources
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/"
+  TD_FILE dialects/FlyCQ.td
+  SOURCES
+    dialects/fly_cq.py
+  DIALECT_NAME fly_cq
+  GEN_ENUM_BINDINGS
+)
+
 # NOTE: Do NOT link MLIRFlyDialect/MLIRFlyROCDLDialect here via PRIVATE_LINK_LIBS.
 # These symbols are already provided by FlyPythonCAPI.so (via MLIRCPIFly's transitive
 # dependencies in EMBED_CAPI_LINK_LIBS). Statically linking them here creates DUPLICATE
@@ -55,6 +65,17 @@ declare_mlir_python_extension(FlyPythonSources.Core.fly_rocdl
     LLVMSupport
 )
 
+declare_mlir_python_extension(FlyPythonSources.Core.fly_cq
+  MODULE_NAME _mlirDialectsFlyCQ
+  ADD_TO_PARENT FlyPythonSources
+  ROOT_DIR "${PROJECT_SOURCE_DIR}/lib/Bindings/Python"
+  PYTHON_BINDINGS_LIBRARY nanobind
+  SOURCES
+    FlyCQExtension.cpp
+  PRIVATE_LINK_LIBS
+    LLVMSupport
+)
+
 # NOTE: Do NOT link MLIRFlyToROCDL or other C++ libs via PRIVATE_LINK_LIBS.
 # Doing so statically embeds a copy of MLIRPass (and its pass registry) into
 # _mlirRegisterEverything.so. Passes registered via registerFlyPasses() then
@@ -78,6 +99,7 @@ declare_mlir_python_extension(FlyPythonSources.RegisterEverything
     MLIRCAPIIR
     MLIRCPIFly
     MLIRCPIFlyROCDL
+    MLIRCPIFlyCQ
     MLIRCPILLVMOption
     MLIRCAPIArith
     MLIRCAPIGPU
@@ -179,6 +201,7 @@ add_custom_command(
       -m flydsl._mlir._mlir_libs._mlir \
       -m flydsl._mlir._mlir_libs._mlirDialectsFly \
       -m flydsl._mlir._mlir_libs._mlirDialectsFlyROCDL \
+      -m flydsl._mlir._mlir_libs._mlirDialectsFlyCQ \
       -m flydsl._mlir._mlir_libs._mlirDialectsGPU \
       -m flydsl._mlir._mlir_libs._mlirDialectsLLVM \
       -O '${_MLIR_LIBS_DIR}' \
@@ -211,6 +234,12 @@ add_custom_target(CopyFlyPythonSources ALL
     "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_rocdl_enum_gen.py"
     "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_rocdl_enum_gen.py"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_cq_ops_gen.py"
+    "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_cq_ops_gen.py"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_cq_enum_gen.py"
+    "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_cq_enum_gen.py"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "$<TARGET_FILE:mlir_c_runner_utils>"
     "${_MLIR_LIBS_DIR}/libmlir_c_runner_utils.so"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -231,21 +260,29 @@ add_dependencies(CopyFlyPythonSources FlyPythonModules)
 
 file(GLOB _ROCM_SEARCH_PATHS LIST_DIRECTORIES true "/opt/rocm*")
 list(SORT _ROCM_SEARCH_PATHS ORDER DESCENDING)
-find_package(hip REQUIRED CONFIG PATHS ${_ROCM_SEARCH_PATHS})
+set(_HIP_SEARCH_PREFIXES "${_ROCM_SEARCH_PATHS}")
+if(DEFINED ENV{ROCM_PATH})
+  list(PREPEND _HIP_SEARCH_PREFIXES "$ENV{ROCM_PATH}")
+endif()
+find_package(hip QUIET CONFIG PATHS ${_HIP_SEARCH_PREFIXES})
 
-add_library(FlyJitRuntime SHARED
-  ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
-)
-target_include_directories(FlyJitRuntime PRIVATE
-  ${LLVM_INCLUDE_DIRS}
-  ${MLIR_INCLUDE_DIRS}
-)
-target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
-target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
-set_target_properties(FlyJitRuntime PROPERTIES
-  OUTPUT_NAME "fly_jit_runtime"
-  LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
-)
-add_dependencies(FlyPythonCAPI FlyJitRuntime)
+if(hip_FOUND)
+  add_library(FlyJitRuntime SHARED
+    ${PROJECT_SOURCE_DIR}/lib/Runtime/FlyRocmRuntimeWrappers.cpp
+  )
+  target_include_directories(FlyJitRuntime PRIVATE
+    ${LLVM_INCLUDE_DIRS}
+    ${MLIR_INCLUDE_DIRS}
+  )
+  target_compile_features(FlyJitRuntime PRIVATE cxx_std_17)
+  target_link_libraries(FlyJitRuntime PRIVATE hip::host hip::amdhip64)
+  set_target_properties(FlyJitRuntime PROPERTIES
+    OUTPUT_NAME "fly_jit_runtime"
+    LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}"
+  )
+  add_dependencies(FlyPythonCAPI FlyJitRuntime)
+else()
+  message(STATUS "HIP / ROCm not found — skipping FlyJitRuntime (GPU JIT needs a ROCm install)")
+endif()
 
 

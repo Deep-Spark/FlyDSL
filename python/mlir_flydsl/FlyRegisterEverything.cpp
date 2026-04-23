@@ -5,6 +5,7 @@
 #include "mlir/Bindings/Python/Nanobind.h"
 #include "mlir/Bindings/Python/NanobindAdaptors.h"
 
+#include "flydsl-c/FlyCQDialect.h"
 #include "flydsl-c/FlyDialect.h"
 #include "flydsl-c/FlyROCDLDialect.h"
 
@@ -18,6 +19,8 @@ NB_MODULE(_mlirRegisterEverything, m) {
     mlirDialectHandleInsertDialect(flyHandle, registry);
     MlirDialectHandle flyROCDLHandle = mlirGetDialectHandle__fly_rocdl__();
     mlirDialectHandleInsertDialect(flyROCDLHandle, registry);
+    MlirDialectHandle flyCQHandle = mlirGetDialectHandle__fly_cq__();
+    mlirDialectHandleInsertDialect(flyCQHandle, registry);
   });
   m.def("register_llvm_translations",
         [](MlirContext context) { mlirRegisterAllLLVMTranslations(context); });
@@ -26,4 +29,5 @@ NB_MODULE(_mlirRegisterEverything, m) {
   mlirRegisterFlyPasses();
   mlirRegisterFlyToROCDLConversionPass();
   mlirRegisterFlyROCDLClusterAttrPass();
+  mlirRegisterFlyToCQConversionPass();
 }

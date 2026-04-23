@@ -1,7 +1,9 @@
 set(LIBS
   MLIRFlyDialect
   MLIRFlyROCDLDialect
+  MLIRFlyCQDialect
   MLIRFlyToROCDL
+  MLIRFlyToCQ
   MLIRRegisterAllExtensions
 
   MLIRMlirOptMain
