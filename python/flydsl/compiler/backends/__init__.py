@@ -90,9 +90,11 @@ def get_backend(name: Optional[str] = None, *, arch: str = "") -> BaseBackend:
 
 
 # -- auto-register built-in backends ------------------------------------
+from .ixdl import IxdlBackend  # noqa: E402
 from .rocm import RocmBackend  # noqa: E402
 
 register_backend("rocm", RocmBackend)
+register_backend("ixdl", IxdlBackend)
 
 __all__ = [
     "BaseBackend",

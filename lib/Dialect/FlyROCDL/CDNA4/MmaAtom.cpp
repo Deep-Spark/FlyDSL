@@ -237,21 +237,31 @@ FailureOr<Value> MmaOpCDNA4_MFMAScaleType::emitAtomCallSSA(OpBuilder &builder, L
   Value scaleB = LLVM::ExtractValueOp::create(
       builder, loc, atomVal, ArrayRef<int64_t>{*getFieldIndex(AtomStateField::ScaleB)});
 
-  auto cbszAttr = builder.getI32IntegerAttr(*aTypeCode);
-  auto blgpAttr = builder.getI32IntegerAttr(*bTypeCode);
-  auto opselAAttr = builder.getI32IntegerAttr(getOpselA());
-  auto opselBAttr = builder.getI32IntegerAttr(getOpselB());
+  // ROCDL's `mfma_scale_f32_*` is declared with a single `Variadic<LLVM_Type>`
+  // operand list (see ROCDLOps.td's `ROCDL_Mfma_OO_IntrOp`). Materialize the
+  // i32 immediates as LLVM constants and pass all operands in order:
+  // {a, b, c, cbsz, blgp, opselA, scaleA, opselB, scaleB}. The ordering mirrors
+  // upstream `AMDGPUToROCDL::ScaledMFMAOpLowering` (sourceA/sourceB/destC,
+  // aTypeCode, bTypeCode, scalesIdxA, scalesA, scalesIdxB, scalesB).
+  Type i32Ty = builder.getI32Type();
+  Value cbsz = LLVM::ConstantOp::create(builder, loc, i32Ty,
+                                        builder.getI32IntegerAttr(*aTypeCode));
+  Value blgp = LLVM::ConstantOp::create(builder, loc, i32Ty,
+                                        builder.getI32IntegerAttr(*bTypeCode));
+  Value opselA = LLVM::ConstantOp::create(builder, loc, i32Ty,
+                                          builder.getI32IntegerAttr(getOpselA()));
+  Value opselB = LLVM::ConstantOp::create(builder, loc, i32Ty,
+                                          builder.getI32IntegerAttr(getOpselB()));
+  SmallVector<Value, 9> operands{a, b, c, cbsz, blgp, opselA, scaleA, opselB, scaleB};
 
   if (m == 16 && n == 16 && k == 128) {
-    return ROCDL::mfma_scale_f32_16x16x128_f8f6f4::create(builder, loc, accTy, a, b, c, cbszAttr,
-                                                          blgpAttr, opselAAttr, scaleA, opselBAttr,
-                                                          scaleB)
+    return ROCDL::mfma_scale_f32_16x16x128_f8f6f4::create(builder, loc, accTy,
+                                                          ValueRange(operands))
         .getResult();
   }
   if (m == 32 && n == 32 && k == 64) {
-    return ROCDL::mfma_scale_f32_32x32x64_f8f6f4::create(builder, loc, accTy, a, b, c, cbszAttr,
-                                                         blgpAttr, opselAAttr, scaleA, opselBAttr,
-                                                         scaleB)
+    return ROCDL::mfma_scale_f32_32x32x64_f8f6f4::create(builder, loc, accTy,
+                                                         ValueRange(operands))
         .getResult();
   }
 

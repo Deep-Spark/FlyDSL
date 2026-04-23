@@ -157,11 +157,19 @@ FailureOr<Value> MmaOpCDNA3_MFMAType::emitAtomCallSSA(OpBuilder &builder, Locati
   if (c.getType() != accTy)
     c = LLVM::BitcastOp::create(builder, loc, accTy, c);
 
+// ROCDL's MFMA ops are declared as `Variadic<LLVM_Type>` (see ROCDLOps.td's
+// `ROCDL_Mfma_IntrOp`). Materialize the three i32 immediates (cbsz, abid,
+// blgp, all zero here) as LLVM constants and pass all nine operands as a
+// single ValueRange, matching upstream AMDGPUToROCDL lowering.
 #define DISPATCH_MFMA_SSA(M_, K_, PRED, OP)                                                        \
   if (m == M_ && n == M_ && k == K_ && (PRED)) {                                                   \
+    Type i32Ty = builder.getI32Type();                                                             \
     auto zeroAttr = builder.getI32IntegerAttr(0);                                                  \
-    return ROCDL::OP::create(builder, loc, accTy, a, b, c, zeroAttr, zeroAttr, zeroAttr)           \
-        .getResult();                                                                              \
+    Value zero0 = LLVM::ConstantOp::create(builder, loc, i32Ty, zeroAttr);                         \
+    Value zero1 = LLVM::ConstantOp::create(builder, loc, i32Ty, zeroAttr);                         \
+    Value zero2 = LLVM::ConstantOp::create(builder, loc, i32Ty, zeroAttr);                         \
+    SmallVector<Value, 6> operands{a, b, c, zero0, zero1, zero2};                                  \
+    return ROCDL::OP::create(builder, loc, accTy, ValueRange(operands)).getResult();               \
   }
 
   DISPATCH_MFMA_SSA(32, 1, elemTyA.isF32(), mfma_f32_32x32x1f32)

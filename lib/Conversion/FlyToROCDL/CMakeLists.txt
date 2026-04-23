@@ -9,9 +9,10 @@ add_mlir_conversion_library(MLIRFlyToROCDL
   LINK_LIBS PUBLIC
   MLIRFlyDialect
   MLIRFlyROCDLDialect
-  
+
   MLIRArithDialect
   MLIRIR
+  MLIRIXDLDialect
   MLIRLLVMDialect
   MLIRPass
   MLIRSCFDialect

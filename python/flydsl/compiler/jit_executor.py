@@ -2,14 +2,68 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 
 import ctypes
+import os
 import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from .._mlir import ir
 from .._mlir.execution_engine import ExecutionEngine
 from .protocol import fly_pointers
+
+
+def _iter_fallback_dirs() -> List[Path]:
+    """Ordered extra search dirs for JIT runtime shared libraries.
+
+    ROCm installs everything into ``_mlir/_mlir_libs`` at build time, so the
+    fallback list is never consulted there. The IXDL backend on the other
+    hand depends on ``libmlir_cuda_runtime.so``, which ships with ixcc and
+    lives outside FlyDSL's own build tree.
+    """
+    dirs: List[Path] = []
+
+    def _push(p: Optional[str]) -> None:
+        if not p:
+            return
+        pp = Path(p).expanduser()
+        if pp.is_dir() and pp not in dirs:
+            dirs.append(pp)
+
+    _push(os.environ.get("FLYDSL_RUNTIME_LIB_DIR"))
+    for entry in (os.environ.get("FLYDSL_RUNTIME_LIB_DIRS") or "").split(os.pathsep):
+        _push(entry)
+    for entry in (os.environ.get("LD_LIBRARY_PATH") or "").split(os.pathsep):
+        _push(entry)
+
+    # Known install roots for the Iluvatar (ixcc) stack. Harmless on other
+    # hosts: the paths simply won't exist and are skipped by _push().
+    _push("/home/caokefan/sw_home/sdk/ixcc/build/lib")
+    sw_home = os.environ.get("SW_HOME")
+    if sw_home:
+        _push(os.path.join(sw_home, "local", "corex", "lib64"))
+        _push(os.path.join(sw_home, "sdk", "ixcc", "build", "lib"))
+
+    return dirs
+
+
+def _find_runtime_lib(name: str, primary: Path) -> Path:
+    """Return an existing path for *name*, searching primary first."""
+    candidate = primary / name
+    if candidate.exists():
+        return candidate
+    for d in _iter_fallback_dirs():
+        p = d / name
+        if p.exists():
+            return p
+    searched = [str(primary)] + [str(d) for d in _iter_fallback_dirs()]
+    raise FileNotFoundError(
+        f"Required JIT runtime library not found: {name}\n"
+        f"Searched (in order): {searched}\n"
+        f"Set FLYDSL_RUNTIME_LIB_DIR (or FLYDSL_RUNTIME_LIB_DIRS) to the "
+        f"directory containing it, or rebuild FlyDSL so it is installed "
+        f"under _mlir/_mlir_libs/."
+    )
 
 
 @lru_cache(maxsize=1)
@@ -18,13 +72,7 @@ def _resolve_runtime_libs() -> List[str]:
 
     backend = get_backend()
     mlir_libs_dir = Path(__file__).resolve().parent.parent / "_mlir" / "_mlir_libs"
-    libs = [mlir_libs_dir / name for name in backend.jit_runtime_lib_basenames()]
-    for lib in libs:
-        if not lib.exists():
-            raise FileNotFoundError(
-                f"Required JIT runtime library not found: {lib}\n"
-                f"Please rebuild the project."
-            )
+    libs = [_find_runtime_lib(name, mlir_libs_dir) for name in backend.jit_runtime_lib_basenames()]
     return [str(p) for p in libs]
 
 

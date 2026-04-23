@@ -11,3 +11,4 @@ from . import utils
 
 from . import arith, vector, gpu, buffer_ops, rocdl, math
 from .rocdl import tdm_ops
+from . import ixdl

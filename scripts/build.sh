@@ -33,6 +33,9 @@ if [ -z "${MLIR_PATH:-}" ]; then
     "${BASE_DIR}/llvm-project-flydsl/build-flydsl/mlir_install"
     "${BASE_DIR}/llvm-project/build-flydsl/mlir_install"
     "${BASE_DIR}/llvm-project/mlir_install"
+    # Iluvatar ixcc (ixdl backend) ships its own MLIR build tree.
+    "${SW_HOME:-${HOME}/sw_home}/sdk/ixcc/build"
+    "/home/caokefan/sw_home/sdk/ixcc/build"
   )
   for p in "${candidates[@]}"; do
     if [ -d "${p}/lib/cmake/mlir" ]; then

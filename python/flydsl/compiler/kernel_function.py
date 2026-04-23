@@ -401,16 +401,25 @@ class KernelLauncher:
                     _to_index_value(cz),
                 )
 
+            # ``cluster_size`` is only accepted by newer MLIR Python bindings
+            # (upstream post-cluster-launch). Older trees (e.g. the Iluvatar
+            # ixcc snapshot) don't know the kwarg — pass it only when needed
+            # and omit it otherwise so the common "no cluster" path still
+            # works on both.
+            launch_kwargs = dict(
+                async_dependencies=async_deps,
+                dynamic_shared_memory_size=smem_val,
+                loc=launch_loc,
+                ip=None,
+            )
+            if cluster_size is not None:
+                launch_kwargs["cluster_size"] = cluster_size
             gpu.LaunchFuncOp(
                 ["kernels", self._kernel_name],
                 (grid_x, grid_y, grid_z),
                 (block_x, block_y, block_z),
                 kernel_operands,
-                async_dependencies=async_deps,
-                dynamic_shared_memory_size=smem_val,
-                cluster_size=cluster_size,
-                loc=launch_loc,
-                ip=None,
+                **launch_kwargs,
             )
 
 

@@ -6,6 +6,7 @@
 #include "mlir/Bindings/Python/NanobindAdaptors.h"
 
 #include "flydsl-c/FlyDialect.h"
+#include "flydsl-c/FlyIXDLDialect.h"
 #include "flydsl-c/FlyROCDLDialect.h"
 
 NB_MODULE(_mlirRegisterEverything, m) {
@@ -18,6 +19,8 @@ NB_MODULE(_mlirRegisterEverything, m) {
     mlirDialectHandleInsertDialect(flyHandle, registry);
     MlirDialectHandle flyROCDLHandle = mlirGetDialectHandle__fly_rocdl__();
     mlirDialectHandleInsertDialect(flyROCDLHandle, registry);
+    MlirDialectHandle flyIXDLHandle = mlirGetDialectHandle__fly_ixdl__();
+    mlirDialectHandleInsertDialect(flyIXDLHandle, registry);
   });
   m.def("register_llvm_translations",
         [](MlirContext context) { mlirRegisterAllLLVMTranslations(context); });

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/IXDLDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -764,7 +765,7 @@ public:
 
     target.addLegalDialect<arith::ArithDialect, scf::SCFDialect, vector::VectorDialect,
                            gpu::GPUDialect, func::FuncDialect, LLVM::LLVMDialect,
-                           ROCDL::ROCDLDialect>();
+                           ROCDL::ROCDLDialect, IXDL::IXDLDialect>();
     target.addIllegalDialect<fly::FlyDialect, fly_rocdl::FlyROCDLDialect>();
 
     // Constructors
