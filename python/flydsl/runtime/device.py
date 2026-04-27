@@ -27,7 +27,7 @@ def get_rocm_arch() -> str:
     """Best-effort ROCm GPU arch string (e.g. 'gfx942')."""
     env = os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("HSA_OVERRIDE_GFX_VERSION")
     if env:
-        if env.startswith("gfx"):
+        if env.startswith("gfx") or env.startswith("ivcore"):
             return env
         if env.count(".") == 2:
             parts = env.split(".")

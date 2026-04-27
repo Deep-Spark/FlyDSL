@@ -55,18 +55,10 @@ public:
   ~ScopedContext() { CUDA_REPORT_IF_ERROR(cuCtxPopCurrent(nullptr)); }
 };
 
-extern "C" CUmodule mgpuModuleLoad(void *data, size_t gpuBlobSize) {
+extern "C" CUmodule mgpuModuleLoad(void *data, size_t /*gpuBlobSize*/) {
   ScopedContext scopedContext;
   CUmodule module = nullptr;
-  fprintf(stderr, "[FlyCorex] mgpuModuleLoad: data=%p, size=%zu\n", data, gpuBlobSize);
-  CUresult result = cuModuleLoadData(&module, data);
-  if (result) {
-    const char *name = nullptr;
-    cuGetErrorName(result, &name);
-    fprintf(stderr, "[FlyCorex] cuModuleLoadData FAILED: %s\n", name ? name : "<unknown>");
-  } else {
-    fprintf(stderr, "[FlyCorex] cuModuleLoadData OK: module=%p\n", (void *)module);
-  }
+  CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, data));
   return module;
 }
 
@@ -95,15 +87,7 @@ extern "C" void mgpuModuleUnload(CUmodule module) {
 
 extern "C" CUfunction mgpuModuleGetFunction(CUmodule module, const char *name) {
   CUfunction function = nullptr;
-  fprintf(stderr, "[FlyCorex] mgpuModuleGetFunction: module=%p, name='%s'\n", (void *)module, name);
-  CUresult result = cuModuleGetFunction(&function, module, name);
-  if (result) {
-    const char *errName = nullptr;
-    cuGetErrorName(result, &errName);
-    fprintf(stderr, "[FlyCorex] cuModuleGetFunction FAILED: %s\n", errName ? errName : "<unknown>");
-  } else {
-    fprintf(stderr, "[FlyCorex] cuModuleGetFunction OK: func=%p\n", (void *)function);
-  }
+  CUDA_REPORT_IF_ERROR(cuModuleGetFunction(&function, module, name));
   return function;
 }
 

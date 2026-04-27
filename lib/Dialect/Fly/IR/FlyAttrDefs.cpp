@@ -525,9 +525,9 @@ static void printComposedFlat(::mlir::AsmPrinter &odsPrinter, ComposedLayoutAttr
   } else {
     printInnermostAttr(odsPrinter, composed.getInner());
   }
-  odsPrinter << " o ";
+  odsPrinter << " o (";
   composed.getOffset().print(odsPrinter);
-  odsPrinter << " o ";
+  odsPrinter << ") o ";
   composed.getOuter().print(odsPrinter);
 }
 
@@ -560,12 +560,14 @@ static Attribute parseInnermostAttr(::mlir::AsmParser &odsParser) {
     return {};
 
   while (odsParser.parseOptionalKeyword("o").succeeded()) {
+    if (odsParser.parseLParen())
+      return {};
     auto offsetAttr = IntTupleAttr::parse(odsParser, odsType);
     if (!offsetAttr)
       return {};
     auto offset = cast<IntTupleAttr>(offsetAttr);
 
-    if (odsParser.parseKeyword("o"))
+    if (odsParser.parseRParen() || odsParser.parseKeyword("o"))
       return {};
 
     auto shapeAttr = IntTupleAttr::parse(odsParser, odsType);

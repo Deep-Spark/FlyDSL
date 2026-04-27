@@ -294,8 +294,37 @@ def _is_iluvatar_arch(chip: str) -> bool:
     return chip.startswith("ivcore")
 
 
+# libdevice bitcode shipped with Iluvatar's ixcc toolchain. It defines GPU
+# helpers (math, printf, ...) referenced by the lowered IR; we link it into
+# the gpu module so ISel can resolve symbols like ``vprintf2``.
+_ILUVATAR_LIBDEVICE_FILE = "libdevice.compute_bi.10.bc"
+
+
+def _find_iluvatar_libdevice() -> str:
+    """Locate ``libdevice.compute_bi.10.bc`` from the ixcc toolchain.
+
+    The toolchain layout is ``$CUDA_ROOT/nvvm/libdevice/<file>``. We try
+    ``CUDA_ROOT`` / ``CUDA_HOME`` first, then fall back to scanning ``PATH``
+    for an entry whose basename contains ``corex`` (e.g. ``.../corex/bin``).
+    Returns an empty string when the file cannot be located.
+    """
+    cuda_root = os.environ.get("CUDA_ROOT") or os.environ.get("CUDA_HOME") or ""
+    if not cuda_root:
+        for p in os.environ.get("PATH", "").split(":"):
+            if "corex" in p and os.path.isdir(p):
+                cuda_root = os.path.dirname(p)
+                break
+    if not cuda_root:
+        return ""
+    candidate = os.path.join(cuda_root, "nvvm", "libdevice", _ILUVATAR_LIBDEVICE_FILE)
+    return candidate if os.path.isfile(candidate) else ""
+
+
 def _gpu_target_attr(chip: str) -> str:
     if _is_iluvatar_arch(chip):
+        libdevice = _find_iluvatar_libdevice()
+        if libdevice:
+            return f'#ixdl.target<chip = "{chip}", link = ["{libdevice}"]>'
         return f'#ixdl.target<chip = "{chip}">'
     return f'#rocdl.target<chip = "{chip}">'
 
@@ -322,7 +351,7 @@ class MlirCompiler:
             "gpu-kernel-outlining{data-layout-str=}",
             "fly-canonicalize",
             "fly-layout-lowering",
-            "convert-fly-to-rocdl",
+            "convert-fly-to-ixdl" if _is_iluvatar_arch(chip) else "convert-fly-to-rocdl",
             "canonicalize",
             gpu_to_backend,
         ]

@@ -4,6 +4,7 @@
 
 #include "flydsl-c/FlyDialect.h"
 #include "flydsl-c/FlyROCDLDialect.h"
+#include "flydsl-c/FlyIXDLDialect.h"
 
 NB_MODULE(_mlirRegisterEverything, m) {
   m.doc() = "MLIR All Upstream Dialects, Translations and Passes Registration";
@@ -15,6 +16,8 @@ NB_MODULE(_mlirRegisterEverything, m) {
     mlirDialectHandleInsertDialect(flyHandle, registry);
     MlirDialectHandle flyROCDLHandle = mlirGetDialectHandle__fly_rocdl__();
     mlirDialectHandleInsertDialect(flyROCDLHandle, registry);
+    MlirDialectHandle flyIXDLHandle = mlirGetDialectHandle__fly_ixdl__();
+    mlirDialectHandleInsertDialect(flyIXDLHandle, registry);
   });
   m.def("register_llvm_translations",
         [](MlirContext context) { mlirRegisterAllLLVMTranslations(context); });
@@ -22,4 +25,5 @@ NB_MODULE(_mlirRegisterEverything, m) {
   mlirRegisterAllPasses();
   mlirRegisterFlyPasses();
   mlirRegisterFlyToROCDLConversionPass();
+  mlirRegisterFlyToIXDLConversionPass();
 }

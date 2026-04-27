@@ -1402,29 +1402,42 @@ public:
     auto layout = op.getLayout();
 
     auto coordTy = dyn_cast<IntTupleType>(coord.getType());
-    auto layoutTy = dyn_cast<LayoutType>(layout.getType());
-    if (!coordTy || !layoutTy)
+    if (!coordTy)
       return failure();
-
-    // Inputs must be in normal form
     if (!isNormalForm(cast<TypedValue<IntTupleType>>(coord)))
       return failure();
-    if (!isNormalForm(cast<TypedValue<LayoutType>>(layout)))
-      return failure();
 
-    IntTupleBuilder<IntTupleValueAdaptor> builder(rewriter, loc);
+    if (auto layoutTy = dyn_cast<LayoutType>(layout.getType())) {
+      if (!isNormalForm(cast<TypedValue<LayoutType>>(layout)))
+        return failure();
 
-    IntTupleValueAdaptor coordAdaptor =
-        IntTupleValueAdaptor::create(builder, coord, coordTy.getAttr());
-    IntTupleValueAdaptor shapeAdaptor = IntTupleValueAdaptor::create(
-        builder, layout.getDefiningOp()->getOperand(0), layoutTy.getAttr().getShape());
-    IntTupleValueAdaptor strideAdaptor = IntTupleValueAdaptor::create(
-        builder, layout.getDefiningOp()->getOperand(1), layoutTy.getAttr().getStride());
+      IntTupleBuilder<IntTupleValueAdaptor> builder(rewriter, loc);
+      IntTupleValueAdaptor coordAdaptor =
+          IntTupleValueAdaptor::create(builder, coord, coordTy.getAttr());
+      IntTupleValueAdaptor shapeAdaptor = IntTupleValueAdaptor::create(
+          builder, layout.getDefiningOp()->getOperand(0), layoutTy.getAttr().getShape());
+      IntTupleValueAdaptor strideAdaptor = IntTupleValueAdaptor::create(
+          builder, layout.getDefiningOp()->getOperand(1), layoutTy.getAttr().getStride());
 
-    IntTupleValueAdaptor result = layoutCrd2Idx(builder, coordAdaptor, shapeAdaptor, strideAdaptor);
+      IntTupleValueAdaptor result =
+          layoutCrd2Idx(builder, coordAdaptor, shapeAdaptor, strideAdaptor);
+      rewriter.replaceOp(op, builder.finalize(result));
+      return success();
+    }
 
-    rewriter.replaceOp(op, builder.finalize(result));
-    return success();
+    if (auto composedTy = dyn_cast<ComposedLayoutType>(layout.getType())) {
+      LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
+      IntTupleValueAdaptor coordAdaptor =
+          IntTupleValueAdaptor::create(layoutBuilder, coord, coordTy.getAttr());
+      LayoutValueAdaptor composedAdaptor(layout, composedTy.getAttr());
+
+      IntTupleValueAdaptor result =
+          layoutCrd2Idx(layoutBuilder, coordAdaptor, composedAdaptor);
+      rewriter.replaceOp(op, layoutBuilder.finalize(result));
+      return success();
+    }
+
+    return failure();
   }
 };
 
@@ -2082,6 +2095,132 @@ public:
   }
 };
 
+// True if the kernel that contains `op` targets the IXDL backend.
+// We detect this by walking up to the parent gpu::GPUModuleOp and inspecting
+// its `targets` array attribute for an entry from the `ixdl` dialect.
+static bool kernelTargetsIXDL(Operation *op) {
+  auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>();
+  if (!gpuModule)
+    return false;
+  auto targetsAttr = gpuModule->getAttrOfType<ArrayAttr>("targets");
+  if (!targetsAttr)
+    return false;
+  for (Attribute attr : targetsAttr) {
+    if (attr.getDialect().getNamespace() == "ixdl")
+      return true;
+  }
+  return false;
+}
+
+// Compute the byte size used by ixcc's ``vprintf2`` for a packed args struct.
+// It uses the natural width of each scalar and pads any unknown type to 8.
+static int computeVprintfArgsBytes(ArrayRef<Type> fieldTypes) {
+  int totalBytes = 0;
+  for (Type ty : fieldTypes) {
+    if (auto intTy = dyn_cast<IntegerType>(ty))
+      totalBytes += (intTy.getWidth() + 7) / 8;
+    else if (isa<Float32Type>(ty))
+      totalBytes += 4;
+    else if (isa<Float64Type>(ty))
+      totalBytes += 8;
+    else
+      totalBytes += 8;
+  }
+  return totalBytes;
+}
+
+// Lower a fly.print to a libdevice ``vprintf2(fmt, args, size)`` call.
+//
+// Why bypass the upstream gpu.printf -> vprintf path: that path emits an
+// ``llvm.alloca`` in addrspace(0) (generic) which IXDL ISel cannot lower
+// (no FrameIndex support). Instead we:
+//   1. declare ``@vprintf2`` once per gpu.module,
+//   2. emit the format string as an ``llvm.mlir.global`` (constant),
+//   3. allocate the args struct in addrspace(5) (private/stack) and
+//      addrspacecast the pointer to generic for the call.
+static void lowerPrintToVprintf2(PatternRewriter &rewriter, PrintOp op,
+                                 const std::string &formatNoNul,
+                                 ArrayRef<Value> args) {
+  Location loc = op.getLoc();
+  MLIRContext *ctx = rewriter.getContext();
+  auto llvmPtrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = rewriter.getI32Type();
+  auto i64Ty = rewriter.getI64Type();
+  auto privatePtrTy = LLVM::LLVMPointerType::get(ctx, /*addressSpace=*/5);
+
+  auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>();
+  OpBuilder::InsertionGuard guard(rewriter);
+
+  // (1) Declare @vprintf2 if not already present.
+  StringRef vprintfName("vprintf2");
+  auto vprintfTy =
+      LLVM::LLVMFunctionType::get(i32Ty, {llvmPtrTy, llvmPtrTy, i32Ty});
+  auto vprintfFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>(vprintfName);
+  if (!vprintfFunc) {
+    rewriter.setInsertionPointToStart(gpuModule.getBody());
+    vprintfFunc =
+        LLVM::LLVMFuncOp::create(rewriter, loc, vprintfName, vprintfTy);
+  }
+
+  // (2) Emit format-string global. Name is unique per existing global count.
+  std::string globalName;
+  {
+    int counter = 0;
+    gpuModule.walk([&](LLVM::GlobalOp) { ++counter; });
+    globalName = "printfFormat_ixdl_" + std::to_string(counter);
+  }
+  std::string formatNul = formatNoNul;
+  formatNul.push_back('\0');
+  rewriter.setInsertionPointToStart(gpuModule.getBody());
+  auto strType = LLVM::LLVMArrayType::get(IntegerType::get(ctx, 8), formatNul.size());
+  LLVM::GlobalOp::create(
+      rewriter, loc, strType, /*isConstant=*/true, LLVM::Linkage::Internal,
+      globalName, rewriter.getStringAttr(StringRef(formatNul.data(), formatNul.size())));
+
+  // (3) Pack args into a private alloca and call vprintf2.
+  rewriter.setInsertionPoint(op);
+  Value fmtAddr =
+      LLVM::AddressOfOp::create(rewriter, loc, llvmPtrTy, globalName).getResult();
+
+  if (args.empty()) {
+    Value nullPtr = LLVM::ZeroOp::create(rewriter, loc, llvmPtrTy).getRes();
+    Value zeroSize = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                              rewriter.getI32IntegerAttr(0))
+                         .getRes();
+    LLVM::CallOp::create(rewriter, loc, vprintfFunc,
+                         ValueRange{fmtAddr, nullPtr, zeroSize});
+    return;
+  }
+
+  SmallVector<Type> fieldTypes;
+  fieldTypes.reserve(args.size());
+  for (Value arg : args)
+    fieldTypes.push_back(arg.getType());
+
+  auto structTy = LLVM::LLVMStructType::getLiteral(ctx, fieldTypes);
+  Value one = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                       rewriter.getI64IntegerAttr(1))
+                  .getRes();
+  Value allocaOp = LLVM::AllocaOp::create(rewriter, loc, privatePtrTy, structTy,
+                                          one, /*alignment=*/8);
+
+  for (int i = 0, e = static_cast<int>(args.size()); i < e; ++i) {
+    Value gep = LLVM::GEPOp::create(rewriter, loc, privatePtrTy, structTy,
+                                    allocaOp, ArrayRef<LLVM::GEPArg>{0, i});
+    LLVM::StoreOp::create(rewriter, loc, args[i], gep);
+  }
+
+  // ``vprintf2`` expects a generic pointer; cast the private alloca up.
+  Value castPtr =
+      LLVM::AddrSpaceCastOp::create(rewriter, loc, llvmPtrTy, allocaOp).getRes();
+  Value sizeConst = LLVM::ConstantOp::create(
+                        rewriter, loc, i32Ty,
+                        rewriter.getI32IntegerAttr(computeVprintfArgsBytes(fieldTypes)))
+                        .getRes();
+  LLVM::CallOp::create(rewriter, loc, vprintfFunc,
+                       ValueRange{fmtAddr, castPtr, sizeConst});
+}
+
 class PrintOpLowering : public OpRewritePattern<PrintOp> {
 public:
   using OpRewritePattern<PrintOp>::OpRewritePattern;
@@ -2221,8 +2360,12 @@ public:
           format += seg.text;
         }
       }
-      format += "\n";
-      gpu::PrintfOp::create(rewriter, loc, rewriter.getStringAttr(format), args);
+      if (kernelTargetsIXDL(op)) {
+        lowerPrintToVprintf2(rewriter, op, format, args);
+      } else {
+        format += "\n";
+        gpu::PrintfOp::create(rewriter, loc, rewriter.getStringAttr(format), args);
+      }
     } else {
       // For CPU, print segments in order
       for (size_t i = 0; i < segments.size(); ++i) {
@@ -2249,6 +2392,37 @@ public:
 //===----------------------------------------------------------------------===//
 // TiledCopy/TiledMma Partition Lowering
 //===----------------------------------------------------------------------===//
+
+// Materialize a static LayoutAttr into a runtime LayoutValue so it can flow
+// through the rest of layout lowering, which expects normal-form layout SSA.
+static Value materializeLayoutAttr(OpBuilder &builder, Location loc, LayoutAttr attr) {
+  Value shape = MakeIntTupleOp::create(builder, loc, IntTupleType::get(attr.getShape()), {});
+  Value stride = MakeIntTupleOp::create(builder, loc, IntTupleType::get(attr.getStride()), {});
+  return MakeLayoutOp::create(builder, loc, LayoutType::get(attr), shape, stride);
+}
+
+// Slice a view backed by a ComposedLayout (Inner ∘ Offset ∘ Outer) by
+// 1) slicing the outer layout to get the per-thread tile,
+// 2) accumulating the slice index into the offset so the inner swizzle still
+//    sees the correct global coordinate.
+//
+// Returns a new fly::make_view with composed layout `Inner ∘ (Offset+outerIdx)
+// ∘ slicedOuter`, or a null Value if the composed layout was not built by a
+// MakeComposedLayoutOp (which means the lowering should bail out).
+static Value buildComposedLayoutSliceView(PatternRewriter &rewriter, Location loc,
+                                          Value ptr, Value composedLayoutValue,
+                                          Value outerLayoutValue, Value sliceCoord) {
+  auto composedOp = composedLayoutValue.getDefiningOp<MakeComposedLayoutOp>();
+  if (!composedOp)
+    return Value{};
+  Value slicedOuter = SliceOp::create(rewriter, loc, outerLayoutValue, sliceCoord);
+  Value outerIdx = Crd2IdxOp::create(rewriter, loc, sliceCoord, outerLayoutValue);
+  Value newOffset =
+      IntTupleAddOp::create(rewriter, loc, composedOp.getOffset(), outerIdx);
+  Value newComposed = MakeComposedLayoutOp::create(
+      rewriter, loc, composedOp.getInner(), newOffset, slicedOuter);
+  return MakeViewOp::create(rewriter, loc, ptr, newComposed);
+}
 
 static std::pair<Value, Value> getMemRefPtrAndLayout(OpBuilder &builder, Location loc,
                                                      Value memref) {
@@ -2282,9 +2456,24 @@ public:
       return failure();
 
     auto [ptr, layoutValue] = getMemRefPtrAndLayout(rewriter, loc, memref);
-    auto layoutTy = dyn_cast<LayoutType>(layoutValue.getType());
-    if (!layoutTy || !isNormalForm(cast<TypedValue<LayoutType>>(layoutValue)))
+
+    LayoutAttr layout;
+    ComposedLayoutAttr composedLayout;
+    Value outerLayoutValue = layoutValue;
+    if (auto la = dyn_cast<LayoutAttr>(memrefTy.getLayout())) {
+      layout = la;
+      if (!dyn_cast<LayoutType>(layoutValue.getType()))
+        return failure();
+      if (!isNormalForm(cast<TypedValue<LayoutType>>(outerLayoutValue)))
+        return failure();
+    } else if (auto ca = dyn_cast<ComposedLayoutAttr>(memrefTy.getLayout())) {
+      composedLayout = ca;
+      layout = ca.getOuter();
+      outerLayoutValue = materializeLayoutAttr(rewriter, loc, layout);
+    } else {
       return failure();
+    }
+
     if (!isNormalForm(cast<TypedValue<IntTupleType>>(coord)))
       return failure();
 
@@ -2294,10 +2483,9 @@ public:
 
     LayoutAttr tiledLayoutThrVal = tiledCopyTy.getLayoutThrVal().getAttr();
     TileAttr tileMN = tiledCopyTy.getTileMN().getAttr();
-    LayoutAttr layout = cast<LayoutAttr>(memrefTy.getLayout());
 
     LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
-    LayoutValueAdaptor layoutAdaptor(layoutValue, layout);
+    LayoutValueAdaptor layoutAdaptor(outerLayoutValue, layout);
     LayoutValueAdaptor thrValView =
         ThrValViewFunc(layoutBuilder, copyAtom, tiledLayoutThrVal, tileMN, layoutAdaptor);
 
@@ -2306,8 +2494,6 @@ public:
     auto expandedShape = intTupleExpand(layoutBuilder, thrValShape, {2});
     auto expandedStride = intTupleExpand(layoutBuilder, thrValStride, {2});
     LayoutValueAdaptor expandedLayout = layoutBuilder.makeLayout(expandedShape, expandedStride);
-
-    Value expandedMemref = MakeViewOp::create(rewriter, loc, ptr, expandedLayout.getValue());
 
     SmallVector<Value> dynElems(coord.getDefiningOp()->getOperands());
     SmallVector<Attribute> sliceCoordElems;
@@ -2320,9 +2506,17 @@ public:
     Value sliceCoord =
         MakeIntTupleOp::create(rewriter, loc, IntTupleType::get(sliceCoordAttr), dynElems);
 
-    Value result = SliceOp::create(rewriter, loc, expandedMemref, sliceCoord);
-
-    rewriter.replaceOp(op, result);
+    if (composedLayout) {
+      Value result = buildComposedLayoutSliceView(
+          rewriter, loc, ptr, layoutValue, expandedLayout.getValue(), sliceCoord);
+      if (!result)
+        return failure();
+      rewriter.replaceOp(op, result);
+    } else {
+      Value expandedMemref = MakeViewOp::create(rewriter, loc, ptr, expandedLayout.getValue());
+      Value result = SliceOp::create(rewriter, loc, expandedMemref, sliceCoord);
+      rewriter.replaceOp(op, result);
+    }
     return success();
   }
 };
@@ -2353,9 +2547,24 @@ public:
       return failure();
 
     auto [inputPtr, inputLayoutValue] = getMemRefPtrAndLayout(rewriter, loc, input);
-    auto inputLayoutTy = dyn_cast<LayoutType>(inputLayoutValue.getType());
-    if (!inputLayoutTy || !isNormalForm(cast<TypedValue<LayoutType>>(inputLayoutValue)))
+
+    LayoutAttr inputLayout;
+    ComposedLayoutAttr inputComposedLayout;
+    Value outerInputLayoutValue = inputLayoutValue;
+    if (auto la = dyn_cast<LayoutAttr>(memrefTy.getLayout())) {
+      inputLayout = la;
+      if (!isa<LayoutType>(inputLayoutValue.getType()))
+        return failure();
+      if (!isNormalForm(cast<TypedValue<LayoutType>>(outerInputLayoutValue)))
+        return failure();
+    } else if (auto ca = dyn_cast<ComposedLayoutAttr>(memrefTy.getLayout())) {
+      inputComposedLayout = ca;
+      inputLayout = ca.getOuter();
+      outerInputLayoutValue = materializeLayoutAttr(rewriter, loc, inputLayout);
+    } else {
       return failure();
+    }
+
     if (!isNormalForm(cast<TypedValue<IntTupleType>>(coord)))
       return failure();
 
@@ -2365,14 +2574,13 @@ public:
 
     LayoutAttr atomLayoutMNK = tiledMmaTy.getAtomLayout().getAttr();
     TileAttr permutationMNK = tiledMmaTy.getPermutation().getAttr();
-    LayoutAttr inputLayout = cast<LayoutAttr>(memrefTy.getLayout());
 
     LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
-    LayoutValueAdaptor inputLayoutAdaptor(inputLayoutValue, inputLayout);
+    LayoutValueAdaptor inputLayoutAdaptor(outerInputLayoutValue, inputLayout);
     LayoutValueAdaptor thrValView = layoutTiledMmaThrValOperandView(
         layoutBuilder, mmaAtom, atomLayoutMNK, permutationMNK, operandId, inputLayoutAdaptor);
 
-    Value thrValMemref = MakeViewOp::create(rewriter, loc, inputPtr, thrValView.getValue());
+    Value thrValOuterLayoutVal = thrValView.getValue();
 
     LayoutBuilder<LayoutAttr> attrBuilder(ctx);
     LayoutAttr atomThrIDLayout = cast<LayoutAttr>(mmaAtom.getThrLayout());
@@ -2453,9 +2661,17 @@ public:
     Value sliceCoord =
         MakeIntTupleOp::create(rewriter, loc, IntTupleType::get(sliceCoordAttr), sliceDynElems);
 
-    Value result = SliceOp::create(rewriter, loc, thrValMemref, sliceCoord);
-
-    rewriter.replaceOp(op, result);
+    if (inputComposedLayout) {
+      Value result = buildComposedLayoutSliceView(
+          rewriter, loc, inputPtr, inputLayoutValue, thrValOuterLayoutVal, sliceCoord);
+      if (!result)
+        return failure();
+      rewriter.replaceOp(op, result);
+    } else {
+      Value thrValMemref = MakeViewOp::create(rewriter, loc, inputPtr, thrValOuterLayoutVal);
+      Value result = SliceOp::create(rewriter, loc, thrValMemref, sliceCoord);
+      rewriter.replaceOp(op, result);
+    }
     return success();
   }
 };
@@ -2485,14 +2701,164 @@ public:
     LayoutAttr tiledLayoutThrVal = tiledCopyTy.getLayoutThrVal().getAttr();
     TileAttr tileMN = tiledCopyTy.getTileMN().getAttr();
 
+    auto inputRetileLayout = dyn_cast<LayoutAttr>(inputMemRefTy.getLayout());
+    if (!inputRetileLayout)
+      return failure();
+
     LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
-    LayoutValueAdaptor inputLayoutAdaptor(inputLayoutValue,
-                                          cast<LayoutAttr>(inputMemRefTy.getLayout()));
+    LayoutValueAdaptor inputLayoutAdaptor(inputLayoutValue, inputRetileLayout);
     LayoutValueAdaptor retiled = layoutTiledCopyRetile(layoutBuilder, copyAtom, tiledLayoutThrVal,
                                                        tileMN, inputLayoutAdaptor);
 
     Value result = MakeViewOp::create(rewriter, loc, inputPtr, retiled.getValue());
     rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// Lower a fly.copy whose source memref carries a ComposedLayout
+// (Inner ∘ Offset ∘ Outer, e.g. swizzled SLB on Iluvatar) into a sequence of
+// per-element CopyAtomCall ops, applying the swizzle/offset to each address.
+//
+// We need a dedicated pattern (not just ExpandCopyOpLowering) because that
+// pattern only knows how to walk a plain LayoutAttr — it would silently drop
+// the Inner swizzle and produce wrong addresses on swizzled shared memory.
+//
+// Constraints:
+//  - The source's outer layout must be fully static (we materialize each
+//    element's offset attribute at compile time).
+//  - The destination layout must also be a plain static LayoutAttr.
+//  - The dynamic part (the per-thread offset of the partitioned source) is
+//    folded into the address using the dialect-level swizzle helper.
+class ExpandCopyComposedSrcLowering : public OpRewritePattern<CopyOp> {
+public:
+  using OpRewritePattern<CopyOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(CopyOp op, PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    Value copyAtomVal = op.getCopyAtom();
+    Value src = op.getSrc();
+    Value dst = op.getDst();
+
+    auto srcMemRefTy = dyn_cast<fly::MemRefType>(src.getType());
+    auto dstMemRefTy = dyn_cast<fly::MemRefType>(dst.getType());
+    if (!srcMemRefTy || !dstMemRefTy)
+      return failure();
+
+    auto srcComposed = dyn_cast<ComposedLayoutAttr>(srcMemRefTy.getLayout());
+    if (!srcComposed)
+      return failure();
+
+    auto dstLayout = dyn_cast<LayoutAttr>(dstMemRefTy.getLayout());
+    if (!dstLayout)
+      return failure();
+
+    if (!srcComposed.isStaticOuter() ||
+        !dstLayout.isStaticShape() || !dstLayout.isStaticStride())
+      return failure();
+
+    LayoutAttr srcOuterLayout = srcComposed.getOuter();
+
+    auto [srcPtr, srcLayoutValue] = getMemRefPtrAndLayout(rewriter, loc, src);
+    auto [dstPtr, dstLayoutValue] = getMemRefPtrAndLayout(rewriter, loc, dst);
+
+    auto *ctx = rewriter.getContext();
+    LayoutBuilder<LayoutAttr> attrBuilder(ctx);
+
+    IntTupleAttr srcOuterShapeAttr = srcOuterLayout.getShape();
+    IntTupleAttr dstShapeAttr = dstLayout.getShape();
+
+    IntAttr srcTotalSize = intTupleProduct(attrBuilder, srcOuterShapeAttr).getLeafAsInt();
+    IntAttr dstTotalSize = intTupleProduct(attrBuilder, dstShapeAttr).getLeafAsInt();
+    if (!srcTotalSize.isStatic() || !dstTotalSize.isStatic())
+      return failure();
+    if (srcTotalSize.getValue() != dstTotalSize.getValue())
+      return failure();
+    int64_t numElems = srcTotalSize.getValue();
+
+    LayoutAttr scalarLayout = LayoutAttr::get(
+        IntTupleAttr::getLeafStatic(ctx, 1),
+        IntTupleAttr::getLeafStatic(ctx, 0));
+
+    Value dynamicOffset = nullptr;
+    SwizzleAttr swizzleAttr;
+    if (isa<ComposedLayoutType>(srcLayoutValue.getType())) {
+      auto composedOp = srcLayoutValue.getDefiningOp<MakeComposedLayoutOp>();
+      if (!composedOp)
+        return failure();
+      dynamicOffset = composedOp.getOffset();
+      if (!isNormalForm(cast<TypedValue<IntTupleType>>(dynamicOffset)))
+        return failure();
+      auto innerAttr = srcComposed.getInner();
+      if (auto sw = dyn_cast<SwizzleAttr>(innerAttr))
+        swizzleAttr = sw;
+    }
+
+    IntTupleBuilder<IntTupleValueAdaptor> tupleBuilder(rewriter, loc);
+
+    for (int64_t i = 0; i < numElems; ++i) {
+      IntTupleAttr iAttr = IntTupleAttr::getLeafStatic(ctx, i);
+
+      IntTupleAttr srcCoord =
+          layoutIdx2CrdColMajor(attrBuilder, iAttr, srcOuterShapeAttr);
+      IntTupleAttr srcOuterIdxAttr =
+          layoutCrd2Idx(attrBuilder, srcCoord, srcOuterLayout.getShape(),
+                        srcOuterLayout.getStride());
+
+      Value srcIdxVal;
+      if (dynamicOffset) {
+        IntTupleAttr dynOffsetAttr =
+            cast<IntTupleType>(dynamicOffset.getType()).getAttr();
+        IntTupleValueAdaptor offsetAdaptor =
+            IntTupleValueAdaptor::create(tupleBuilder, dynamicOffset,
+                                         dynOffsetAttr);
+        IntTupleValueAdaptor outerIdxAdaptor =
+            tupleBuilder.materializeConstantLeaf(srcOuterIdxAttr.getLeafAsInt());
+        IntTupleValueAdaptor preSwizzle =
+            tupleBuilder.add(offsetAdaptor, outerIdxAdaptor);
+        if (swizzleAttr && !swizzleAttr.isTrivialSwizzle()) {
+          IntTupleValueAdaptor swizzled =
+              tupleBuilder.applySwizzle(preSwizzle, swizzleAttr);
+          srcIdxVal = tupleBuilder.finalize(swizzled);
+        } else {
+          srcIdxVal = tupleBuilder.finalize(preSwizzle);
+        }
+      } else {
+        IntTupleAttr srcIdxAttr =
+            layoutCrd2Idx(attrBuilder, srcCoord, srcComposed);
+        srcIdxVal = MakeIntTupleOp::create(rewriter, loc,
+            IntTupleType::get(srcIdxAttr), ValueRange{});
+      }
+
+      IntTupleAttr dstCoord =
+          layoutIdx2CrdColMajor(attrBuilder, iAttr, dstShapeAttr);
+      IntTupleAttr dstIdxAttr =
+          layoutCrd2Idx(attrBuilder, dstCoord, dstLayout.getShape(),
+                        dstLayout.getStride());
+      Value dstOff = MakeIntTupleOp::create(rewriter, loc,
+          IntTupleType::get(dstIdxAttr), ValueRange{});
+
+      Value srcElemPtr = AddOffsetOp::create(rewriter, loc, srcPtr, srcIdxVal);
+      Value dstElemPtr = AddOffsetOp::create(rewriter, loc, dstPtr, dstOff);
+
+      Value srcScalarShape = MakeIntTupleOp::create(rewriter, loc,
+          IntTupleType::get(scalarLayout.getShape()), ValueRange{});
+      Value srcScalarStride = MakeIntTupleOp::create(rewriter, loc,
+          IntTupleType::get(scalarLayout.getStride()), ValueRange{});
+      Value srcScalarLay = MakeLayoutOp::create(rewriter, loc,
+          LayoutType::get(ctx, scalarLayout), srcScalarShape, srcScalarStride);
+      Value dstScalarLay = MakeLayoutOp::create(rewriter, loc,
+          LayoutType::get(ctx, scalarLayout), srcScalarShape, srcScalarStride);
+
+      Value srcView = MakeViewOp::create(rewriter, loc, srcElemPtr, srcScalarLay);
+      Value dstView = MakeViewOp::create(rewriter, loc, dstElemPtr, dstScalarLay);
+
+      CopyAtomCall::create(rewriter, loc, copyAtomVal, srcView, dstView,
+                            /*pred=*/Value{});
+    }
+
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -2551,8 +2917,10 @@ public:
     if (!srcMemRefTy || !dstMemRefTy)
       return failure();
 
-    LayoutAttr srcLayout = cast<LayoutAttr>(srcMemRefTy.getLayout());
-    LayoutAttr dstLayout = cast<LayoutAttr>(dstMemRefTy.getLayout());
+    auto srcLayout = dyn_cast<LayoutAttr>(srcMemRefTy.getLayout());
+    auto dstLayout = dyn_cast<LayoutAttr>(dstMemRefTy.getLayout());
+    if (!srcLayout || !dstLayout)
+      return failure();
 
     int32_t srcRank = srcLayout.rank();
     int32_t dstRank = dstLayout.rank();
@@ -2579,7 +2947,9 @@ public:
       auto predMemRefTy = dyn_cast<fly::MemRefType>(pred.getType());
       if (!predMemRefTy)
         return failure();
-      predLayout = cast<LayoutAttr>(predMemRefTy.getLayout());
+      predLayout = dyn_cast<LayoutAttr>(predMemRefTy.getLayout());
+      if (!predLayout)
+        return failure();
       auto [pp, pl] = getMemRefPtrAndLayout(rewriter, loc, pred);
       predPtr = pp;
       predLayoutValue = pl;
@@ -2709,10 +3079,12 @@ public:
     if (!dMemRefTy || !aMemRefTy || !bMemRefTy || !cMemRefTy)
       return failure();
 
-    LayoutAttr dLayout = cast<LayoutAttr>(dMemRefTy.getLayout());
-    LayoutAttr aLayout = cast<LayoutAttr>(aMemRefTy.getLayout());
-    LayoutAttr bLayout = cast<LayoutAttr>(bMemRefTy.getLayout());
-    LayoutAttr cLayout = cast<LayoutAttr>(cMemRefTy.getLayout());
+    auto dLayout = dyn_cast<LayoutAttr>(dMemRefTy.getLayout());
+    auto aLayout = dyn_cast<LayoutAttr>(aMemRefTy.getLayout());
+    auto bLayout = dyn_cast<LayoutAttr>(bMemRefTy.getLayout());
+    auto cLayout = dyn_cast<LayoutAttr>(cMemRefTy.getLayout());
+    if (!dLayout || !aLayout || !bLayout || !cLayout)
+      return failure();
 
     int32_t dRank = dLayout.rank();
     int32_t aRank = aLayout.rank();
@@ -2930,6 +3302,7 @@ public:
     patterns.add<TiledCopyPartitionSrcOpLowering, TiledCopyPartitionDstOpLowering,
                  TiledMmaPartitionOpLowering>(context);
     patterns.add<TiledCopyRetileOpLowering>(context);
+    patterns.add<ExpandCopyComposedSrcLowering>(context);
     patterns.add<ExpandCopyOpLowering, ExpandGemmOpLowering>(context);
 
     patterns.add<PrintOpLowering>(context);

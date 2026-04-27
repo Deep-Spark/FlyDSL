@@ -14,4 +14,15 @@ def FlyToROCDLConversionPass : Pass<"convert-fly-to-rocdl"> {
   ];
 }
 
+def FlyToIXDLConversionPass : Pass<"convert-fly-to-ixdl"> {
+  let summary = "Lower Fly to MLIR upstream and ixdl dialects for Iluvatar";
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "scf::SCFDialect",
+    "vector::VectorDialect",
+    "LLVM::LLVMDialect",
+    "IXDL::IXDLDialect"
+  ];
+}
+
 #endif // FLYDSL_CONVERSION_PASSES

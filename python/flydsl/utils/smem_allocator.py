@@ -213,6 +213,8 @@ SMEM_CAPACITY_MAP = {
     # CDNA 4 (MI350 Series) - 160KB LDS per CU (key upgrade for CDNA4)
     "gfx950": 163840,   # MI300C / MI300X Enhanced Models: 64KB LDS per CU
     "gfx1201": 65536,  # RDNA4: 64KB LDS per WGP
+    # ===================== Iluvatar ivcore11 =====================
+    "ivcore11": 65536,  # 64KB SLB per SM
 }
 
 def check_smem_capacity(allocated_bytes: int, arch: str = None):

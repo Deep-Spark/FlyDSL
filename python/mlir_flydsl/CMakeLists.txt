@@ -25,6 +25,15 @@ declare_mlir_dialect_python_bindings(
   GEN_ENUM_BINDINGS
 )
 
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT FlyPythonSources
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/"
+  TD_FILE dialects/FlyIXDL.td
+  SOURCES
+    dialects/fly_ixdl.py
+  DIALECT_NAME fly_ixdl
+)
+
 # NOTE: Do NOT link MLIRFlyDialect/MLIRFlyROCDLDialect here via PRIVATE_LINK_LIBS.
 # These symbols are already provided by FlyPythonCAPI.so (via MLIRCPIFly's transitive
 # dependencies in EMBED_CAPI_LINK_LIBS). Statically linking them here creates DUPLICATE
@@ -55,6 +64,17 @@ declare_mlir_python_extension(FlyPythonSources.Core.fly_rocdl
     LLVMSupport
 )
 
+declare_mlir_python_extension(FlyPythonSources.Core.fly_ixdl
+  MODULE_NAME _fly_ixdl
+  ADD_TO_PARENT FlyPythonSources
+  ROOT_DIR "${PROJECT_SOURCE_DIR}/lib/Bindings/Python"
+  PYTHON_BINDINGS_LIBRARY nanobind
+  SOURCES
+    FlyIXDLExtension.cpp
+  PRIVATE_LINK_LIBS
+    LLVMSupport
+)
+
 # NOTE: Do NOT link MLIRFlyToROCDL or other C++ libs via PRIVATE_LINK_LIBS.
 # Doing so statically embeds a copy of MLIRPass (and its pass registry) into
 # _mlirRegisterEverything.so. Passes registered via registerFlyPasses() then
@@ -78,6 +98,7 @@ declare_mlir_python_extension(FlyPythonSources.RegisterEverything
     MLIRCAPIIR
     MLIRCPIFly
     MLIRCPIFlyROCDL
+    MLIRCPIFlyIXDL
     MLIRCAPIArith
     MLIRCAPIGPU
     MLIRCAPILLVM
@@ -101,6 +122,7 @@ set(MLIRFlyDSLSources
   MLIRPythonSources.Dialects.cf
   MLIRPythonSources.Dialects.scf
   MLIRPythonSources.Dialects.rocdl
+  MLIRPythonSources.Dialects.ixdl
   MLIRPythonSources.Dialects.vector
   MLIRPythonSources.Dialects.llvm
   MLIRPythonSources.ExecutionEngine
@@ -178,6 +200,7 @@ add_custom_command(
       -m flydsl._mlir._mlir_libs._mlir \
       -m flydsl._mlir._mlir_libs._fly \
       -m flydsl._mlir._mlir_libs._fly_rocdl \
+      -m flydsl._mlir._mlir_libs._fly_ixdl \
       -m flydsl._mlir._mlir_libs._mlirDialectsGPU \
       -m flydsl._mlir._mlir_libs._mlirDialectsLLVM \
       -O '${_MLIR_LIBS_DIR}' \
@@ -209,6 +232,9 @@ add_custom_target(CopyFlyPythonSources ALL
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_rocdl_enum_gen.py"
     "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_rocdl_enum_gen.py"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_ixdl_ops_gen.py"
+    "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_ixdl_ops_gen.py"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "$<TARGET_FILE:mlir_c_runner_utils>"
     "${_MLIR_LIBS_DIR}/libmlir_c_runner_utils.so"

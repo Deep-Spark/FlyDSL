@@ -1,0 +1,6 @@
+#ifndef PYTHON_BINDINGS_FLYIXDL_OPS
+#define PYTHON_BINDINGS_FLYIXDL_OPS
+
+include "flydsl/Dialect/FlyIXDL/IR/Atom.td"
+
+#endif // PYTHON_BINDINGS_FLYIXDL_OPS
