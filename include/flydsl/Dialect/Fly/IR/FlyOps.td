@@ -358,6 +358,7 @@ def Fly_AtomSetValueOp : Fly_Op<"atom.set_value", [Pure, DeclareOpInterfaceMetho
 }
 
 def Fly_CopyAtomCall : Fly_Op<"copy_atom_call"> {
+  let hasVerifier = 1;
   let arguments = (ins Fly_CopyAtom:$copyAtom, Fly_MemRef:$src, Fly_MemRef:$dst, Optional<Fly_MemRef>:$pred);
 }
 def Fly_MmaAtomCall : Fly_Op<"mma_atom_call"> {
@@ -365,6 +366,7 @@ def Fly_MmaAtomCall : Fly_Op<"mma_atom_call"> {
 }
 
 def Fly_CopyAtomCallSSA : Fly_Op<"copy_atom_call_ssa", [AttrSizedOperandSegments]> {
+  let hasVerifier = 1;
   let arguments = (ins Fly_CopyAtom:$copyAtom, AnyType:$src,
                        Optional<AnyType>:$dst, Optional<AnyType>:$pred);
   let results = (outs Variadic<AnyType>:$results);
@@ -373,6 +375,51 @@ def Fly_MmaAtomCallSSA : Fly_Op<"mma_atom_call_ssa"> {
   let arguments = (ins Fly_MmaAtom:$mmaAtom, Optional<AnyType>:$d,
                        AnyType:$a, AnyType:$b, AnyType:$c);
   let results = (outs Variadic<AnyType>:$results);
+}
+
+// Close a batch of issued async copies into a named group. Lowers to
+// ``ixdl.cp.async.commit.group`` on the IXDL backend; ignored on backends
+// that don't have an async-copy engine.
+def Fly_CpAsyncCommitGroupOp : Fly_Op<"cp_async_commit_group"> {
+  let summary = "Commit a group of pending async copy operations.";
+  let arguments = (ins);
+  let results = (outs);
+  let assemblyFormat = "attr-dict";
+}
+
+// Wait for all but the most-recent ``n`` committed groups to retire.
+// ``n = 0`` drains every outstanding group (the common case before a
+// consumer block). Lowers to ``ixdl.cp.async.wait.group $n``.
+def Fly_CpAsyncWaitGroupOp : Fly_Op<"cp_async_wait_group"> {
+  let summary = "Wait for committed async copy groups to drain.";
+  let arguments = (ins I32Attr:$n);
+  let results = (outs);
+  let assemblyFormat = "$n attr-dict";
+}
+
+// IXDL lightweight synchronization helpers. These are intentionally modeled
+// as target-specific utility ops rather than generic GPU barriers because the
+// IVCore11 pipeline barrier and waitcnt semantics do not map cleanly to
+// portable GPU dialect operations.
+def Fly_PipebarReqOp : Fly_Op<"pipebar_req"> {
+  let summary = "Issue an IXDL pipeline-barrier arrive/request.";
+  let arguments = (ins I32Attr:$id);
+  let results = (outs);
+  let assemblyFormat = "$id attr-dict";
+}
+
+def Fly_PipebarWaitOp : Fly_Op<"pipebar_wait"> {
+  let summary = "Wait on an IXDL pipeline barrier.";
+  let arguments = (ins I32Attr:$id);
+  let results = (outs);
+  let assemblyFormat = "$id attr-dict";
+}
+
+def Fly_SlWaitcntOp : Fly_Op<"sl_waitcnt"> {
+  let summary = "Issue an IXDL sl.waitcnt with an encoded counter mask.";
+  let arguments = (ins I64Attr:$cnt);
+  let results = (outs);
+  let assemblyFormat = "$cnt attr-dict";
 }
 
 def Fly_MakeTiledCopyOp : Fly_Op<"make_tiled_copy", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {

@@ -10,7 +10,8 @@ def FlyToROCDLConversionPass : Pass<"convert-fly-to-rocdl"> {
     "scf::SCFDialect",
     "vector::VectorDialect",
     "LLVM::LLVMDialect",
-    "ROCDL::ROCDLDialect"
+    "ROCDL::ROCDLDialect",
+    "IXDL::IXDLDialect"
   ];
 }
 

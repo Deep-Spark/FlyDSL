@@ -133,6 +133,32 @@ Type applyOffsetOnTensorLike(LayoutBuilder<LayoutAttr> &builder, Type tensorLike
       mlir::OpaqueProperties properties, mlir::RegionRange regions,                                \
       llvm::SmallVectorImpl<mlir::Type> &inferredReturnTypes)
 
+LogicalResult CopyAtomCall::verify() {
+  auto copyAtomTy = dyn_cast<CopyAtomType>(getCopyAtom().getType());
+  if (!copyAtomTy)
+    return emitOpError("copyAtom is not CopyAtomType");
+
+  auto srcTy = cast<fly::MemRefType>(getSrc().getType());
+  auto dstTy = cast<fly::MemRefType>(getDst().getType());
+  if (srcTy.getElemTy() != dstTy.getElemTy())
+    return emitOpError("src/dst element types mismatch");
+
+  return success();
+}
+
+LogicalResult CopyAtomCallSSA::verify() {
+  auto copyAtomTy = dyn_cast<CopyAtomType>(getCopyAtom().getType());
+  if (!copyAtomTy)
+    return emitOpError("copyAtom is not CopyAtomType");
+
+  auto srcTy = dyn_cast<fly::MemRefType>(getSrc().getType());
+  auto dstTy = getDst() ? dyn_cast<fly::MemRefType>(getDst().getType()) : fly::MemRefType();
+  if (srcTy && dstTy && srcTy.getElemTy() != dstTy.getElemTy())
+    return emitOpError("src/dst element types mismatch");
+
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Constructors
 //===----------------------------------------------------------------------===//

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 FlyDSL Project Contributors
 
+#include "mlir/Dialect/LLVMIR/IXDLDialect.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/InitAllDialects.h"
@@ -14,6 +15,7 @@
 #include "flydsl/Conversion/Passes.h"
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
 #include "flydsl/Dialect/Fly/Transforms/Passes.h"
+#include "flydsl/Dialect/FlyIXDL/IR/Dialect.h"
 #include "flydsl/Dialect/FlyROCDL/IR/Dialect.h"
 
 int main(int argc, char **argv) {
@@ -27,6 +29,8 @@ int main(int argc, char **argv) {
   mlir::registerAllExtensions(registry);
   registry.insert<mlir::fly::FlyDialect>();
   registry.insert<mlir::fly_rocdl::FlyROCDLDialect>();
+  registry.insert<mlir::fly_ixdl::FlyIXDLDialect>();
+  registry.insert<mlir::IXDL::IXDLDialect>();
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "Fly Optimizer Driver\n", registry));

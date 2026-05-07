@@ -15,6 +15,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
 #include "flydsl/Conversion/FlyToROCDL/FlyToROCDL.h"
@@ -636,6 +637,61 @@ public:
   }
 };
 
+class CpAsyncCommitGroupLowering : public OpConversionPattern<CpAsyncCommitGroupOp> {
+public:
+  using OpConversionPattern<CpAsyncCommitGroupOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(CpAsyncCommitGroupOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<IXDL::CpAsyncCommitGroupOp>(op);
+    return success();
+  }
+};
+
+class CpAsyncWaitGroupLowering : public OpConversionPattern<CpAsyncWaitGroupOp> {
+public:
+  using OpConversionPattern<CpAsyncWaitGroupOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(CpAsyncWaitGroupOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<IXDL::CpAsyncWaitGroupOp>(op, adaptor.getNAttr());
+    return success();
+  }
+};
+
+class PipebarReqLowering : public OpConversionPattern<PipebarReqOp> {
+public:
+  using OpConversionPattern<PipebarReqOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(PipebarReqOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<IXDL::PipebarReqOp>(op, adaptor.getIdAttr());
+    return success();
+  }
+};
+
+class PipebarWaitLowering : public OpConversionPattern<PipebarWaitOp> {
+public:
+  using OpConversionPattern<PipebarWaitOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(PipebarWaitOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<IXDL::PipebarWaitOp>(op, adaptor.getIdAttr());
+    return success();
+  }
+};
+
+class SlWaitcntLowering : public OpConversionPattern<SlWaitcntOp> {
+public:
+  using OpConversionPattern<SlWaitcntOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(SlWaitcntOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<IXDL::SlWaitcntOp>(op, adaptor.getCntAttr());
+    return success();
+  }
+};
+
 /// Lower `gpu.launch_func` kernel operands so that any `!fly.memref` values are
 /// replaced by their type-converted builtin `memref` values. This prevents
 /// `unrealized_conversion_cast` materializations from remaining live after
@@ -751,6 +807,422 @@ public:
   }
 };
 
+static std::optional<int64_t> getI32Constant(Value value) {
+  if (auto cst = value.getDefiningOp<arith::ConstantIntOp>())
+    return cst.value();
+  return std::nullopt;
+}
+
+static bool matchI32Constant(Value value, int64_t expected) {
+  std::optional<int64_t> cst = getI32Constant(value);
+  return cst && *cst == expected;
+}
+
+static bool matchMulBy(Value value, int64_t factor, Value &operand) {
+  auto mul = value.getDefiningOp<arith::MulIOp>();
+  if (!mul)
+    return false;
+  if (matchI32Constant(mul.getRhs(), factor)) {
+    operand = mul.getLhs();
+    return true;
+  }
+  if (matchI32Constant(mul.getLhs(), factor)) {
+    operand = mul.getRhs();
+    return true;
+  }
+  return false;
+}
+
+static bool matchRemBy(Value value, int64_t divisor, Value &operand) {
+  auto rem = value.getDefiningOp<arith::RemSIOp>();
+  if (!rem || !matchI32Constant(rem.getRhs(), divisor))
+    return false;
+  operand = rem.getLhs();
+  return true;
+}
+
+static bool matchDivBy(Value value, int64_t divisor, Value &operand) {
+  auto div = value.getDefiningOp<arith::DivSIOp>();
+  if (!div || !matchI32Constant(div.getRhs(), divisor))
+    return false;
+  operand = div.getLhs();
+  return true;
+}
+
+static bool matchLane(Value value) {
+  Value threadId;
+  return matchRemBy(value, 64, threadId);
+}
+
+// Match the IX11 MMAD A-operand lane layout:
+//   (lane % 16) * 2 + (lane / 16) * 32
+// which is exactly lane * 2 for lane in [0, 64).
+static bool matchAOperandLaneTimesTwo(Value value) {
+  auto add = value.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return false;
+
+  auto match = [](Value lhs, Value rhs) {
+    Value rem16, div16;
+    if (!matchMulBy(lhs, 2, rem16) || !matchMulBy(rhs, 32, div16))
+      return false;
+    Value laneFromRem, laneFromDiv;
+    if (!matchRemBy(rem16, 16, laneFromRem) || !matchDivBy(div16, 16, laneFromDiv))
+      return false;
+    return laneFromRem == laneFromDiv && matchLane(laneFromRem);
+  };
+
+  return match(add.getLhs(), add.getRhs()) || match(add.getRhs(), add.getLhs());
+}
+
+static bool matchAddConst(Value value, Value &base, int64_t &constant) {
+  constant = 0;
+  for (int depth = 0; depth < 4; ++depth) {
+    auto add = value.getDefiningOp<arith::AddIOp>();
+    if (!add)
+      break;
+    if (auto rhs = getI32Constant(add.getRhs())) {
+      constant += *rhs;
+      value = add.getLhs();
+      continue;
+    }
+    if (auto lhs = getI32Constant(add.getLhs())) {
+      constant += *lhs;
+      value = add.getRhs();
+      continue;
+    }
+    break;
+  }
+  base = value;
+  return true;
+}
+
+static bool matchNoopAOperandSwizzle(Value value, Value &laneTimesTwo, int64_t &constant) {
+  auto xorOp = value.getDefiningOp<arith::XOrIOp>();
+  if (!xorOp) {
+    Value base;
+    int64_t cst = 0;
+    if (!matchAddConst(value, base, cst) || !matchAOperandLaneTimesTwo(base))
+      return false;
+    laneTimesTwo = base;
+    constant = cst;
+    return true;
+  }
+
+  auto shr = xorOp.getRhs().getDefiningOp<arith::ShRUIOp>();
+  if (!shr)
+    return false;
+  auto andOp = shr.getLhs().getDefiningOp<arith::AndIOp>();
+  if (!andOp)
+    return false;
+  if (andOp.getLhs() != xorOp.getLhs())
+    return false;
+  if (!matchI32Constant(andOp.getRhs(), 256) || !matchI32Constant(shr.getRhs(), 2))
+    return false;
+
+  Value base;
+  int64_t cst = 0;
+  if (!matchAddConst(xorOp.getLhs(), base, cst) || !matchAOperandLaneTimesTwo(base))
+    return false;
+  // For lane*2 + {0, 128}, S<1,6,2> has no effect because bit 8 is clear.
+  if (cst != 0 && cst != 128)
+    return false;
+  laneTimesTwo = base;
+  constant = cst;
+  return true;
+}
+
+static bool matchAOperandS2ROffset(Value offset, Value &baseElems, int64_t &constantElems) {
+  auto add = offset.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return false;
+
+  Value laneTimesTwo;
+  if (matchNoopAOperandSwizzle(add.getRhs(), laneTimesTwo, constantElems)) {
+    baseElems = add.getLhs();
+    return true;
+  }
+  if (matchNoopAOperandSwizzle(add.getLhs(), laneTimesTwo, constantElems)) {
+    baseElems = add.getRhs();
+    return true;
+  }
+  return false;
+}
+
+static bool matchBOperandInner(Value value, Value &lane) {
+  auto add = value.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return false;
+
+  auto match = [](Value lhs, Value rhs, Value &lane) {
+    Value rem4, div4;
+    if (!matchMulBy(lhs, 2, rem4) || !matchMulBy(rhs, 128, div4))
+      return false;
+    Value laneMod16FromRem, laneMod16FromDiv;
+    if (!matchRemBy(rem4, 4, laneMod16FromRem) || !matchDivBy(div4, 4, laneMod16FromDiv))
+      return false;
+    if (laneMod16FromRem != laneMod16FromDiv)
+      return false;
+    Value candidateLane;
+    if (!matchRemBy(laneMod16FromRem, 16, candidateLane) || !matchLane(candidateLane))
+      return false;
+    lane = candidateLane;
+    return true;
+  };
+
+  return match(add.getLhs(), add.getRhs(), lane) || match(add.getRhs(), add.getLhs(), lane);
+}
+
+// Match the IX11 MMAD B-operand col_xfb8 lane layout before swizzle:
+//   ((lane % 16) % 4) * 2 + ((lane % 16) / 4) * 128 + (lane / 16) * 32
+static bool matchBOperandUnswizzled(Value value, Value &lane) {
+  auto add = value.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return false;
+
+  auto match = [](Value lhs, Value rhs, Value &lane) {
+    Value innerLane;
+    if (!matchBOperandInner(lhs, innerLane))
+      return false;
+
+    Value div16;
+    if (!matchMulBy(rhs, 32, div16))
+      return false;
+    Value laneFromDiv;
+    if (!matchDivBy(div16, 16, laneFromDiv) || laneFromDiv != innerLane)
+      return false;
+
+    lane = innerLane;
+    return true;
+  };
+
+  return match(add.getLhs(), add.getRhs(), lane) || match(add.getRhs(), add.getLhs(), lane);
+}
+
+static bool matchBOperandSwizzle(Value value, Value &lane, int64_t &constantElems) {
+  auto xorOp = value.getDefiningOp<arith::XOrIOp>();
+  if (!xorOp)
+    return false;
+
+  auto shr = xorOp.getRhs().getDefiningOp<arith::ShRUIOp>();
+  if (!shr)
+    return false;
+  auto andOp = shr.getLhs().getDefiningOp<arith::AndIOp>();
+  if (!andOp || andOp.getLhs() != xorOp.getLhs())
+    return false;
+  if (!matchI32Constant(andOp.getRhs(), 384) || !matchI32Constant(shr.getRhs(), 4))
+    return false;
+
+  Value base;
+  int64_t cst = 0;
+  if (!matchAddConst(xorOp.getLhs(), base, cst) || !matchBOperandUnswizzled(base, lane))
+    return false;
+  if (cst != 0 && cst != 8 && cst != 16 && cst != 24)
+    return false;
+
+  constantElems = cst;
+  return true;
+}
+
+static bool matchBOperandS2ROffset(Value offset, Value &baseElems, int64_t &constantElems) {
+  auto add = offset.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return false;
+
+  Value lane;
+  if (matchBOperandSwizzle(add.getRhs(), lane, constantElems)) {
+    baseElems = add.getLhs();
+    return true;
+  }
+  if (matchBOperandSwizzle(add.getLhs(), lane, constantElems)) {
+    baseElems = add.getRhs();
+    return true;
+  }
+  return false;
+}
+
+class IX11AOperandBlkloadFriendlyLoad final : public OpRewritePattern<LLVM::LoadOp> {
+public:
+  using OpRewritePattern<LLVM::LoadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::LoadOp op, PatternRewriter &rewriter) const override {
+    auto vecTy = dyn_cast<VectorType>(op.getResult().getType());
+    if (!vecTy || vecTy.getNumElements() != 2 ||
+        vecTy.getElementType().getIntOrFloatBitWidth() != 16)
+      return failure();
+
+    auto gep = op.getAddr().getDefiningOp<LLVM::GEPOp>();
+    if (!gep)
+      return failure();
+    auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(gep.getType());
+    if (!ptrTy || ptrTy.getAddressSpace() != 3)
+      return failure();
+
+    SmallVector<Value> dynamicIndices(gep.getDynamicIndices());
+    if (dynamicIndices.size() != 1)
+      return failure();
+
+    Value baseElems;
+    int64_t constantElems = 0;
+    if (!matchAOperandS2ROffset(dynamicIndices.front(), baseElems, constantElems))
+      return failure();
+    if ((constantElems & 1) != 0)
+      return failure();
+
+    Location loc = op.getLoc();
+    Type i32Ty = rewriter.getI32Type();
+    Value two = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+    Value baseDwords = arith::DivSIOp::create(rewriter, loc, baseElems, two);
+    Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+    Value uniformBaseDwords =
+        IXDL::ReadlaneOp::create(rewriter, loc, i32Ty, baseDwords, zero);
+    Value laneId = IXDL::LaneIdOp::create(rewriter, loc, i32Ty);
+    Value dwordOffset = arith::AddIOp::create(rewriter, loc, uniformBaseDwords, laneId);
+    Value i32Ptr =
+        LLVM::GEPOp::create(rewriter, loc, ptrTy, i32Ty, gep.getBase(), ValueRange{dwordOffset});
+    if (constantElems != 0) {
+      int64_t constantBytes = constantElems * (vecTy.getElementType().getIntOrFloatBitWidth() / 8);
+      i32Ptr = LLVM::GEPOp::create(
+          rewriter, loc, ptrTy, rewriter.getI8Type(), i32Ptr,
+          ArrayRef<LLVM::GEPArg>{static_cast<int32_t>(constantBytes)});
+    }
+    auto loaded = LLVM::LoadOp::create(rewriter, loc, i32Ty, i32Ptr);
+    if (op.getAlignmentAttr())
+      loaded.setAlignmentAttr(op.getAlignmentAttr());
+    Value casted = LLVM::BitcastOp::create(rewriter, loc, op.getResult().getType(), loaded);
+    rewriter.replaceOp(op, casted);
+    return success();
+  }
+};
+
+class IX11BOperandAddressFriendlyLoad final : public OpRewritePattern<LLVM::LoadOp> {
+public:
+  using OpRewritePattern<LLVM::LoadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::LoadOp op, PatternRewriter &rewriter) const override {
+    auto vecTy = dyn_cast<VectorType>(op.getResult().getType());
+    if (!vecTy || vecTy.getNumElements() != 2 ||
+        vecTy.getElementType().getIntOrFloatBitWidth() != 16)
+      return failure();
+
+    auto gep = op.getAddr().getDefiningOp<LLVM::GEPOp>();
+    if (!gep)
+      return failure();
+    auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(gep.getType());
+    if (!ptrTy || ptrTy.getAddressSpace() != 3)
+      return failure();
+
+    SmallVector<Value> dynamicIndices(gep.getDynamicIndices());
+    if (dynamicIndices.size() != 1)
+      return failure();
+
+    Value baseElems;
+    int64_t constantElems = 0;
+    if (!matchBOperandS2ROffset(dynamicIndices.front(), baseElems, constantElems))
+      return failure();
+    if ((constantElems & 1) != 0)
+      return failure();
+
+    Location loc = op.getLoc();
+    Type i32Ty = rewriter.getI32Type();
+    Value laneId = IXDL::LaneIdOp::create(rewriter, loc, i32Ty);
+    Value four = arith::ConstantIntOp::create(rewriter, loc, 4, 32);
+    Value laneShifted = arith::ShLIOp::create(rewriter, loc, laneId, four);
+    Value mask = arith::ConstantIntOp::create(rewriter, loc, 192, 32);
+    Value laneHighBits = arith::AndIOp::create(rewriter, loc, laneShifted, mask);
+    Value laneDwords = arith::OrIOp::create(rewriter, loc, laneId, laneHighBits);
+    if (constantElems != 0) {
+      Value cst = arith::ConstantIntOp::create(rewriter, loc, constantElems / 2, 32);
+      laneDwords = arith::XOrIOp::create(rewriter, loc, laneDwords, cst);
+    }
+
+    Value two = arith::ConstantIntOp::create(rewriter, loc, 2, 32);
+    Value baseDwords = arith::DivSIOp::create(rewriter, loc, baseElems, two);
+    Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+    Value uniformBaseDwords =
+        IXDL::ReadlaneOp::create(rewriter, loc, i32Ty, baseDwords, zero);
+    Value dwordOffset = arith::AddIOp::create(rewriter, loc, uniformBaseDwords, laneDwords);
+    Value i32Ptr =
+        LLVM::GEPOp::create(rewriter, loc, ptrTy, i32Ty, gep.getBase(), ValueRange{dwordOffset});
+    auto loaded = LLVM::LoadOp::create(rewriter, loc, i32Ty, i32Ptr);
+    if (op.getAlignmentAttr())
+      loaded.setAlignmentAttr(op.getAlignmentAttr());
+    Value casted = LLVM::BitcastOp::create(rewriter, loc, op.getResult().getType(), loaded);
+    rewriter.replaceOp(op, casted);
+    return success();
+  }
+};
+
+static void cseIXDLAddressOpsInRegion(Region &region) {
+  for (Block &block : region) {
+    SmallVector<Operation *> scalarOps;
+    Value laneId;
+    SmallVector<IXDL::ReadlaneOp> readlanes;
+
+    for (Operation &op : llvm::make_early_inc_range(block)) {
+      for (Region &nested : op.getRegions())
+        cseIXDLAddressOpsInRegion(nested);
+
+      if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp, arith::RemSIOp,
+              arith::ShLIOp, arith::ShRUIOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp>(&op)) {
+        bool replaced = false;
+        for (Operation *prev : scalarOps) {
+          if (prev->getName() != op.getName())
+            continue;
+          if (prev->getResult(0).getType() != op.getResult(0).getType())
+            continue;
+          if (!llvm::equal(prev->getOperands(), op.getOperands()))
+            continue;
+          if (prev->getAttrDictionary() != op.getAttrDictionary())
+            continue;
+          op.getResult(0).replaceAllUsesWith(prev->getResult(0));
+          op.erase();
+          replaced = true;
+          break;
+        }
+        if (replaced)
+          continue;
+        scalarOps.push_back(&op);
+        continue;
+      }
+
+      if (auto curLaneId = dyn_cast<IXDL::LaneIdOp>(&op)) {
+        Value cur = curLaneId->getResult(0);
+        if (laneId && laneId.getType() == cur.getType()) {
+          cur.replaceAllUsesWith(laneId);
+          curLaneId->erase();
+        } else {
+          laneId = cur;
+        }
+        continue;
+      }
+
+      if (auto curReadlane = dyn_cast<IXDL::ReadlaneOp>(&op)) {
+        Value src = curReadlane->getOperand(0);
+        Value lane = curReadlane->getOperand(1);
+        Type resultTy = curReadlane->getResult(0).getType();
+        for (IXDL::ReadlaneOp prevReadlane : readlanes) {
+          if (prevReadlane->getResult(0).getType() != resultTy)
+            continue;
+          if (prevReadlane->getOperand(0) != src || prevReadlane->getOperand(1) != lane)
+            continue;
+          curReadlane->getResult(0).replaceAllUsesWith(prevReadlane->getResult(0));
+          curReadlane->erase();
+          curReadlane = nullptr;
+          break;
+        }
+        if (curReadlane)
+          readlanes.push_back(curReadlane);
+      }
+    }
+  }
+}
+
+static void cseIXDLAddressOps(Operation *op) {
+  for (Region &region : op->getRegions())
+    cseIXDLAddressOpsInRegion(region);
+}
+
 class FlyToROCDLConversionPass
     : public mlir::impl::FlyToROCDLConversionPassBase<FlyToROCDLConversionPass> {
 public:
@@ -820,6 +1292,8 @@ public:
     patterns.add<AtomSetValueOpLowering>(typeConverter, context);
     patterns.add<CopyAtomCallLowering, MmaAtomCallLowering>(typeConverter, context);
     patterns.add<CopyAtomCallSSALowering, MmaAtomCallSSALowering>(typeConverter, context);
+    patterns.add<CpAsyncCommitGroupLowering, CpAsyncWaitGroupLowering, PipebarReqLowering,
+                 PipebarWaitLowering, SlWaitcntLowering>(typeConverter, context);
     patterns.add<GpuLaunchFuncOpLowering>(typeConverter, context);
 
     // TODO: deprecated in the future
@@ -828,8 +1302,17 @@ public:
     populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns, typeConverter);
     populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(patterns, typeConverter);
 
-    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
+    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
       signalPassFailure();
+      return;
+    }
+
+    RewritePatternSet ix11S2RPatterns(context);
+    ix11S2RPatterns.add<IX11AOperandBlkloadFriendlyLoad, IX11BOperandAddressFriendlyLoad>(context);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(ix11S2RPatterns))))
+      signalPassFailure();
+
+    cseIXDLAddressOps(getOperation());
   }
 };
 

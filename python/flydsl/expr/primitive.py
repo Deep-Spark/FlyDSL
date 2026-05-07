@@ -156,6 +156,9 @@ __all__ = [
     "atom_set_value",
     "copy_atom_call",
     "mma_atom_call",
+    "mma_atom_call_ssa",
+    "cp_async_commit_group",
+    "cp_async_wait_group",
     "make_tiled_copy",
     "make_tiled_mma",
     "tiled_copy_partition_src",
@@ -722,6 +725,49 @@ def copy_atom_call(copy_atom, src, dst, *, pred=None, loc=None, ip=None):
 @traced_op
 def mma_atom_call(mma_atom, d, a, b, c, loc=None, ip=None):
     return fly.mma_atom_call(mma_atom, d, a, b, c, loc=loc, ip=ip)
+
+
+@traced_op
+def mma_atom_call_ssa(mma_atom, a, b, c, loc=None, ip=None):
+    return fly.mma_atom_call_ssa([c.type], mma_atom, a, b, c, loc=loc, ip=ip)
+
+
+@traced_op
+def cp_async_commit_group(loc=None, ip=None):
+    """Commit all preceding async copy issues into a barrier group.
+
+    On IX11 this lowers to ``ixdl.cp.async.commit.group``; on backends
+    without an async-copy engine the op is a no-op that gets eliminated
+    during lowering.
+    """
+    return fly.cp_async_commit_group(loc=loc, ip=ip)
+
+
+@traced_op
+def cp_async_wait_group(n, loc=None, ip=None):
+    """Wait until all but the most-recent ``n`` committed groups retire.
+
+    Pass ``n=0`` to drain every outstanding group before a consumer block.
+    """
+    return fly.cp_async_wait_group(int(n), loc=loc, ip=ip)
+
+
+@traced_op
+def pipebar_req(barrier_id=0, loc=None, ip=None):
+    """Issue an IXDL pipeline-barrier arrive/request."""
+    return fly.pipebar_req(int(barrier_id), loc=loc, ip=ip)
+
+
+@traced_op
+def pipebar_wait(barrier_id=0, loc=None, ip=None):
+    """Wait on an IXDL pipeline barrier."""
+    return fly.pipebar_wait(int(barrier_id), loc=loc, ip=ip)
+
+
+@traced_op
+def sl_waitcnt(cnt, loc=None, ip=None):
+    """Issue an IXDL ``sl.waitcnt`` with a pre-encoded 64-bit counter mask."""
+    return fly.sl_waitcnt(int(cnt), loc=loc, ip=ip)
 
 
 @traced_op

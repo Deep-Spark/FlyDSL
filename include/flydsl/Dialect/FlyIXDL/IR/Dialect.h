@@ -21,6 +21,11 @@
 
 #include "flydsl/Dialect/FlyIXDL/IR/Dialect.h.inc"
 
+#include "flydsl/Dialect/FlyIXDL/IR/Enums.h.inc"
+
+#define GET_ATTRDEF_CLASSES
+#include "flydsl/Dialect/FlyIXDL/IR/AttrDefs.h.inc"
+
 #define GET_TYPEDEF_CLASSES
 #include "flydsl/Dialect/FlyIXDL/IR/Atom.h.inc"
 

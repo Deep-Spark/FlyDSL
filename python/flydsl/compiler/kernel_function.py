@@ -79,6 +79,15 @@ def _validate_known_block_size(value):
     return elems
 
 
+def _backend_is_ixdl() -> bool:
+    """True when the active FlyDSL compile backend targets Iluvatar IXDL."""
+    try:
+        from .backends import compile_backend_name
+        return compile_backend_name() == "ixdl"
+    except Exception:
+        return False
+
+
 def create_gpu_func(
     sym_name: str,
     function_type: ir.TypeAttr,
@@ -87,6 +96,15 @@ def create_gpu_func(
     loc=None,
     ip=None,
 ) -> gpu.GPUFuncOp:
+    # Drop ``known_block_size`` on the MLIR ``gpu.func`` when the active
+    # backend is IXDL. The SDK's ``convert-gpu-to-ixdl`` pass copies that
+    # attribute into ``ixdl.maxntid`` as a DenseI32ArrayAttr, but the
+    # IXDL dialect verifier expects an ArrayAttr<IntegerAttr> and
+    # hard-errors. IXDL's device toolchain does not require the
+    # ``max_flat_workgroup_size`` metadata the attribute models, so
+    # dropping it is safe.
+    if known_block_size is not None and _backend_is_ixdl():
+        known_block_size = None
     return gpu.GPUFuncOp(
         function_type,
         sym_name=sym_name,
@@ -308,6 +326,11 @@ class KernelLauncher:
     def _check_block_vs_known(self, block_dims: Tuple) -> None:
         """Raise when statically-known *block* dims are invalid for AMDGPU."""
         if self._known_block_size is None:
+            # IXDL backend has no equivalent of AMDGPU's 256-thread
+            # ``max_flat_workgroup_size`` cap -- ivcore11 routinely runs
+            # 1024-thread blocks. Skip the check in that case.
+            if _backend_is_ixdl():
+                return
             # Without known_block_size the AMDGPU backend assumes
             # max_flat_workgroup_size = 256.  Error if the launch exceeds that.
             if all(isinstance(v, int) for v in block_dims):

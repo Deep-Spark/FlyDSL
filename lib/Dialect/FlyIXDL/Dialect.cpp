@@ -14,10 +14,19 @@ using namespace mlir::fly_ixdl;
 
 #include "flydsl/Dialect/FlyIXDL/IR/Dialect.cpp.inc"
 
+#include "flydsl/Dialect/FlyIXDL/IR/Enums.cpp.inc"
+
+#define GET_ATTRDEF_CLASSES
+#include "flydsl/Dialect/FlyIXDL/IR/AttrDefs.cpp.inc"
+
 #define GET_TYPEDEF_CLASSES
 #include "flydsl/Dialect/FlyIXDL/IR/Atom.cpp.inc"
 
 void FlyIXDLDialect::initialize() {
+  addAttributes<
+#define GET_ATTRDEF_LIST
+#include "flydsl/Dialect/FlyIXDL/IR/AttrDefs.cpp.inc"
+      >();
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "flydsl/Dialect/FlyIXDL/IR/Atom.cpp.inc"

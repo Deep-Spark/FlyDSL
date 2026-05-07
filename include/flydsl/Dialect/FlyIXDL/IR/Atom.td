@@ -6,5 +6,6 @@
 
 include "flydsl/Dialect/FlyIXDL/IR/Dialect.td"
 include "flydsl/Dialect/FlyIXDL/IR/MmaAtom.td"
+include "flydsl/Dialect/FlyIXDL/IR/CopyAtom.td"
 
 #endif // FLYIXDL_ATOM
