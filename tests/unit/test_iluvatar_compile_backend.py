@@ -72,6 +72,38 @@ def test_iluvatar_pipeline_uses_ixdl_without_codegen(monkeypatch):
     assert not any("runtime" in fragment.lower() for fragment in fragments)
 
 
+def test_iluvatar_runtime_metadata_uses_iluvatar_libraries(monkeypatch):
+    backends = _load_backends(monkeypatch)
+    backend = backends.get_backend("iluvatar", arch="ivcore11")
+
+    native_patterns = backend.native_lib_patterns()
+    runtime_libs = backend.jit_runtime_lib_basenames()
+
+    assert "_mlirDialectsFly*.so" in native_patterns
+    assert "libFly*.so" in native_patterns
+    assert "_mlirRegisterEverything*.so" in native_patterns
+    assert "libfly_iluvatar_jit_runtime.so" in native_patterns
+    assert "libfly_jit_runtime.so" not in native_patterns
+    assert "libmlir_rocm_runtime.so" not in native_patterns
+    assert runtime_libs == [
+        "libfly_iluvatar_jit_runtime.so",
+        "libmlir_c_runner_utils.so",
+    ]
+
+
+def test_rocm_default_runtime_metadata_stays_rocm(monkeypatch):
+    backends = _load_backends(monkeypatch)
+    monkeypatch.delenv("FLYDSL_COMPILE_BACKEND", raising=False)
+
+    backend = backends.get_backend(arch="gfx942")
+
+    assert backend.target.backend == "rocm"
+    assert "libfly_jit_runtime.so" in backend.native_lib_patterns()
+    assert "libmlir_rocm_runtime.so" in backend.native_lib_patterns()
+    assert "libfly_iluvatar_jit_runtime.so" not in backend.native_lib_patterns()
+    assert backend.jit_runtime_lib_basenames()[0] == "libfly_jit_runtime.so"
+
+
 def test_rocm_default_pipeline_does_not_use_ixdl(monkeypatch):
     backends = _load_backends(monkeypatch)
     monkeypatch.delenv("FLYDSL_COMPILE_BACKEND", raising=False)
