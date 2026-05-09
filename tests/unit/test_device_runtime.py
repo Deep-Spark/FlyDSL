@@ -52,6 +52,30 @@ def test_rocm_runtime_kind_matches_compile_backend(monkeypatch):
     dr.ensure_compile_runtime_compatible("rocm", runtime=rt)
 
 
+def test_iluvatar_runtime_kind_matches_compile_backend(monkeypatch):
+    monkeypatch.setenv("FLYDSL_COMPILE_BACKEND", "iluvatar")
+    monkeypatch.setenv("FLYDSL_RUNTIME_KIND", "iluvatar")
+    rt = dr.get_device_runtime()
+    assert rt.kind == "iluvatar"
+    assert isinstance(rt, dr.IluvatarDeviceRuntime)
+    dr.ensure_compile_runtime_compatible("iluvatar", runtime=rt)
+
+
+def test_iluvatar_pairing_from_env_no_singleton(monkeypatch):
+    """Iluvatar pairing check should not instantiate the runtime."""
+    monkeypatch.setenv("FLYDSL_COMPILE_BACKEND", "iluvatar")
+    monkeypatch.setenv("FLYDSL_RUNTIME_KIND", "iluvatar")
+    dr.ensure_compile_runtime_pairing_from_env("iluvatar")
+    assert dr._instance is None
+
+
+def test_iluvatar_runtime_kind_mismatch_raises(monkeypatch):
+    monkeypatch.setenv("FLYDSL_COMPILE_BACKEND", "iluvatar")
+    monkeypatch.setenv("FLYDSL_RUNTIME_KIND", "rocm")
+    with pytest.raises(RuntimeError, match="requires device runtime kind"):
+        dr.get_device_runtime()
+
+
 def test_ensure_mismatch_raises():
     bad = _FakeCudaRuntime()
     with pytest.raises(RuntimeError, match="requires device runtime kind"):
