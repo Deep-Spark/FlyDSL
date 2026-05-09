@@ -3,6 +3,17 @@
 #
 # Iluvatar backend descriptor.
 #
-# This descriptor is intentionally empty for the initial in-tree backend
-# selection step. Add dialect, conversion, CAPI, Python, and runtime targets in
-# later baby steps only when the corresponding files and tests are introduced.
+# TableGen / header subdirectories under include/flydsl/
+set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_INCLUDE_DIALECT_SUBDIRS "FlyIXDL")
+
+# C++ library subdirectories under lib/
+set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_LIB_DIALECT_SUBDIRS "FlyIXDL")
+
+# CAPI wrapper subdirectory under lib/CAPI/Dialect/
+set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_CAPI_SUBDIRS "FlyIXDL")
+
+# CAPI link targets for _mlirRegisterEverything (EMBED_CAPI_LINK_LIBS)
+set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_EMBED_CAPI_LIBS "MLIRCPIFlyIXDL")
+
+# Link targets for fly-opt
+set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_FLYOPT_LINK_LIBS "MLIRCPIFlyIXDL")

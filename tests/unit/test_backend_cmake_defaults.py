@@ -71,7 +71,8 @@ def test_future_backend_descriptor_is_opt_in(tmp_path):
         'set(GUARDRAIL_SELECTED_DUMMY ON CACHE BOOL "" FORCE)\n'
     )
     (backend_dir / "iluvatar.cmake").write_text(
-        'set(GUARDRAIL_SELECTED_ILUVATAR ON CACHE BOOL "" FORCE)\n'
+        (_REPO_ROOT / "cmake" / "backends" / "iluvatar.cmake").read_text()
+        + '\nset(GUARDRAIL_SELECTED_ILUVATAR ON CACHE BOOL "" FORCE)\n'
     )
     (tmp_path / "CMakeLists.txt").write_text(
         "\n".join(
@@ -141,7 +142,8 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
         'set(GUARDRAIL_SELECTED_ROCDL ON CACHE BOOL "" FORCE)\n'
     )
     (backend_dir / "iluvatar.cmake").write_text(
-        'set(GUARDRAIL_SELECTED_ILUVATAR ON CACHE BOOL "" FORCE)\n'
+        (_REPO_ROOT / "cmake" / "backends" / "iluvatar.cmake").read_text()
+        + '\nset(GUARDRAIL_SELECTED_ILUVATAR ON CACHE BOOL "" FORCE)\n'
     )
     (tmp_path / "CMakeLists.txt").write_text(
         "\n".join(
@@ -149,6 +151,16 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 "cmake_minimum_required(VERSION 3.20)",
                 "project(FlyDSLIluvatarSelectionGuardrail NONE)",
                 'include("${CMAKE_CURRENT_LIST_DIR}/cmake/FlyDSLBackends.cmake")',
+                "get_property(_dialect_includes GLOBAL PROPERTY FLYDSL_BACKEND_INCLUDE_DIALECT_SUBDIRS)",
+                "get_property(_dialect_libs GLOBAL PROPERTY FLYDSL_BACKEND_LIB_DIALECT_SUBDIRS)",
+                "get_property(_capi_subdirs GLOBAL PROPERTY FLYDSL_BACKEND_CAPI_SUBDIRS)",
+                "get_property(_embed_capi_libs GLOBAL PROPERTY FLYDSL_BACKEND_EMBED_CAPI_LIBS)",
+                "get_property(_flyopt_libs GLOBAL PROPERTY FLYDSL_BACKEND_FLYOPT_LINK_LIBS)",
+                'list(FIND _dialect_includes "FlyIXDL" _flyixdl_include_idx)',
+                'list(FIND _dialect_libs "FlyIXDL" _flyixdl_lib_idx)',
+                'list(FIND _capi_subdirs "FlyIXDL" _flyixdl_capi_idx)',
+                'list(FIND _embed_capi_libs "MLIRCPIFlyIXDL" _flyixdl_embed_idx)',
+                'list(FIND _flyopt_libs "MLIRCPIFlyIXDL" _flyixdl_flyopt_idx)',
                 'add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/lib/Runtime")',
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND GUARDRAIL_SELECTED_ROCDL)',
                 '  message(FATAL_ERROR "rocdl descriptor was included for iluvatar-only build")',
@@ -158,6 +170,24 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 "endif()",
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND GUARDRAIL_ENTERED_ROCM_RUNTIME)',
                 '  message(FATAL_ERROR "ROCm runtime was included for iluvatar-only build")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "rocdl" AND NOT _flyixdl_include_idx EQUAL -1)',
+                '  message(FATAL_ERROR "FlyIXDL include dialect subdir was selected for default build")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_include_idx EQUAL -1)',
+                '  message(FATAL_ERROR "FlyIXDL include dialect subdir was not selected")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_lib_idx EQUAL -1)',
+                '  message(FATAL_ERROR "FlyIXDL lib dialect subdir was not selected")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_capi_idx EQUAL -1)',
+                '  message(FATAL_ERROR "FlyIXDL CAPI subdir was not selected")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_embed_idx EQUAL -1)',
+                '  message(FATAL_ERROR "MLIRCPIFlyIXDL embed CAPI lib was not selected")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_flyopt_idx EQUAL -1)',
+                '  message(FATAL_ERROR "MLIRCPIFlyIXDL fly-opt lib was not selected")',
                 "endif()",
                 "",
             ]
