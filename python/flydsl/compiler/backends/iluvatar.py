@@ -26,7 +26,18 @@ class IluvatarBackend(BaseBackend):
         return GPUTarget(backend="iluvatar", arch=arch or _DEFAULT_ARCH, warp_size=_WARP_SIZE)
 
     def pipeline_fragments(self, *, compile_hints: dict) -> List[str]:
-        raise NotImplementedError("Iluvatar MLIR pipeline is not wired yet")
+        return [
+            "fly-rewrite-func-signature",
+            "fly-canonicalize",
+            "fly-layout-lowering",
+            "fly-int-swizzle-simplify",
+            "canonicalize",
+            "fly-convert-atom-call-to-ssa-form",
+            "fly-promote-regmem-to-vectorssa",
+            "convert-fly-to-ixdl",
+            "canonicalize",
+            "reconcile-unrealized-casts",
+        ]
 
     def gpu_module_targets(self) -> List[str]:
         return [f'#iluvatar.target<arch = "{self.target.arch}">']
