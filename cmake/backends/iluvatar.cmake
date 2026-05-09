@@ -17,3 +17,10 @@ set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_EMBED_CAPI_LIBS "MLIRCPIFlyIX
 
 # Link targets for fly-opt
 set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_FLYOPT_LINK_LIBS "MLIRCPIFlyIXDL")
+
+# Stubgen modules for this backend
+set_property(GLOBAL APPEND PROPERTY FLYDSL_BACKEND_STUBGEN_MODULES
+  "flydsl._mlir._mlir_libs._mlirDialectsFlyIXDL")
+
+# Convenience boolean for Python CMakeLists gating of Iluvatar-specific bindings
+set(FLYDSL_HAS_ILUVATAR ON)

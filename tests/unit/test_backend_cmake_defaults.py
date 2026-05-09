@@ -43,6 +43,16 @@ def test_backend_descriptors_are_loaded_from_selected_backend_list():
     assert 'set(FLYDSL_BACKENDS_TUPLE "(${_backends_joined})")' in text
 
 
+def test_iluvatar_python_bindings_are_backend_gated():
+    text = (_REPO_ROOT / "python" / "mlir_flydsl" / "CMakeLists.txt").read_text()
+
+    assert "if(FLYDSL_HAS_ILUVATAR)" in text
+    assert "TD_FILE dialects/FlyIXDL.td" in text
+    assert "DIALECT_NAME fly_ixdl" in text
+    assert "MODULE_NAME _mlirDialectsFlyIXDL" in text
+    assert "_FLY_COPY_IXDL_TABLEGEN" in text
+
+
 def test_future_backend_descriptor_is_opt_in(tmp_path):
     """A future backend should be legal only when explicitly selected."""
     cmake = shutil.which("cmake")
@@ -156,11 +166,16 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 "get_property(_capi_subdirs GLOBAL PROPERTY FLYDSL_BACKEND_CAPI_SUBDIRS)",
                 "get_property(_embed_capi_libs GLOBAL PROPERTY FLYDSL_BACKEND_EMBED_CAPI_LIBS)",
                 "get_property(_flyopt_libs GLOBAL PROPERTY FLYDSL_BACKEND_FLYOPT_LINK_LIBS)",
+                "get_property(_stubgen_modules GLOBAL PROPERTY FLYDSL_BACKEND_STUBGEN_MODULES)",
                 'list(FIND _dialect_includes "FlyIXDL" _flyixdl_include_idx)',
                 'list(FIND _dialect_libs "FlyIXDL" _flyixdl_lib_idx)',
                 'list(FIND _capi_subdirs "FlyIXDL" _flyixdl_capi_idx)',
                 'list(FIND _embed_capi_libs "MLIRCPIFlyIXDL" _flyixdl_embed_idx)',
                 'list(FIND _flyopt_libs "MLIRCPIFlyIXDL" _flyixdl_flyopt_idx)',
+                (
+                    'list(FIND _stubgen_modules "flydsl._mlir._mlir_libs._mlirDialectsFlyIXDL" '
+                    "_flyixdl_stubgen_idx)"
+                ),
                 'add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/lib/Runtime")',
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND GUARDRAIL_SELECTED_ROCDL)',
                 '  message(FATAL_ERROR "rocdl descriptor was included for iluvatar-only build")',
@@ -174,8 +189,17 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 'if(FLYDSL_BACKENDS STREQUAL "rocdl" AND NOT _flyixdl_include_idx EQUAL -1)',
                 '  message(FATAL_ERROR "FlyIXDL include dialect subdir was selected for default build")',
                 "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "rocdl" AND FLYDSL_HAS_ILUVATAR)',
+                '  message(FATAL_ERROR "FLYDSL_HAS_ILUVATAR was set for default build")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "rocdl" AND NOT _flyixdl_stubgen_idx EQUAL -1)',
+                '  message(FATAL_ERROR "FlyIXDL stubgen module was selected for default build")',
+                "endif()",
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_include_idx EQUAL -1)',
                 '  message(FATAL_ERROR "FlyIXDL include dialect subdir was not selected")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND NOT FLYDSL_HAS_ILUVATAR)',
+                '  message(FATAL_ERROR "FLYDSL_HAS_ILUVATAR was not set")',
                 "endif()",
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_lib_idx EQUAL -1)',
                 '  message(FATAL_ERROR "FlyIXDL lib dialect subdir was not selected")',
@@ -188,6 +212,9 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 "endif()",
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_flyopt_idx EQUAL -1)',
                 '  message(FATAL_ERROR "MLIRCPIFlyIXDL fly-opt lib was not selected")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND _flyixdl_stubgen_idx EQUAL -1)',
+                '  message(FATAL_ERROR "FlyIXDL stubgen module was not selected")',
                 "endif()",
                 "",
             ]
