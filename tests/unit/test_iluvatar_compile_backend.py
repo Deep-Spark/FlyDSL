@@ -65,8 +65,10 @@ def test_iluvatar_pipeline_uses_ixdl_without_codegen(monkeypatch):
     fragments = backend.pipeline_fragments(compile_hints={})
 
     assert "convert-fly-to-ixdl" in fragments
+    assert any("convert-gpu-to-ixdl" in fragment for fragment in fragments)
     assert not any("attach-target" in fragment for fragment in fragments)
     assert not any("gpu-module-to-binary" in fragment for fragment in fragments)
+    assert not any("fly-rocdl-cluster-attr" in fragment for fragment in fragments)
     assert not any("runtime" in fragment.lower() for fragment in fragments)
 
 

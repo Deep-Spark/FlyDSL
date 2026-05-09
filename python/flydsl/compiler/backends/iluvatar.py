@@ -36,6 +36,8 @@ class IluvatarBackend(BaseBackend):
             "fly-promote-regmem-to-vectorssa",
             "convert-fly-to-ixdl",
             "canonicalize",
+            "gpu.module(convert-scf-to-cf,cse,"
+            "convert-gpu-to-ixdl{index-bitwidth=0 use-bare-ptr-memref-call-conv=true})",
             "reconcile-unrealized-casts",
         ]
 
