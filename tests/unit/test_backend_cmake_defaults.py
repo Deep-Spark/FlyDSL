@@ -123,9 +123,18 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
 
     cmake_dir = tmp_path / "cmake"
     backend_dir = cmake_dir / "backends"
+    runtime_dir = tmp_path / "lib" / "Runtime"
+    rocm_runtime_dir = runtime_dir / "ROCm"
     backend_dir.mkdir(parents=True)
+    rocm_runtime_dir.mkdir(parents=True)
     (cmake_dir / "FlyDSLBackends.cmake").write_text(
         (_REPO_ROOT / "cmake" / "FlyDSLBackends.cmake").read_text()
+    )
+    (runtime_dir / "CMakeLists.txt").write_text(
+        (_REPO_ROOT / "lib" / "Runtime" / "CMakeLists.txt").read_text()
+    )
+    (rocm_runtime_dir / "CMakeLists.txt").write_text(
+        'set(GUARDRAIL_ENTERED_ROCM_RUNTIME ON CACHE BOOL "" FORCE)\n'
     )
 
     (backend_dir / "rocdl.cmake").write_text(
@@ -140,11 +149,15 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 "cmake_minimum_required(VERSION 3.20)",
                 "project(FlyDSLIluvatarSelectionGuardrail NONE)",
                 'include("${CMAKE_CURRENT_LIST_DIR}/cmake/FlyDSLBackends.cmake")',
+                'add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/lib/Runtime")',
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND GUARDRAIL_SELECTED_ROCDL)',
                 '  message(FATAL_ERROR "rocdl descriptor was included for iluvatar-only build")',
                 "endif()",
                 'if(FLYDSL_BACKENDS STREQUAL "rocdl" AND GUARDRAIL_SELECTED_ILUVATAR)',
                 '  message(FATAL_ERROR "iluvatar descriptor was included for default build")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND GUARDRAIL_ENTERED_ROCM_RUNTIME)',
+                '  message(FATAL_ERROR "ROCm runtime was included for iluvatar-only build")',
                 "endif()",
                 "",
             ]
@@ -161,6 +174,7 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     default_cache = (default_build / "CMakeCache.txt").read_text()
     assert "FLYDSL_BACKENDS:STRING=rocdl" in default_cache
     assert "GUARDRAIL_SELECTED_ROCDL:BOOL=ON" in default_cache
+    assert "GUARDRAIL_ENTERED_ROCM_RUNTIME:BOOL=ON" in default_cache
     assert "GUARDRAIL_SELECTED_ILUVATAR" not in default_cache
 
     iluvatar_build = tmp_path / "build-iluvatar"
@@ -174,3 +188,4 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     assert "FLYDSL_BACKENDS:STRING=iluvatar" in iluvatar_cache
     assert "GUARDRAIL_SELECTED_ILUVATAR:BOOL=ON" in iluvatar_cache
     assert "GUARDRAIL_SELECTED_ROCDL" not in iluvatar_cache
+    assert "GUARDRAIL_ENTERED_ROCM_RUNTIME" not in iluvatar_cache
