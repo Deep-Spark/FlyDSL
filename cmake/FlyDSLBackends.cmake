@@ -12,14 +12,14 @@
 
 set(FLYDSL_BACKENDS "rocdl"
     CACHE STRING "Enabled FlyDSL backend stacks (semicolon-separated)")
-set_property(CACHE FLYDSL_BACKENDS PROPERTY STRINGS rocdl)
+set_property(CACHE FLYDSL_BACKENDS PROPERTY STRINGS rocdl iluvatar)
 
 # ---- Validate ----
 list(LENGTH FLYDSL_BACKENDS _n_backends)
 if(_n_backends EQUAL 0)
   message(FATAL_ERROR "FLYDSL_BACKENDS is empty — at least one backend is required.")
 endif()
-set(_FLYDSL_BACKENDS_ALLOWED rocdl)
+set(_FLYDSL_BACKENDS_ALLOWED rocdl iluvatar)
 foreach(_b ${FLYDSL_BACKENDS})
   if(NOT _b IN_LIST _FLYDSL_BACKENDS_ALLOWED)
     message(FATAL_ERROR
