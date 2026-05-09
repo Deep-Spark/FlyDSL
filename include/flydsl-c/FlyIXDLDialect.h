@@ -13,6 +13,8 @@ extern "C" {
 
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(FlyIXDL, fly_ixdl);
 
+MLIR_CAPI_EXPORTED void mlirRegisterFlyToIXDLConversionPass(void);
+
 /// Backend plugin registration: insert all Iluvatar dialects into \p registry.
 MLIR_CAPI_EXPORTED void flydsl_register_iluvatar_dialects(MlirDialectRegistry registry);
 /// Backend plugin registration: register all Iluvatar passes.

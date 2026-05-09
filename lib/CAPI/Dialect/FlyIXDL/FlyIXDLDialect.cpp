@@ -3,14 +3,17 @@
 
 #include "flydsl-c/FlyIXDLDialect.h"
 
+#include "flydsl/Conversion/FlyToIXDL/FlyToIXDL.h"
 #include "flydsl/Dialect/FlyIXDL/IR/Dialect.h"
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Registration.h"
 
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(FlyIXDL, fly_ixdl, mlir::fly_ixdl::FlyIXDLDialect)
 
+void mlirRegisterFlyToIXDLConversionPass(void) { mlir::registerFlyToIXDLConversionPass(); }
+
 void flydsl_register_iluvatar_dialects(MlirDialectRegistry registry) {
   unwrap(registry)->insert<mlir::fly_ixdl::FlyIXDLDialect>();
 }
 
-void flydsl_register_iluvatar_passes(void) {}
+void flydsl_register_iluvatar_passes(void) { mlirRegisterFlyToIXDLConversionPass(); }
