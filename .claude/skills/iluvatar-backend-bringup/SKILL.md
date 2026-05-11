@@ -715,6 +715,34 @@ Verified command:
 python3 -m pytest tests/unit/test_iluvatar_jit_runtime_resolution.py -q --confcutdir=tests/unit
 ```
 
+Phase 5.3c-2: FlyDSL compile-only binary pipeline smoke
+
+Status: completed locally in the current Iluvatar branch. This step verifies a
+minimal Iluvatar `gpu.module` can pass through the FlyDSL backend pipeline and
+be serialized to `gpu.binary` without loading or launching it. The smoke input
+does not pre-attach a target, so the pipeline validates the normal
+`ixdl-attach-target` path before `gpu-module-to-binary`.
+
+Fixes required by this step:
+
+- `FlyToIXDL.cpp` includes the upstream `IXDLDialect.h` before the generated
+  pass header so `IXDL::IXDLDialect` is declared for dependent dialect
+  registration.
+- `fly-opt` registers GPU-to-LLVMIR translation interfaces and links
+  `MLIRToLLVMIRTranslationRegistration`, matching ixcc `mlir-opt`, so
+  `gpu-module-to-binary` can serialize GPU modules.
+- `ixdl-attach-target` is expected to be registered by the ixcc MLIR stack; keep
+  it in `IluvatarBackend.pipeline_fragments()` to match the ROCm
+  `rocdl-attach-target` pipeline structure.
+
+Verified commands:
+
+```bash
+cmake --build /tmp/flydsl-iluvatar-runtime-smoke --target fly-opt -j8
+FLYDSL_ILUVATAR_FLY_OPT=/tmp/flydsl-iluvatar-runtime-smoke/bin/fly-opt \
+  python3 -m pytest tests/unit/test_iluvatar_binary_pipeline_smoke.py -q --confcutdir=tests/unit
+```
+
 ## Phase 6: Atoms And Kernels
 
 Goal: add real Iluvatar copy/MMA atoms and port kernels.

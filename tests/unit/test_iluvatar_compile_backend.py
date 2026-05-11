@@ -13,11 +13,13 @@ import pytest
 pytestmark = [pytest.mark.l0_backend_agnostic]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_PYTHON_DIR = _REPO_ROOT / "python"
 _COMPILER_DIR = _REPO_ROOT / "python" / "flydsl" / "compiler"
 
 
 def _load_backends(monkeypatch):
     """Import flydsl.compiler.backends without importing JIT-only compiler exports."""
+    monkeypatch.syspath_prepend(str(_PYTHON_DIR))
     for name in list(sys.modules):
         if name == "flydsl.compiler" or name.startswith("flydsl.compiler.backends"):
             monkeypatch.delitem(sys.modules, name, raising=False)
@@ -68,6 +70,7 @@ def test_iluvatar_pipeline_uses_ixdl_attach_and_binary_codegen(monkeypatch):
     assert any("convert-gpu-to-ixdl" in fragment for fragment in fragments)
     assert "ixdl-attach-target{O=2 chip=ivcore11 triple=bi-iluvatar-ilurt}" in fragments
     assert "gpu-module-to-binary{format=fatbin}" in fragments
+    assert backend.gpu_module_targets() == ['#ixdl.target<chip = "ivcore11">']
     assert fragments.index("ixdl-attach-target{O=2 chip=ivcore11 triple=bi-iluvatar-ilurt}") < fragments.index(
         "gpu-module-to-binary{format=fatbin}"
     )
