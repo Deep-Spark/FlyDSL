@@ -589,6 +589,41 @@ Notes:
   `mgpuModuleLoadJIT`, `mgpuLaunchKernel`, `mgpuMemAlloc`, and
   `mgpuSetDefaultDevice`.
 
+Phase 5.2c: Module load/unload smoke
+
+Status: completed locally in the current Iluvatar branch. This step adds an
+opt-in L2 pytest smoke that `dlopen`s the built Iluvatar JIT runtime shared
+library and calls `mgpuModuleLoad` / `mgpuModuleUnload` on a caller-provided
+Iluvatar module blob. The test is skipped by default unless both required env
+vars are provided, so default ROCm users do not need Iluvatar hardware,
+libraries, or blobs.
+
+Test env:
+
+- `FLYDSL_ILUVATAR_JIT_RUNTIME_LIB`: path to `libfly_iluvatar_jit_runtime.so`.
+- `FLYDSL_ILUVATAR_SMOKE_BLOB`: path to a loadable Iluvatar cubin/fatbin blob.
+- `LD_LIBRARY_PATH`: must include the CUDA-compatible CoreX driver library path
+  when the runtime shared library depends on `libcuda.so.1`.
+
+Verified command shape:
+
+```bash
+LD_LIBRARY_PATH=/home/peter/sw_home/local/corex/lib64:$LD_LIBRARY_PATH \
+  FLYDSL_ILUVATAR_JIT_RUNTIME_LIB=/tmp/flydsl-iluvatar-runtime-smoke/python_packages/flydsl/_mlir/_mlir_libs/libfly_iluvatar_jit_runtime.so \
+  FLYDSL_ILUVATAR_SMOKE_BLOB=/tmp/add_ivcore11.cubin \
+  /home/peter/sw_home/sdk/FlyDSL/.venv/bin/python -m pytest \
+    tests/unit/test_iluvatar_runtime_smoke.py -q --confcutdir=tests/unit
+```
+
+Default verification:
+
+```bash
+python3 -m pytest tests/unit/test_iluvatar_runtime_smoke.py -q --confcutdir=tests/unit
+```
+
+The default run should skip the test when the Iluvatar-specific env vars are not
+set.
+
 Phase 5.3: Kernel launch smoke
 
 - Implement `mgpuModuleGetFunction`, `mgpuLaunchKernel`, and minimal stream handling.
