@@ -58,6 +58,44 @@ def test_iluvatar_runtime_skeleton_uses_cuda_compatible_api():
     assert "if(TARGET FlyIluvatarJitRuntime)" in python_cmake
 
 
+def test_iluvatar_runtime_exports_mgpu_symbol_contract():
+    runtime_cpp = (
+        _REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "FlyIluvatarRuntimeWrappers.cpp"
+    ).read_text()
+
+    required_symbols = [
+        "mgpuModuleLoad",
+        "mgpuModuleLoadJIT",
+        "mgpuModuleUnload",
+        "mgpuModuleGetFunction",
+        "mgpuLaunchKernel",
+        "mgpuStreamCreate",
+        "mgpuStreamDestroy",
+        "mgpuStreamSynchronize",
+        "mgpuStreamWaitEvent",
+        "mgpuEventCreate",
+        "mgpuEventDestroy",
+        "mgpuEventSynchronize",
+        "mgpuEventRecord",
+        "mgpuMemAlloc",
+        "mgpuMemFree",
+        "mgpuMemcpy",
+        "mgpuMemset32",
+        "mgpuMemset16",
+        "mgpuMemHostRegister",
+        "mgpuMemHostRegisterMemRef",
+        "mgpuMemHostUnregister",
+        "mgpuMemHostUnregisterMemRef",
+        "mgpuMemGetDeviceMemRef1dFloat",
+        "mgpuMemGetDeviceMemRef1dInt32",
+        "mgpuSetDefaultDevice",
+    ]
+
+    for symbol in required_symbols:
+        assert f"{symbol}(" in runtime_cpp
+    assert "mgpuLaunchClusterKernel" not in runtime_cpp
+
+
 def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     """The real Iluvatar descriptor should only load when selected."""
     cmake = shutil.which("cmake")
