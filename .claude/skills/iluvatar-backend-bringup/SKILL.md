@@ -653,6 +653,49 @@ LD_LIBRARY_PATH=/home/peter/sw_home/local/corex/lib64:$LD_LIBRARY_PATH \
     tests/unit/test_iluvatar_runtime_smoke.py -q --confcutdir=tests/unit
 ```
 
+Phase 5.3b: Minimal launch smoke
+
+Status: completed locally in the current Iluvatar branch. This step extends the
+opt-in runtime smoke with a no-argument kernel launch path:
+`mgpuModuleLoad`, `mgpuModuleGetFunction`, `mgpuStreamCreate`,
+`mgpuLaunchKernel`, `mgpuStreamSynchronize`, `mgpuStreamDestroy`, and
+`mgpuModuleUnload`. It deliberately uses a separate launch kernel env var so a
+function-lookup blob with parameterized kernels is not accidentally launched.
+
+Additional test env:
+
+- `FLYDSL_ILUVATAR_LAUNCH_KERNEL`: no-argument kernel symbol to launch.
+
+Compile a temporary no-op cubin with the CoreX LLVM toolchain, not `nvcc`:
+
+```bash
+CUDA_PATH=/home/peter/sw_home/local/corex
+cat >/tmp/iluvatar_noop.cu <<'EOF'
+extern "C" __global__ void noop_kernel() {}
+EOF
+"$CUDA_PATH/bin/clang++" -O3 -std=c++14 -Wall -I/tmp -I"$CUDA_PATH/include" \
+  --cuda-path="$CUDA_PATH" --cuda-gpu-arch=ivcore11 \
+  -fno-discard-value-names --cuda-device-only -emit-llvm -S -x ivcore \
+  /tmp/iluvatar_noop.cu -o /tmp/iluvatar_noop.ll
+"$CUDA_PATH/bin/llc" -march=bi -mcpu=ivcore11 -filetype=obj \
+  -mtriple=bi-iluvatar-ilurt /tmp/iluvatar_noop.ll \
+  -o /tmp/iluvatar_noop.cuda.o
+"$CUDA_PATH/bin/lld" -flavor ld.lld -no-warn-missing-entry --no-undefined \
+  /tmp/iluvatar_noop.cuda.o -o /tmp/iluvatar_noop.cubin
+```
+
+Verified command shape:
+
+```bash
+LD_LIBRARY_PATH=/home/peter/sw_home/local/corex/lib64:$LD_LIBRARY_PATH \
+  FLYDSL_ILUVATAR_JIT_RUNTIME_LIB=/tmp/flydsl-iluvatar-runtime-smoke/python_packages/flydsl/_mlir/_mlir_libs/libfly_iluvatar_jit_runtime.so \
+  FLYDSL_ILUVATAR_SMOKE_BLOB=/tmp/iluvatar_noop.cubin \
+  FLYDSL_ILUVATAR_SMOKE_KERNEL=noop_kernel \
+  FLYDSL_ILUVATAR_LAUNCH_KERNEL=noop_kernel \
+  /home/peter/sw_home/sdk/FlyDSL/.venv/bin/python -m pytest \
+    tests/unit/test_iluvatar_runtime_smoke.py -q --confcutdir=tests/unit
+```
+
 ## Phase 6: Atoms And Kernels
 
 Goal: add real Iluvatar copy/MMA atoms and port kernels.
