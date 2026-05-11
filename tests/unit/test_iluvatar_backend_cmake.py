@@ -37,6 +37,27 @@ def test_iluvatar_python_bindings_are_backend_gated():
     assert "_FLY_COPY_IXDL_TABLEGEN" in text
 
 
+def test_iluvatar_runtime_skeleton_uses_cuda_compatible_api():
+    runtime_cmake = (_REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "CMakeLists.txt").read_text()
+    runtime_cpp = (
+        _REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "FlyIluvatarRuntimeWrappers.cpp"
+    ).read_text()
+    python_cmake = (_REPO_ROOT / "python" / "mlir_flydsl" / "CMakeLists.txt").read_text()
+
+    assert 'if("iluvatar" IN_LIST FLYDSL_BACKENDS)' in (
+        _REPO_ROOT / "lib" / "Runtime" / "CMakeLists.txt"
+    ).read_text()
+    assert "find_package(CUDAToolkit REQUIRED)" in runtime_cmake
+    assert "add_library(FlyIluvatarJitRuntime SHARED FlyIluvatarRuntimeWrappers.cpp)" in runtime_cmake
+    assert "CUDA::cuda_driver" in runtime_cmake
+    assert 'OUTPUT_NAME "fly_iluvatar_jit_runtime"' in runtime_cmake
+    assert "#include \"cuda.h\"" in runtime_cpp
+    assert "cuModuleLoadData" in runtime_cpp
+    assert "cuLaunchKernel" in runtime_cpp
+    assert "ixModule" not in runtime_cpp
+    assert "if(TARGET FlyIluvatarJitRuntime)" in python_cmake
+
+
 def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     """The real Iluvatar descriptor should only load when selected."""
     cmake = shutil.which("cmake")
@@ -47,8 +68,10 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     backend_dir = cmake_dir / "backends"
     runtime_dir = tmp_path / "lib" / "Runtime"
     rocm_runtime_dir = runtime_dir / "ROCm"
+    iluvatar_runtime_dir = runtime_dir / "Iluvatar"
     backend_dir.mkdir(parents=True)
     rocm_runtime_dir.mkdir(parents=True)
+    iluvatar_runtime_dir.mkdir(parents=True)
     (cmake_dir / "FlyDSLBackends.cmake").write_text(
         (_REPO_ROOT / "cmake" / "FlyDSLBackends.cmake").read_text()
     )
@@ -57,6 +80,9 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     )
     (rocm_runtime_dir / "CMakeLists.txt").write_text(
         'set(GUARDRAIL_ENTERED_ROCM_RUNTIME ON CACHE BOOL "" FORCE)\n'
+    )
+    (iluvatar_runtime_dir / "CMakeLists.txt").write_text(
+        'set(GUARDRAIL_ENTERED_ILUVATAR_RUNTIME ON CACHE BOOL "" FORCE)\n'
     )
 
     (backend_dir / "rocdl.cmake").write_text(
@@ -100,6 +126,9 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 "endif()",
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND GUARDRAIL_ENTERED_ROCM_RUNTIME)',
                 '  message(FATAL_ERROR "ROCm runtime was included for iluvatar-only build")',
+                "endif()",
+                'if(FLYDSL_BACKENDS STREQUAL "rocdl" AND GUARDRAIL_ENTERED_ILUVATAR_RUNTIME)',
+                '  message(FATAL_ERROR "Iluvatar runtime was included for default build")',
                 "endif()",
                 'if(FLYDSL_BACKENDS STREQUAL "rocdl" AND NOT _flyixdl_include_idx EQUAL -1)',
                 '  message(FATAL_ERROR "FlyIXDL include dialect subdir was selected for default build")',
@@ -157,6 +186,7 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     assert "GUARDRAIL_SELECTED_ROCDL:BOOL=ON" in default_cache
     assert "GUARDRAIL_ENTERED_ROCM_RUNTIME:BOOL=ON" in default_cache
     assert "GUARDRAIL_SELECTED_ILUVATAR" not in default_cache
+    assert "GUARDRAIL_ENTERED_ILUVATAR_RUNTIME" not in default_cache
 
     iluvatar_build = tmp_path / "build-iluvatar"
     subprocess.run(
@@ -168,5 +198,6 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     iluvatar_cache = (iluvatar_build / "CMakeCache.txt").read_text()
     assert "FLYDSL_BACKENDS:STRING=iluvatar" in iluvatar_cache
     assert "GUARDRAIL_SELECTED_ILUVATAR:BOOL=ON" in iluvatar_cache
+    assert "GUARDRAIL_ENTERED_ILUVATAR_RUNTIME:BOOL=ON" in iluvatar_cache
     assert "GUARDRAIL_SELECTED_ROCDL" not in iluvatar_cache
     assert "GUARDRAIL_ENTERED_ROCM_RUNTIME" not in iluvatar_cache
