@@ -305,3 +305,9 @@ if(TARGET FlyJitRuntime)
     LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}")
   add_dependencies(FlyPythonCAPI FlyJitRuntime)
 endif()
+
+if(TARGET FlyIluvatarJitRuntime)
+  set_target_properties(FlyIluvatarJitRuntime PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}")
+  add_dependencies(FlyPythonCAPI FlyIluvatarJitRuntime)
+endif()
