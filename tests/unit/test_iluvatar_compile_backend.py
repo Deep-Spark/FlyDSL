@@ -34,7 +34,7 @@ def test_iluvatar_backend_explicit_arch(monkeypatch):
     assert backend.target.backend == "iluvatar"
     assert backend.target.arch == "ivcore11"
     assert backend.target.warp_size == 64
-    assert backend.gpu_module_targets() == ['#iluvatar.target<arch = "ivcore11">']
+    assert backend.gpu_module_targets() == ['#ixdl.target<chip = "ivcore11">']
 
 
 def test_iluvatar_backend_detects_arch_from_env(monkeypatch):
@@ -58,7 +58,7 @@ def test_iluvatar_backend_defaults_to_ivcore11(monkeypatch):
     assert backend.target.warp_size == 64
 
 
-def test_iluvatar_pipeline_uses_ixdl_without_codegen(monkeypatch):
+def test_iluvatar_pipeline_uses_ixdl_attach_and_binary_codegen(monkeypatch):
     backends = _load_backends(monkeypatch)
     backend = backends.get_backend("iluvatar", arch="ivcore11")
 
@@ -66,8 +66,12 @@ def test_iluvatar_pipeline_uses_ixdl_without_codegen(monkeypatch):
 
     assert "convert-fly-to-ixdl" in fragments
     assert any("convert-gpu-to-ixdl" in fragment for fragment in fragments)
-    assert not any("attach-target" in fragment for fragment in fragments)
-    assert not any("gpu-module-to-binary" in fragment for fragment in fragments)
+    assert "ixdl-attach-target{O=2 chip=ivcore11 triple=bi-iluvatar-ilurt}" in fragments
+    assert "gpu-module-to-binary{format=fatbin}" in fragments
+    assert fragments.index("ixdl-attach-target{O=2 chip=ivcore11 triple=bi-iluvatar-ilurt}") < fragments.index(
+        "gpu-module-to-binary{format=fatbin}"
+    )
+    assert not any("rocdl-attach-target" in fragment for fragment in fragments)
     assert not any("fly-rocdl-cluster-attr" in fragment for fragment in fragments)
     assert not any("runtime" in fragment.lower() for fragment in fragments)
 
