@@ -25,7 +25,19 @@ class IluvatarBackend(BaseBackend):
     def make_target(cls, arch: str) -> GPUTarget:
         return GPUTarget(backend="iluvatar", arch=arch or _DEFAULT_ARCH, warp_size=_WARP_SIZE)
 
+    @staticmethod
+    def _format_pass_opts(opts: dict) -> str:
+        """Format {key: value, ...} as 'key=value key2=value2' for MLIR pass options."""
+        return " ".join(f"{k}={v}" for k, v in opts.items())
+
     def pipeline_fragments(self, *, compile_hints: dict) -> List[str]:
+        chip = self.target.arch
+        ixdl_opts = {
+            "O": 2,
+            "chip": chip,
+            "triple": "bi-iluvatar-ilurt",
+        }
+
         return [
             "fly-rewrite-func-signature",
             "fly-canonicalize",
@@ -38,11 +50,19 @@ class IluvatarBackend(BaseBackend):
             "canonicalize",
             "gpu.module(convert-scf-to-cf,cse,"
             "convert-gpu-to-ixdl{index-bitwidth=0 use-bare-ptr-memref-call-conv=true})",
+            f"ixdl-attach-target{{{self._format_pass_opts(ixdl_opts)}}}",
+            "convert-scf-to-cf",
+            "convert-cf-to-llvm",
+            "gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}",
+            "convert-vector-to-llvm",
+            "convert-arith-to-llvm",
+            "convert-func-to-llvm",
             "reconcile-unrealized-casts",
+            "gpu-module-to-binary{format=fatbin}",
         ]
 
     def gpu_module_targets(self) -> List[str]:
-        return [f'#iluvatar.target<arch = "{self.target.arch}">']
+        return [f'#ixdl.target<chip = "{self.target.arch}">']
 
     def native_lib_patterns(self) -> List[str]:
         return [
