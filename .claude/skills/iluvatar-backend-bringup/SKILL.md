@@ -696,6 +696,25 @@ LD_LIBRARY_PATH=/home/peter/sw_home/local/corex/lib64:$LD_LIBRARY_PATH \
     tests/unit/test_iluvatar_runtime_smoke.py -q --confcutdir=tests/unit
 ```
 
+Phase 5.3c-1: FlyDSL JIT runtime library resolution smoke
+
+Status: completed locally in the current Iluvatar branch. This step verifies
+the FlyDSL JIT executor's runtime library resolution path without compiling or
+launching a kernel. With `FLYDSL_COMPILE_BACKEND=iluvatar`, the JIT executor
+resolves the backend-provided runtime library basenames to
+`libfly_iluvatar_jit_runtime.so` and `libmlir_c_runner_utils.so` under
+`flydsl/_mlir/_mlir_libs`.
+
+This is an L0-style unit test with a temporary `_mlir/_mlir_libs` directory. It
+does not require Iluvatar hardware, CoreX driver libraries, a real shared
+library, or MLIR `ExecutionEngine` construction.
+
+Verified command:
+
+```bash
+python3 -m pytest tests/unit/test_iluvatar_jit_runtime_resolution.py -q --confcutdir=tests/unit
+```
+
 ## Phase 6: Atoms And Kernels
 
 Goal: add real Iluvatar copy/MMA atoms and port kernels.
