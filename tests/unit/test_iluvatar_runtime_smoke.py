@@ -4,7 +4,7 @@
 """Opt-in smoke tests for the Iluvatar JIT runtime library."""
 
 import os
-from ctypes import CDLL, c_size_t, c_void_p, create_string_buffer
+from ctypes import CDLL, c_char_p, c_size_t, c_void_p, create_string_buffer
 from pathlib import Path
 
 import pytest
@@ -23,7 +23,14 @@ def _required_path_from_env(name: str) -> Path:
     return path
 
 
-def test_iluvatar_runtime_loads_and_unloads_module():
+def _required_value_from_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        pytest.skip(f"{name} is not set")
+    return value
+
+
+def _load_runtime_and_blob():
     runtime_path = _required_path_from_env("FLYDSL_ILUVATAR_JIT_RUNTIME_LIB")
     blob_path = _required_path_from_env("FLYDSL_ILUVATAR_SMOKE_BLOB")
 
@@ -37,8 +44,28 @@ def test_iluvatar_runtime_loads_and_unloads_module():
     if not blob:
         pytest.fail(f"FLYDSL_ILUVATAR_SMOKE_BLOB is empty: {blob_path}")
 
-    buffer = create_string_buffer(blob)
-    module = runtime.mgpuModuleLoad(buffer, len(blob))
+    return runtime, create_string_buffer(blob), len(blob)
+
+
+def test_iluvatar_runtime_loads_and_unloads_module():
+    runtime, buffer, blob_size = _load_runtime_and_blob()
+
+    module = runtime.mgpuModuleLoad(buffer, blob_size)
     assert module, "mgpuModuleLoad returned a null module handle"
 
     runtime.mgpuModuleUnload(module)
+
+
+def test_iluvatar_runtime_gets_function():
+    kernel_name = _required_value_from_env("FLYDSL_ILUVATAR_SMOKE_KERNEL")
+    runtime, buffer, blob_size = _load_runtime_and_blob()
+    runtime.mgpuModuleGetFunction.argtypes = [c_void_p, c_char_p]
+    runtime.mgpuModuleGetFunction.restype = c_void_p
+
+    module = runtime.mgpuModuleLoad(buffer, blob_size)
+    assert module, "mgpuModuleLoad returned a null module handle"
+    try:
+        function = runtime.mgpuModuleGetFunction(module, kernel_name.encode())
+        assert function, f"mgpuModuleGetFunction returned null for {kernel_name!r}"
+    finally:
+        runtime.mgpuModuleUnload(module)

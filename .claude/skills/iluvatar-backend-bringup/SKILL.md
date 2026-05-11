@@ -630,6 +630,29 @@ Phase 5.3: Kernel launch smoke
 - Add smallest possible L2 launch test.
 - Use `FLYDSL_COMPILE_BACKEND=iluvatar` and `FLYDSL_RUNTIME_KIND=iluvatar`.
 
+Phase 5.3a: Function lookup smoke
+
+Status: completed locally in the current Iluvatar branch. This step extends the
+opt-in Iluvatar runtime smoke so it loads a module and calls
+`mgpuModuleGetFunction` for a caller-provided kernel symbol, without launching
+the kernel. The test is skipped by default unless the runtime library, module
+blob, and kernel name env vars are all provided.
+
+Additional test env:
+
+- `FLYDSL_ILUVATAR_SMOKE_KERNEL`: kernel symbol to look up in the loaded module.
+
+Verified command shape:
+
+```bash
+LD_LIBRARY_PATH=/home/peter/sw_home/local/corex/lib64:$LD_LIBRARY_PATH \
+  FLYDSL_ILUVATAR_JIT_RUNTIME_LIB=/tmp/flydsl-iluvatar-runtime-smoke/python_packages/flydsl/_mlir/_mlir_libs/libfly_iluvatar_jit_runtime.so \
+  FLYDSL_ILUVATAR_SMOKE_BLOB=/tmp/add_ivcore11.cubin \
+  FLYDSL_ILUVATAR_SMOKE_KERNEL=add_kernel \
+  /home/peter/sw_home/sdk/FlyDSL/.venv/bin/python -m pytest \
+    tests/unit/test_iluvatar_runtime_smoke.py -q --confcutdir=tests/unit
+```
+
 ## Phase 6: Atoms And Kernels
 
 Goal: add real Iluvatar copy/MMA atoms and port kernels.
