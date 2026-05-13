@@ -5,10 +5,10 @@
 
 import importlib
 import os
-from pathlib import Path
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -81,3 +81,38 @@ def test_iluvatar_backend_pipeline_lowers_minimal_gpu_module_to_binary(monkeypat
     assert "gpu.binary @kernels" in result.stdout
     assert "#gpu.object<#ixdl.target" in result.stdout
     assert "gpu.func @k" not in result.stdout
+
+
+def test_fly_to_ixdl_lowers_scalar_pointer_store(tmp_path):
+    fly_opt = _required_path_from_env("FLYDSL_ILUVATAR_FLY_OPT")
+
+    input_mlir = tmp_path / "scalar_store.mlir"
+    input_mlir.write_text(
+        "\n".join(
+            [
+                "module {",
+                "  func.func @store_i32(%ptr: !fly.ptr<i32, global>) {",
+                "    %c7 = arith.constant 7 : i32",
+                "    %offset = fly.make_int_tuple() : () -> !fly.int_tuple<1>",
+                "    %slot = fly.add_offset(%ptr, %offset)",
+                "      : (!fly.ptr<i32, global>, !fly.int_tuple<1>) -> !fly.ptr<i32, global>",
+                "    fly.ptr.store(%c7, %slot) : (i32, !fly.ptr<i32, global>) -> ()",
+                "    return",
+                "  }",
+                "}",
+                "",
+            ]
+        )
+    )
+
+    result = subprocess.run(
+        [str(fly_opt), str(input_mlir), "--pass-pipeline=builtin.module(convert-fly-to-ixdl,canonicalize)"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "llvm.getelementptr" in result.stdout
+    assert "llvm.store" in result.stdout
+    assert "fly.add_offset" not in result.stdout
+    assert "fly.ptr.store" not in result.stdout
