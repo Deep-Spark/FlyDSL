@@ -738,9 +738,76 @@ Fixes required by this step:
 Verified commands:
 
 ```bash
-cmake --build /tmp/flydsl-iluvatar-runtime-smoke --target fly-opt -j8
-FLYDSL_ILUVATAR_FLY_OPT=/tmp/flydsl-iluvatar-runtime-smoke/bin/fly-opt \
+# From the FlyDSL repo root. Point MLIR_DIR at your ixcc MLIR CMake package.
+rm -rf build-fly
+cmake -S . -B build-fly \
+  -DFLYDSL_BACKENDS=iluvatar \
+  -DPython3_EXECUTABLE="$(command -v python3)" \
+  -DMLIR_DIR=<path-to-ixcc>/build/lib/cmake/mlir
+cmake --build build-fly --target fly-opt -j8
+
+build-fly/bin/fly-opt --help | grep ixdl-attach-target
+FLYDSL_ILUVATAR_FLY_OPT="$PWD/build-fly/bin/fly-opt" \
   python3 -m pytest tests/unit/test_iluvatar_binary_pipeline_smoke.py -q --confcutdir=tests/unit
+```
+
+Phase 5.3c-3: Minimal FlyDSL JIT launch smoke
+
+Status: completed locally in the current Iluvatar branch after the ixcc
+`IXDLToLLVMIRTranslation` fix that maps `ixdl.kernel` to
+`llvm::CallingConv::ILUVATAR_KERNEL`. This verifies a minimal `@flyc.kernel` /
+`@flyc.jit` program can compile through the Iluvatar backend, produce a binary,
+load it through the FlyDSL JIT runtime, and call `mgpuLaunchKernel`.
+
+The first smoke uses an empty no-argument kernel launched with a 1x1x1 grid and
+1x1x1 block. It is opt-in because it requires the Iluvatar runtime library,
+CoreX driver stack, and a built FlyDSL Python package.
+
+Fixes required by this step:
+
+- `flydsl.expr` no longer requires ROCDL Python dialect bindings at import time,
+  so an Iluvatar-only build can import the generic DSL/compiler surface.
+- `KernelLauncher.launch()` only passes `cluster_size` to `gpu.LaunchFuncOp`
+  when a cluster launch is requested, preserving compatibility with bindings
+  that do not accept `cluster_size=None`.
+- ixcc `IXDLToLLVMIRTranslation` must set
+  `llvm::CallingConv::ILUVATAR_KERNEL` for `ixdl.kernel`, analogous to ROCDL
+  setting `llvm::CallingConv::AMDGPU_KERNEL` for `rocdl.kernel`.
+
+Run from the repo root with the `build-fly` Python package first on
+`PYTHONPATH`:
+
+```bash
+# From the FlyDSL repo root after configuring and building (see above).
+cmake --build build-fly -j8
+
+export PYTHONPATH="$PWD/build-fly/python_packages:$PWD"
+export LD_LIBRARY_PATH="$PWD/build-fly/python_packages/flydsl/_mlir/_mlir_libs:${LD_LIBRARY_PATH:-}"
+export FLYDSL_PYTHON_PACKAGES="$PWD/build-fly/python_packages"
+FLYDSL_ILUVATAR_RUN_JIT_SMOKE=1 \
+FLYDSL_COMPILE_BACKEND=iluvatar \
+FLYDSL_RUNTIME_KIND=iluvatar \
+ARCH=ivcore11 \
+python3 -m pytest tests/unit/test_iluvatar_jit_launch_smoke.py -q --confcutdir=tests/unit
+```
+
+Phase 5.3c-4: Single-element FlyDSL store smoke
+
+Status: completed locally in the current Iluvatar branch. This extends the same
+opt-in JIT smoke to a scalar correctness check such as `out[0] = 7`. It depends
+on enough `FlyToIXDL` lowering for scalar global pointer arithmetic and stores:
+`fly.add_offset` and `fly.ptr.store` lower to LLVM-compatible pointer and store
+operations before the IXDL binary pipeline runs.
+
+Focused command:
+
+```bash
+FLYDSL_ILUVATAR_RUN_JIT_SMOKE=1 \
+FLYDSL_COMPILE_BACKEND=iluvatar \
+FLYDSL_RUNTIME_KIND=iluvatar \
+ARCH=ivcore11 \
+python3 -m pytest tests/unit/test_iluvatar_jit_launch_smoke.py \
+  -q -k stores_single_element --confcutdir=tests/unit
 ```
 
 ## Phase 6: Atoms And Kernels
