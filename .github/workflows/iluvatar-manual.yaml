@@ -51,6 +51,7 @@ jobs:
         with:
           fetch-depth: 1
           clean: false
+          submodules: recursive
 
       - name: Pre-flight check (toolchain + venv paths)
         shell: bash
