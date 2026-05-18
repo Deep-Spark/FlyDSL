@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: Apache-2.0
+# Manual-only Iluvatar CI for the deepspark fork.
+#
+# Trigger: Actions tab -> "Iluvatar Manual CI" -> Run workflow.
+# Runs on a self-hosted runner that already has ixcc / CoreX / a shared
+# .venv populated. No branch is bound, any ref can be dispatched.
+
+name: Iluvatar Manual CI
+
+"on":
+  workflow_dispatch:
+    inputs:
+      run_store_kernel:
+        description: "Run minimal_iluvatar_kernel_store.py (needs torch + GPU)"
+        type: boolean
+        default: true
+      clean_build:
+        description: "Remove build-fly/ before configure (forces full rebuild)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: iluvatar-manual-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  iluvatar-tests:
+    name: Build & test (Iluvatar)
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+
+    env:
+      IXCC_MLIR_CMAKE: /home/wcyx/sw_home/sdk/ixcc/build/lib/cmake/mlir
+      COREX_ROOT: /home/wcyx/sw_home/local/corex
+      FLYDSL_SHARED_VENV: /home/flydsl/FlyDSL/.venv
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: false
+
+      - name: Pre-flight check (toolchain + venv paths)
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          check_file() {
+            if [[ ! -e "$1" ]]; then
+              echo "MISSING: $1"
+              fail=1
+            else
+              echo "OK: $1"
+            fi
+          }
+          check_file "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake"
+          check_file "${COREX_ROOT}/bin/ld.lld"
+          check_file "${COREX_ROOT}/lib64/libcuda.so.1"
+          check_file "${FLYDSL_SHARED_VENV}/bin/python3"
+          if [[ $fail -ne 0 ]]; then
+            echo "::error::Runner is missing required Iluvatar toolchain or venv paths."
+            exit 1
+          fi
+
+      - name: Export runtime env to $GITHUB_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          # env.sh exports the FlyDSL Iluvatar runtime/test variables. We do
+          # this before any python import (e.g. torch) so CoreX libs resolve.
+          source ./env.sh
+          # Propagate selected vars to subsequent steps via GITHUB_ENV.
+          {
+            echo "PATH=${PATH}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+            echo "PYTHONPATH=${PYTHONPATH}"
+            echo "COREX_ROOT=${COREX_ROOT}"
+            echo "IXCC_MLIR_CMAKE=${IXCC_MLIR_CMAKE}"
+            echo "ARCH=${ARCH}"
+            echo "FLYDSL_COMPILE_BACKEND=${FLYDSL_COMPILE_BACKEND}"
+            echo "FLYDSL_RUNTIME_KIND=${FLYDSL_RUNTIME_KIND}"
+            echo "FLYDSL_RUNTIME_ENABLE_CACHE=${FLYDSL_RUNTIME_ENABLE_CACHE}"
+            echo "FLYDSL_PYTHON_PACKAGES=${FLYDSL_PYTHON_PACKAGES}"
+            echo "FLYDSL_ILUVATAR_FLY_OPT=${FLYDSL_ILUVATAR_FLY_OPT}"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify shared venv has build/test deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          python3 -c "import nanobind, pybind11, numpy; print('build deps OK')"
+          python3 -c "import torch; print('torch', torch.__version__, 'cuda available =', torch.cuda.is_available())"
+          python3 -c "import pytest; print('pytest', pytest.__version__)"
+
+      - name: Optional clean build-fly
+        if: ${{ inputs.clean_build }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build-fly
+
+      - name: Configure & build FlyDSL (Iluvatar-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          cmake -S . -B build-fly -G Ninja \
+            -DFLYDSL_BACKENDS=iluvatar \
+            -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
+            -DCUDAToolkit_ROOT="${COREX_ROOT}" \
+            -DPython3_EXECUTABLE="${FLYDSL_SHARED_VENV}/bin/python3"
+          cmake --build build-fly -j"$(nproc)"
+
+      - name: L0 unit tests (device runtime + Iluvatar JIT runtime resolution)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          python3 -m pytest \
+            tests/unit/test_device_runtime.py \
+            tests/unit/test_iluvatar_jit_runtime_resolution.py \
+            -v --confcutdir=tests/unit
+
+      - name: L1b binary pipeline smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          python3 -m pytest \
+            tests/unit/test_iluvatar_binary_pipeline_smoke.py \
+            -v --confcutdir=tests/unit
+
+      - name: Minimal empty kernel launch
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          python3 minimal_iluvatar_kernel.py
+
+      - name: Minimal store kernel + torch readback
+        if: ${{ inputs.run_store_kernel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          python3 minimal_iluvatar_kernel_store.py
+
+      - name: Diagnostics (always run)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          echo "--- which ld.lld ---"
+          which ld.lld
+          echo "--- ld.lld --version ---"
+          ld.lld --version 2>&1 | head -5
+          echo "--- ldd libfly_iluvatar_jit_runtime.so ---"
+          ldd "build-fly/python_packages/flydsl/_mlir/_mlir_libs/libfly_iluvatar_jit_runtime.so" 2>&1 | head -20
+          echo "--- env (selected) ---"
+          env | grep -E '^(PATH|LD_LIBRARY_PATH|PYTHONPATH|COREX_ROOT|IXCC_MLIR_CMAKE|ARCH|FLYDSL_)' | sort
