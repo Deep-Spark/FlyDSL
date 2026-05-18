@@ -1,13 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-# Manual-only Iluvatar CI for the deepspark fork.
+# Iluvatar CI for the deepspark fork.
 #
-# Trigger: Actions tab -> "Iluvatar Manual CI" -> Run workflow.
+# Triggers:
+#   - push to flydsl-ci / flydsl-ci-* / ci/iluvatar-* branches: auto-run on the
+#     pushed ref. This avoids requiring the file on the default branch.
+#   - workflow_dispatch from the Actions UI: only visible after the file lands
+#     on the default branch (GitHub Actions hard requirement).
 # Runs on a self-hosted runner that already has ixcc / CoreX / a shared
-# .venv populated. No branch is bound, any ref can be dispatched.
+# .venv populated.
 
 name: Iluvatar Manual CI
 
 "on":
+  push:
+    branches:
+      - flydsl-ci
+      - flydsl-ci-*
+      - ci/iluvatar-*
   workflow_dispatch:
     inputs:
       run_store_kernel:
@@ -143,7 +152,9 @@ jobs:
           python3 minimal_iluvatar_kernel.py
 
       - name: Minimal store kernel + torch readback
-        if: ${{ inputs.run_store_kernel }}
+        # workflow_dispatch: respect the input (default true).
+        # push: inputs.* is null, so fall back to running by default.
+        if: ${{ inputs.run_store_kernel || github.event_name == 'push' }}
         shell: bash
         run: |
           set -euo pipefail

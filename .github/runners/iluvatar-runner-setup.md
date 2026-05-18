@@ -90,14 +90,34 @@ LD_LIBRARY_PATH=/home/wcyx/sw_home/local/corex/lib64 \
 
 ## Workflow trigger
 
-After the runner is online, on the Deep-Spark/FlyDSL repo:
+After the runner is online, two ways to trigger:
 
-1. Open the **Actions** tab.
+### 1. Push-based (current default; works without main)
+
+Push to a branch matching one of these patterns automatically runs the
+workflow on that ref:
+
+- `flydsl-ci`
+- `flydsl-ci-*`
+- `ci/iluvatar-*`
+
+Example: `git push origin flydsl-ci-myfeature` triggers a run; `inputs.*`
+fall back to defaults (`run_store_kernel = true`, `clean_build = false`).
+
+This avoids GitHub's "`workflow_dispatch` requires the file on the default
+branch" rule, so the workflow does not need to be merged into `main`.
+
+### 2. Manual dispatch (UI / `gh workflow run`)
+
+Only visible after the workflow file is merged into the default branch.
+Once that's done:
+
+1. Open the **Actions** tab on Deep-Spark/FlyDSL.
 2. Choose **Iluvatar Manual CI**.
-3. Click **Run workflow**, pick the branch / ref, optionally toggle
+3. Click **Run workflow**, pick the ref, optionally toggle
    `run_store_kernel` or `clean_build`.
 
-Concurrency is queued (`cancel-in-progress: false`); back-to-back dispatches on
+Concurrency is queued (`cancel-in-progress: false`); back-to-back triggers on
 the same ref serialize so the GPU is never shared.
 
 ## Troubleshooting
