@@ -152,41 +152,40 @@ jobs:
           source "${FLYDSL_SHARED_VENV}/bin/activate"
           python3 minimal_iluvatar_kernel.py
 
-      - name: Wait for free GPU memory (shared runner guard)
-        # The minimal store kernel needs a torch CUDA context (~hundreds of
-        # MiB). On this shared runner other tenants intermittently fill the
-        # device, causing a 4-byte allocation to OOM. Poll ixsmi for memory.free
-        # before running so we fail fast with a clear "no GPU available" signal
-        # instead of a confusing torch OOM mid-kernel.
+      - name: Probe CUDA context (shared runner guard)
+        # ixsmi memory.free is not enough on this runner: a stale CUDA context
+        # from another user (zombie process holding the device but using 0 MiB)
+        # makes new context creation fail with "out of memory" even though
+        # ixsmi reports 32700 MiB free per card. So actually attempt a tiny
+        # torch allocation; if it works the next step will too. Retry to ride
+        # out transient contention; on persistent failure dump diagnostics
+        # (ixsmi + other-tenant python processes) so the next person can
+        # identify which PID to kill.
         if: ${{ inputs.run_store_kernel || github.event_name == 'push' }}
         shell: bash
         run: |
           set -euo pipefail
-          THRESHOLD_MIB=256
           MAX_ATTEMPTS=3
           SLEEP_S=30
-          IXSMI="${COREX_ROOT}/bin/ixsmi"
-          if [[ ! -x "${IXSMI}" ]]; then
-            echo "::warning::${IXSMI} not found; skipping GPU memory pre-check."
-            exit 0
-          fi
-          visible="${CUDA_VISIBLE_DEVICES:-}"
+          source "${FLYDSL_SHARED_VENV}/bin/activate"
+          probe() {
+            python3 - <<'PY'
+          import sys, traceback
+          import torch
+          try:
+              t = torch.zeros(1, device="cuda", dtype=torch.int32)
+              del t
+              torch.cuda.synchronize()
+              print("probe alloc OK")
+          except Exception as e:
+              print(f"probe alloc FAILED: {type(e).__name__}: {str(e).splitlines()[0]}",
+                    file=sys.stderr)
+              sys.exit(2)
+          PY
+          }
           for attempt in $(seq 1 ${MAX_ATTEMPTS}); do
             echo "--- attempt ${attempt}/${MAX_ATTEMPTS} ($(date -u +%FT%TZ)) ---"
-            lines=$("${IXSMI}" --query-gpu=index,memory.free --format=csv,noheader,nounits)
-            echo "${lines}"
-            best=0
-            while IFS=, read -r idx free; do
-              idx="${idx// /}"; free="${free// /}"
-              [[ -z "${idx}" ]] && continue
-              if [[ -n "${visible}" ]] && ! echo ",${visible}," | grep -q ",${idx},"; then
-                continue
-              fi
-              if (( free > best )); then best="${free}"; fi
-            done <<< "${lines}"
-            echo "max free among visible GPUs = ${best} MiB (threshold ${THRESHOLD_MIB})"
-            if (( best >= THRESHOLD_MIB )); then
-              echo "GPU memory OK."
+            if probe; then
               exit 0
             fi
             if (( attempt < MAX_ATTEMPTS )); then
@@ -194,7 +193,20 @@ jobs:
               sleep "${SLEEP_S}"
             fi
           done
-          echo "::error::No visible GPU has >=${THRESHOLD_MIB} MiB free after ${MAX_ATTEMPTS} attempts. Runner is contended; re-run later."
+          echo "::error::CUDA context probe failed after ${MAX_ATTEMPTS} attempts. Runner GPU state is broken (likely stale CUDA context from another user); see diagnostics below."
+          echo "--- ixsmi ---"
+          "${COREX_ROOT}/bin/ixsmi" || true
+          echo "--- other tenants likely holding GPU contexts (non-self, non-root) ---"
+          # Tight filter: only processes whose cmd line points at a CoreX
+          # runtime artifact, an iluvatar workload path, or libixthunk. Skips
+          # build-side clang invocations, celery/gunicorn workers and avahi's
+          # hostname (which also contains the string "iluvatar"). Kernel
+          # threads [iluvatar-N-M-K] are normal driver workers and not shown.
+          ps -eo user,pid,etime,cmd 2>&1 \
+            | awk -v me="${USER}" 'NR>1 && $1!=me && $1!="root" \
+                && /(corex\/(bin|lib|lib64)\/|examples\/iluvatar|libixthunk|ixthunk\.so)/ \
+                && !/clang-1[0-9]/' \
+            | head -30 || true
           exit 1
 
       - name: Minimal store kernel + torch readback
