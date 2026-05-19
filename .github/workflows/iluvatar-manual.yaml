@@ -152,6 +152,51 @@ jobs:
           source "${FLYDSL_SHARED_VENV}/bin/activate"
           python3 minimal_iluvatar_kernel.py
 
+      - name: Wait for free GPU memory (shared runner guard)
+        # The minimal store kernel needs a torch CUDA context (~hundreds of
+        # MiB). On this shared runner other tenants intermittently fill the
+        # device, causing a 4-byte allocation to OOM. Poll ixsmi for memory.free
+        # before running so we fail fast with a clear "no GPU available" signal
+        # instead of a confusing torch OOM mid-kernel.
+        if: ${{ inputs.run_store_kernel || github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          THRESHOLD_MIB=256
+          MAX_ATTEMPTS=3
+          SLEEP_S=30
+          IXSMI="${COREX_ROOT}/bin/ixsmi"
+          if [[ ! -x "${IXSMI}" ]]; then
+            echo "::warning::${IXSMI} not found; skipping GPU memory pre-check."
+            exit 0
+          fi
+          visible="${CUDA_VISIBLE_DEVICES:-}"
+          for attempt in $(seq 1 ${MAX_ATTEMPTS}); do
+            echo "--- attempt ${attempt}/${MAX_ATTEMPTS} ($(date -u +%FT%TZ)) ---"
+            lines=$("${IXSMI}" --query-gpu=index,memory.free --format=csv,noheader,nounits)
+            echo "${lines}"
+            best=0
+            while IFS=, read -r idx free; do
+              idx="${idx// /}"; free="${free// /}"
+              [[ -z "${idx}" ]] && continue
+              if [[ -n "${visible}" ]] && ! echo ",${visible}," | grep -q ",${idx},"; then
+                continue
+              fi
+              if (( free > best )); then best="${free}"; fi
+            done <<< "${lines}"
+            echo "max free among visible GPUs = ${best} MiB (threshold ${THRESHOLD_MIB})"
+            if (( best >= THRESHOLD_MIB )); then
+              echo "GPU memory OK."
+              exit 0
+            fi
+            if (( attempt < MAX_ATTEMPTS )); then
+              echo "Waiting ${SLEEP_S}s before retry..."
+              sleep "${SLEEP_S}"
+            fi
+          done
+          echo "::error::No visible GPU has >=${THRESHOLD_MIB} MiB free after ${MAX_ATTEMPTS} attempts. Runner is contended; re-run later."
+          exit 1
+
       - name: Minimal store kernel + torch readback
         # workflow_dispatch: respect the input (default true).
         # push: inputs.* is null, so fall back to running by default.
