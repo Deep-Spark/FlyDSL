@@ -36,16 +36,16 @@ static Value buildSMEDescriptor(OpBuilder &builder, Location loc, Value src,
                                 int64_t strideByte) {
   MLIRContext *ctx = builder.getContext();
   auto i32Ty = builder.getIntegerType(32);
-  auto i64Ty = builder.getIntegerType(64);
   auto v4i32Ty = VectorType::get({4}, i32Ty);
 
-  // ptr -> i64 -> (lo:i32, hi:i32)
-  Value ptrAsI64 = LLVM::PtrToIntOp::create(builder, loc, i64Ty, src);
-  Value ptrLo = LLVM::TruncOp::create(builder, loc, i32Ty, ptrAsI64);
-  Value shiftAmt = LLVM::ConstantOp::create(builder, loc, i64Ty,
-                                            builder.getI64IntegerAttr(32));
-  Value ptrHiI64 = LLVM::LShrOp::create(builder, loc, ptrAsI64, shiftAmt);
-  Value ptrHi = LLVM::TruncOp::create(builder, loc, i32Ty, ptrHiI64);
+  // Extract full 64-bit global address into lo/hi 32-bit halves.
+  auto i64Ty = builder.getIntegerType(64);
+  Value ptrI64 = LLVM::PtrToIntOp::create(builder, loc, i64Ty, src);
+  Value ptrLo = LLVM::TruncOp::create(builder, loc, i32Ty, ptrI64);
+  Value shift32 = LLVM::ConstantOp::create(builder, loc, i64Ty,
+                                           builder.getI64IntegerAttr(32));
+  Value ptrHi64 = LLVM::LShrOp::create(builder, loc, ptrI64, shift32);
+  Value ptrHi = LLVM::TruncOp::create(builder, loc, i32Ty, ptrHi64);
 
   Value negOne = LLVM::ConstantOp::create(builder, loc, i32Ty,
                                           builder.getI32IntegerAttr(-1));

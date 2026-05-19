@@ -66,7 +66,8 @@ class IxdlBackend(BaseBackend):
             "canonicalize",
             (
                 "gpu.module(convert-scf-to-cf,cse,"
-                "convert-gpu-to-ixdl{index-bitwidth=0 use-bare-ptr-memref-call-conv=true})"
+                "convert-gpu-to-ixdl{index-bitwidth=0 use-bare-ptr-memref-call-conv=true},"
+                "convert-math-to-llvm)"
             ),
             "convert-scf-to-cf",
             "convert-cf-to-llvm",
@@ -85,7 +86,8 @@ class IxdlBackend(BaseBackend):
 
     def gpu_module_targets(self) -> List[str]:
         chip = self.target.arch
-        return [f'#ixdl.target<chip = "{chip}">']
+        libdevice = "/home/caokefan/sw_home/local/corex/nvvm/libdevice/libdevice.compute_bi.10.bc"
+        return [f'#ixdl.target<chip = "{chip}", link = ["{libdevice}"]>']
 
     # -- cache / fingerprint ---------------------------------------------
 

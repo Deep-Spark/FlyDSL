@@ -325,6 +325,48 @@ def SMELayout16x512b(elem_type, transpose=False, target_shape=None):
     return make_composed_layout(swizzle, offset, outer)
 
 
+def SMELayout16x512b_T(elem_type):
+    """Transposed col_xfb8 SME layout: ``(cols, rows)`` instead of ``(rows, cols)``.
+
+    For bf16 this yields atom shape ``(32, 16)`` — i.e. ``(d, sk)`` coordinates —
+    so that V data loaded via ``col_xfb8`` SMECopy can be read directly as a
+    B-operand ``B[N=d, K=sk]`` for PV MMAD without any operand swap or
+    epilogue transpose.
+
+    Constructed by swapping the two rank sublayouts of the ``col_xfb8``
+    bit-level atom layout before ``recast_layout``.
+    """
+    from .primitive import (
+        make_composed_layout,
+        make_int_tuple,
+        make_layout,
+        recast_layout,
+        static,
+    )
+
+    ty = _ir(elem_type)
+    elem_bits = int(getattr(ty, "width", 0))
+    if elem_bits <= 0 or 512 % elem_bits != 0:
+        raise ValueError(
+            f"SMELayout16x512b_T: unsupported element width {elem_bits}")
+
+    from .primitive import tile_to_shape
+
+    atom_cols = 512 // elem_bits  # 32 for bf16
+    atom_rows = 16
+
+    swizzle = static(SwizzleType.get(2, 3, 4))
+    offset = make_int_tuple(0)
+    outer_bits_T = make_layout(((32, 4, 4), (4, 4)),
+                               ((1, 512, 128), (32, 2048)))
+    outer = tile_to_shape(
+        recast_layout(outer_bits_T, 1, elem_bits),
+        make_int_tuple((atom_cols, atom_rows)),
+        make_int_tuple((0, 1)),
+    )
+    return make_composed_layout(swizzle, offset, outer)
+
+
 def SMEView16x512b(base_ptr, elem_type, transpose=False, elem_offset=0,
                    target_shape=None):
     """Create a swizzled shared-memory view for a 16x512b SME tile.
@@ -358,6 +400,7 @@ __all__ = [
     "sl_waitcnt",
     "sched_barrier",
     "SMELayout16x512b",
+    "SMELayout16x512b_T",
     "SMEView16x512b",
     "SME_MAJOR_MN",
     "SME_MAJOR_K",
