@@ -54,6 +54,14 @@ unsigned mapAttrToLLVMAddressSpace(Attribute attr) {
   return 0; // default to generic address space
 }
 
+bool compatibleCopyElemTypes(Type srcElemTy, Type dstElemTy) {
+  if (srcElemTy == dstElemTy)
+    return true;
+  if (!srcElemTy.isIntOrFloat() || !dstElemTy.isIntOrFloat())
+    return false;
+  return srcElemTy.getIntOrFloatBitWidth() == dstElemTy.getIntOrFloatBitWidth();
+}
+
 class MakePtrOpLowering : public OpConversionPattern<MakePtrOp> {
 public:
   MakePtrOpLowering(const TypeConverter &typeConverter, MLIRContext *context)
@@ -460,7 +468,7 @@ public:
 
     if (!srcMemTy || !dstMemTy)
       return rewriter.notifyMatchFailure(op, "expected MemRef types on original op");
-    if (srcMemTy.getElemTy() != dstMemTy.getElemTy())
+    if (!compatibleCopyElemTypes(srcMemTy.getElemTy(), dstMemTy.getElemTy()))
       return rewriter.notifyMatchFailure(op, "src/dst element types mismatch");
 
     Location loc = op.getLoc();
@@ -699,6 +707,32 @@ public:
   }
 };
 
+class FlyIXDLCpAsyncCommitGroupLowering
+    : public OpConversionPattern<fly_ixdl::CpAsyncCommitGroupOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(fly_ixdl::CpAsyncCommitGroupOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    IXDL::CpAsyncCommitGroupOp::create(rewriter, op.getLoc());
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class FlyIXDLCpAsyncWaitGroupLowering
+    : public OpConversionPattern<fly_ixdl::CpAsyncWaitGroupOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(fly_ixdl::CpAsyncWaitGroupOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    IXDL::CpAsyncWaitGroupOp::create(rewriter, op.getLoc(), op.getN());
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 class FlyToIXDLConversionPass
     : public mlir::impl::FlyToIXDLConversionPassBase<FlyToIXDLConversionPass> {
 public:
@@ -760,6 +794,8 @@ public:
     patterns.add<AtomSetValueOpLowering>(typeConverter, context);
     patterns.add<CopyAtomCallLowering, MmaAtomCallLowering>(typeConverter, context);
     patterns.add<CopyAtomCallSSALowering, MmaAtomCallSSALowering>(typeConverter, context);
+    patterns.add<FlyIXDLCpAsyncCommitGroupLowering, FlyIXDLCpAsyncWaitGroupLowering>(
+        typeConverter, context);
     patterns.add<GpuLaunchFuncOpLowering>(typeConverter, context);
 
     // TODO: deprecated in the future

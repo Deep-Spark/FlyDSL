@@ -5,5 +5,6 @@
 #define PYTHON_BINDINGS_FLYIXDL_OPS
 
 include "flydsl/Dialect/FlyIXDL/IR/Dialect.td"
+include "flydsl/Dialect/FlyIXDL/IR/Ops.td"
 
 #endif // PYTHON_BINDINGS_FLYIXDL_OPS

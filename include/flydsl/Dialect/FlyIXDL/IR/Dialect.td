@@ -4,7 +4,10 @@
 #ifndef FLYIXDL_DIALECT
 #define FLYIXDL_DIALECT
 
+include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/OpBase.td"
+
+include "flydsl/Dialect/Fly/IR/FlyInterfaces.td"
 
 def FlyIXDL_Dialect : Dialect {
   let name = "fly_ixdl";
@@ -13,6 +16,51 @@ def FlyIXDL_Dialect : Dialect {
   let dependentDialects = [
     "IXDL::IXDLDialect"
   ];
+
+  let useDefaultTypePrinterParser = 1;
+}
+
+class FlyIXDL_Op<string mnemonic, list<Trait> traits = []>
+    : Op<FlyIXDL_Dialect, mnemonic, traits> {
+  let assemblyFormat = "`(` operands `)` attr-dict `:` functional-type(operands, results)";
+}
+
+class FlyIXDL_MmaOp<string typeName, string typeMnemonic, list<Trait> traits = []>
+    : TypeDef<FlyIXDL_Dialect, typeName, !listconcat(traits, [
+        DeclareTypeInterfaceMethods<Fly_MayStaticTypeInterface>,
+        DeclareTypeInterfaceMethods<Fly_MmaOpTypeInterface>
+      ])> {
+  let mnemonic = typeMnemonic;
+}
+
+class FlyIXDL_CopyOp<string typeName, string typeMnemonic, list<Trait> traits = []>
+    : TypeDef<FlyIXDL_Dialect, typeName, !listconcat(traits, [
+        DeclareTypeInterfaceMethods<Fly_MayStaticTypeInterface>,
+        DeclareTypeInterfaceMethods<Fly_CopyOpTypeInterface>
+      ])> {
+  let mnemonic = typeMnemonic;
+}
+
+class FlyIXDL_StatefulCopyOp<string typeName, string typeMnemonic, list<Trait> traits = []>
+    : TypeDef<FlyIXDL_Dialect, typeName, !listconcat(traits, [
+        DeclareTypeInterfaceMethods<Fly_CopyOpTypeInterface>,
+        DeclareTypeInterfaceMethods<Fly_StatefulOpTypeInterface>
+      ])> {
+  let mnemonic = typeMnemonic;
+  let extraClassDeclaration = [{
+    static std::optional<unsigned> getFieldIndex(AtomStateField field);
+  }];
+}
+
+class FlyIXDL_StatefulMmaOp<string typeName, string typeMnemonic, list<Trait> traits = []>
+    : TypeDef<FlyIXDL_Dialect, typeName, !listconcat(traits, [
+        DeclareTypeInterfaceMethods<Fly_MmaOpTypeInterface>,
+        DeclareTypeInterfaceMethods<Fly_StatefulOpTypeInterface>
+      ])> {
+  let mnemonic = typeMnemonic;
+  let extraClassDeclaration = [{
+    static std::optional<unsigned> getFieldIndex(AtomStateField field);
+  }];
 }
 
 #endif // FLYIXDL_DIALECT

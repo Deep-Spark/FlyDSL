@@ -18,6 +18,7 @@ _LAZY_MODULES = {
     "buffer_ops": ".buffer_ops",
     "rocdl": ".rocdl",
     "tdm_ops": ".rocdl.tdm_ops",
+    "iluvatar": ".iluvatar",
 }
 
 
