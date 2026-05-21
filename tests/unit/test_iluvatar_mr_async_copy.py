@@ -30,14 +30,31 @@ SENTINEL = 37
 SUBTILE_CASES = {
     "three_tiles": ((0, 0), (32, 32), (96, 64)),
 }
-MAX_TILES = max(len(coords) for coords in SUBTILE_CASES.values())
 
 _PENDING_SWIZZLE = "placeholder: enable after shared-memory swizzle path is implemented"
 
 ATOM_CASES = [
     pytest.param(
-        {"elem_bits": 8, "tile_n": 64, "copy_op_ctor": "AsyncCopy16x64B8Row"},
-        id="b8_row",
+        {
+            "elem_bits": 8,
+            "tile_m": 4,
+            "tile_n": 64,
+            "copy_op_ctor": "AsyncCopy4x64B8Row",
+            "smem_read_mode": "mr4x64_b8_row_perm",
+            "subtile_cases": {"three_tiles_b8_row": ((0, 0), (32, 64), (96, 0))},
+        },
+        id="b8_row_4x64",
+    ),
+    pytest.param(
+        {
+            "elem_bits": 8,
+            "tile_m": 16,
+            "tile_n": 64,
+            "copy_op_ctor": "AsyncCopy16x64B8Row",
+            "smem_read_mode": "rowxfb8_mod",
+            "subtile_cases": {"three_tiles_b8_row": ((0, 0), (32, 64), (96, 0))},
+        },
+        id="b8_row_16x64",
         marks=pytest.mark.skip(reason=_PENDING_SWIZZLE),
     ),
     pytest.param(
@@ -96,11 +113,11 @@ def _require_torch():
     return torch
 
 
-def _build_expected(a, tile_coords, out_rows, tile_n):
+def _build_expected(a, tile_coords, out_rows, tile_m, tile_n):
     expected = a.new_full((out_rows, tile_n), fill_value=SENTINEL)
     for tile_idx, (tile_row, tile_col) in enumerate(tile_coords):
-        dst_row = tile_idx * TILE_M
-        expected[dst_row : dst_row + TILE_M, :] = a[tile_row : tile_row + TILE_M, tile_col : tile_col + tile_n]
+        dst_row = tile_idx * tile_m
+        expected[dst_row : dst_row + tile_m, :] = a[tile_row : tile_row + tile_m, tile_col : tile_col + tile_n]
     return expected
 
 
@@ -137,14 +154,18 @@ def test_iluvatar_mr_async_copy_subtile_gather(monkeypatch, atom_case):
     flyc, fx, ix = _require_imports()
     torch = _require_torch()
     elem_bits = atom_case["elem_bits"]
+    tile_m = atom_case.get("tile_m", TILE_M)
     tile_n = atom_case["tile_n"]
     elem_bytes = elem_bits // 8
-    tile_bits = TILE_M * tile_n * elem_bits
-    smem_bytes = TILE_M * tile_n * elem_bytes
-    tile_elems = TILE_M * tile_n
+    tile_bits = tile_m * tile_n * elem_bits
+    smem_bytes = tile_m * tile_n * elem_bytes
+    tile_elems = tile_m * tile_n
     assert tile_elems % 64 == 0
     elems_per_lane = tile_elems // 64
     copy_op = getattr(ix, atom_case["copy_op_ctor"])
+    smem_read_mode = atom_case.get("smem_read_mode", "linear")
+    subtile_cases = atom_case.get("subtile_cases", SUBTILE_CASES)
+    max_tiles = max(len(coords) for coords in subtile_cases.values())
     torch_dtype = _torch_dtype_for_bits(torch, elem_bits)
     fx_elem_type = _fx_elem_type_for_bits(fx, elem_bits)
 
@@ -164,8 +185,8 @@ def test_iluvatar_mr_async_copy_subtile_gather(monkeypatch, atom_case):
         src_pitch_bytes: fx.Int32,
     ):
         tid = fx.thread_idx.x
-        g_src_layout = fx.make_layout((TILE_M, tile_n), (src_pitch_elems, 1))
-        s_layout = fx.make_layout((TILE_M, tile_n), (tile_n, 1))
+        g_src_layout = fx.make_layout((tile_m, tile_n), (src_pitch_elems, 1))
+        s_layout = fx.make_layout((tile_m, tile_n), (tile_n, 1))
         a_base = fx.get_iter(A)
         b_base = fx.get_iter(B)
         s_base = fx.get_dyn_shared(fx_elem_type)
@@ -180,12 +201,35 @@ def test_iluvatar_mr_async_copy_subtile_gather(monkeypatch, atom_case):
         ix.cp_async_commit_group()
         ix.cp_async_wait_group(0)
 
-        lane_base = tid * elems_per_lane
-        for i in fx.range_constexpr(elems_per_lane):
-            elem_idx = lane_base + i
-            src_ptr = fx.add_offset(s_base, fx.make_int_tuple(elem_idx))
-            dst_ptr = fx.add_offset(gB_base, fx.make_int_tuple(elem_idx))
-            fx.ptr_store(fx.ptr_load(src_ptr), dst_ptr)
+        smem_base_addr = fx.ptrtoint(s_base)
+        if smem_read_mode == "linear":
+            lane_base = tid * elems_per_lane
+            for i in fx.range_constexpr(elems_per_lane):
+                elem_idx = lane_base + i
+                src_ptr = fx.add_offset(s_base, fx.make_int_tuple(elem_idx))
+                dst_ptr = fx.add_offset(gB_base, fx.make_int_tuple(elem_idx))
+                fx.ptr_store(fx.ptr_load(src_ptr), dst_ptr)
+        elif tid == 0:
+            for elem_idx in fx.range_constexpr(tile_elems):
+                smem_elem_idx = elem_idx
+                if smem_read_mode == "mr4x64_b8_row_perm":
+                    # For 4x64.b8.row, shared layout is column-interleaved by 4 rows:
+                    # logical (row, col) maps to physical linear index col * 4 + row.
+                    row = elem_idx // tile_n
+                    col = elem_idx % tile_n
+                    smem_elem_idx = col * tile_m + row
+                elif smem_read_mode == "rowxfb8_mod":
+                    # RowXFB8 follows Swizzle_Mod<2,6,2> in byte-address space:
+                    # low8' = (low8 + ((offset & 0x300) >> 2)) mod 256.
+                    # b8 uses 1 byte/element, so element index equals byte offset.
+                    abs_idx = smem_base_addr + elem_idx
+                    abs_hi = abs_idx >> 8
+                    swizzled_abs_low8 = (abs_idx - ((abs_idx & 0x300) >> 2)) & 0xFF
+                    swizzled_abs_idx = (abs_hi << 8) | swizzled_abs_low8
+                    smem_elem_idx = swizzled_abs_idx - smem_base_addr
+                src_ptr = fx.add_offset(s_base, fx.make_int_tuple(smem_elem_idx))
+                dst_ptr = fx.add_offset(gB_base, fx.make_int_tuple(elem_idx))
+                fx.ptr_store(fx.ptr_load(src_ptr), dst_ptr)
 
     @flyc.jit
     def _launch(
@@ -211,13 +255,13 @@ def test_iluvatar_mr_async_copy_subtile_gather(monkeypatch, atom_case):
     assert src_pitch_bytes % 64 == 0
     stream = torch.cuda.Stream()
 
-    for case_name, tile_coords in SUBTILE_CASES.items():
-        B = torch.full((MAX_TILES * TILE_M, tile_n), fill_value=SENTINEL, dtype=torch_dtype, device="cuda")
+    for case_name, tile_coords in subtile_cases.items():
+        B = torch.full((max_tiles * tile_m, tile_n), fill_value=SENTINEL, dtype=torch_dtype, device="cuda")
         for tile_idx, (tile_row, tile_col) in enumerate(tile_coords):
-            assert tile_row % TILE_M == 0 and tile_col % tile_n == 0
-            assert tile_row + TILE_M <= GMEM_M and tile_col + tile_n <= GMEM_N
+            assert tile_row % tile_m == 0 and tile_col % tile_n == 0
+            assert tile_row + tile_m <= GMEM_M and tile_col + tile_n <= GMEM_N
             src_offset = tile_row * src_pitch_elems + tile_col
-            dst_offset = tile_idx * TILE_M * tile_n
+            dst_offset = tile_idx * tile_m * tile_n
             _launch(
                 A,
                 B,
@@ -230,10 +274,20 @@ def test_iluvatar_mr_async_copy_subtile_gather(monkeypatch, atom_case):
 
         torch.cuda.synchronize()
 
-        expected = _build_expected(A, tile_coords, out_rows=MAX_TILES * TILE_M, tile_n=tile_n)
+        expected = _build_expected(A, tile_coords, out_rows=max_tiles * tile_m, tile_m=tile_m, tile_n=tile_n)
         if not torch.equal(expected, B):
             if expected.is_floating_point():
                 max_abs_diff = (expected.to(torch.float64) - B.to(torch.float64)).abs().max().item()
             else:
                 max_abs_diff = (expected.to(torch.int64) - B.to(torch.int64)).abs().max().item()
-            pytest.fail(f"{case_name} failed: max_abs_diff={max_abs_diff}")
+            exp_head = expected[0, :16].detach().cpu().tolist()
+            got_head = B[0, :16].detach().cpu().tolist()
+            mismatch = (expected != B).nonzero(as_tuple=False)
+            first_mismatch = mismatch[0].detach().cpu().tolist() if mismatch.numel() else None
+            first_exp = expected[first_mismatch[0], first_mismatch[1]].item() if first_mismatch else None
+            first_got = B[first_mismatch[0], first_mismatch[1]].item() if first_mismatch else None
+            pytest.fail(
+                f"{case_name} failed: max_abs_diff={max_abs_diff}, "
+                f"expected_head={exp_head}, got_head={got_head}, "
+                f"first_mismatch={first_mismatch}, first_expected={first_exp}, first_got={first_got}"
+            )
