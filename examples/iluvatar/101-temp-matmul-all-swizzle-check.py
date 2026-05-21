@@ -12,8 +12,8 @@ Approach per case:
   1) Auto-discover logical->physical shared permutation by copying a known tile
      and dumping shared linear order.
   2) Run a CUDA-core-style scalar-FMA matmul kernel (no tensor core op), where
-     A/B are loaded to shared with the target MR async-copy instruction and then
-     read back using the discovered permutation.
+     B is loaded to shared with the target MR async-copy instruction and read
+     back using the discovered permutation (A is read directly from global).
   3) Compare against torch.matmul reference.
 """
 
@@ -273,9 +273,8 @@ def _build_matmul_runner(case: MatmulCase):
     assert out_elems % 64 == 0
     out_per_lane = out_elems // 64
 
-    val_bits_a = a_tile_elems * case.elem_bits
     val_bits_b = b_chunk_elems * case.elem_bits
-    smem_elems = a_tile_elems + num_b_chunks * b_chunk_elems
+    smem_elems = num_b_chunks * b_chunk_elems
     smem_bytes = smem_elems * (case.elem_bits // 8)
     copy_ctor = getattr(ix, case.copy_ctor_name)
     if case.elem_bits == 8:
@@ -290,28 +289,19 @@ def _build_matmul_runner(case: MatmulCase):
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
-        PermA: fx.Tensor,
         PermBAll: fx.Tensor,
         pitch_a_elems: fx.Int32,
         pitch_b_elems: fx.Int32,
-        pitch_a_bytes: fx.Int32,
         pitch_b_bytes: fx.Int32,
     ):
         tid = fx.thread_idx.x
 
         s_base = fx.get_dyn_shared(case.fx_dtype)
-        sA_ptr = s_base
-        sB_ptr = fx.add_offset(s_base, fx.make_int_tuple(a_tile_elems))
-
-        a_layout = fx.make_layout((tile_m, tile_k), (pitch_a_elems, 1))
-        sA_layout = fx.make_layout((tile_m, tile_k), (tile_k, 1))
+        sB_ptr = s_base
         b_layout = fx.make_layout((tile_m, tile_n), (pitch_b_elems, 1))
         sB_layout = fx.make_layout((tile_m, tile_n), (tile_n, 1))
 
-        gA = fx.make_view(fx.get_iter(A), a_layout)
-        sA = fx.make_view(sA_ptr, sA_layout)
-        atomA = fx.make_copy_atom(copy_ctor(), val_bits_a).set_value("stride_byte", pitch_a_bytes)
-        fx.copy(atomA, gA, sA)
+        gA_base = fx.get_iter(A)
 
         atomB = fx.make_copy_atom(copy_ctor(), val_bits_b).set_value("stride_byte", pitch_b_bytes)
         b_base = fx.get_iter(B)
@@ -327,7 +317,6 @@ def _build_matmul_runner(case: MatmulCase):
         ix.cp_async_commit_group()
         ix.cp_async_wait_group(0)
 
-        permA_base = fx.get_iter(PermA)
         permB_base = fx.get_iter(PermBAll)
         c_base = fx.get_iter(C)
 
@@ -339,10 +328,8 @@ def _build_matmul_runner(case: MatmulCase):
 
             acc = fx.Float32(0.0)
             for k in fx.range_constexpr(tile_k):
-                a_logical = row * tile_k + k
-                a_perm_ptr = fx.add_offset(permA_base, fx.make_int_tuple(a_logical))
-                a_phys = fx.ptr_load(a_perm_ptr)
-                a_ptr = fx.add_offset(sA_ptr, fx.make_int_tuple(a_phys))
+                a_g_idx = row * pitch_a_elems + k
+                a_ptr = fx.add_offset(gA_base, fx.make_int_tuple(a_g_idx))
 
                 b_chunk = k // tile_m
                 b_row = k % tile_m
@@ -365,11 +352,9 @@ def _build_matmul_runner(case: MatmulCase):
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
-        PermA: fx.Tensor,
         PermBAll: fx.Tensor,
         pitch_a_elems: fx.Int32,
         pitch_b_elems: fx.Int32,
-        pitch_a_bytes: fx.Int32,
         pitch_b_bytes: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -377,11 +362,9 @@ def _build_matmul_runner(case: MatmulCase):
             A,
             B,
             C,
-            PermA,
             PermBAll,
             pitch_a_elems,
             pitch_b_elems,
-            pitch_a_bytes,
             pitch_b_bytes,
         ).launch(grid=(1, 1, 1), block=(64, 1, 1), smem=smem_bytes, stream=stream)
 
@@ -408,12 +391,11 @@ def _run_case(case: MatmulCase) -> bool:
         a_tile_elems = case.tile_m * case.tile_k
         b_chunk_elems = case.tile_m * case.tile_n
         num_b_chunks = case.tile_k // case.tile_m
-        smem_total_elems = a_tile_elems + num_b_chunks * b_chunk_elems
+        smem_total_elems = num_b_chunks * b_chunk_elems
 
-        perm_a = _discover_perm(case, smem_offset_elems=0, smem_total_elems=smem_total_elems)
         perm_b_chunks = []
         for chunk in range(num_b_chunks):
-            b_off = a_tile_elems + chunk * b_chunk_elems
+            b_off = chunk * b_chunk_elems
             perm_b_chunks.append(_discover_perm(case, smem_offset_elems=b_off, smem_total_elems=smem_total_elems))
         perm_b_all = torch.stack(perm_b_chunks, dim=0).reshape(-1).contiguous()
 
@@ -431,11 +413,9 @@ def _run_case(case: MatmulCase) -> bool:
             A,
             B,
             C,
-            perm_a,
             perm_b_all,
             pitch_a_elems,
             pitch_b_elems,
-            pitch_a_bytes,
             pitch_b_bytes,
             stream=stream,
         )

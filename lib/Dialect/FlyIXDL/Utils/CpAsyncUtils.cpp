@@ -147,8 +147,7 @@ LogicalResult fly_ixdl::emitCpAsyncByKind(OpBuilder &builder, Location loc, MRCp
     IXDL::CpAsync_4x64_b8_ColOp::create(builder, loc, sOffset, gBase, gOffset, kop);
     return success();
   case MRCpAsyncKind::k16x64_b8_Row:
-    // Use the non-swizzled 16x1b64 path (b32-shaped form) for linear G2S copy.
-    IXDL::CpAsync_16x16_b32_RowOp::create(builder, loc, sOffset, gBase, gOffset, kop);
+    IXDL::CpAsync_16x64_b8_RowOp::create(builder, loc, sOffset, gBase, gOffset, kop);
     return success();
   case MRCpAsyncKind::k16x64_b8_Col:
     IXDL::CpAsync_16x64_b8_ColOp::create(builder, loc, sOffset, gBase, gOffset, kop);
