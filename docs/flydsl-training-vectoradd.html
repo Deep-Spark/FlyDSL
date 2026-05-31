@@ -1,0 +1,1111 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlyDSL 内部 Training：从 vectorAdd 理解 Layout、CopyAtom 与 SSA Pass</title>
+<style>
+  :root {
+    --bg: #f8f9fc;
+    --surface: #ffffff;
+    --surface2: #f0f2f7;
+    --border: #dde1ea;
+    --text: #1a1d2e;
+    --text2: #5a6078;
+    --accent: #3b6bff;
+    --accent2: #3b6bff;
+    --green: #1a8a5c;
+    --orange: #c47200;
+    --red: #d03030;
+    --purple: #7c3aed;
+    --cyan: #0e7e8a;
+    --code-bg: #f3f4f8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 2rem; margin-bottom: 2.5rem;
+  }
+  .toc h3 { margin-top: 0; color: var(--accent); }
+  .toc ol { margin-left: 1.2rem; }
+  .toc li { margin-bottom: 0.3rem; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  h1 {
+    font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text2); font-size: 1rem; margin-bottom: 2.5rem; }
+
+  h2 {
+    font-size: 1.5rem; font-weight: 700; margin-top: 3rem; margin-bottom: 1rem;
+    padding-bottom: 0.5rem; border-bottom: 2px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.15rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem;
+    color: var(--green);
+  }
+  h4 {
+    font-size: 1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem;
+    color: var(--orange);
+  }
+
+  p { margin-bottom: 1rem; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+
+  code {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px; font-size: 0.9em;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    color: #0e7e8a;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+    overflow-x: auto; font-size: 0.88rem; line-height: 1.6;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  pre code { background: none; border: none; padding: 0; color: var(--text); }
+
+  .highlight { color: var(--orange); font-weight: 600; }
+  .note {
+    background: var(--surface); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .note-title { font-weight: 700; color: var(--accent); margin-bottom: 0.3rem; }
+  .warn {
+    background: rgba(240,164,93,0.08); border-left: 4px solid var(--orange);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .warn-title { font-weight: 700; color: var(--orange); margin-bottom: 0.3rem; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 0.6rem 0.8rem; text-align: left;
+  }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--surface); }
+
+  .flow-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1.25rem; margin: 1rem 0 1.5rem;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.88rem;
+    line-height: 1.8; white-space: pre; overflow-x: auto;
+  }
+  .flow-box .arrow { color: var(--accent); }
+  .flow-box .label { color: var(--green); }
+  .flow-box .comment { color: var(--text2); }
+
+  .conv-card {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 1.75rem; margin: 2rem 0;
+  }
+  .conv-card-title {
+    font-size: 1.2rem; font-weight: 700; color: var(--accent);
+    margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem;
+  }
+  .conv-card-title .conv-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 2rem; height: 2rem; border-radius: 50%; font-weight: 700;
+    font-size: 0.9rem; color: #fff; background: var(--accent); flex-shrink: 0;
+  }
+  .conv-card .conv-op {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;
+    color: var(--cyan); margin-bottom: 0.75rem;
+  }
+  .conv-card p { margin-bottom: 0.75rem; }
+  .conv-card ul { margin: 0.3rem 0 0.75rem 1.2rem; }
+  .conv-card li { margin-bottom: 0.3rem; }
+
+  .ir-before-after {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;
+    margin: 1rem 0 1.5rem;
+  }
+  .ir-box {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; overflow-x: auto;
+  }
+  .ir-box-title {
+    font-weight: 700; font-size: 0.85rem; margin-bottom: 0.5rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .ir-box-title.before { color: var(--red); }
+  .ir-box-title.after { color: var(--green); }
+  .ir-box pre {
+    margin: 0; padding: 0; border: none; background: none;
+    font-size: 0.82rem; line-height: 1.6;
+  }
+  .ir-box pre code { color: var(--text); }
+
+  @media (max-width: 720px) {
+    .ir-before-after { grid-template-columns: 1fr; }
+  }
+
+</style>
+
+
+<div class="container">
+
+<h1>FlyDSL 内部 Training</h1>
+<p class="subtitle">从 vectorAdd 理解 Layout、CopyAtom 与 SSA Pass</p>
+
+<div class="toc">
+<h3>目录</h3>
+<ol>
+  <li><a href="#s1">代码中 Layout 操作的含义</a></li>
+  <li><a href="#s2">什么是 Atom ---- 深入理解 CopyAtom</a></li>
+  <li><a href="#s3">CopyOpUniversalCopy 与 CopyAtom 的配合使用</a></li>
+  <li><a href="#s4">CopyOpUniversalCopyType 接口方法逐行详解</a></li>
+  <li><a href="#s5">SSA 相关 Pass 的具体作用（通过 IR 对比讲解）</a></li>
+  <li><a href="#s6">Iluvatar 架构下的数据类型与 Layout 优化</a></li>
+</ol>
+</div>
+
+<!-- ===================== Section 1 ===================== -->
+<h2 id="s1">1. 代码中 Layout 操作的含义</h2>
+
+<h3>1.1 示例代码回顾</h3>
+
+<p><code>01-vectorAdd.py</code> kernel 主体（与仓库示例一致）：</p>
+
+<pre><code>ta = fx.logical_divide(a, fx.make_layout(block_dim, 1))   # (1)
+tc = fx.logical_divide(c, fx.make_layout(block_dim, 1))
+
+ta = fx.slice(ta, (None, bid))                             # (2)
+tc = fx.slice(tc, (None, bid))
+
+ta = fx.logical_divide(ta, fx.make_layout(1, 1))           # (3)
+tc = fx.logical_divide(tc, fx.make_layout(1, 1))
+
+reg_ty = fx.MemRefType.get(fx.T.f32(), fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+
+ra = fx.memref_alloca(reg_ty, fx.make_layout(1, 1))        # (4)
+rc = fx.memref_alloca(reg_ty, fx.make_layout(1, 1))
+
+fx.copy_atom_call(copy_atom, fx.slice(ta, (None, tid)), ra) # (5) load
+
+vc = fx.arith.addf(fx.memref_load_vec(ra), fx.memref_load_vec(ra))
+fx.memref_store_vec(vc, rc)
+
+fx.copy_atom_call(copy_atom, rc, fx.slice(tc, (None, tid))) # store</code></pre>
+
+<p>下文 Sec.1.3-Sec.1.6 重点讲解 (1)-(3) 的 Layout 映射；CopyAtom 与 SSA 见 Sec.2-Sec.5。</p>
+
+<h3>1.2 Layout 的核心概念：Shape + Stride</h3>
+
+<p>在 FlyDSL 中，<strong>Layout = (Shape, Stride)</strong>，它描述了逻辑坐标到物理内存偏移的映射关系：</p>
+
+<pre><code>Index = Sum(coord_i x stride_i)</code></pre>
+
+<p>例如 <code>make_layout(64, 1)</code> 表示：</p>
+<ul>
+  <li>Shape = 64，即有 64 个元素</li>
+  <li>Stride = 1，即相邻逻辑坐标在内存中偏移 1 个元素</li>
+</ul>
+<p>这对应一个连续的一维数组访问模式。</p>
+
+<h3>1.3 <code>logical_divide</code>：用 Layout 切分 Tensor</h3>
+
+<p><strong><code>logical_divide(tensor, divisor_layout)</code></strong> 是 FlyDSL 中最核心的 tiling 操作之一。</p>
+
+<p>其语义是：将一个 tensor 按 divisor_layout 进行分块，产生分层 layout。<code>layoutLogicalDivide</code> 将 <strong>divisor 放在第 0 维、complement 放在第 1 维</strong>（见 <code>LayoutUtils.h</code>）。</p>
+
+<p><strong>在 vectorAdd 中的含义：</strong></p>
+
+<pre><code># (1) logical_divide(a, make_layout(block_dim=64, stride=1))</code></pre>
+
+<p>假设全局 tensor <code>a</code> 的大小为 N，用 layout <code>(64, 1)</code> 做 logical_divide：</p>
+<ul>
+  <li>结果 layout 的 shape 变为 <code>(64, N/64)</code>，stride 变为 <code>(1, 64)</code></li>
+  <li><strong>第 0 维 (64)</strong>：每个 block 内的元素索引</li>
+  <li><strong>第 1 维 (N/64)</strong>：block 索引（即 <code>bid</code> 切片所用维度）</li>
+</ul>
+<p>这实际上是在说：<strong>把一维数组按 64 个元素一组切分，每组由一个 GPU block 处理</strong>。</p>
+
+<div class="note" id="note-logical-divide-shape">
+  <div class="note-title">读者注意：shape 维度顺序</div>
+  <p>直觉上常把 block 索引写成 shape 的<strong>第 0 维</strong>、块内 64 元素写成<strong>第 1 维</strong>，即 <code>(N/64, 64):(64, 1)</code>----这与 FlyDSL 实现不一致，也与 Sec.1.4 中 <code>slice(ta, (None, bid))</code> 的用法矛盾（<code>None</code> 保留第 0 维、<code>bid</code> 切第 1 维，说明第 0 维才是块内元素）。</p>
+  <p><code>layoutLogicalDivide</code>（<code>include/flydsl/Dialect/Fly/Utils/LayoutUtils.h</code>）构造结果 layout 时<strong>先 push divisor、再 push complement</strong>，因此 divisor 总是落在第 0 维：</p>
+<pre><code>rhsShapeElems.push_back(builder.getShape(divisorLayout));   // 第 0 维
+rhsShapeElems.push_back(builder.getShape(complement));       // 第 1 维
+rhsStrideElems.push_back(builder.getStride(divisorLayout));
+rhsStrideElems.push_back(builder.getStride(complement));</code></pre>
+  <p>对全局 layout <code>N:1</code> 除以 divisor <code>64:1</code>，complement 的 shape 为 <code>N/64</code>、stride 为 <code>64</code>，故正确结果为 <code>(64, N/64):(1, 64)</code>：</p>
+  <ul>
+    <li><strong>第 0 维</strong>：size=64, stride=1 -- 块内元素（<code>slice(..., (None, bid))</code> 中 <code>None</code> 保留的这一维）</li>
+    <li><strong>第 1 维</strong>：size=N/64, stride=64 -- block 索引（<code>bid</code> 切片所用维度）</li>
+  </ul>
+  <p>Sec.1.6 流程图中的 <code>(64, N/64):(1, 64)</code> 与上述约定一致；阅读 IR 或手写 layout 时请按<strong>实现顺序</strong>（divisor 在前）理解，而非按「外层 block、内层 tile」的口头习惯。</p>
+</div>
+
+<h3>1.4 <code>slice</code>：按坐标切片</h3>
+
+<p><strong><code>slice(tensor, coord)</code></strong> 在指定维度上选取一个坐标值，将那个维度"消除"。</p>
+
+<pre><code># (2) slice(ta, (None, bid))</code></pre>
+
+<ul>
+  <li><code>None</code> 表示保留第 0 维（块内维度，size=64）</li>
+  <li><code>bid</code> 表示在第 1 维（block 索引，size=N/64）选取当前 block</li>
+</ul>
+
+<p>切片后，<code>ta</code> 从 <code>(64, N/64)</code> 变为 <code>(64,)</code>，即当前 block 负责的那 64 个元素。坐标含义与 <a href="#note-logical-divide-shape">Sec.1.3 维度顺序说明</a> 一致。</p>
+
+<h3>1.5 第二次 <code>logical_divide</code>：为 thread 切分</h3>
+
+<pre><code># (3) logical_divide(ta, make_layout(1, 1))</code></pre>
+
+<p>这里 divisor 是 <code>(1, 1)</code>，即每个"块"只有 1 个元素。这实际上是在为后续按 thread 索引切片做准备----将每个元素独立出来，使得可以用 <code>slice(ta, (None, tid))</code> 取出当前 thread 负责的那一个元素。</p>
+
+<h3>1.6 Layout 操作的整体流程图</h3>
+
+<div class="flow-box"><span class="label">全局 Tensor a</span> (shape=N)
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">logical_divide(a, (64, 1))</span>
+<span class="label">Tensor with layout</span> (64, N/64):(1, 64)
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">slice(..., (None, bid))</span>
+<span class="label">当前 Block 的 Tensor</span> (shape=64)
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">logical_divide(..., (1, 1))</span>
+<span class="label">Tensor with layout</span> (64, 1):(1, 1)
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">slice(..., (None, tid))</span>
+<span class="label">当前 Thread 的 Tensor</span> (shape=1)  <- 单个 f32 元素</div>
+
+<div class="note">
+  <div class="note-title">核心思想</div>
+  通过 <code>logical_divide</code> + <code>slice</code> 的组合，FlyDSL 用 Layout 代数精确描述了"全局数据 -> Block -> Thread"的层次化映射关系，而非依赖手动的 index 计算。
+</div>
+
+<!-- ===================== Section 2 ===================== -->
+<h2 id="s2">2. 什么是 Atom ---- 深入理解 CopyAtom</h2>
+
+<h3>2.1 Atom 的概念</h3>
+
+<p>在 FlyDSL 中，<strong>Atom</strong> 是对硬件基本操作单元的抽象。它回答了一个核心问题：</p>
+
+<div class="note">
+  <div class="note-title">核心问题</div>
+  "一次原子操作中，哪些 thread 参与了操作，每个 thread 操作了哪些数据？"
+</div>
+
+<p>FlyDSL 中有两种 Atom：</p>
+<ul>
+  <li><strong>CopyAtom</strong>：描述数据搬运（load/store）的原子操作</li>
+  <li><strong>MmaAtom</strong>：描述矩阵乘法（MMA）的原子操作</li>
+</ul>
+
+<h3>2.2 CopyAtom 的定义</h3>
+
+<p>从 <code>FlyTypeDefs.td</code> 中可以看到 CopyAtom 的核心接口：</p>
+
+<pre><code>CopyAtomType {
+  copyOp    : Type       // 底层 CopyOp 类型
+  valBits   : int32_t    // 每个值的位宽
+
+  // 关键属性
+  getThrLayout()       -&gt; Attribute   // Thread 布局：哪些 thread 参与
+  getThrValLayoutSrc() -&gt; Attribute   // Thread-Value 布局（源端）
+  getThrValLayoutDst() -&gt; Attribute   // Thread-Value 布局（目标端）
+  getThrValLayoutRef() -&gt; Attribute   // Thread-Value 布局（参考端）
+
+  // 关键方法
+  emitAtomCall(...)     -&gt; LogicalResult     // 发出 MemRef 形式的拷贝 IR
+  emitAtomCallSSA(...)  -&gt; FailureOr&lt;Value&gt;  // 发出 SSA 形式的拷贝 IR
+}</code></pre>
+
+<h3>2.3 Thread-Value (TV) Layout 详解</h3>
+
+<p><strong>TV Layout</strong> 是 CopyAtom 最核心的概念，它用 <code>(Thr, Val)</code> 二元组描述：</p>
+<ul>
+  <li><strong>Thr 维度</strong>：哪些 thread 参与这次原子操作</li>
+  <li><strong>Val 维度</strong>：每个 thread 操作了哪些数据值</li>
+</ul>
+
+<p>对于 <code>UniversalCopy32b</code> + <code>Float32</code>，其 TV Layout 为：</p>
+
+<pre><code>ThrLayout       = (1):(1)              // 1 个 thread
+ThrValLayoutSrc = ((1, 1):(1, 1))       // 1 个 thread，1 个 f32 值
+ThrValLayoutDst = ((1, 1):(1, 1))       // 同上</code></pre>
+
+<p>这意味着：<strong>每个 thread 独立搬运 32 bit（即一个 f32）的数据</strong>，没有跨 thread 协作。</p>
+
+<h3>2.4 <code>make_copy_atom</code> 的过程</h3>
+
+<div class="conv-card" id="card-make-copy-atom">
+  <div class="conv-card-title">
+    <span class="conv-num">Op</span>
+    fly.make_copy_atom
+  </div>
+  <div class="conv-op">fx.UniversalCopy32b() + fx.Float32 -> fly.make_copy_atom</div>
+
+  <p><code>fx.make_copy_atom(copy_op, elem_type)</code> 构造一个 CopyAtom----数据搬运的最小执行单元描述符.CopyOp 类型(<code>!fly.universal_copy&lt;32&gt;</code>) 由第一个参数 <code>fx.UniversalCopy32b()</code> 事先构造,<strong>并非</strong> <code>make_copy_atom</code> 创建.</p>
+
+  <h4>MakeCopyAtomOp 定义</h4>
+<pre><code>def Fly_MakeCopyAtomOp : Fly_Op&lt;"make_copy_atom", [Pure]&gt; {
+  let arguments = (ins I32Attr:$valBits);
+  let results = (outs Fly_CopyAtom:$result);
+  let assemblyFormat = "attr-dict `:` qualified(type($result))";
+}</code></pre>
+
+  <h4>Python 两个参数 vs Op 一个 attribute</h4>
+  <p>Python 侧 <code>fx.make_copy_atom(copy_op, elem_type)</code> 有两个参数,但 Fly IR 的 <code>fly.make_copy_atom</code> 在 TableGen 里只有 <code>valBits</code> 一个 attribute----<strong>第二个参数和 CopyOp 并没有丢失</strong>,而是拆到不同位置:</p>
+  <table>
+    <tr><th>Python 参数</th><th>Tracing 如何处理</th><th>出现在 Fly IR 哪里</th></tr>
+    <tr>
+      <td><code>copy_op</code>（如 <code>UniversalCopy32b()</code>）</td>
+      <td>传入 <code>CopyAtomType.get(copy_op, valBits)</code></td>
+      <td>编码在 result type 的内嵌 CopyOp 里:<code>!fly.copy_atom&lt;!fly.universal_copy&lt;32&gt;, 32&gt;</code> 中的 <code>!fly.universal_copy&lt;32&gt;</code></td>
+    </tr>
+    <tr>
+      <td><code>elem_type</code>（如 <code>Float32</code>）</td>
+      <td>提取 <code>valBits = 32</code></td>
+      <td>同时写入 result type 的第二个参数 <code>, 32</code> <strong>和</strong> op attribute <code>{valBits = 32 : i32}</code></td>
+    </tr>
+  </table>
+  <p><code>Fly_MakeCopyAtomOp</code> 是 <code>[Pure]</code> 的"类型构造"op:CopyOp 种类由 result 的 <code>!fly.copy_atom&lt;copyOp, valBits&gt;</code> 完全确定,不需要再占一个 operand;attribute 里保留 <code>valBits</code> 是为 assembly/parser 与 verifier 方便.对应 Python 调用:</p>
+<pre><code>copy_atom_ty = CopyAtomType.get(copy_op=copy_op_type, val_bits=val_bits)
+return fly.make_copy_atom(copy_atom_ty, val_bits=val_bits, ...)</code></pre>
+  <p>第一个实参 <code>copy_atom_ty</code> 决定 op 的 result type(含 copyOp);第二个 <code>val_bits</code> 写入 attribute.</p>
+
+  <h4>Tracing 三步</h4>
+  <table>
+    <tr><th>步骤</th><th>位置</th><th>说明</th></tr>
+    <tr>
+      <td>(1)</td>
+      <td><code>python/flydsl/expr/primitive.py</code></td>
+      <td>从 <code>elem_type</code>(<code>Float32</code>) 提取 <code>valBits = 32</code></td>
+    </tr>
+    <tr>
+      <td>(2)</td>
+      <td><code>CopyAtomType.get(copy_op, valBits)</code></td>
+      <td>将 CopyOp 与 valBits 组合为 <code>!fly.copy_atom&lt;!fly.universal_copy&lt;32&gt;, 32&gt;</code></td>
+    </tr>
+    <tr>
+      <td>(3)</td>
+      <td><code>fly.make_copy_atom</code></td>
+      <td>插入 Pure op,产生 CopyAtom SSA 值;语义全部编码在 result type 中</td>
+    </tr>
+  </table>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Python DSL</div>
+      <pre><code>copy_atom = fx.make_copy_atom(
+    fx.UniversalCopy32b(), fx.Float32)</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">Tracing 生成的 Fly IR</div>
+      <pre><code>%atom = fly.make_copy_atom {valBits = 32 : i32}
+  : !fly.copy_atom&lt;
+      !fly.universal_copy&lt;32&gt;, 32&gt;</code></pre>
+    </div>
+  </div>
+
+  <div class="note">
+    <div class="note-title">CopyAtomType 类型参数</div>
+    <p><code>FlyTypeDefs.td</code> 中 <code>CopyAtomType</code> 含 <code>copyOp</code> 与 <code>valBits</code> 两个参数,assembly 为 <code>!fly.copy_atom&lt;copyOp, valBits&gt;</code>.op 的 <code>{valBits = ...}</code> attribute 与类型中的 valBits 一致.</p>
+  </div>
+</div>
+
+<h3>2.5 CopyAtom 的层次结构</h3>
+
+<pre><code>CopyOpTypeInterface (接口)
+  +-- CopyOpUniversalCopy&lt;bitSize&gt;     &lt;- 通用 memcpy 语义
+  +-- CopyOpUniversalAtomic&lt;op, type&gt;  &lt;- 通用原子操作语义
+  +-- (硬件特定实现)
+       +-- CopyOpCDNA3BufferCopy       &lt;- AMD CDNA3 Buffer 拷贝
+       +-- CopyOpCDNA3BufferCopyLDS    &lt;- AMD CDNA3 Buffer-&gt;LDS
+       +-- CopyOpCDNA4LdsReadTranspose &lt;- AMD CDNA4 LDS 读取转置
+
+CopyAtomType = CopyOpType + valBits
+  -&gt; 封装了 thread 布局 + TV 布局 + emit 逻辑</code></pre>
+
+<p><code>01-vectorAdd.py</code> 使用 <code>UniversalCopy32b</code>（无状态、不依赖 ROCDL buffer 指令），经 <code>convert-fly-to-ixdl</code> 落到 Iluvatar/IXDL 路径。上列 CDNA CopyOp 是 ROCDL 后端的硬件特定实现示例。</p>
+
+<!-- ===================== Section 3 ===================== -->
+<h2 id="s3">3. CopyOpUniversalCopy 与 CopyAtom 的配合使用</h2>
+
+<h3>3.1 CopyOpUniversalCopy 的语义</h3>
+
+<p>从 <code>FlyUniversalOps.cpp</code> 中可以看到：</p>
+
+<pre><code>Attribute CopyOpUniversalCopyType::getThrLayout() const {
+    return FxLayout(FxC(1), FxC(1));  // 1 个 thread
+}
+
+Attribute CopyOpUniversalCopyType::getThrBitLayoutSrc() const {
+    return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
+    // shape = (1 thread, bitSize bits), stride = (1, 1)
+}</code></pre>
+
+<p><strong>UniversalCopy 的特点</strong>：</p>
+<ul>
+  <li>每个 thread 独立操作，无跨 thread 协作</li>
+  <li>使用 <code>memcpy</code> 语义搬运数据</li>
+  <li>是最通用的 CopyOp，不依赖任何硬件特定指令</li>
+</ul>
+
+<h3>3.2 从 CopyOp 到 CopyAtom：Layout 的 recast</h3>
+
+<p>CopyAtomType 在构建 TV Layout 时，会将 CopyOp 提供的 <strong>bit-level</strong> layout 通过 <code>layoutRecast</code> 转换为 <strong>value-level</strong> layout：</p>
+
+<pre><code>// CopyAtomType::getThrValLayoutSrc()
+Attribute CopyAtomType::getThrValLayoutSrc() {
+    auto copyOp = cast&lt;CopyOpTypeInterface&gt;(getCopyOp());
+    LayoutBuilder&lt;LayoutAttr&gt; builder(getContext());
+    // 将 bit layout 按 valBits 重新解释
+    return layoutRecast(builder, cast&lt;LayoutAttr&gt;(copyOp.getThrBitLayoutSrc()),
+                        1, getValBits());
+}</code></pre>
+
+<p>对于 <code>UniversalCopy32b</code> + <code>Float32</code>：</p>
+<ul>
+  <li>Bit-level: <code>(1, 32):(1, 1)</code> -> 1 thread, 32 bits</li>
+  <li>Value-level (recast by 32): <code>(1, 1):(1, 1)</code> -> 1 thread, 1 个 f32 值</li>
+</ul>
+
+<h3>3.3 <code>copy_atom_call</code> 的执行流程</h3>
+
+<pre><code>fx.copy_atom_call(copy_atom, fx.slice(ta, (None, tid)), ra)</code></pre>
+
+<p>这行代码的含义是：使用 <code>copy_atom</code> 描述的搬运模式，从 <code>slice(ta, (None, tid))</code>（全局内存中当前 thread 的数据）搬运到 <code>ra</code>（寄存器）。</p>
+
+<p>Tracing 阶段 IR 保留 <code>fly.copy_atom_call</code>；在 <code>convert-fly-to-ixdl</code>（或 ROCDL 后端的 FlyToROCDL）中，由 CopyOp 的 <code>emitAtomCall</code> / <code>emitAtomCallSSA</code> 展开为具体 LLVM IR。对 UniversalCopy 有两条路径：</p>
+
+<table>
+  <tr><th>调用形式</th><th>展开方式</th><th>UniversalCopy 行为</th></tr>
+  <tr>
+    <td><code>copy_atom_call</code>（MemRef operands）</td>
+    <td><code>emitAtomCall</code></td>
+    <td>对 src/dst 指针生成一次 <code>LLVM::MemcpyOp</code>（<code>bitSize/8</code> 字节），<strong>不是</strong>按地址空间拆成单独的 Load + Store</td>
+  </tr>
+  <tr>
+    <td><code>copy_atom_call_ssa</code>（SSA operands）</td>
+    <td><code>emitAtomCallSSA</code></td>
+    <td>源为 MemRef -> <code>LLVM::LoadOp</code>；目标为 MemRef -> <code>LLVM::StoreOp</code>；Register->Register 直传</td>
+  </tr>
+</table>
+
+<h3>3.4 配合使用的完整数据流</h3>
+
+<div class="flow-box"><span class="label">CopyOpUniversalCopy&lt;32&gt;</span>
+    <span class="arrow">|</span>  定义拷贝语义：1 thread 搬运 32 bit
+    <span class="arrow">|</span>  ThrLayout = (1):(1)
+    <span class="arrow">|</span>  ThrBitLayout = ((1, 32):(1, 1))
+    <span class="arrow">v</span>
+<span class="label">CopyAtomType(UniversalCopy&lt;32&gt;, valBits=32)</span>
+    <span class="arrow">|</span>  ThrValLayoutSrc = ((1, 1):(1, 1))  <- recast
+    <span class="arrow">|</span>  ThrValLayoutDst = ((1, 1):(1, 1))  <- recast
+    <span class="arrow">|</span>  emitAtomCall -> MemRef 路径: LLVM::MemcpyOp
+    <span class="arrow">|</span>  emitAtomCallSSA -> SSA 路径: Load / Store / 直传
+    <span class="arrow">v</span>
+<span class="label">copy_atom_call(atom, src_memref, dst_memref)</span>
+    <span class="arrow">|</span>  convert-fly-to-ixdl 时 emitAtomCall -> memcpy</div>
+
+<!-- ===================== Section 4 ===================== -->
+<h2 id="s4">4. CopyOpUniversalCopyType 接口方法逐行详解</h2>
+
+<h3>4.1 接口继承层次</h3>
+
+<pre><code>CopyOpUniversalCopyType
+  +-- Fly_MayStaticTypeInterface    &lt;- 是否为纯静态类型
+  |     +-- isStatic()
+  |     +-- rebuildStaticValue(builder, loc, currentValue)
+  |
+  +-- Fly_CopyOpTypeInterface       &lt;- CopyOp 核心接口
+        +-- getThrLayout()
+        +-- getThrBitLayoutSrc()
+        +-- getThrBitLayoutDst()
+        +-- getThrBitLayoutRef()
+        +-- emitAtomCall(...)           x 2 (无 predicate / 有 predicate)
+        +-- emitAtomCallSSA(...)        x 2 (无 predicate / 有 predicate)</code></pre>
+
+<h3>4.2 宏定义前置知识：FxLayout / FxC / FxShape / FxStride / FxThr / FxVal</h3>
+
+<p>这些宏定义在 <code>ThrValLayoutMacro.h.inc</code> 中，是构建 Layout 的便捷工具：</p>
+
+<table>
+  <tr><th>宏</th><th>展开结果</th><th>含义</th></tr>
+  <tr><td><code>FxC(val)</code></td><td><code>IntTupleAttr::getLeafStatic(ctx, val)</code></td><td>创建一个<strong>叶子节点</strong>的静态 IntTuple，值为 <code>val</code>，可理解为标量常量</td></tr>
+  <tr><td><code>FxT(a, b)</code></td><td><code>IntTupleAttr::get(ArrayAttr::get(ctx, {a, b}))</code></td><td>创建一个<strong>二元组</strong> IntTuple</td></tr>
+  <tr><td><code>FxShape(a, b)</code></td><td><code>FxT_2(a, b)</code></td><td>创建 shape 部分（二元组），参数可以是 <code>FxC(...)</code> 或 <code>FxThr(...)</code> / <code>FxVal(...)</code></td></tr>
+  <tr><td><code>FxStride(a, b)</code></td><td><code>FxT_2(a, b)</code></td><td>创建 stride 部分（二元组），参数同上</td></tr>
+  <tr><td><code>FxThr(a, b, ...)</code></td><td><code>FxT(FxC(a), FxC(b), ...)</code></td><td>创建 <strong>Thread 维度</strong>的 shape/stride</td></tr>
+  <tr><td><code>FxVal(a, b, ...)</code></td><td><code>FxT(FxC(a), FxC(b), ...)</code></td><td>创建 <strong>Value 维度</strong>的 shape/stride</td></tr>
+  <tr><td><code>FxLayout(shape, stride)</code></td><td><code>LayoutAttr::get(shape, stride)</code></td><td>用 shape + stride 构造一个 LayoutAttr</td></tr>
+</table>
+
+<p><strong>关键理解</strong>：<code>FxLayout(FxShape(A, B), FxStride(C, D))</code> 构造的 Layout 语义为：</p>
+
+<pre><code>Layout: shape = (A, B), stride = (C, D)</code></pre>
+
+<p>即一个二维 layout，第 0 维大小为 A、步长为 C，第 1 维大小为 B、步长为 D。</p>
+
+<p>在 CopyAtom 的 TV Layout 语境中，<strong>第 0 维代表 Thread，第 1 维代表 Value</strong>。</p>
+
+<h3>4.3 逐接口方法详解</h3>
+
+<h4>4.3.1 <code>isStatic()</code> -- 来自 MayStaticTypeInterface</h4>
+
+<pre><code>bool CopyOpUniversalCopyType::isStatic() const { return true; }</code></pre>
+
+<p><strong>含义</strong>：<code>CopyOpUniversalCopyType</code> 是纯静态类型，它的所有参数（只有 <code>bitSize</code>）都是编译期常量，不依赖任何运行时值。</p>
+
+<p><strong>对比</strong>：ROCDL 的 stateful CopyOp（如 <code>CopyOpCDNA3BufferCopy</code>）实现 <code>StatefulOpTypeInterface</code>（运行时状态如 <code>soffset</code>），<strong>不</strong>实现 <code>MayStaticTypeInterface</code>。因此包装它的 <code>CopyAtomType::isStatic()</code> 在 <code>dyn_cast&lt;MayStaticTypeInterface&gt;</code> 失败时返回 <code>false</code>（见 <code>FlyTypeDefs.cpp</code>），与 UniversalCopy 的 <code>isStatic() == true</code> 形成对比。</p>
+
+<h4>4.3.2 <code>rebuildStaticValue(builder, loc, currentValue)</code></h4>
+
+<pre><code>Value CopyOpUniversalCopyType::rebuildStaticValue(OpBuilder &builder, Location loc,
+                                                  Value currentValue) const {
+  if (currentValue && isa&lt;MakeCopyAtomOp&gt;(currentValue.getDefiningOp()))
+    return nullptr;  // 已经是正常形式，无需重建
+  return MakeCopyAtomOp::create(builder, loc,
+                                CopyAtomType::get(*this, getBitSize()), getBitSize());
+}</code></pre>
+
+<p><strong>含义</strong>：将此类型重建为"正常形式"的 SSA 值。在 <code>fly-rewrite-func-signature</code> Pass 中，静态类型的参数会从函数签名中移除，然后在函数体内通过此方法重建。</p>
+
+<ul>
+  <li>如果当前值已经由 <code>MakeCopyAtomOp</code> 产生 -> 返回 <code>nullptr</code>，表示无需重建</li>
+  <li>否则 -> 创建一个 <code>fly.make_copy_atom</code> 操作</li>
+</ul>
+
+<h4>4.3.3 <code>getThrLayout()</code></h4>
+
+<pre><code>Attribute CopyOpUniversalCopyType::getThrLayout() const {
+    return FxLayout(FxC(1), FxC(1));
+}</code></pre>
+
+<p><strong>展开</strong>：<code>LayoutAttr::get(IntTupleAttr::getLeafStatic(ctx, 1), IntTupleAttr::getLeafStatic(ctx, 1))</code></p>
+
+<p><strong>含义</strong>：Thread Layout = <code>(shape: 1, stride: 1)</code></p>
+
+<p>这是一个一维 layout，只有 <strong>1 个 thread</strong> 参与，步长为 1。在 TV Layout 的语境中，这个 layout 描述的是"哪些 thread 参与了这次原子操作"。<code>UniversalCopy</code> 是单 thread 独立操作，所以 Thr 维度只有 1。</p>
+
+<div class="note">
+  <div class="note-title">为什么 stride 是 1？</div>
+  <p>Layout 的映射公式：<code>物理索引 = coord x stride</code>。Stride = 1 表示逻辑坐标到物理索引是<strong>紧密排列</strong>的：coord 0->索引 0, coord 1->索引 1, ..., coord 15->索引 15。</p>
+  <p>对于 <code>UniversalCopy</code>，只有 1 个 thread，stride 的值实际上不影响结果（0x1 = 0x任何值 = 0），但 stride=1 是最自然的"连续排列"语义。</p>
+</div>
+
+<p><strong>对比硬件特定实现</strong>：CDNA4 的 <code>CopyOpCDNA4LdsReadTranspose</code>：</p>
+
+<pre><code>Attribute CopyOpCDNA4LdsReadTransposeType::getThrLayout() const {
+    return FxLayout(FxC(16), FxC(1));  // 16 个 thread 协作
+}</code></pre>
+
+<p>这里 16 个 thread 一起参与一次 LDS 读取转置操作，stride=1 表示这 16 个 thread 的 ID 是连续排列的（0, 1, 2, ..., 15），这由硬件指令要求连续 lane 的语义决定。</p>
+
+<h4>4.3.4 <code>getThrBitLayoutSrc()</code></h4>
+
+<pre><code>Attribute CopyOpUniversalCopyType::getThrBitLayoutSrc() const {
+    return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
+}</code></pre>
+
+<p><strong>展开</strong>（以 <code>UniversalCopy32b</code> 为例，<code>getBitSize() = 32</code>）：</p>
+
+<pre><code>LayoutAttr::get(
+    IntTupleAttr::get(ArrayAttr::get(ctx, {
+        IntTupleAttr::getLeafStatic(ctx, 1),     // Thr shape = 1
+        IntTupleAttr::getLeafStatic(ctx, 32)     // Val shape = 32 (bits)
+    })),
+    IntTupleAttr::get(ArrayAttr::get(ctx, {
+        IntTupleAttr::getLeafStatic(ctx, 1),     // Thr stride = 1
+        IntTupleAttr::getLeafStatic(ctx, 1)      // Val stride = 1
+    }))
+)</code></pre>
+
+<p><strong>含义</strong>：Thread-Value Bit Layout（源端）= <code>shape: (1, 32), stride: (1, 1)</code></p>
+
+<table>
+  <tr><th>维度</th><th>Shape</th><th>Stride</th><th>含义</th></tr>
+  <tr><td>第 0 维 (Thread)</td><td>1</td><td>1</td><td>1 个 thread，thread 索引步长为 1</td></tr>
+  <tr><td>第 1 维 (Value)</td><td>32</td><td>1</td><td>32 bit 数据，bit 之间连续（步长 1）</td></tr>
+</table>
+
+<p>这描述的是：<strong>1 个 thread 从源端读取 32 bit 连续数据</strong>。</p>
+
+<p><strong>注意</strong>：这里的 Value 维度单位是 <strong>bit</strong>，不是"值"的个数。后续 <code>CopyAtomType</code> 会通过 <code>layoutRecast</code> 将 bit-level layout 转换为 value-level layout。</p>
+
+<h4>4.3.5 <code>getThrBitLayoutDst()</code></h4>
+
+<pre><code>Attribute CopyOpUniversalCopyType::getThrBitLayoutDst() const {
+    return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
+}</code></pre>
+
+<p>与 <code>getThrBitLayoutSrc()</code> 完全相同。<strong>1 个 thread 写入 32 bit 连续数据</strong>。</p>
+
+<p><strong>对比硬件特定实现</strong>：CDNA4 的 <code>LdsReadTranspose</code> 中，源端和目标端的 Bit Layout 不同（因为转置操作改变了数据排列）：</p>
+
+<pre><code>// 源端：16 thread 各读 64 bit，按行排列
+getThrBitLayoutSrc() = FxLayout(FxShape(FxC(16), FxC(64)), FxStride(FxC(64), FxC(1)));
+// 目标端：16 thread 各写 64 bit，但经过转置，stride 发生了变化
+getThrBitLayoutDst() = FxLayout(FxShape(FxC(16), FxVal(4, 16)), FxStride(FxC(4), FxVal(1, 64)));</code></pre>
+
+<h4>4.3.6 <code>getThrBitLayoutRef()</code></h4>
+
+<pre><code>Attribute CopyOpUniversalCopyType::getThrBitLayoutRef() const {
+    return FxLayout(FxShape(FxC(1), FxC(getBitSize())), FxStride(FxC(1), FxC(1)));
+}</code></pre>
+
+<p>与 Src/Dst 完全相同。</p>
+
+<p><strong>什么是 "Ref" 端？</strong></p>
+
+<p>Ref（Reference）Layout 是 TiledCopy 中用于计算"从 Atom 的参考视角到源端/目标端的映射"的基准：</p>
+
+<pre><code>// 从 Ref 到 Src 的映射
+auto atomLayoutRef = cast&lt;LayoutAttr&gt;(copyAtom.getThrValLayoutRef());
+auto atomLayoutSrc = cast&lt;LayoutAttr&gt;(copyAtom.getThrValLayoutSrc());
+LayoutAttr refInv = layoutRightInverse(attrBuilder, atomLayoutRef);
+LayoutAttr ref2src = layoutComposition(attrBuilder, refInv, atomLayoutSrc);
+
+// 从 Ref 到 Dst 的映射
+auto atomLayoutDst = cast&lt;LayoutAttr&gt;(copyAtom.getThrValLayoutDst());
+LayoutAttr ref2dst = layoutComposition(attrBuilder, refInv, atomLayoutDst);</code></pre>
+
+<p>即：<code>ref2src = right_inverse(Ref) . Src</code>，<code>ref2dst = right_inverse(Ref) . Dst</code>。</p>
+
+<p>对于 <code>UniversalCopy</code>，因为 Src = Dst = Ref，所以 <code>ref2src</code> 和 <code>ref2dst</code> 都是恒等映射。</p>
+
+<div class="note">
+  <div class="note-title">为什么需要 Ref？</div>
+  当源端和目标端的数据排列不同时（如转置操作），Ref 提供了一个"标准参考坐标系"，使得可以通过 Layout 代数精确描述源端到目标端的坐标变换。
+</div>
+
+<h4>4.3.7 <code>emitAtomCall(...)</code> -- 无 predicate 版本</h4>
+
+<pre><code>LogicalResult CopyOpUniversalCopyType::emitAtomCall(
+    OpBuilder &builder, Location loc,
+    Type copyAtomTyArg, Type srcMemTyArg, Type dstMemTyArg,
+    Value atomVal, Value src, Value dst) const
+{
+  auto srcMemTy = cast&lt;fly::MemRefType&gt;(srcMemTyArg);
+  auto dstMemTy = cast&lt;fly::MemRefType&gt;(dstMemTyArg);
+
+  if (!isa&lt;LLVM::LLVMPointerType&gt;(src.getType()) ||
+      !isa&lt;LLVM::LLVMPointerType&gt;(dst.getType()))
+    return failure();
+
+  int32_t copyBytes = getBitSize() / 8;
+  Value srcPtr = applySwizzleOnPtr(builder, loc, src, srcMemTy.getSwizzle());
+  Value dstPtr = applySwizzleOnPtr(builder, loc, dst, dstMemTy.getSwizzle());
+  Value len = arith::ConstantIntOp::create(builder, loc, copyBytes, 32);
+  LLVM::MemcpyOp::create(builder, loc, dstPtr, srcPtr, len, false);
+
+  return success();
+}</code></pre>
+
+<p><strong>含义</strong>：在 MemRef 形式下，生成 <code>LLVM::MemcpyOp</code> 来搬运 <code>bitSize / 8</code> 字节的数据。</p>
+
+<table>
+  <tr><th>参数</th><th>类型</th><th>含义</th></tr>
+  <tr><td><code>copyAtomTyArg</code></td><td>Type</td><td>CopyAtom 的类型</td></tr>
+  <tr><td><code>srcMemTyArg</code></td><td>Type</td><td>源端 MemRef 类型</td></tr>
+  <tr><td><code>dstMemTyArg</code></td><td>Type</td><td>目标端 MemRef 类型</td></tr>
+  <tr><td><code>atomVal</code></td><td>Value</td><td>Atom 的 SSA 值（UniversalCopy 不使用，因为无状态）</td></tr>
+  <tr><td><code>src</code></td><td>Value</td><td>源端指针</td></tr>
+  <tr><td><code>dst</code></td><td>Value</td><td>目标端指针</td></tr>
+</table>
+
+<p><strong>关键点</strong>：<code>UniversalCopy</code> 的 MemRef 形式 lowering 就是简单的 <code>memcpy</code>，没有任何硬件加速。</p>
+
+<h4>4.3.8 <code>emitAtomCall(...)</code> -- 有 predicate 版本</h4>
+
+<pre><code>LogicalResult CopyOpUniversalCopyType::emitAtomCall(
+    OpBuilder &builder, Location loc,
+    Type copyAtomTyArg, Type srcMemTyArg, Type dstMemTyArg, Type predMemTyArg,
+    Value atomVal, Value src, Value dst, Value pred) const
+{
+  auto predMemTy = cast&lt;fly::MemRefType&gt;(predMemTyArg);
+  Value predVal = LLVM::LoadOp::create(builder, loc, predMemTy.getElemTy(), pred);
+  auto ifOp = scf::IfOp::create(builder, loc, TypeRange{}, predVal, false);
+  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  return emitAtomCall(builder, loc, copyAtomTyArg, srcMemTyArg, dstMemTyArg, atomVal, src, dst);
+}</code></pre>
+
+<p><strong>含义</strong>：带 predicate 的版本 = 加载 predicate 值 -> <code>scf.if</code> 包裹无 predicate 版本。</p>
+
+<h4>4.3.9 <code>emitAtomCallSSA(...)</code> -- 无 predicate 版本</h4>
+
+<pre><code>FailureOr&lt;Value&gt; CopyOpUniversalCopyType::emitAtomCallSSA(
+    OpBuilder &builder, Location loc,
+    Type resultTy, Type copyAtomTyArg, Type srcTyArg, Type dstTyArg,
+    Value atomVal, Value src, Value dst) const
+{
+  Value result;
+  if (isa&lt;fly::MemRefType&gt;(srcTyArg)) {
+    // 源端是内存 -&gt; 生成 Load
+    auto srcMemTy = cast&lt;fly::MemRefType&gt;(srcTyArg);
+    Type loadTy = resultTy ? resultTy : builder.getIntegerType(getBitSize());
+    Value srcPtr = applySwizzleOnPtr(builder, loc, src, srcMemTy.getSwizzle());
+    result = LLVM::LoadOp::create(builder, loc, loadTy, srcPtr);
+  } else {
+    // 源端是寄存器 SSA 值 -&gt; 直接使用
+    result = src;
+  }
+
+  if (!resultTy) {
+    // 目标端是内存 -&gt; 生成 Store
+    auto dstMemTy = cast&lt;fly::MemRefType&gt;(dstTyArg);
+    Value dstPtr = applySwizzleOnPtr(builder, loc, dst, dstMemTy.getSwizzle());
+    LLVM::StoreOp::create(builder, loc, result, dstPtr);
+  }
+  return result;
+}</code></pre>
+
+<p><strong>含义</strong>：SSA 形式的拷贝，根据源端/目标端是内存还是寄存器，生成不同的 IR：</p>
+
+<table>
+  <tr><th>源端</th><th>目标端</th><th>生成的 IR</th><th>返回值</th></tr>
+  <tr><td>MemRef (内存)</td><td>Register (SSA)</td><td><code>Load</code></td><td>加载的值</td></tr>
+  <tr><td>Register (SSA)</td><td>MemRef (内存)</td><td><code>Store</code></td><td><code>Value()</code></td></tr>
+  <tr><td>Register (SSA)</td><td>Register (SSA)</td><td>直接传递</td><td><code>src</code></td></tr>
+</table>
+
+<p><strong>关键参数</strong>：<code>resultTy</code> 如果非空，说明目标端是 SSA，需要返回结果值；如果为空，说明目标端是内存，只需 store。</p>
+
+<h4>4.3.10 <code>emitAtomCallSSA(...)</code> -- 有 predicate 版本</h4>
+
+<pre><code>FailureOr&lt;Value&gt; CopyOpUniversalCopyType::emitAtomCallSSA(
+    OpBuilder &builder, Location loc,
+    Type resultTy, ..., Value pred) const
+{
+  if (resultTy) {
+    // 目标端是 SSA -&gt; 需要 scf.if 返回值
+    auto ifOp = scf::IfOp::create(builder, loc, resultTy, pred, true);
+    // then: 执行拷贝，yield 结果
+    auto result = emitAtomCallSSA(builder, loc, ...);
+    scf::YieldOp::create(builder, loc, *result);
+    // else: 不拷贝，yield 旧的目标值
+    scf::YieldOp::create(builder, loc, dst);
+    return ifOp.getResult(0);
+  }
+  // 目标端是内存 -&gt; 只需 then 分支
+  auto ifOp = scf::IfOp::create(builder, loc, TypeRange{}, pred, false);
+  emitAtomCallSSA(builder, loc, ...);
+  return Value();
+}</code></pre>
+
+<p><strong>含义</strong>：带 predicate 的 SSA 版本。关键区别：</p>
+<ul>
+  <li><strong>目标端是 SSA</strong>：需要 <code>scf.if</code> 的 then/else 两个分支，else 分支 yield 旧值 <code>dst</code>（因为不执行拷贝时，目标寄存器保持原值）</li>
+  <li><strong>目标端是内存</strong>：只需要 then 分支执行 store</li>
+</ul>
+
+<h3>4.4 完整对照表（以 UniversalCopy32b + Float32 为例）</h3>
+
+<table>
+  <tr><th>接口方法</th><th>返回值</th><th>MLIR 表示</th><th>含义</th></tr>
+  <tr><td><code>isStatic()</code></td><td><code>true</code></td><td>--</td><td>纯静态类型，无运行时状态</td></tr>
+  <tr><td><code>getThrLayout()</code></td><td><code>FxLayout(FxC(1), FxC(1))</code></td><td><code>!fly.layout&lt;(1):(1)&gt;</code></td><td>1 个 thread 参与</td></tr>
+  <tr><td><code>getThrBitLayoutSrc()</code></td><td><code>FxLayout(FxShape(FxC(1), FxC(32)), FxStride(FxC(1), FxC(1)))</code></td><td><code>!fly.layout&lt;(1, 32):(1, 1)&gt;</code></td><td>1 thread 读 32 bit 连续数据</td></tr>
+  <tr><td><code>getThrBitLayoutDst()</code></td><td>同 Src</td><td>同上</td><td>1 thread 写 32 bit 连续数据</td></tr>
+  <tr><td><code>getThrBitLayoutRef()</code></td><td>同 Src</td><td>同上</td><td>参考布局 = 源端布局</td></tr>
+  <tr><td><code>emitAtomCall (MemRef)</code></td><td><code>LLVM::MemcpyOp</code></td><td>--</td><td>生成 memcpy(bitSize/8 字节)</td></tr>
+  <tr><td><code>emitAtomCallSSA (SSA)</code></td><td><code>Load/Store</code></td><td>--</td><td>内存->Load, 寄存器->直传</td></tr>
+</table>
+
+<p>CopyAtom 层面的 value-level TV Layout（经 <code>layoutRecast</code> 后）：</p>
+
+<table>
+  <tr><th>CopyAtom 方法</th><th>返回值</th><th>含义</th></tr>
+  <tr><td><code>getThrValLayoutSrc()</code></td><td><code>!fly.layout&lt;(1, 1):(1, 1)&gt;</code></td><td>1 thread, 1 个 f32 值</td></tr>
+  <tr><td><code>getThrValLayoutDst()</code></td><td><code>!fly.layout&lt;(1, 1):(1, 1)&gt;</code></td><td>1 thread, 1 个 f32 值</td></tr>
+  <tr><td><code>getThrValLayoutRef()</code></td><td><code>!fly.layout&lt;(1, 1):(1, 1)&gt;</code></td><td>参考布局 = 源端布局</td></tr>
+</table>
+
+<h3>4.5 与硬件特定 CopyOp 的对比</h3>
+
+<p>以 CDNA4 <code>LdsReadTranspose</code>（16 thread 协作转置读取）为例：</p>
+
+<table>
+  <tr><th>方法</th><th>UniversalCopy32b</th><th>CDNA4 LdsReadTranspose (bitSize=64, transGranularity=4)</th></tr>
+  <tr><td><code>getThrLayout()</code></td><td><code>(1):(1)</code> -- 1 thread</td><td><code>(16):(1)</code> -- 16 thread 协作</td></tr>
+  <tr><td><code>getThrBitLayoutSrc()</code></td><td><code>(1, 32):(1, 1)</code></td><td><code>(16, 64):(64, 1)</code> -- 16 thread 各读 64 bit</td></tr>
+  <tr><td><code>getThrBitLayoutDst()</code></td><td><code>(1, 32):(1, 1)</code></td><td><code>(16, (4, 16)):((4), (1, 64))</code> -- 转置后排列不同</td></tr>
+  <tr><td><code>emitAtomCall</code></td><td><code>memcpy</code></td><td>硬件特定的 LDS 读取指令</td></tr>
+  <tr><td><code>emitAtomCallSSA</code></td><td><code>Load/Store</code></td><td>硬件特定的向量读取 + 转置</td></tr>
+</table>
+
+<div class="note">
+  <div class="note-title">设计哲学</div>
+  通过统一的 <code>CopyOpTypeInterface</code> 接口，将通用语义（UniversalCopy）和硬件特定语义（BufferCopy、LdsReadTranspose 等）统一抽象，使得上层 <code>CopyAtom</code> 和 <code>TiledCopy</code> 可以透明地使用不同的底层实现。
+</div>
+
+<!-- ===================== Section 5 ===================== -->
+<h2 id="s5">5. SSA 相关 Pass 的具体作用</h2>
+
+<h3>5.1 Iluvatar 后端的 Pass Pipeline</h3>
+
+<p>以下只列出与 Layout / SSA 相关的 <strong>Fly 方言 pass</strong>（完整 pipeline 在 <code>python/flydsl/compiler/backends/iluvatar.py</code> 中；<code>convert-fly-to-ixdl</code> 之后还有 <code>convert-gpu-to-ixdl</code>、<code>gpu-to-llvm</code>、<code>gpu-module-to-binary</code> 等）：</p>
+
+<pre><code>"fly-rewrite-func-signature",          # Pass 1
+"fly-canonicalize",                     # Pass 2
+"fly-layout-lowering",                  # Pass 3
+"fly-int-swizzle-simplify",            # Pass 4
+"canonicalize",                         # Pass 5
+"fly-convert-atom-call-to-ssa-form",   # Pass 6 &lt;- SSA 关键
+"fly-promote-regmem-to-vectorssa",     # Pass 7 &lt;- SSA 关键
+"convert-fly-to-ixdl",                 # Pass 8
+; ... 后续: gpu/ixdl/LLVM lowering ...</code></pre>
+
+<h3>5.2 Pass 6：<code>fly-convert-atom-call-to-ssa-form</code></h3>
+
+<p><strong>目标</strong>：将 <code>copy_atom_call</code>（MemRef 形式）转换为 <code>copy_atom_call_ssa</code>（SSA 形式）。</p>
+
+<p><strong>为什么需要这个 Pass？</strong></p>
+
+<p>在原始 IR 中，寄存器数据通过 MemRef（内存引用）的方式访问。下面为 <strong>Tracing 刚生成的 Fly IR</strong>（仍使用 <code>fly.memref_alloca</code>）：</p>
+
+<pre><code>// Tracing IR（MemRef 形式）
+%ra = fly.memref_alloca ... : !fly.memref&lt;f32, (1,1), register&gt;
+fly.copy_atom_call %atom, %src, %ra
+%val = fly.memref_load_vec %ra</code></pre>
+
+<p>这种形式的问题：</p>
+<ul>
+  <li>寄存器数据被当作"内存"来处理，引入了不必要的 load/store</li>
+  <li>阻碍了编译器对数据流的优化（如 CSE、死代码消除）</li>
+  <li>与 SSA（Static Single Assignment）范式不一致</li>
+</ul>
+
+<p><strong>转换后的 SSA 形式</strong>（Pass 6 之后，示意）：</p>
+
+<pre><code>// SSA 形式（示意；完整 assembly 含 operandSegmentSizes 等）
+%val = fly.copy_atom_call_ssa %atom, %src
+  {operandSegmentSizes = array&lt;i32: 1, 1, 0, 0&gt;} : f32
+// %val 可直接用于 arith，无需 memref_load_vec</code></pre>
+
+<p><strong>转换逻辑</strong>：</p>
+<ol>
+  <li>遍历所有 <code>CopyAtomCall</code> 操作</li>
+  <li>判断 src/dst 是否为 Register 地址空间</li>
+  <li>如果 src 是 Register：先用 <code>PtrLoadOp</code> 将 MemRef 中的值加载为 SSA 值</li>
+  <li>如果 dst 是 Register：创建 <code>CopyAtomCallSSA</code>，结果类型为 <code>RegMem2SSAType</code></li>
+  <li>用 <code>PtrStoreOp</code> 将 SSA 结果写回（后续 Pass 会消除）</li>
+</ol>
+
+<h3>5.3 Pass 7：<code>fly-promote-regmem-to-vectorssa</code></h3>
+
+<p><strong>目标</strong>：将所有 Register MemRef 彻底提升为 Vector SSA 值。</p>
+
+<p><strong>这是最关键的 SSA 提升 Pass</strong>，它做了以下事情：</p>
+
+<ol>
+  <li><strong>识别 Register 分配</strong>：Pass 3 <code>fly-layout-lowering</code> 已将 <code>memref_alloca</code> lower 为 <code>fly.make_ptr</code> + <code>fly.make_view</code>；本 pass 在这些 register 指针上工作</li>
+  <li><strong>计算 SSA 类型</strong>：将 <code>MemRef&lt;f32, (1,1), register&gt;</code> 转换为 <code>f32</code>（标量）或 <code>vector&lt;4xf32&gt;</code>（向量）</li>
+  <li><strong>重写整个函数体</strong>：
+    <ul>
+      <li><code>make_ptr</code> / <code>make_view</code>（register）-> 消除，用 SSA 值替代</li>
+      <li><code>memref_load_vec</code> / <code>ptr_load</code> -> 直接使用对应的 SSA 值</li>
+      <li><code>memref_store_vec</code> / <code>ptr_store</code> -> 更新 SSA 值的定义</li>
+      <li><code>copy_atom_call_ssa</code> -> 已经是 SSA 形式，保持</li>
+    </ul>
+  </li>
+  <li><strong>处理控制流</strong>：
+    <ul>
+      <li><code>scf.for</code>：将 Register SSA 值作为 iter_args 传递</li>
+      <li><code>scf.if</code>：在 then/else 分支中正确传播 SSA 值</li>
+      <li><code>scf.while</code>：类似处理</li>
+    </ul>
+  </li>
+</ol>
+
+<h3>5.4 IR 对比示例</h3>
+
+<p>同一 kernel 在不同 pass 阶段的 IR 形态不同；下面用<strong>示意 IR</strong>对比 Pass 6 前后（省略 layout/类型细节）。</p>
+
+<h4>Before Pass 6（layout lowering 之后、SSA 转换之前）</h4>
+
+<p>Tracing 的 <code>memref_alloca</code> 经 Pass 3 已变为 pointer + view：</p>
+
+<pre><code>%ra = fly.make_ptr ... : !fly.pointer&lt;register, f32&gt;
+%ra_view = fly.make_view %ra, %layout : ...
+fly.copy_atom_call %atom, %src, %ra_view
+%val = fly.ptr_load %ra_view : f32
+%result = arith.addf %val, %val : f32
+%rc = fly.make_ptr ... : !fly.pointer&lt;register, f32&gt;
+%rc_view = fly.make_view %rc, %layout : ...
+fly.ptr_store %result, %rc_view
+fly.copy_atom_call %atom, %rc_view, %dst</code></pre>
+
+<h4>After Pass 6 + 7（SSA 提升后，示意）</h4>
+
+<pre><code>%val = fly.copy_atom_call_ssa %atom, %src
+  {operandSegmentSizes = array&lt;i32: 1, 1, 0, 0&gt;} : f32
+%result = arith.addf %val, %val : f32
+fly.copy_atom_call_ssa %atom, %result, %dst
+  {operandSegmentSizes = array&lt;i32: 1, 1, 1, 0&gt;}</code></pre>
+
+<div class="note">
+  <div class="note-title">关键收益</div>
+  寄存器数据不再通过指针间接访问，而是作为 SSA 值直接流动，使得后续优化 Pass（CSE、常量折叠、死代码消除）能够生效。
+</div>
+
+<h3>5.5 其他相关 Pass</h3>
+
+<h4>Pass 1：<code>fly-rewrite-func-signature</code></h4>
+
+<p>在函数边界处将 DSL 类型转换为 LLVM 兼容的类型：</p>
+<ul>
+  <li>完全静态的 DSL 参数从函数签名中移除，在函数体内通过 <code>fly.static</code> 重建</li>
+  <li>DSL 类型（IntTuple, Layout, MemRef 等）被打包为 LLVM struct，只包含动态分量</li>
+  <li><code>scf.for</code>/<code>scf.if</code>/<code>scf.while</code> 中的 DSL 类型也做同样转换</li>
+</ul>
+
+<h4>Pass 3：<code>fly-layout-lowering</code></h4>
+
+<p>将高层 Layout 代数操作 lowering 为底层算术操作，并将 register 侧的 <code>fly.memref_alloca</code> lower 为 <code>fly.make_ptr</code> + <code>fly.make_view</code>：</p>
+<ul>
+  <li><code>fly.logical_divide</code> -> 一系列 <code>fly.crd2idx</code> + <code>arith</code> 操作</li>
+  <li><code>fly.slice</code> -> 坐标计算 + offset 叠加</li>
+  <li><code>fly.memref_alloca</code>（register）-> <code>fly.make_ptr</code> + <code>fly.make_view</code></li>
+</ul>
+
+<h3>5.6 各 Pass 的 IR 变化总结</h3>
+
+<div class="flow-box"><span class="label">原始 Python IR</span>
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">fly-rewrite-func-signature</span>
+<span class="label">函数签名中静态参数被移除，DSL 类型打包为 LLVM struct</span>
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">fly-canonicalize</span>
+<span class="label">FlyDSL 特定的规范化（常量折叠、公共子表达式消除等）</span>
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">fly-layout-lowering</span>
+<span class="label">Layout 代数操作 -> 算术操作</span>
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">fly-convert-atom-call-to-ssa-form</span>
+<span class="label">copy_atom_call -> copy_atom_call_ssa（Register 端）</span>
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">fly-promote-regmem-to-vectorssa</span>
+<span class="label">Register MemRef -> Vector SSA 值（彻底消除 register 指针）</span>
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">convert-fly-to-ixdl</span>
+<span class="label">Fly Dialect -> IXDL Dialect（Iluvatar 硬件指令）</span>
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">convert-gpu-to-ixdl / gpu-to-llvm / ...</span>
+<span class="label">GPU module -> LLVM -> HSACO/fatbin（完整 pipeline 见 iluvatar.py）</span></div>
+
+<!-- ===================== Section 6 ===================== -->
+<h2 id="s6">6. Iluvatar 架构下的数据类型与 Layout 优化</h2>
+
+<h3>6.1 Iluvatar 硬件的访问特性</h3>
+
+<p>在 Iluvatar 的硬件架构下，<strong>每个 thread 访问 32 bit（即一个 f32 或 2 个 f16）是最优的访问粒度</strong>。这与 CUDA 的 32-bit word 对齐类似。</p>
+
+<p>对于 f32 数据类型，一个 f32 恰好就是 32 bit，因此 <strong>每个 thread 访问一个 f32 天然就是最优的</strong>，无需额外调整。</p>
+
+<h3>6.2 fp32 场景：天然对齐</h3>
+
+<p>当前 <code>01-vectorAdd.py</code> 使用的就是最优方案：</p>
+
+<pre><code># fp32 版本 -- 天然最优
+copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+reg_ty = fx.MemRefType.get(fx.T.f32(), fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+# 每个 thread 搬运 1 个 f32 = 32 bit，完美对齐 Iluvatar 最优访问粒度</code></pre>
+
+<p>Tracing 生成的 Fly IR（<code>make_copy_atom</code> 细节见 <a href="#card-make-copy-atom">Sec.2.4</a>）：</p>
+
+<pre><code>%atom = fly.make_copy_atom {valBits = 32 : i32}
+  : !fly.copy_atom&lt;
+      !fly.universal_copy&lt;32&gt;, 32&gt;
+%ra = fly.memref_alloca ... {layout = (1,1)}
+  : !fly.memref&lt;f32, register&gt;
+fly.copy_atom_call %atom, %src, %ra
+; -&gt; 每个 thread 搬运 32 bit = 1 个 f32
+; -&gt; Pass 6/7 SSA 提升后变成 f32 标量</code></pre>
+
+<h3>6.3 fp16 场景：需要凑齐 32 bit</h3>
+
+<p>如果数据类型从 fp32 改为 fp16，每个 fp16 只有 16 bit，直接使用 <code>UniversalCopy16b</code> 会<strong>浪费一半带宽</strong>：</p>
+
+<pre><code># [NG] 未优化的 fp16 版本
+copy_atom = fx.make_copy_atom(fx.UniversalCopy16b(), fx.Float16)
+reg_ty = fx.MemRefType.get(fx.T.f16(), fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+# 每个 thread 只搬运 16 bit = 1 个 f16，带宽利用率仅 50%</code></pre>
+
+<p><strong>优化方案</strong>：让每个 thread 一次搬运 2 个 fp16 值（共 32 bit），充分利用硬件带宽：</p>
+
+<pre><code># [OK] 优化后的 fp16 版本
+copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float16)
+# valBits=16, 但 CopyOp 的 bitSize=32
+# -&gt; 每个 thread 搬运 32 bit = 2 个 fp16 值
+reg_ty = fx.MemRefType.get(fx.T.f16(), fx.LayoutType.get(2, 1), fx.AddressSpace.Register)
+# Layout 从 (1, 1) 改为 (2, 1)：每个 thread 持有 2 个连续的 fp16 值</code></pre>
+
+<h3>6.4 Layout 调整对 TV Layout 的影响</h3>
+
+<p>当 <code>CopyAtom</code> 的 <code>bitSize=32</code> 而 <code>valBits=16</code> 时，<code>layoutRecast</code> 会产生不同的 TV Layout：</p>
+
+<pre><code>UniversalCopy32b:
+  ThrBitLayoutSrc = ((1, 32):(1, 1))    // bit-level: 1 thread, 32 bits
+
+CopyAtomType(UniversalCopy32b, valBits=16):
+  ThrValLayoutSrc = layoutRecast(bitLayout, 1, 16)
+                   = ((1, 2):(1, 1))     // value-level: 1 thread, 2 个 f16 值</code></pre>
+
+<p>这意味着 <code>RegMem2SSAType</code> 会将寄存器 MemRef 转换为 <code>vector&lt;2xf16&gt;</code>，而非标量 <code>f16</code>。</p>
+
+<h3>6.5 Layout 修改对 logical_divide 和 slice 的影响</h3>
+
+<p>当每个 thread 处理多个元素时，<code>logical_divide</code> 的 tiler 也需要相应调整：</p>
+
+<pre><code># 原始：每个 thread 处理 1 个元素
+ta = fx.logical_divide(a, fx.make_layout(block_dim, 1))
+ta = fx.slice(ta, (None, bid))
+ta = fx.logical_divide(ta, fx.make_layout(1, 1))
+# slice(ta, (None, tid)) -&gt; 1 个元素
+
+# 优化：每个 thread 处理 2 个 fp16 元素
+elements_per_thread = 2
+ta = fx.logical_divide(a, fx.make_layout(block_dim * elements_per_thread, 1))
+ta = fx.slice(ta, (None, bid))
+ta = fx.logical_divide(ta, fx.make_layout(elements_per_thread, 1))
+# slice(ta, (None, tid)) -&gt; 2 个连续的 fp16 元素</code></pre>
+
+<h3>6.6 优化决策总结</h3>
+
+<table>
+  <tr><th>场景</th><th>数据类型</th><th>CopyAtom bitSize</th><th>Register Layout</th><th>SSA 类型</th><th>带宽利用率</th></tr>
+  <tr><td>标准 fp32</td><td>f32</td><td>32</td><td>(1, 1)</td><td>f32</td><td>100% [OK]</td></tr>
+  <tr><td>未优化 fp16</td><td>f16</td><td>16</td><td>(1, 1)</td><td>f16</td><td>50% [NG]</td></tr>
+  <tr><td>优化 fp16</td><td>f16</td><td>32</td><td>(2, 1)</td><td>vector&lt;2xf16&gt;</td><td>100% [OK]</td></tr>
+</table>
+
+<div class="note">
+  <div class="note-title">优化原则</div>
+  在 Iluvatar 架构下，确保每个 thread 的单次访问对齐到 32-bit 边界。对于 f32 数据类型，每个 thread 访问一个 f32 天然最优；对于 f16 等小于 32 bit 的数据类型，需要通过增大每个 thread 处理的元素数量来凑齐 32 bit。
+</div>
+
+<!-- ===================== Summary ===================== -->
+<h2 style="margin-top: 3.5rem;">总结</h2>
+
+<table>
+  <tr><th>概念</th><th>核心要点</th></tr>
+  <tr><td><strong>Layout 操作</strong></td><td><code>logical_divide</code> + <code>slice</code> 组合实现层次化数据映射（Global -> Block -> Thread）</td></tr>
+  <tr><td><strong>CopyAtom</strong></td><td>封装"哪些 thread 搬运哪些数据"的原子操作描述，包含 TV Layout</td></tr>
+  <tr><td><strong>CopyOpUniversalCopy</strong></td><td>提供通用 memcpy 语义的 CopyOp，定义 bit-level 的 thread-value 布局</td></tr>
+  <tr><td><strong>CopyAtom = CopyOp + valBits</strong></td><td>通过 <code>layoutRecast</code> 将 bit-level layout 转换为 value-level layout</td></tr>
+  <tr><td><strong>SSA Pass</strong></td><td><code>convert-atom-call-to-ssa-form</code> + <code>promote-regmem-to-vectorssa</code> 将 Register MemRef 提升为 SSA 值</td></tr>
+  <tr><td><strong>Iluvatar 优化</strong></td><td>f32 天然 32-bit 对齐最优；f16 需凑齐 32 bit（每个 thread 处理 2 个 f16）</td></tr>
+</table>
+
+</div>

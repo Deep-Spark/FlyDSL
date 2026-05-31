@@ -1,0 +1,919 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlyDSL MmaAtom 体系:从 Python DSL 到硬件 Lowering</title>
+<style>
+  :root {
+    --bg: #f8f9fc;
+    --surface: #ffffff;
+    --surface2: #f0f2f7;
+    --border: #dde1ea;
+    --text: #1a1d2e;
+    --text2: #5a6078;
+    --accent: #3b6bff;
+    --accent2: #3b6bff;
+    --green: #1a8a5c;
+    --orange: #c47200;
+    --red: #d03030;
+    --purple: #7c3aed;
+    --cyan: #0e7e8a;
+    --code-bg: #f3f4f8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 2rem; margin-bottom: 2.5rem;
+  }
+  .toc h3 { margin-top: 0; color: var(--accent); }
+  .toc ol { margin-left: 1.2rem; }
+  .toc li { margin-bottom: 0.3rem; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  h1 {
+    font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text2); font-size: 1rem; margin-bottom: 2.5rem; }
+
+  h2 {
+    font-size: 1.5rem; font-weight: 700; margin-top: 3rem; margin-bottom: 1rem;
+    padding-bottom: 0.5rem; border-bottom: 2px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.15rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem;
+    color: var(--green);
+  }
+  h4 {
+    font-size: 1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem;
+    color: var(--orange);
+  }
+
+  p { margin-bottom: 1rem; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+
+  code {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px; font-size: 0.9em;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    color: #0e7e8a;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+    overflow-x: auto; font-size: 0.88rem; line-height: 1.6;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  pre code { background: none; border: none; padding: 0; color: var(--text); }
+
+  .highlight { color: var(--orange); font-weight: 600; }
+  .note {
+    background: var(--surface); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .note-title { font-weight: 700; color: var(--accent); margin-bottom: 0.3rem; }
+  .warn {
+    background: rgba(240,164,93,0.08); border-left: 4px solid var(--orange);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .warn-title { font-weight: 700; color: var(--orange); margin-bottom: 0.3rem; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 0.6rem 0.8rem; text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--surface); }
+
+  .flow-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1.25rem; margin: 1rem 0 1.5rem;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.88rem;
+    line-height: 1.8; white-space: pre; overflow-x: auto;
+  }
+  .flow-box .arrow { color: var(--accent); }
+  .flow-box .label { color: var(--green); }
+  .flow-box .comment { color: var(--text2); }
+
+  .conv-card {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 1.75rem; margin: 2rem 0;
+  }
+  .conv-card-title {
+    font-size: 1.2rem; font-weight: 700; color: var(--accent);
+    margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem;
+  }
+  .conv-card-title .conv-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 2rem; height: 2rem; border-radius: 50%; font-weight: 700;
+    font-size: 0.9rem; color: #fff; background: var(--accent); flex-shrink: 0;
+  }
+  .conv-card .conv-op {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;
+    color: var(--cyan); margin-bottom: 0.75rem;
+  }
+  .conv-card .conv-line {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.82rem;
+    color: var(--text2); margin-bottom: 1rem;
+  }
+  .conv-card p { margin-bottom: 0.75rem; }
+  .conv-card ul { margin: 0.3rem 0 0.75rem 1.2rem; }
+  .conv-card li { margin-bottom: 0.3rem; }
+
+  .ir-before-after {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;
+    margin: 1rem 0 1.5rem;
+  }
+  .ir-box {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; overflow-x: auto;
+  }
+  .ir-box-title {
+    font-weight: 700; font-size: 0.85rem; margin-bottom: 0.5rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .ir-box-title.before { color: var(--red); }
+  .ir-box-title.after { color: var(--green); }
+  .ir-box pre {
+    margin: 0; padding: 0; border: none; background: none;
+    font-size: 0.82rem; line-height: 1.6;
+  }
+  .ir-box pre code { color: var(--text); }
+
+  @media (max-width: 720px) {
+    .ir-before-after { grid-template-columns: 1fr; }
+  }
+</style>
+
+
+<div class="container">
+
+<h1>FlyDSL MmaAtom 体系:从 Python DSL 到硬件 Lowering</h1>
+<p class="subtitle">系统整理 MmaAtom 相关的 Python 绑定、Fly IR、Interface 与 ROCDL Lowering,理清各层职责与调用关系</p>
+
+<div class="toc">
+<h3>目录</h3>
+<ol>
+  <li><a href="#s1">整体架构:MmaAtom 四层模型与数据流</a></li>
+  <li><a href="#s2">Interface 体系:谁定义什么契约</a></li>
+  <li><a href="#s3">Fly Dialect:Types 与 Ops</a></li>
+  <li><a href="#s4">C++ 实现:转发与 emit</a></li>
+  <li><a href="#s5">Python 绑定与 DSL 层</a></li>
+  <li><a href="#s6">TiledMma 与 Layout 推导</a></li>
+  <li><a href="#s7">Pass Pipeline 与调用链</a></li>
+  <li><a href="#s8">FlyROCDL 后端:硬件 MmaOp 实现</a></li>
+  <li><a href="#s9">端到端示例</a></li>
+  <li><a href="#s10">符号速查表与总结</a></li>
+</ol>
+</div>
+
+<!-- ===================== Section 1 ===================== -->
+<h2 id="s1">1. 整体架构:MmaAtom 四层模型与数据流</h2>
+
+<p><strong>核心思想 — Type-erased Wrapper + Interface Dispatch:</strong> Fly Dialect 不直接编码 MFMA/WMMA 等硬件张量核心指令.它只持有一个 <code>!fly.mma_atom&lt;InnerMmaOp&gt;</code> 包装类型.<code>InnerMmaOp</code> 是 Fly 通用类型(如 <code>!fly.universal_fma&lt;f32&gt;</code>)或后端 Dialect(<code>fly_rocdl</code>)定义的<em>纯 MLIR 类型</em>,实现了 <code>Fly_MmaOpTypeInterface</code>,通过 <code>emitAtomCall</code> / <code>emitAtomCallSSA</code> 把自己 lower 成 ROCDL intrinsic 或 LLVM FMA.</p>
+
+<p>因此<strong>新增一种硬件 MMA 指令 = 在后端 Dialect 加一个 TypeDef + 实现 MmaOpTypeInterface</strong>,Fly Dialect 与上层 Python DSL 通常无需修改.</p>
+
+<h3>1.1 四层抽象(自上而下)</h3>
+
+<table>
+  <tr><th>层级</th><th>类型 / Op</th><th>表达内容</th><th>例子</th></tr>
+  <tr>
+    <td><strong>① 指令</strong></td>
+    <td>实现 <code>MmaOpTypeInterface</code> 的具体类型</td>
+    <td>一条 MMA 指令的 (M,N,K)、dtype、thread-value 布局、如何 emit</td>
+    <td><code>!fly.universal_fma&lt;f32&gt;</code><br><code>!fly_rocdl.cdna3.mfma&lt;16x16x4,(f32,f32)-&gt;f32&gt;</code></td>
+  </tr>
+  <tr>
+    <td><strong>② 原子</strong></td>
+    <td><code>!fly.mma_atom&lt;MmaOp&gt;</code></td>
+    <td>可调用的最小 MMA 单元;对外屏蔽硬件差异;转发 layout 与 emit</td>
+    <td><code>!fly.mma_atom&lt;!fly_rocdl.cdna3.mfma&lt;...&gt;&gt;</code></td>
+  </tr>
+  <tr>
+    <td><strong>③ 平铺</strong></td>
+    <td><code>!fly.tiled_mma&lt;atom, atomLayout, perm&gt;</code></td>
+    <td>一个 block 内多个 atom 的平铺方式;partition A/B/C fragment</td>
+    <td><code>!fly.tiled_mma&lt;atom, (2,2,1), (M,N,K)&gt;</code></td>
+  </tr>
+  <tr>
+    <td><strong>④ 调用</strong></td>
+    <td><code>fly.mma_atom_call</code> / <code>fly.mma_atom_call_ssa</code> / <code>fly.gemm</code></td>
+    <td>发起一次或多次 MMA;语义 <strong>D = A×B + C</strong></td>
+    <td><code>fly.mma_atom_call(%atom, %d, %a, %b, %c)</code></td>
+  </tr>
+</table>
+
+<h3>1.2 MmaAtom 相关组件总览</h3>
+
+<table>
+  <tr><th>#</th><th>组件</th><th>所在层</th><th>详见</th></tr>
+  <tr><td>1</td><td><code>Fly_MmaOpTypeInterface</code></td><td>Interface</td><td><a href="#card-mmaop-interface">§2</a></td></tr>
+  <tr><td>2</td><td><code>MmaOpUniversalFMAType</code></td><td>Fly 通用 MmaOp</td><td><a href="#card-universal-fma">§4</a></td></tr>
+  <tr><td>3</td><td><code>MmaAtomType</code></td><td>Fly 包装类型</td><td><a href="#card-mma-atom-type">§3 / §4</a></td></tr>
+  <tr><td>4</td><td><code>TiledMmaType</code></td><td>Fly 平铺类型</td><td><a href="#card-tiled-mma">§6</a></td></tr>
+  <tr><td>5</td><td><code>fly.make_mma_atom</code></td><td>Fly Op</td><td><a href="#card-make-mma-atom">§3</a></td></tr>
+  <tr><td>6</td><td><code>fly.mma_atom_call</code> / <code>fly.gemm</code></td><td>Fly Op</td><td><a href="#card-mma-atom-call">§7</a></td></tr>
+  <tr><td>7</td><td><code>fly-convert-atom-call-to-ssa-form</code></td><td>Pass</td><td><a href="#card-ssa-pass">§7</a></td></tr>
+  <tr><td>8</td><td><code>MmaAtomCallLowering</code></td><td>FlyToROCDL</td><td><a href="#card-mma-atom-call">§7</a></td></tr>
+  <tr><td>9</td><td><code>MmaOpCDNA3_MFMAType</code></td><td>fly_rocdl</td><td><a href="#card-cdna3-mfma">§8</a></td></tr>
+  <tr><td>10</td><td><code>fx.make_mma_atom</code> / <code>MmaAtom</code></td><td>Python DSL</td><td><a href="#s5">§5</a></td></tr>
+</table>
+
+<h3>1.3 整体数据流(03-tiledMma 为例)</h3>
+
+<div class="flow-box"><span class="comment">── Python DSL ──</span>
+<span class="label">fx.rocdl.MFMA(16,16,4, f32)</span>   <span class="comment">→ MmaOp 类型</span>
+<span class="label">fx.make_mma_atom(mma_op)</span>        <span class="comment">→ fly.make_mma_atom</span>
+<span class="label">fx.make_tiled_mma(atom, layout)</span> <span class="comment">→ fly.make_tiled_mma</span>
+<span class="label">fx.gemm(mma_atom, D, A, B, C)</span>   <span class="comment">→ fly.gemm (D=A×B+C)</span>
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span>  <span class="comment">Pass: fly-convert-atom-call-to-ssa-form</span>
+<span class="label">Fly IR (SSA)</span>
+  fly.mma_atom_call_ssa(%atom, %d?, %a, %b, %c) : vector&lt;...&gt;
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span>  <span class="comment">Pass: convert-fly-to-rocdl</span>
+<span class="label">Lowering</span>
+  MmaAtomType::emitAtomCallSSA
+    <span class="arrow">→</span> MmaOpTypeInterface::emitAtomCallSSA
+    <span class="arrow">▼</span>
+<span class="label">Target IR</span>
+  UniversalFMA: llvm.fmul + llvm.fadd
+  CDNA3 MFMA:   rocdl.mfma_f32_16x16x4f32</div>
+
+<div class="note">
+  <div class="note-title">与 CopyAtom 的对称关系</div>
+  <p>MmaAtom 与 CopyAtom 共用同一套 Atom 设计模式:包装类型 + Interface dispatch + StatefulOpTypeInterface + SSA Pass + FlyToROCDL lowering.主要差异:MMA 有 (M,N,K) 与 A/B/C 三套 TV layout;调用语义是 <code>D = A×B + C</code> 而非 src→dst 搬运;无 <code>valBits</code> 参数.</p>
+</div>
+
+<!-- ===================== Section 2 ===================== -->
+<h2 id="s2">2. Interface 体系:谁定义什么契约</h2>
+
+<p>TableGen 定义在 <code>include/flydsl/Dialect/Fly/IR/FlyInterfaces.td</code>,C++ 实现分散在各 MmaOp 类型对应的 <code>*.cpp</code> 中.</p>
+
+<h3>2.1 继承关系总览</h3>
+
+<pre><code>MmaOpCDNA3_MFMAType / MmaOpGFX1250_WMMAType / MmaOpUniversalFMAType / …
+  ├── Fly_MayStaticTypeInterface
+  │     ├── isStatic()
+  │     └── rebuildStaticValue()
+  │
+  ├── Fly_MmaOpTypeInterface             ← MmaOp 核心契约(必选)
+  │     ├── getThrLayout()
+  │     ├── getShapeMNK()
+  │     ├── getValTypeA/B/C/D()
+  │     ├── getThrValLayoutA/B/C()
+  │     ├── emitAtomCall(...)            ← MemRef 路径
+  │     └── emitAtomCallSSA(...)         ← SSA 路径
+  │
+  └── Fly_StatefulOpTypeInterface         ← 可选(如 CDNA4 MFMA-Scale)
+        ├── getConvertedType()
+        ├── getDefaultState()
+        └── setAtomState()
+
+MmaAtomType
+  └── Fly_MayStaticTypeInterface
+        + 转发: getThrLayout / getShapeMNK / getValType* / getThrValLayout*
+                 emitAtomCall* / isStateful / setAtomState</code></pre>
+
+<!-- ========== MmaOpTypeInterface ========== -->
+<div class="conv-card" id="card-mmaop-interface">
+  <div class="conv-card-title">
+    <span class="conv-num">IF</span>
+    Fly_MmaOpTypeInterface
+  </div>
+  <div class="conv-op">TableGen: FlyInterfaces.td:139–182 &nbsp;|&nbsp; 所有 MmaOp 类型必须实现</div>
+
+  <h4>每个方法的作用</h4>
+
+  <table>
+    <tr><th>方法</th><th>返回/行为</th><th>谁消费</th></tr>
+    <tr>
+      <td><code>getThrLayout()</code></td>
+      <td>参与单条 MMA 的 thread 子布局;CDNA3 MFMA 为 <code>(64):(1)</code>(wave64);WMMA 为 <code>(32):(1)</code>(wave32)</td>
+      <td>TiledMma layout 推导</td>
+    </tr>
+    <tr>
+      <td><code>getShapeMNK()</code></td>
+      <td>静态 (M, N, K) IntTuple</td>
+      <td>tile 大小推导;指令选择</td>
+    </tr>
+    <tr>
+      <td><code>getValTypeA/B/C/D()</code></td>
+      <td>每个 register fragment 的标量/向量元素类型</td>
+      <td>fragment memref / SSA vector 类型推导</td>
+    </tr>
+    <tr>
+      <td><code>getThrValLayoutA/B/C()</code></td>
+      <td>(thread, value) 在参考 tile 中的逻辑坐标</td>
+      <td><code>tiled_mma.partition</code>、<code>make_fragment_*</code></td>
+    </tr>
+    <tr>
+      <td><code>emitAtomCall</code></td>
+      <td>MemRef 形式:load A/B/C,做 MMA,store D</td>
+      <td><code>MmaAtomCallLowering</code></td>
+    </tr>
+    <tr>
+      <td><code>emitAtomCallSSA</code></td>
+      <td>SSA 形式:A/B/C 已是 vector,返回 D vector</td>
+      <td><code>MmaAtomCallSSALowering</code></td>
+    </tr>
+  </table>
+
+  <div class="note">
+    <div class="note-title">与 CopyOpTypeInterface 的对比</div>
+    <p>CopyOp 用 bit-level <code>getThrBitLayoutSrc/Dst/Ref</code> + <code>valBits</code> recast;MmaOp 直接提供 value-level 的 A/B/C TV layout,且多 <code>getShapeMNK</code> 与四套 val type.</p>
+  </div>
+</div>
+
+<h3>2.2 Fly_StatefulOpTypeInterface — 何时需要</h3>
+
+<p>例如 CDNA4 <code>MmaOpCDNA4_MFMAScaleType</code> 带 <code>scale_a</code> / <code>scale_b</code> 运行时状态:</p>
+<ul>
+  <li><code>fly.make_mma_atom</code> lower 为 <code>getDefaultState()</code> 返回的 LLVM struct</li>
+  <li>Python 通过 <code>mma_atom.set_value("scale_a", v)</code> &rarr; <code>fly.atom.set_value</code> &rarr; <code>setAtomState</code></li>
+  <li><code>fx.gemm(mma_atom.set_value(...), d, a, b, c)</code> 走 <code>fly.gemm</code>(operand 为 AnyType)</li>
+</ul>
+
+<!-- ===================== Section 3 ===================== -->
+<h2 id="s3">3. Fly Dialect:Types 与 Ops</h2>
+
+<h3>3.1 核心 Types(<code>FlyTypeDefs.td</code>)</h3>
+
+<table>
+  <tr><th>MLIR 类型</th><th>参数</th><th>职责</th></tr>
+  <tr>
+    <td><code>!fly.mma_atom&lt;MmaOp&gt;</code></td>
+    <td>内嵌 MmaOp 类型</td>
+    <td>包装层;转发 layout 与 <code>emitAtomCall*</code></td>
+  </tr>
+  <tr>
+    <td><code>!fly.tiled_mma&lt;atom, atomLayout, perm&gt;</code></td>
+    <td>MmaAtom + atom 平铺 layout + MNK permutation</td>
+    <td>block 级 MMA 平铺;lower 时擦除为 MmaAtom</td>
+  </tr>
+  <tr>
+    <td><code>!fly.universal_fma&lt;elemTy&gt;</code></td>
+    <td>标量元素类型</td>
+    <td>通用 FMA 回退;lower 为 <code>llvm.fmul + llvm.fadd</code></td>
+  </tr>
+</table>
+
+<h3>3.2 核心 Ops(<code>FlyOps.td</code>)</h3>
+
+<table>
+  <tr><th>Op</th><th>Operands / Results</th><th>生成时机 / 用途</th></tr>
+  <tr>
+    <td><code>fly.make_mma_atom</code></td>
+    <td>无 operand &rarr; <code>!fly.mma_atom</code></td>
+    <td><code>fx.make_mma_atom</code>;Pure op,类型全在 result type</td>
+  </tr>
+  <tr>
+    <td><code>fly.mma_atom_call</code></td>
+    <td>atom, d/a/b/c MemRef</td>
+    <td>MemRef 形式 MMA;<strong>D = A×B + C</strong></td>
+  </tr>
+  <tr>
+    <td><code>fly.mma_atom_call_ssa</code></td>
+    <td>atom, d?, a, b, c &rarr; result?</td>
+    <td>SSA Pass 生成;Register fragment 提升后</td>
+  </tr>
+  <tr>
+    <td><code>fly.make_tiled_mma</code></td>
+    <td>atom, atomLayout, perm? &rarr; tiled_mma</td>
+    <td><code>fx.make_tiled_mma</code></td>
+  </tr>
+  <tr>
+    <td><code>fly.tiled_mma.partition</code></td>
+    <td>operand_id(A/B/C), tiled_mma, tensor, coord</td>
+    <td>按 thread 切分 A/B/C 视图</td>
+  </tr>
+  <tr>
+    <td><code>fly.mma.make_fragment</code></td>
+    <td>operand_id, tiled_mma, memref, stages?</td>
+    <td>分配 register fragment(与 partition 配合)</td>
+  </tr>
+  <tr>
+    <td><code>fly.gemm</code></td>
+    <td>mmaAtom/tiled_mma, d, a, b, c, traversal?</td>
+    <td><code>fx.gemm</code>;高层 GEMM,可由 layout-lowering 展开</td>
+  </tr>
+  <tr>
+    <td><code>fly.atom.set_value</code></td>
+    <td>atom, field, value &rarr; atom</td>
+    <td>Stateful mma atom 设置 scale 等字段</td>
+  </tr>
+</table>
+
+<!-- ========== MakeMmaAtomOp ========== -->
+<div class="conv-card" id="card-make-mma-atom">
+  <div class="conv-card-title">
+    <span class="conv-num">Op</span>
+    fly.make_mma_atom
+  </div>
+  <div class="conv-op">Python: fx.make_mma_atom(mma_op_type) &rarr; fly.make_mma_atom</div>
+
+  <h4>Op 定义</h4>
+<pre><code>def Fly_MakeMmaAtomOp : Fly_Op&lt;"make_mma_atom", [Pure]&gt; {
+  let arguments = (ins);
+  let results = (outs Fly_MmaAtom:$result);
+}</code></pre>
+
+  <p>与 <code>make_copy_atom</code> 对称,但<strong>无 valBits attribute</strong>——MMA 的 dtype 与 MNK 全在内嵌 MmaOp 类型中.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Python DSL</div>
+      <pre><code>mma_atom = fx.make_mma_atom(
+    fx.rocdl.MFMA(16, 16, 4, fx.Float32))</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">Tracing 生成的 Fly IR</div>
+      <pre><code>%atom = fly.make_mma_atom
+  : !fly.mma_atom&lt;
+      !fly_rocdl.cdna3.mfma&lt;
+        16x16x4, (f32,f32)-&gt;f32&gt;&gt;</code></pre>
+    </div>
+  </div>
+
+  <p>Lowering(<code>MakeMmaAtomOpLowering</code>, <code>FlyToROCDL.cpp</code>):stateful &rarr; <code>getDefaultState()</code>;non-stateful &rarr; <code>llvm.undef</code>.</p>
+</div>
+
+<div class="warn">
+  <div class="warn-title">mma_atom_call vs gemm</div>
+  <p><code>fly.mma_atom_call</code> 是一次原子级 MMA,operand 为四个 MemRef/SSA fragment.<code>fly.gemm</code> 是高层 GEMM,可接受 <code>mma_atom</code> 或 <code>tiled_mma</code>,并可选 traversal layout;<code>fly-layout-lowering</code> 可将其展开为循环 + 多次 <code>mma_atom_call</code>.简单 kernel(如 <code>03-tiledMma.py</code>)通常直接 <code>fx.gemm(mma_atom, ...)</code>.</p>
+</div>
+
+<!-- ===================== Section 4 ===================== -->
+<h2 id="s4">4. C++ 实现:转发与 emit</h2>
+
+<!-- ========== MmaAtomType ========== -->
+<div class="conv-card" id="card-mma-atom-type">
+  <div class="conv-card-title">
+    <span class="conv-num">T</span>
+    MmaAtomType
+  </div>
+  <div class="conv-op">FlyTypeDefs.td:297–333 &nbsp;|&nbsp; lib/Dialect/Fly/IR/FlyTypeDefs.cpp:498–558</div>
+
+  <h4>职责:纯转发(无 layoutRecast)</h4>
+
+<pre><code>Attribute MmaAtomType::getThrValLayoutA() const {
+  return cast&lt;MmaOpTypeInterface&gt;(getMmaOp()).getThrValLayoutA();
+}
+
+FailureOr&lt;Value&gt; MmaAtomType::emitAtomCallSSA(...) const {
+  return cast&lt;MmaOpTypeInterface&gt;(getMmaOp())
+      .emitAtomCallSSA(builder, loc, resultTy, mmaAtomTy, dTy, aTy, bTy, cTy,
+                       atomVal, d, a, b, c);
+}</code></pre>
+
+  <p><strong>关键不变量:</strong> <code>MmaAtomType</code> 不决定生成哪条 MFMA/WMMA;内嵌 <code>getMmaOp()</code> 的类型决定.</p>
+</div>
+
+<!-- ========== UniversalFMA ========== -->
+<div class="conv-card" id="card-universal-fma">
+  <div class="conv-card-title">
+    <span class="conv-num">U</span>
+    MmaOpUniversalFMAType
+  </div>
+  <div class="conv-op">FlyTypeDefs.td:362–374 &nbsp;|&nbsp; lib/Dialect/Fly/IR/FlyUniversalOps.cpp:310–338</div>
+
+  <table>
+    <tr><th>方法</th><th>UniversalFMA 行为</th></tr>
+    <tr><td><code>getShapeMNK</code></td><td><code>(1, 1, 1)</code></td></tr>
+    <tr><td><code>getThrLayout</code></td><td><code>(1):(1)</code></td></tr>
+    <tr><td><code>getThrValLayoutA/B/C</code></td><td>单 thread 单元素</td></tr>
+    <tr><td><code>emitAtomCallSSA</code></td><td><code>res = a*b + c</code>;可选 store 到 d</td></tr>
+    <tr><td><code>emitAtomCall</code></td><td>load A/B/C &rarr; FMA &rarr; store D</td></tr>
+  </table>
+
+  <p>用于无张量核心硬件或单元测试;Python 入口:<code>fx.UniversalFMA(fx.Float32)</code>.</p>
+</div>
+
+<!-- ===================== Section 5 ===================== -->
+<h2 id="s5">5. Python 绑定与 DSL 层</h2>
+
+<p>Python 侧分三层:<strong>MLIR 原生绑定</strong> &rarr; <strong>primitive 薄封装</strong> &rarr; <strong>typing 值_caster 增强</strong>.</p>
+
+<h3>5.1 分层对照表</h3>
+
+<table>
+  <tr><th>层级</th><th>模块 / 文件</th><th>内容</th></tr>
+  <tr>
+    <td><strong>MLIR Type 绑定</strong></td>
+    <td><code>lib/Bindings/Python/FlyExtension.cpp</code></td>
+    <td><code>MmaAtomType</code>、<code>TiledMmaType</code>、<code>MmaOpUniversalFMAType</code></td>
+  </tr>
+  <tr>
+    <td><strong>ROCDL Type 绑定</strong></td>
+    <td><code>lib/Bindings/Python/FlyROCDLExtension.cpp</code></td>
+    <td><code>MmaOpCDNA3_MFMAType</code>、<code>MmaOpCDNA4_MFMAScaleType</code>、<code>MmaOpGFX1250_WMMAType</code>、<code>MmaOpGFX11_WMMAType</code></td>
+  </tr>
+  <tr>
+    <td><strong>DSL primitive</strong></td>
+    <td><code>python/flydsl/expr/primitive.py</code></td>
+    <td><code>make_mma_atom</code>、<code>mma_atom_call</code>、<code>make_tiled_mma</code>、<code>gemm</code></td>
+  </tr>
+  <tr>
+    <td><strong>DSL 便捷别名</strong></td>
+    <td><code>rocdl.py</code>、<code>rocdl/universal.py</code>、<code>rocdl/cdna4.py</code></td>
+    <td><code>fx.rocdl.MFMA(...)</code>、<code>WMMA_Gfx1250(...)</code>、<code>MFMAScale(...)</code></td>
+  </tr>
+  <tr>
+    <td><strong>值_caster 类</strong></td>
+    <td><code>python/flydsl/expr/typing.py</code></td>
+    <td><code>MmaAtom</code>、<code>TiledMma</code></td>
+  </tr>
+  <tr>
+    <td><strong>高层 helper</strong></td>
+    <td><code>python/flydsl/expr/derived.py</code></td>
+    <td><code>make_tiled_copy_A/B/C</code>、<code>ThrMma.partition_A/B/C</code></td>
+  </tr>
+</table>
+
+<h3>5.2 Python API &rarr; IR 映射</h3>
+
+<table>
+  <tr><th>用户写法 (fx.*)</th><th>内部调用</th><th>生成的 Fly IR</th></tr>
+  <tr>
+    <td><code>fx.rocdl.MFMA(16,16,4, f32)</code></td>
+    <td><code>MmaOpCDNA3_MFMAType.get(...)</code></td>
+    <td>(纯类型,嵌入 mma_atom 类型参数)</td>
+  </tr>
+  <tr>
+    <td><code>fx.make_mma_atom(mma_op)</code></td>
+    <td><code>MmaAtomType.get</code> + <code>fly.make_mma_atom</code></td>
+    <td><code>fly.make_mma_atom : !fly.mma_atom&lt;...&gt;</code></td>
+  </tr>
+  <tr>
+    <td><code>fx.make_tiled_mma(atom, layout)</code></td>
+    <td><code>fly.make_tiled_mma</code></td>
+    <td><code>fly.make_tiled_mma(%atom, %layout, ...)</code></td>
+  </tr>
+  <tr>
+    <td><code>fx.gemm(atom, d, a, b, c)</code></td>
+    <td><code>fly.gemm</code></td>
+    <td><code>fly.gemm(%atom, %d, %a, %b, %c)</code></td>
+  </tr>
+  <tr>
+    <td><code>thr_mma.make_fragment_A(a)</code></td>
+    <td><code>fly.mma_make_fragment</code></td>
+    <td><code>fly.mma.make_fragment(A, %tm, %a, ...)</code></td>
+  </tr>
+  <tr>
+    <td><code>thr_mma.partition_A(a)</code></td>
+    <td><code>fly.tiled_mma_partition</code></td>
+    <td><code>fly.tiled_mma.partition(A, %tm, %a, %coord)</code></td>
+  </tr>
+</table>
+
+<h3>5.3 MmaAtom / TiledMma Python 类</h3>
+
+<table>
+  <tr><th>类</th><th>属性 / 方法</th><th>含义</th></tr>
+  <tr>
+    <td rowspan="5"><code>MmaAtom</code></td>
+    <td><code>.shape_mnk</code></td>
+    <td>静态 (M,N,K)</td>
+  </tr>
+  <tr><td><code>.thr_layout</code></td><td>参与 MMA 的 thread 布局</td></tr>
+  <tr><td><code>.layout_A_tv</code> / <code>_B_</code> / <code>_C_</code></td><td>A/B/C 的 TV layout</td></tr>
+  <tr><td><code>.set_value(field, val)</code></td><td>Stateful atom(scale 等)</td></tr>
+  <tr><td colspan="2"></td></tr>
+  <tr>
+    <td rowspan="6"><code>TiledMma</code></td>
+    <td><code>.atom_layout</code></td>
+    <td>block 内 atom 平铺 layout</td>
+  </tr>
+  <tr><td><code>.tile_size_mnk</code></td><td>推导的 tile MNK 大小</td></tr>
+  <tr><td><code>.thr_layout_vmnk</code></td><td>block 级 thread×MNK layout</td></tr>
+  <tr><td><code>.tv_layout_A/B/C_tiled</code></td><td>平铺后的 A/B/C TV view</td></tr>
+  <tr><td><code>.get_slice(thr_idx)</code></td><td>返回 <code>ThrMma</code></td></tr>
+  <tr><td><code>.make_fragment_A/B/C</code></td><td>分配 register fragment</td></tr>
+</table>
+
+<!-- ===================== Section 6 ===================== -->
+<h2 id="s6">6. TiledMma 与 Layout 推导</h2>
+
+<!-- ========== TiledMmaType ========== -->
+<div class="conv-card" id="card-tiled-mma">
+  <div class="conv-card-title">
+    <span class="conv-num">T</span>
+    TiledMmaType
+  </div>
+  <div class="conv-op">!fly.tiled_mma&lt;atom, atomLayout, perm&gt; &nbsp;|&nbsp; fly.make_tiled_mma</div>
+
+  <p>TiledMma 描述<strong>一个 block 内如何用多个 MmaAtom 覆盖更大的 GEMM tile</strong>,并驱动 A/B/C 的 partition 与 fragment 布局.</p>
+
+  <div class="flow-box"><span class="label">MmaAtom</span>  — 最小单元:一条 MFMA/WMMA 的 MNK 与 TV layout
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span> <span class="comment">+ atomLayout(如 (2,2,1)) + permutation(M,N,K)</span>
+<span class="label">TiledMma</span>  — 平铺描述:tile_size_mnk、thr_layout_vmnk、tv_layout_*_tiled
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span> <span class="comment">partition / make_fragment</span>
+<span class="label">Register fragments</span>  — 每个 thread 持有的 A/B/C 子块
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span>
+<span class="label">gemm / mma_atom_call</span>  — D = A×B + C</div>
+
+  <p>Layout 工具:<code>include/flydsl/Dialect/Fly/Utils/TiledOpUtils.h</code> 中的 <code>layoutTiledMmaThrValView</code> 等;Python 通过 <code>TiledOpTraits.cpp</code> 暴露 <code>tile_size_mnk</code>、<code>thr_layout_vmnk</code>、<code>tiled_tv_layout_a/b/c</code>.</p>
+
+  <p>Lowering 时 <code>MakeTiledMmaOpLowering</code> 透传 <code>mmaAtom</code> 操作数(<code>FlyTypeConverter</code> 将 <code>TiledMmaType</code> 映射为内部 MmaAtom 的转换后类型).</p>
+
+  <div class="note">
+    <div class="note-title">与 Copy 管线协作</div>
+    <p>典型 GEMM kernel 同时用 TiledMma 与 TiledCopy:<code>make_tiled_copy_A/B/C(copy_atom, tiled_mma)</code>(<code>derived.py</code>) 生成与 MMA operand layout 对齐的拷贝平铺,先 copy 数据到 fragment,再 <code>fx.gemm</code>.</p>
+  </div>
+</div>
+
+<!-- ===================== Section 7 ===================== -->
+<h2 id="s7">7. Pass Pipeline 与调用链</h2>
+
+<h3>7.1 编译阶段一览</h3>
+
+<table>
+  <tr><th>阶段</th><th>Pass / 组件</th><th>对 MmaAtom 做什么</th></tr>
+  <tr>
+    <td>Tracing</td>
+    <td><code>@traced_op</code></td>
+    <td>插入 <code>make_mma_atom</code>、<code>gemm</code>、<code>mma.make_fragment</code> 等</td>
+  </tr>
+  <tr>
+    <td>Layout</td>
+    <td><code>fly-layout-lowering</code></td>
+    <td>展开 <code>fly.gemm</code> 为 <code>mma_atom_call</code> 循环(<code>LayoutLowering.cpp</code>)</td>
+  </tr>
+  <tr>
+    <td>SSA 提升</td>
+    <td><code>fly-convert-atom-call-to-ssa-form</code></td>
+    <td>Register MemRef eligible 时:<code>mma_atom_call</code> &rarr; <code>mma_atom_call_ssa</code></td>
+  </tr>
+  <tr>
+    <td>Vector SSA</td>
+    <td><code>fly-promote-regmem-to-vectorssa</code></td>
+    <td>按 TV layout 将 register fragment 提升为 vector SSA</td>
+  </tr>
+  <tr>
+    <td>Backend</td>
+    <td><code>convert-fly-to-rocdl</code></td>
+    <td><code>MmaAtomCall*Lowering</code> &rarr; <code>emitAtomCall*</code> &rarr; ROCDL MFMA/WMMA</td>
+  </tr>
+</table>
+
+<!-- ========== SSA Pass ========== -->
+<div class="conv-card" id="card-ssa-pass">
+  <div class="conv-card-title">
+    <span class="conv-num">P</span>
+    fly-convert-atom-call-to-ssa-form (MMA 路径)
+  </div>
+  <div class="conv-op">lib/Dialect/Fly/Transforms/ConvertAtomCallToSSAForm.cpp</div>
+
+  <p>与 CopyAtom 共用同一 Pass:对 <code>MmaAtomCall</code>,若 d/a/b/c 中任一 Register MemRef 满足 <code>isEligibleToPromote</code>,则先 <code>ptr_load</code> 为 SSA,再插入 <code>mma_atom_call_ssa</code>,最后对 d 端 <code>ptr_store</code>.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (MemRef 形式)</div>
+      <pre><code>fly.mma_atom_call %atom, %d, %a, %b, %c
+  : !fly.mma_atom&lt;...&gt;,
+    !fly.memref&lt;..., register&gt;, ...</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After SSA Pass (d eligible)</div>
+      <pre><code>%a_ssa = fly.ptr_load %a_iter : vector&lt;...&gt;
+%b_ssa = fly.ptr_load %b_iter : vector&lt;...&gt;
+%c_ssa = fly.ptr_load %c_iter : vector&lt;...&gt;
+%d_ssa = fly.mma_atom_call_ssa
+  %atom, %d=null, %a_ssa, %b_ssa, %c_ssa
+fly.ptr_store %d_ssa, %d_iter</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== MmaAtomCallLowering ========== -->
+<div class="conv-card" id="card-mma-atom-call">
+  <div class="conv-card-title">
+    <span class="conv-num">L</span>
+    MmaAtomCallLowering / MmaAtomCallSSALowering
+  </div>
+  <div class="conv-op">lib/Conversion/FlyToROCDL/FlyToROCDL.cpp:609–680</div>
+
+<pre><code>MmaAtomCallLowering::matchAndRewrite(MmaAtomCall op, ...) {
+  mmaAtomTy.emitAtomCall(rewriter, loc, ..., dPtr, aPtr, bPtr, cPtr);
+}
+
+MmaAtomCallSSALowering::matchAndRewrite(MmaAtomCallSSA op, ...) {
+  mmaAtomTy.emitAtomCallSSA(rewriter, loc, resultTy, ...,
+                            adaptor.getD(), a, b, c);
+}</code></pre>
+
+  <p>MemRef 路径:四个 operand 须已转为 <code>llvm.ptr</code>.SSA 路径:有 result 则 <code>replaceOp</code>,否则 side-effect only 则 <code>eraseOp</code>.</p>
+</div>
+
+<!-- ===================== Section 8 ===================== -->
+<h2 id="s8">8. FlyROCDL 后端:硬件 MmaOp 实现</h2>
+
+<h3>8.1 TableGen 基类(<code>FlyROCDL/IR/Dialect.td</code>)</h3>
+
+<table>
+  <tr><th>TableGen 基类</th><th>实现的 Interface</th><th>用途</th></tr>
+  <tr><td><code>FlyROCDL_MmaOp</code></td><td>MayStatic + MmaOpTypeInterface</td><td>无状态 MFMA/WMMA(CDNA3、GFX11、GFX1250)</td></tr>
+  <tr><td><code>FlyROCDL_StatefulMmaOp</code></td><td>MmaOpTypeInterface + StatefulOpTypeInterface</td><td>CDNA4 MFMA-Scale(scale_a/b)</td></tr>
+</table>
+
+<h3>8.2 已实现的 MmaOp 类型(<code>MmaAtom.td</code>)</h3>
+
+<table>
+  <tr><th>MLIR 类型</th><th>Python 入口</th><th>C++ 实现</th><th>目标架构</th></tr>
+  <tr>
+    <td><code>!fly_rocdl.cdna3.mfma&lt;MxNxK,...&gt;</code></td>
+    <td><code>fx.rocdl.MFMA(m,n,k, ty)</code></td>
+    <td><code>CDNA3/MmaAtom.cpp</code></td>
+    <td>CDNA3 wave64 MFMA</td>
+  </tr>
+  <tr>
+    <td><code>!fly_rocdl.cdna4.mfma_scale&lt;...&gt;</code></td>
+    <td><code>fx.rocdl.cdna4.MFMAScale(...)</code></td>
+    <td><code>CDNA4/MmaAtom.cpp</code></td>
+    <td>CDNA4 FP8/scale MFMA</td>
+  </tr>
+  <tr>
+    <td><code>!fly_rocdl.gfx1250.wmma&lt;...&gt;</code></td>
+    <td><code>fx.rocdl.WMMA_Gfx1250(...)</code></td>
+    <td><code>GFX1250/MmaAtom.cpp</code></td>
+    <td>MI450 wave32 WMMA</td>
+  </tr>
+  <tr>
+    <td><code>!fly_rocdl.gfx11.wmma&lt;...&gt;</code></td>
+    <td><code>fx.rocdl.WMMA_Gfx11(...)</code></td>
+    <td><code>GFX11/MmaAtom.cpp</code></td>
+    <td>RDNA3 wave32 WMMA</td>
+  </tr>
+</table>
+
+<!-- ========== CDNA3 MFMA ========== -->
+<div class="conv-card" id="card-cdna3-mfma">
+  <div class="conv-card-title">
+    <span class="conv-num">R</span>
+    MmaOpCDNA3_MFMAType
+  </div>
+  <div class="conv-op">lib/Dialect/FlyROCDL/CDNA3/MmaAtom.cpp</div>
+
+  <table>
+    <tr><th>项目</th><th>内容</th></tr>
+    <tr><td><code>getThrLayout</code></td><td><code>(64):(1)</code> — 整个 wave64 协作一条 MFMA</td></tr>
+    <tr><td><code>getShapeMNK</code></td><td><code>(M, N, K)</code> 来自类型参数;要求 M==N</td></tr>
+    <tr><td><code>getThrValLayoutA/B</code></td><td>由 MNK 与 dtype 推导(见 <code>getThrValLayoutAB</code>)</td></tr>
+    <tr><td><code>getThrValLayoutC</code></td><td>累加器 fragment 布局(与 A/B 不同)</td></tr>
+    <tr><td><code>emitAtomCallSSA</code></td><td><code>DISPATCH_MFMA_SSA</code> 宏匹配 M/N/K/dtype &rarr; <code>rocdl.mfma_*</code></td></tr>
+  </table>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">SSA 输入(fragment vector)</div>
+      <pre><code>%a : vector&lt;1xf32&gt;   ; 16x16x4 f32 MFMA
+%b : vector&lt;1xf32&gt;
+%c : vector&lt;4xf32&gt;   ; acc fragment
+fly.mma_atom_call_ssa %atom, %d?, %a, %b, %c</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">emitAtomCallSSA 输出</div>
+      <pre><code>%d = rocdl.mfma_f32_16x16x4f32
+  %a, %b, %c,
+  cbsz=0, abid=0, blgp=0
+  : vector&lt;4xf32&gt;</code></pre>
+    </div>
+  </div>
+</div>
+
+<h3>8.3 新增硬件 MMA 指令 checklist</h3>
+
+<ol>
+  <li>在 <code>fly_rocdl</code> 的 <code>MmaAtom.td</code> 添加 TypeDef(选 MmaOp 或 StatefulMmaOp 基类)</li>
+  <li>在 <code>lib/Dialect/FlyROCDL/&lt;arch&gt;/MmaAtom.cpp</code> 实现 layout 方法与 <code>emitAtomCallSSA</code></li>
+  <li>在 <code>FlyROCDLExtension.cpp</code> 添加 Python Type 绑定 + <code>rocdl/*.py</code> 便捷函数</li>
+  <li>用户侧:<code>fx.make_mma_atom(fx.rocdl.NewMmaOp(...))</code> — Fly Dialect 无需改</li>
+</ol>
+
+<!-- ===================== Section 9 ===================== -->
+<h2 id="s9">9. 端到端示例</h2>
+
+<h3>9.1 小型 GEMM:<code>examples/03-tiledMma.py</code></h3>
+
+<pre><code>mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((2, 2, 1), (1, 2, 0)))
+thr_mma = tiled_mma.thr_slice(tid)
+
+frag_A = thr_mma.make_fragment_A(bA)
+frag_B = thr_mma.make_fragment_B(bB)
+frag_C = thr_mma.make_fragment_C(bC)
+
+# ... copy global → fragment ...
+
+frag_C.fill(0)
+fx.gemm(mma_atom, frag_C, frag_A, frag_B, frag_C)  # D = A×B + C
+
+# ... copy fragment → global ...</code></pre>
+
+<div class="ir-before-after">
+  <div class="ir-box">
+    <div class="ir-box-title before">Tracing 后(Fly IR 片段)</div>
+    <pre><code>%atom = fly.make_mma_atom : !fly.mma_atom&lt;...mfma...&gt;
+%tm = fly.make_tiled_mma(%atom, %layout, ...)
+fly.gemm(%atom, %fragC, %fragA, %fragB, %fragC)</code></pre>
+  </div>
+  <div class="ir-box">
+    <div class="ir-box-title after">FlyToROCDL 后(CDNA3 MFMA)</div>
+    <pre><code>%atom = llvm.undef : !llvm.struct&lt;&gt;
+; ... ptr_load fragments ...
+%d = rocdl.mfma_f32_16x16x4f32 %a, %b, %c, ...
+fly.ptr_store %d, %fragC_iter</code></pre>
+  </div>
+</div>
+
+<h3>9.2 生产级 GEMM</h3>
+
+<p>生产 kernel(如 <code>kernels/preshuffle_gemm.py</code>)在相同 MmaAtom/TiledMma 抽象之上叠加:双缓冲 LDS、software pipeline、C shuffle epilogue、autotune config 等.底层 MMA 调用链不变 — <code>make_mma_atom</code> &rarr; <code>gemm</code> / <code>mma_atom_call</code> &rarr; SSA Pass &rarr; <code>emitAtomCallSSA</code> &rarr; MFMA.</p>
+
+<!-- ===================== Section 10 ===================== -->
+<h2 id="s10">10. 符号速查表与总结</h2>
+
+<h3>10.1 按职责分类</h3>
+
+<table>
+  <tr><th>职责</th><th>C++ / TableGen</th><th>Python</th></tr>
+  <tr><td><strong>Interface 定义</strong></td><td><code>Fly_MmaOpTypeInterface</code>、<code>Fly_StatefulOpTypeInterface</code></td><td>—</td></tr>
+  <tr><td><strong>包装类型</strong></td><td><code>MmaAtomType</code>、<code>TiledMmaType</code></td><td><code>MmaAtom</code>、<code>TiledMma</code></td></tr>
+  <tr><td><strong>通用 MmaOp</strong></td><td><code>MmaOpUniversalFMAType</code></td><td><code>UniversalFMA</code></td></tr>
+  <tr><td><strong>ROCm MmaOp</strong></td><td><code>MmaOpCDNA3_MFMAType</code> 等</td><td><code>fx.rocdl.MFMA</code>、<code>WMMA_Gfx1250</code></td></tr>
+  <tr><td><strong>构造 Op</strong></td><td><code>MakeMmaAtomOp</code>、<code>MakeTiledMmaOp</code></td><td><code>make_mma_atom</code>、<code>make_tiled_mma</code></td></tr>
+  <tr><td><strong>执行 Op</strong></td><td><code>MmaAtomCall</code>、<code>MmaAtomCallSSA</code>、<code>GemmOp</code></td><td><code>mma_atom_call</code>、<code>gemm</code></td></tr>
+  <tr><td><strong>Partition / Fragment</strong></td><td><code>TiledMmaPartitionOp</code>、<code>MmaMakeFragmentOp</code></td><td><code>tiled_mma_partition</code>、<code>make_fragment_*</code></td></tr>
+  <tr><td><strong>Lowering</strong></td><td><code>FlyToROCDL.cpp</code></td><td>—</td></tr>
+  <tr><td><strong>SSA Pass</strong></td><td><code>ConvertAtomCallToSSAForm.cpp</code></td><td>—</td></tr>
+</table>
+
+<h3>10.2 源文件索引</h3>
+
+<table>
+  <tr><th>文件</th><th>内容</th></tr>
+  <tr><td><code>include/flydsl/Dialect/Fly/IR/FlyInterfaces.td</code></td><td><code>Fly_MmaOpTypeInterface</code> 声明</td></tr>
+  <tr><td><code>include/flydsl/Dialect/Fly/IR/FlyTypeDefs.td</code></td><td>MmaAtom、TiledMma、UniversalFMA 类型</td></tr>
+  <tr><td><code>include/flydsl/Dialect/Fly/IR/FlyOps.td</code></td><td>make_mma_atom、mma_atom_call、gemm 等 Op</td></tr>
+  <tr><td><code>lib/Dialect/Fly/IR/FlyTypeDefs.cpp</code></td><td>MmaAtomType 转发</td></tr>
+  <tr><td><code>lib/Dialect/Fly/IR/FlyUniversalOps.cpp</code></td><td>UniversalFMA emit</td></tr>
+  <tr><td><code>include/flydsl/Dialect/Fly/Utils/TiledOpUtils.h</code></td><td>TiledMma layout 代数</td></tr>
+  <tr><td><code>include/flydsl/Dialect/FlyROCDL/IR/MmaAtom.td</code></td><td>ROCm MmaOp 类型声明</td></tr>
+  <tr><td><code>lib/Dialect/FlyROCDL/CDNA3/MmaAtom.cpp</code></td><td>CDNA3 MFMA emit + TV layout</td></tr>
+  <tr><td><code>lib/Conversion/FlyToROCDL/FlyToROCDL.cpp</code></td><td>MmaAtomCall*Lowering</td></tr>
+  <tr><td><code>lib/Bindings/Python/FlyExtension.cpp</code></td><td>MmaAtom / TiledMma Python 绑定</td></tr>
+  <tr><td><code>lib/Bindings/Python/FlyROCDLExtension.cpp</code></td><td>ROCDL MmaOp Python 绑定</td></tr>
+  <tr><td><code>python/flydsl/expr/primitive.py</code></td><td>DSL 入口函数</td></tr>
+  <tr><td><code>examples/03-tiledMma.py</code></td><td>TiledMma + gemm 最小示例</td></tr>
+</table>
+
+<h3>10.3 总结</h3>
+
+<div class="note">
+<table>
+  <tr><th>要记住的 5 件事</th><th>说明</th></tr>
+  <tr>
+    <td><strong>1. 四层模型</strong></td>
+    <td>MmaOp(指令) &rarr; MmaAtom(包装) &rarr; TiledMma(平铺) &rarr; mma_atom_call / gemm(执行)</td>
+  </tr>
+  <tr>
+    <td><strong>2. Interface 是扩展点</strong></td>
+    <td>所有 lower 逻辑在 <code>MmaOpTypeInterface::emitAtomCall*</code>;MmaAtomType 只转发</td>
+  </tr>
+  <tr>
+    <td><strong>3. 语义 D=A×B+C</strong></td>
+    <td>四个 operand d/a/b/c;SSA 路径返回累加结果 vector</td>
+  </tr>
+  <tr>
+    <td><strong>4. 三套 TV layout</strong></td>
+    <td>A/B/C 各有 <code>getThrValLayout*</code>;驱动 partition 与 fragment 类型</td>
+  </tr>
+  <tr>
+    <td><strong>5. Python 三层</strong></td>
+    <td>MLIR 绑定 &rarr; primitive(@traced_op) &rarr; typing(MmaAtom/TiledMma 增强)</td>
+  </tr>
+</table>
+</div>
+
+<p>一句话:<strong>MmaAtom 是 Fly 方言对「矩阵乘指令」的类型擦除包装;具体生成哪条 MFMA/WMMA 完全由内嵌 MmaOp 的 Interface 实现决定;Python 侧通过 <code>make_mma_atom</code> 组装类型、通过 <code>gemm</code> / <code>mma_atom_call</code> 插入 IR,再经 SSA Pass 与 FlyToROCDL 落到 ROCDL intrinsic.</strong></p>
+
+</div>

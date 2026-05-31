@@ -1,0 +1,1346 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlyDSL 编译全流程:从 DSL 到第一个 IR 生成</title>
+<style>
+  :root {
+    --bg: #f8f9fc;
+    --surface: #ffffff;
+    --surface2: #f0f2f7;
+    --border: #dde1ea;
+    --text: #1a1d2e;
+    --text2: #5a6078;
+    --accent: #3b6bff;
+    --accent2: #3b6bff;
+    --green: #1a8a5c;
+    --orange: #c47200;
+    --red: #d03030;
+    --purple: #7c3aed;
+    --cyan: #0e7e8a;
+    --code-bg: #f3f4f8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 2rem; margin-bottom: 2.5rem;
+  }
+  .toc h3 { margin-top: 0; color: var(--accent); }
+  .toc ol { margin-left: 1.2rem; }
+  .toc li { margin-bottom: 0.3rem; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  h1 {
+    font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text2); font-size: 1rem; margin-bottom: 2.5rem; }
+
+  h2 {
+    font-size: 1.5rem; font-weight: 700; margin-top: 3rem; margin-bottom: 1rem;
+    padding-bottom: 0.5rem; border-bottom: 2px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.15rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem;
+    color: var(--green);
+  }
+  h4 {
+    font-size: 1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem;
+    color: var(--orange);
+  }
+
+  p { margin-bottom: 1rem; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+
+  code {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px; font-size: 0.9em;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    color: #0e7e8a;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+    overflow-x: auto; font-size: 0.88rem; line-height: 1.6;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  pre code { background: none; border: none; padding: 0; color: var(--text); }
+
+  .highlight { color: var(--orange); font-weight: 600; }
+  .note {
+    background: var(--surface); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .note-title { font-weight: 700; color: var(--accent); margin-bottom: 0.3rem; }
+  .warn {
+    background: rgba(240,164,93,0.08); border-left: 4px solid var(--orange);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 0.6rem 0.8rem; text-align: left;
+  }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--surface); }
+
+  .flow-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1.25rem; margin: 1rem 0 1.5rem;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.88rem;
+    line-height: 1.8; white-space: pre; overflow-x: auto;
+  }
+  .flow-box .arrow { color: var(--accent); }
+  .flow-box .label { color: var(--green); }
+  .flow-box .comment { color: var(--text2); }
+
+
+
+  .section { margin-bottom: 1rem; }
+
+  .arch-box {
+    background: var(--surface); border: 2px solid var(--purple);
+    border-radius: 12px; padding: 1.25rem 1.5rem; margin: 1.5rem 0;
+  }
+  .arch-box-title {
+    font-weight: 700; color: var(--purple); margin-bottom: 0.75rem; font-size: 1rem;
+  }
+  .layer-box {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; margin: 0.75rem 0;
+  }
+  .layer-box-title {
+    font-weight: 700; margin-bottom: 0.5rem; font-size: 0.95rem;
+  }
+  .layer-box ul { margin: 0.3rem 0 0 1.2rem; }
+  .layer-box li { margin-bottom: 0.25rem; font-size: 0.9rem; }
+</style>
+
+
+<div class="container">
+
+<h1>FlyDSL 编译全流程:从 DSL 到第一个 IR 生成</h1>
+<p class="subtitle">以 01-vectorAdd.py 为例,深入理解 AST 改写,traced_op 与 IR 插入机制</p>
+
+<div class="toc">
+<h3>目录</h3>
+<ol>
+  <li><a href="#s1">整体流程概览:从 Python 函数到 MLIR Module</a></li>
+  <li><a href="#s2">AST 改写:5 个 Transformer 的前后对比</a></li>
+  <li><a href="#s3">Kernel 发射:从改写后的函数到 gpu.func</a></li>
+  <li><a href="#s4">traced_op:DSL 调用如何实时插入 IR</a></li>
+  <li><a href="#s5">端到端示例:vector_add_kernel 的完整编译路径</a></li>
+  <li><a href="#s6">总结</a></li>
+</ol>
+</div>
+
+<!-- ===================== Section 1 ===================== -->
+<h2 id="s1">1. 整体流程概览:从 Python 函数到 MLIR Module</h2>
+
+<p>以 <code>vector_add_kernel</code> 为例,用户编写一个 Python 函数并加上 <code>@flyc.kernel</code> 装饰器.当它被 <code>@flyc.jit</code> 装饰的函数调用时,FlyDSL 编译器执行以下步骤:</p>
+
+<style>
+  .pipeline { display:flex; flex-direction:column; gap:0; margin:1.5rem 0; }
+  .pipe-card {
+    background: var(--surface); border:2px solid var(--border); border-radius:10px;
+    padding:1rem 1.25rem; position:relative;
+  }
+  .pipe-card + .pipe-card { margin-top:0; }
+  .pipe-card .pipe-head {
+    display:flex; align-items:center; gap:0.6rem; margin-bottom:0.5rem;
+  }
+  .pipe-card .pipe-num {
+    display:inline-flex; align-items:center; justify-content:center;
+    width:1.7rem; height:1.7rem; border-radius:50%; font-weight:700;
+    font-size:0.85rem; color:#fff; flex-shrink:0;
+  }
+  .pipe-card .pipe-title { font-weight:700; font-size:0.95rem; }
+  .pipe-card .pipe-body { font-size:0.88rem; line-height:1.75; margin-left:0.2rem; }
+  .pipe-card .pipe-body code { font-size:0.85em; }
+  .pipe-card .pipe-io {
+    display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:0.4rem;
+  }
+  .pipe-card .pipe-io .io-tag {
+    font-size:0.78rem; padding:0.15rem 0.5rem; border-radius:4px;
+    font-weight:600; font-family:'JetBrains Mono',monospace;
+  }
+  .pipe-card .pipe-io .io-in { background:rgba(26,138,92,0.1); color:var(--green); border:1px solid rgba(26,138,92,0.25); }
+  .pipe-card .pipe-io .io-out { background:rgba(59,107,255,0.1); color:var(--accent); border:1px solid rgba(59,107,255,0.25); }
+  .pipe-arrow {
+    display:flex; justify-content:center; color:var(--accent); font-size:1.1rem;
+    line-height:1; padding:0.15rem 0;
+  }
+  .pipe-nest {
+    margin:0.5rem 0 0.25rem 1.5rem; padding-left:1rem;
+    border-left:3px solid var(--border);
+  }
+  .pipe-nest .pipe-card { border-width:1px; }
+  .pipe-nest .pipe-card .pipe-title { font-size:0.9rem; }
+  .pipe-nest .pipe-card .pipe-body { font-size:0.85rem; }
+  .pipe-nest .pipe-nest { margin-left:1rem; border-left-color:var(--purple); }
+</style>
+
+<div class="pipeline">
+
+  <div class="pipe-card" style="border-color:var(--green); background:rgba(26,138,92,0.04);">
+    <div class="pipe-head">
+      <span class="pipe-num" style="background:var(--green);">用户</span>
+      <span class="pipe-title" style="color:var(--green);">用户代码</span>
+    </div>
+    <div class="pipe-body"><code>@flyc.kernel def vector_add_kernel(a, c, block_dim): ...</code></div>
+  </div>
+
+  <div class="pipe-arrow">v</div>
+
+  <div class="pipe-card" style="border-color:var(--purple);">
+    <div class="pipe-head">
+      <span class="pipe-num" style="background:var(--purple);">1</span>
+      <span class="pipe-title" style="color:var(--purple);">装饰时(@flyc.kernel / @flyc.jit 均触发)</span>
+    </div>
+    <div class="pipe-body">
+      <code>ASTRewriter.transform(func)</code>:获取源码 --> <code>ast.parse()</code> --> 5 个 Transformer --> Python <code>compile()</code> --> 替换 <code>__code__</code>
+    </div>
+    <div class="pipe-io">
+      <span class="io-tag io-in">输入 Python 函数(含 if/for/while/bool)</span>
+      <span class="io-tag io-out">输出 改写后的 Python 函数(if-->scf_if_dispatch, for-->scf_for_dispatch, and/or/not-->dsl_and_/dsl_or_/dsl_not_),仍为 Python 字节码,非 MLIR(改写效果见 <a href="#s2_8">S2.8</a>)</span>
+    </div>
+  </div>
+
+  <div class="pipe-arrow">v</div>
+
+  <div class="pipe-card" style="border-color:var(--accent);">
+    <div class="pipe-head">
+      <span class="pipe-num" style="background:var(--accent);">2</span>
+      <span class="pipe-title" style="color:var(--accent);">@flyc.jit 函数被调用时(整个 JIT 函数体的执行)</span>
+    </div>
+    <div class="pipe-body">
+      参数处理:<code>get_ir_types(jit_args)</code> --> 推导 MLIR 类型;<code>convert_to_jit_arguments</code> --> 分离 constexpr<br>
+      创建 <code>ir.Context</code> + <code>ir.Module</code>(空的 MLIR 模块)<br>
+      创建 <code>gpu.module @kernels</code>(空的 GPU 模块,用于存放 kernel 定义)<br>
+      创建 <code>func.func</code>(host 函数,参数类型 = 用户参数的 MLIR 类型,用于存放 host 代码 + gpu.launch_func)<br>
+      将 <code>gpu.module</code> 的 body Block 保存到 <code>CompilationContext.gpu_module_body</code><br>
+      InsertionPoint --> <code>func.func</code> 的 entry_block<br>
+      <code>construct_from_ir_values</code>:func.func 的 Block 参数(ir.Value)--> DSL 对象<br>
+      执行 <code>self.func(**named_args)</code> <-- JIT 函数体,以下 3. 4. 均在此期间发生:
+    </div>
+    <div class="pipe-io">
+      <span class="io-tag io-in">输入 用户传入的运行时参数(Tensor,Int32 等)</span>
+    </div>
+
+    <div class="pipe-nest">
+
+      <div class="pipe-card" style="border-color:var(--cyan);">
+        <div class="pipe-head">
+          <span class="pipe-num" style="background:var(--cyan);">3a</span>
+          <span class="pipe-title" style="color:var(--cyan);">kernel 被调用时(vector_add_kernel(a, c, block_dim))</span>
+        </div>
+        <div class="pipe-body">
+          <code>KernelFunction.__call__()</code> --> <code>_emit_kernel()</code><br>
+          --> InsertionPoint 切到 <code>ctx.gpu_module_body</code>,gpu.func 就插入 gpu.module 内<br>
+          --> 创建 <code>gpu.func</code> + entry_block(此时 gpu.func 体为空)<br>
+          --> 设置 <code>ir.InsertionPoint(entry_block)</code><br>
+          --> 将 Block 参数(ir.Value)重建为 DSL 对象(<code>construct_from_ir_values</code>)<br>
+          --> 执行步骤 1 已改写好的函数体 <code>self._func(**dsl_args)</code>,触发 tracing<br>
+          --> 返回 KernelLauncher 对象(尚未启动)
+        </div>
+        <div class="pipe-io">
+          <span class="io-tag io-out">输出 gpu.func 内已填入 IR(由 3b 的 tracing 生成)</span>
+        </div>
+
+        <div class="pipe-nest">
+          <div class="pipe-card" style="border-color:var(--orange);">
+            <div class="pipe-head">
+              <span class="pipe-num" style="background:var(--orange);">3b</span>
+              <span class="pipe-title" style="color:var(--orange);">步骤 1 已改写好的函数体执行(Python tracing)</span>
+            </div>
+            <div class="pipe-body">
+              每个 <code>fx.xxx()</code> --> <code>traced_op</code> 解包为 ir.Value --> <code>OpView.__init__()</code> --> 实时插入 MLIR Op
+            </div>
+            <div class="pipe-io">
+              <span class="io-tag io-in">输入 DSL 对象(Tensor,Layout,Int32 等)</span>
+              <span class="io-tag io-out">输出 gpu.func 内的 Fly 方言 IR</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="pipe-arrow">v</div>
+
+      <div class="pipe-card" style="border-color:var(--orange);">
+        <div class="pipe-head">
+          <span class="pipe-num" style="background:var(--orange);">4</span>
+          <span class="pipe-title" style="color:var(--orange);">用户调用 .launch() 时</span>
+        </div>
+        <div class="pipe-body">
+          <code>KernelLauncher.launch()</code> --> 发射 <code>gpu.launch_func</code><br>
+          --> 解包 kernel 参数为 ir.Value(<code>__extract_to_ir_values__</code>)<br>
+          --> 将 grid/block 维度转为 index 值<br>
+          --> 创建 <code>gpu.launch_func</code> 引用已定义的 <code>gpu.func</code>
+        </div>
+        <div class="pipe-io">
+          <span class="io-tag io-out">输出 func.func 内的 gpu.launch_func IR</span>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="pipe-body" style="margin-top:0.5rem;">
+      <code>func.ReturnOp([])</code> <-- func.func 结束
+    </div>
+    <div class="pipe-io">
+      <span class="io-tag io-out">输出 ir.Module 内含 gpu.module(kernel 定义)+ func.func(host 代码 + gpu.launch_func)</span>
+    </div>
+  </div>
+
+  <div class="pipe-arrow">v</div>
+
+  <div class="pipe-card" style="border-color:var(--red);">
+    <div class="pipe-head">
+      <span class="pipe-num" style="background:var(--red);">5</span>
+      <span class="pipe-title" style="color:var(--red);">生成第一个 IR(origin IR)</span>
+    </div>
+    <div class="pipe-body">
+      <code>gpu.module</code> 内包含完整的 <code>gpu.func</code>(kernel 定义)<br>
+      <code>func.func</code> 内包含 <code>gpu.launch_func</code>(kernel 启动)<br>
+      <code>original_ir = module.operation.get_asm(...)</code> 保存 tracing 产物
+    </div>
+  </div>
+
+  <div class="pipe-arrow">v</div>
+
+  <div class="pipe-card" style="border-color:var(--red);">
+    <div class="pipe-head">
+      <span class="pipe-num" style="background:var(--red);">6</span>
+      <span class="pipe-title" style="color:var(--red);">Pass Pipeline + 代码生成</span>
+    </div>
+    <div class="pipe-body">
+      <code>MlirCompiler.compile(module, ...)</code> 运行 Pass Pipeline(canonicalize, layout-lowering, GPU lowering 等)<br>
+      生成 <code>CompiledArtifact</code> 并执行(或写入 JIT cache)
+    </div>
+  </div>
+
+</div>
+
+<h3>1.1 关键文件与职责</h3>
+
+<table>
+  <tr><th>文件</th><th>职责</th><th>关键类/函数</th></tr>
+  <tr><td><code>ast_rewriter.py</code></td><td>AST 改写:将 Python 控制流转为 scf 操作</td><td><code>ASTRewriter</code>,5 个 <code>Transformer</code> 子类</td></tr>
+  <tr><td><code>kernel_function.py</code></td><td>Kernel 发射与启动:创建 gpu.func 并执行 tracing;发射 gpu.launch_func</td><td><code>KernelFunction</code>,<code>KernelLauncher</code></td></tr>
+  <tr><td><code>jit_function.py</code></td><td>JIT 编译:创建 Context/Module,tracing 后调用 <code>MlirCompiler.compile</code></td><td><code>JITFunction</code>,<code>MlirCompiler</code></td></tr>
+  <tr><td><code>protocol.py</code></td><td>DSL/MLIR 转换协议的分派入口</td><td><code>get_ir_types</code>,<code>construct_from_ir_values</code>,<code>extract_to_ir_values</code></td></tr>
+  <tr><td><code>expr/meta.py</code></td><td>traced_op 装饰器:设置 Location + 解包参数</td><td><code>traced_op</code>,<code>_caller_location</code>,<code>_flatten_args</code></td></tr>
+  <tr><td><code>expr/primitive.py</code></td><td>DSL 原语:调用 Fly 方言 Op</td><td><code>logical_divide</code>,<code>copy_atom_call</code> 等</td></tr>
+  <tr><td><code>expr/typing.py</code></td><td>DSL 类型实现:各类型的协议方法</td><td><code>BuiltinDslType.__construct_from_ir_values__</code>,<code>Numeric.__extract_to_ir_values__</code> 等</td></tr>
+</table>
+
+<!-- ===================== Section 2 ===================== -->
+<h2 id="s2">2. AST 改写:5 个 Transformer 的前后对比</h2>
+
+<p><code>ASTRewriter.transform(func)</code> 在装饰时执行----<code>@flyc.kernel</code> 和 <code>@flyc.jit</code> 分别在各自的 <code>__init__</code> 中调用它.它通过 <code>inspect.getsource()</code> 获取函数源码,<code>ast.parse()</code> 解析为 AST,然后依次应用 5 个注册的 Transformer,最终 <code>compile()</code> 回 Python 字节码并替换 <code>func.__code__</code>.</p>
+
+<h3>2.1 Transformer 1:RewriteBoolOps -- 布尔运算改写</h3>
+
+<p><strong>目的</strong>:将 Python 的 <code>and</code>/<code>or</code>/<code>not</code> 改写为 DSL 版本 <code>dsl_and_</code>/<code>dsl_or_</code>/<code>dsl_not_</code>,使其支持 MLIR Value 的短路求值.</p>
+
+<h4>改写前</h4>
+<pre><code>if a and b:
+    ...
+result = not flag</code></pre>
+
+<h4>改写后</h4>
+<pre><code>if dsl_and_(a, b) if not (isinstance(a, bool) and a == False) else a:
+    ...
+result = dsl_not_(flag)</code></pre>
+
+<p><code>dsl_and_</code> 会先检查对象是否有 <code>__fly_and__</code> 方法.<strong>有这个方法的是 <code>Numeric</code> 子类</strong>(如 <code>Int32</code>,<code>Boolean</code>),因为它们可能代表一个 MLIR 动态值(编译期未知),需要生成 <code>arith.andi</code> Op;而 <code>Tensor</code>,<code>Layout</code> 等 DSL 类型没有 <code>__fly_and__</code>,对它们做布尔与没有意义,会回退到 Python 原生 <code>and</code>.这保证了编译期和运行时的兼容性.</p>
+
+<h3>2.2 Transformer 2:ReplaceIfWithDispatch -- if/else 改写为 scf.if</h3>
+
+<p><strong>目的</strong>:将 Python <code>if/else</code> 改写为 <code>scf_if_dispatch</code> 调用,在运行时根据条件是否为 MLIR Value 来决定走 <code>scf.if</code> 还是 Python 原生 if.</p>
+
+<h4>改写前</h4>
+<pre><code>if cond:
+    x = a + b
+    y = c + d
+else:
+    x = a - b
+    y = c - d</code></pre>
+
+<h4>改写后</h4>
+<pre><code>def __then_0(__ret_names, x, y):
+    x = a + b
+    y = c + d
+    return scf_if_collect_results(__ret_names, locals())
+
+def __else_0(__ret_names, x, y):
+    x = a - b
+    y = c - d
+    return scf_if_collect_results(__ret_names, locals())
+
+x, y = scf_if_dispatch(cond, __then_0, __else_0,
+                        result_names=('x', 'y'),
+                        result_values=(locals().get('x', None), locals().get('y', None)))</code></pre>
+
+<p><strong>关键机制</strong>:</p>
+<ul>
+  <li><code>_collect_assigned_vars</code> 分析 if/else body 中赋值的变量,确定需要从 scf.if 返回的 <code>result_names</code></li>
+  <li>then/else 分支被提取为独立函数,函数体末尾追加 <code>scf_if_collect_results</code> 收集结果</li>
+  <li><code>scf_if_dispatch</code> 在运行时判断:若 cond 是 <code>ir.Value</code>(动态条件),生成 <code>scf.IfOp</code>;否则走 Python 原生 if</li>
+  <li>若 cond 被 <code>const_expr()</code> 包裹,则跳过改写,保持 Python 原生 if</li>
+</ul>
+
+<h3>2.3 Transformer 3:InsertEmptyYieldForSCFFor -- for 循环改写为 scf.for</h3>
+
+<p><strong>目的</strong>:将 Python <code>for i in range(...)</code> 改写为 <code>scf_for_dispatch</code> 调用,在运行时生成 <code>scf.ForOp</code>.</p>
+
+<h4>改写前</h4>
+<pre><code>for i in range(n):
+    acc = acc + data[i]</code></pre>
+
+<h4>改写后</h4>
+<pre><code>def __for_body_0(i, __ret_names, acc):
+    acc = acc + data[i]
+    return scf_for_collect_results(__ret_names, locals())
+
+acc = scf_for_dispatch(0, n, 1, __for_body_0,
+                        result_names=('acc',),
+                        result_values=(locals().get('acc', None),))</code></pre>
+
+<p><strong>关键机制</strong>:</p>
+<ul>
+  <li>自动推断循环携带变量(loop-carried values):分析 body 中赋值且在循环前已存在的变量</li>
+  <li><code>scf_for_dispatch</code> 在运行时生成 <code>scf.ForOp</code>,循环携带变量作为 <code>iter_args</code></li>
+  <li>若 range 参数是 <code>const_expr()</code>,则跳过改写,保持 Python 原生 for</li>
+  <li>也支持 <code>scf_range</code> 形式的手动 yield 循环</li>
+</ul>
+
+<h3>2.4 Transformer 4:ReplaceYieldWithSCFYield -- yield 改写为 scf.yield</h3>
+
+<p><strong>目的</strong>:将 Python <code>yield</code> 语句改写为 <code>scf_yield_()</code> 调用,在运行时生成 <code>scf.YieldOp</code>.</p>
+
+<h4>改写前</h4>
+<pre><code>for i in scf_range(0, n, 1, init=[acc]):
+    yield acc</code></pre>
+
+<h4>改写后</h4>
+<pre><code>for i in scf_range(0, n, 1, init=[acc]):
+    scf_yield_(acc)</code></pre>
+
+<p><code>scf_yield_</code> 在运行时调用 <code>scf.YieldOp</code> 生成 MLIR yield 操作,并返回父 Op 的 results(如果有的话).</p>
+
+<h3 id="s2_5">2.5 Transformer 5:CanonicalizeWhile -- while 循环改写为 scf.while</h3>
+
+<p><strong>目的</strong>:将 Python <code>while</code> 循环改写为 <code>scf_while_gen</code> 调用,在运行时生成 <code>scf.WhileOp</code>.</p>
+
+<h4>改写前</h4>
+<pre><code>while cond:
+    body</code></pre>
+
+<h4>改写后</h4>
+<pre><code>w_42 = scf_while_gen(cond)
+while (__init__42 := next(w_42, False)):
+    body</code></pre>
+
+<p><code>scf_while_gen</code> 是一个生成器,第一次 <code>next()</code> 创建 <code>scf.WhileOp</code> 并设置 before/after region,第二次 <code>next()</code> 返回 False 退出.循环体在 after region 的 InsertionPoint 中执行.</p>
+
+<h3>2.6 Transformer 应用顺序与全局注入</h3>
+
+<p>5 个 Transformer 按 <code>@ASTRewriter.register</code> 的注册顺序依次应用:</p>
+
+<table>
+  <tr><th>顺序</th><th>Transformer</th><th>注入的全局函数</th></tr>
+  <tr><td>1</td><td>RewriteBoolOps</td><td><code>dsl_and_</code>, <code>dsl_or_</code>, <code>dsl_not_</code></td></tr>
+  <tr><td>2</td><td>ReplaceIfWithDispatch</td><td><code>const_expr</code>, <code>scf_if_dispatch</code>, <code>scf_ifexp_dispatch</code>, <code>scf_if_collect_results</code></td></tr>
+  <tr><td>3</td><td>InsertEmptyYieldForSCFFor</td><td><code>scf_range</code>, <code>scf_for_dispatch</code>, <code>scf_for_collect_results</code></td></tr>
+  <tr><td>4</td><td>ReplaceYieldWithSCFYield</td><td><code>scf_yield_</code></td></tr>
+  <tr><td>5</td><td>CanonicalizeWhile</td><td><code>scf_while_gen</code>, <code>scf_while_init</code></td></tr>
+</table>
+
+<p>每个 Transformer 的 <code>rewrite_globals()</code> 方法返回需要注入到函数全局作用域的函数.改写完成后,<code>ASTRewriter.transform</code> 通过 <code>f.__globals__[name] = val</code> 将这些函数注入,使得改写后的代码可以引用它们.</p>
+
+<h3>2.7 vectorAdd 为什么不需要 AST 改写?</h3>
+
+<p><code>vector_add_kernel</code> 中没有 if/else/for/while 等控制流,也没有布尔运算,所以 5 个 Transformer 都不会修改它的 AST.改写后的代码与原始代码完全相同.但 AST 改写机制仍然会执行(获取源码,解析,遍历,编译),只是不会产生实质变化.</p>
+
+<h3 id="s2_8">2.8 改写前后对比:含控制流的 kernel 示例</h3>
+
+<p>当一个 kernel 包含 <code>if</code>/<code>for</code>/<code>and</code> 等控制流时,5 个 Transformer 按 Sec.2.6 的顺序依次改写 AST.下面是一个嵌套示例(改写后代码已省略部分细节,完整形态见 Sec.2.2 与 Sec.2.3):</p>
+  <table style="width:100%;">
+    <tr>
+      <th style="width:50%;">改写前(用户写的代码)</th>
+      <th style="width:50%;">改写后(self._func 指向的版本,示意)</th>
+    </tr>
+    <tr>
+      <td>
+<pre><code>@flyc.kernel
+def example(cond, acc):
+    if cond and acc &gt; 0:
+        for i in range(10):
+            acc = acc + 1</code></pre>
+      </td>
+      <td>
+<pre><code>@flyc.kernel
+def example(cond, acc):
+    def __then_0(__ret_names, acc):
+        def __for_body_0(i, __ret_names, acc):
+            acc = acc + 1
+            return scf_for_collect_results(__ret_names, locals())
+        acc = scf_for_dispatch(0, 10, 1, __for_body_0,
+            result_names=('acc',),
+            result_values=(locals().get('acc', None),))
+        return scf_if_collect_results(__ret_names, locals())
+
+    acc = scf_if_dispatch(
+        dsl_and_(cond, acc &gt; 0) if not (isinstance(cond, bool) and cond == False) else cond,
+        __then_0, __else_0,
+        result_names=('acc',),
+        result_values=(locals().get('acc', None),))</code></pre>
+      </td>
+    </tr>
+  </table>
+  <p>三个 Transformer 各自负责一类改写(名称与 Sec.2.6 一致):</p>
+  <ul>
+    <li><strong>RewriteBoolOps</strong>:<code>cond and acc > 0</code> --> <code>dsl_and_(cond, acc > 0)</code>(运行时若操作数为 <code>Numeric</code>,经 <code>__fly_and__</code> 生成 <code>arith.andi</code>;否则回退 Python <code>and</code>)</li>
+    <li><strong>ReplaceIfWithDispatch</strong>:<code>if ...:</code> --> <code>scf_if_dispatch(cond, __then_0, __else_0, result_names=..., result_values=...)</code></li>
+    <li><strong>InsertEmptyYieldForSCFFor</strong>:<code>for i in range(10):</code> --> <code>scf_for_dispatch(0, 10, 1, __for_body_0, result_names=..., result_values=...)</code></li>
+  </ul>
+  <p><strong>注意</strong>:Python 的按位与 <code>a &amp; b</code>(<code>ast.BitAnd</code>)不会被 AST 改写;只有逻辑与 <code>a and b</code> 才会变成 <code>dsl_and_</code>.改写后的代码在 tracing 执行时,<code>scf_if_dispatch</code>/<code>scf_for_dispatch</code> 在条件/循环边界为动态 MLIR Value 时发射 <code>scf.if</code>/<code>scf.for</code>,否则走 Python 原生分支.</p>
+
+<!-- ===================== Section 3 ===================== -->
+<h2 id="s3">3. Kernel 发射:从改写后的函数到 gpu.func</h2>
+
+<p>AST 改写发生在装饰时,而 <code>gpu.func</code> 的创建发生在 kernel 被调用时(即 <code>@flyc.jit</code> 函数体内调用 <code>vector_add_kernel(a, c, block_dim)</code> 时).</p>
+
+<h3>3.1 JIT 函数的调用入口</h3>
+
+<p>当用户调用 <code>vector_add(ta, c, n, n+1)</code> 时:</p>
+
+<pre><code># jit_function.py 核心流程(简化)
+class JITFunction:
+    def __call__(self, *args, **kwargs):
+        # 1. 创建 MLIR Context 和 Module
+        with _create_mlir_context() as ctx:
+            module = ir.Module.create()
+            # 2. 创建 gpu.module 与 func.func(host)
+            with ir.InsertionPoint(module.body):
+                gpu_module = create_gpu_module("kernels")
+            func_op = func.FuncOp(self.func.__name__, (ir_types, []))
+            entry_block = func_op.add_entry_block()
+
+            # 3. 在 CompilationContext 中执行 host 函数(tracing)
+            with CompilationContext.create() as comp_ctx:
+                comp_ctx.gpu_module_body = get_gpu_module_body(gpu_module)
+                with ir.InsertionPoint(entry_block):
+                    dsl_args = construct_from_ir_values(dsl_types, jit_args, ir_args)
+                    self.func(**named_args)   # 内部调用 kernel --&gt; 触发 3.2
+                    func.ReturnOp([])
+
+            # 4. 保存 origin IR,再运行 Pass Pipeline
+            original_ir = module.operation.get_asm(enable_debug_info=True)
+            compiled_module = MlirCompiler.compile(
+                module, arch=backend.target.arch, func_name=self.func.__name__
+            )
+
+            # 5. 构造 CompiledArtifact 并执行(或写入 cache)
+            compiled_func = CompiledArtifact(compiled_module, self.func.__name__, original_ir)
+            return compiled_func(args_tuple)</code></pre>
+
+<div class="note">
+  <div class="note-title">3.1 与 3.2 的关系</div>
+  <p>3.1 的 <code>self.func(**named_args)</code> 执行 <code>vector_add</code> 函数体,函数体内调用 <code>vector_add_kernel(a, c, block_dim)</code> 时触发 <code>KernelFunction.__call__</code>,即进入 3.2,嵌套在 tracing 阶段(步骤 4 之前)执行.Pass Pipeline 在 tracing 全部完成、<code>func.ReturnOp</code> 之后,由 <code>MlirCompiler.compile</code> 统一运行.</p>
+</div>
+
+<h3>3.2 Kernel 函数的发射过程</h3>
+
+<p>3.1 中 <code>self.func()</code> 执行到 <code>vector_add_kernel(a, c, block_dim)</code> 时,<code>KernelFunction.__call__</code> 被触发:</p>
+
+<pre><code># kernel_function.py KernelFunction._emit_kernel(简化)
+def _emit_kernel(self, ctx, args, kwargs):
+    # 1. 解析参数,区分 constexpr 和普通参数
+    #    a: Tensor, c: Tensor --&gt; 普通参数
+    #    block_dim: Constexpr[int] --&gt; constexpr 参数
+
+    # 2. 获取参数的 MLIR 类型
+    kernel_arg_types = []
+    for value in param_values:
+        kernel_arg_types.extend(get_ir_types(value))
+    # --&gt; [TensorType(f32, ...), TensorType(f32, ...)]
+
+    # 3. 创建 gpu.func
+    with ir.InsertionPoint(ctx.gpu_module_body):
+        func_type = ir.FunctionType.get(kernel_arg_types, [])
+        gpu_func = create_gpu_func(kernel_name, ir.TypeAttr.get(func_type))
+        gpu_func.regions[0].blocks.append(*kernel_arg_types)
+        entry_block = gpu_func.regions[0].blocks[0]
+
+        # 4. 在 entry_block 中设置 InsertionPoint
+        with ir.InsertionPoint(entry_block), kernel_loc:
+            # 5. 将 Block 参数重建为 DSL 对象
+            block_args = list(entry_block.arguments)
+            dsl_args = {}
+            idx = 0
+            for param_name, value in zip(param_names, param_values):
+                n = len(get_ir_types(value))
+                dsl_args[param_name] = construct_from_ir_values(
+                    type(value), value, list(block_args[idx:idx+n])
+                )
+                idx += n
+            dsl_args.update(constexpr_values)
+
+            # 6. 执行步骤 1 已改写好的函数体 --&gt; 触发 tracing
+            self._func(**dsl_args)
+            gpu.ReturnOp([])</code></pre>
+
+<h3>3.3 参数重建:construct_from_ir_values</h3>
+
+<p><code>gpu.func</code> 的 Block 参数是 <code>ir.Value</code>,但步骤 1 已改写好的函数体期望接收 DSL 对象(如 <code>Tensor</code>).<code>protocol.construct_from_ir_values</code> 负责分派到各类型的 <code>__construct_from_ir_values__</code>:</p>
+
+<pre><code># protocol.py
+def construct_from_ir_values(dsl_type, args, values):
+    if hasattr(dsl_type, "__construct_from_ir_values__"):
+        return dsl_type.__construct_from_ir_values__(values)
+    ...
+
+# expr/typing.py BuiltinDslType 的实现
+class BuiltinDslType(ir.Value):
+    @classmethod
+    def __construct_from_ir_values__(cls, values):
+        return cls(values[0])
+
+# 例如:Tensor.__construct_from_ir_values__([ir.Value(%arg0)])
+# --&gt; Tensor(ir.Value(%arg0))</code></pre>
+
+<p>这样,<code>self._func(a=Tensor(...), c=Tensor(...), block_dim=64)</code> 被调用时,函数体内的 <code>fx.logical_divide(a, ...)</code> 等调用就能正常工作.</p>
+
+<h3>3.4 Constexpr 参数:编译期常量不进入 gpu.func 签名</h3>
+
+<p>在 <code>vector_add_kernel</code> 中,<code>block_dim: fx.Constexpr[int]</code> 是一个 Constexpr 参数.它的处理路径与普通参数(<code>a</code>, <code>c</code>)完全不同:</p>
+
+<pre><code># _emit_kernel 中的参数分流逻辑
+for param_name, value in bound.arguments.items():
+    param = sig.parameters[param_name]
+    annotation = param.annotation
+    if Constexpr.is_constexpr_annotation(annotation):
+        constexpr_values[param_name] = value    # &lt;-- block_dim 走这里
+    else:
+        param_names.append(param_name)           # &lt;-- a, c 走这里
+        param_values.append(value)</code></pre>
+
+<p>分流后,两类参数的命运截然不同:</p>
+
+<table>
+  <tr><th>参数</th><th>类型</th><th>是否进入 gpu.func 签名</th><th>传入函数体的方式</th></tr>
+  <tr><td><code>a</code></td><td><code>Tensor</code></td><td>-> <code>%arg0: !fly.Tensor&lt;...&gt;</code></td><td>Block 参数 -> <code>construct_from_ir_values</code> -> DSL 对象</td></tr>
+  <tr><td><code>c</code></td><td><code>Tensor</code></td><td>-> <code>%arg1: !fly.Tensor&lt;...&gt;</code></td><td>Block 参数 -> <code>construct_from_ir_values</code> -> DSL 对象</td></tr>
+  <tr><td><code>block_dim</code></td><td><code>Constexpr[int]</code></td><td>不进入</td><td>直接作为 Python <code>int</code> 64 传入</td></tr>
+</table>
+
+<p>具体来说,<code>constexpr_values</code> 通过 <code>dsl_args.update(constexpr_values)</code> 直接合并到参数字典中,不经过 <code>get_ir_types</code> --> Block 参数 --> <code>construct_from_ir_values</code> 这条路.</p>
+
+<div class="note">
+  <div class="note-title">为什么 Constexpr 不进入 gpu.func 签名?</div>
+  <p><strong>Constexpr 的语义是"编译期常量"</strong>----它的值在 tracing 时就确定了,不需要在 GPU kernel 运行时从参数传入.这样做有两个关键好处:</p>
+  <ul>
+    <li><strong>常量折叠</strong>:编译器可以看到 <code>block_dim=64</code> 的具体值,在 IR 中直接生成 <code>arith.constant 64 : i32</code>,而非运行时参数,从而允许后续 Pass 进行常量折叠和死代码消除.</li>
+    <li><strong>Layout 静态推导</strong>:<code>fx.make_layout(block_dim, 1)</code> 中 <code>block_dim</code> 是已知常量,编译器可以静态推导出完整的 Layout 形状,而无需在运行时动态计算.</li>
+  </ul>
+  <p>如果 <code>block_dim</code> 是运行时参数,这些优化都无法进行.</p>
+</div>
+
+<p>在函数体执行时,<code>fx.make_layout(block_dim, 1)</code> 中的 <code>block_dim</code> 就是 Python 原生 <code>int</code> 64.它会在 <code>make_layout</code> 内部被物化为 MLIR 常量(如 <code>arith.constant 64 : i32</code>),而非从 kernel 参数传入.</p>
+
+<h3>3.5 Kernel 启动:从 KernelLauncher 到 gpu.launch_func</h3>
+
+<p>前面的 3.2~3.4 讲的是 <strong>kernel 定义</strong>----在 <code>gpu.module</code> 内创建 <code>gpu.func</code> 并通过 tracing 填入 IR.但 <code>gpu.func</code> 本身不会执行,它需要被 <strong>启动</strong> 才能在 GPU 上运行.</p>
+
+<p>这就是 <code>KernelLauncher</code> 的职责.用户代码中的调用链是:</p>
+
+<pre><code># 01-vectorAdd.py
+vector_add_kernel(a, c, block_dim)       # &lt;-- 阶段一:发射 gpu.func(定义 kernel)
+    .launch(grid=(grid_x,1,1),           # &lt;-- 阶段二:发射 gpu.launch_func(启动 kernel)
+            block=[block_dim,1,1],
+            stream=stream)</code></pre>
+
+<p><code>KernelFunction.__call__</code> 返回一个 <code>KernelLauncher</code> 对象,它持有 kernel 名称和参数.当用户调用 <code>.launch()</code> 时,<code>KernelLauncher.launch()</code> 发射 <code>gpu.launch_func</code>:</p>
+
+<pre><code># kernel_function.py KernelLauncher.launch(简化)
+def launch(self, *, grid, block, stream=None, ...):
+    # 1. 解包 kernel 参数为 ir.Value
+    kernel_operands = []
+    for arg in self._kernel_args:
+        kernel_operands.extend(extract_to_ir_values(arg))
+
+    # 2. 将 grid/block 维度转为 index 值
+    grid_x, grid_y, grid_z = _to_index_value(...)
+    block_x, block_y, block_z = _to_index_value(...)
+
+    # 3. 发射 gpu.launch_func
+    launch_op = gpu.LaunchFuncOp(
+        ["kernels", self._kernel_name],   # 引用已定义的 gpu.func
+        (grid_x, grid_y, grid_z),         # grid 维度
+        (block_x, block_y, block_z),      # block 维度
+        kernel_operands,                   # 传入参数
+        ...
+    )</code></pre>
+
+<div class="note">
+  <div class="note-title">Kernel 定义 vs Kernel 启动:两个不同的 IR 区域</div>
+  <p><code>gpu.func</code> 和 <code>gpu.launch_func</code> 生成在 IR 的不同位置:</p>
+  <table>
+    <tr><th></th><th>Kernel 定义</th><th>Kernel 启动</th></tr>
+    <tr><td><strong>IR 操作</strong></td><td><code>gpu.func @vector_add_kernel_0</code></td><td><code>gpu.launch_func @kernels::vector_add_kernel_0</code></td></tr>
+    <tr><td><strong>所在区域</strong></td><td><code>gpu.module</code> 内部</td><td><code>func.func</code>(host 函数)内部</td></tr>
+    <tr><td><strong>触发方式</strong></td><td><code>vector_add_kernel(a, c, block_dim)</code></td><td><code>.launch(grid=..., block=...)</code></td></tr>
+    <tr><td><strong>语义</strong></td><td>"这个 kernel 做什么"(函数体 IR)</td><td>"以什么配置运行这个 kernel"(启动参数)</td></tr>
+  </table>
+  <p>这种分离与 CUDA 编程模型一致:<code>__global__ void kernel(...)</code> 定义 kernel,<code>kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...)</code> 启动 kernel.</p>
+</div>
+
+<!-- ===================== Section 4 ===================== -->
+<h2 id="s4">4. traced_op:DSL 调用如何实时插入 IR</h2>
+
+<p>前两节我们看到了 AST 改写和 Kernel 发射的过程.本节深入回答一个核心问题:<strong>DSL 函数调用时,IR 是在哪里,如何被实时插入到 MLIR Module 中的?</strong></p>
+
+<h3>4.1 核心结论:traced_op 搭台,OpView 唱戏</h3>
+
+<p><code>traced_op</code> 本身<strong>不插入 IR</strong>,它只是一个"搭台"的包装器----设置调试位置,解包参数.真正插入 IR 的是它所包装的函数体内调用的 <strong>MLIR Op 构造器</strong>(<code>OpView.__init__</code>).</p>
+
+<p>以 <code>fx.logical_divide(a, layout)</code> 为例,完整调用链如下:</p>
+
+<div class="flow-box"><span class="label">用户代码</span>: fx.logical_divide(a, layout)
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">1. traced_op 包装层(搭台)</span>
+    <span class="arrow">|</span>   _caller_location() --> 创建 ir.Location
+    <span class="arrow">|</span>   _flatten_args()    --> 解包 DSL 对象为 ir.Value
+    <span class="arrow">|</span>   with loc:          --> 设置 Location 上下文
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">2. DSL 函数体(primitive.py)</span>
+    <span class="arrow">|</span>   return fly.logical_divide(layout, divisor, loc=loc, ip=ip)
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">3. MLIR ODS 自动生成的 Python 绑定</span>
+    <span class="arrow">|</span>   return LogicalDivideOp(..., loc=loc, ip=ip).result
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">4. OpView.__init__()(C++ nanobind 绑定)</span>
+    <span class="arrow">|</span>   读取 ir.InsertionPoint.current --> 确定插入位置
+    <span class="arrow">|</span>   读取 ir.Location.current      --> 确定调试位置
+    <span class="arrow">|</span>   创建 Op --> 插入到 Block 中
+    <span class="arrow">|</span>
+    <span class="arrow">v</span> <span class="comment">5. 返回 ir.Value(OpResult)</span></div>
+
+<h3>4.2 第一层:traced_op -- 搭台(设置上下文 + 解包参数)</h3>
+
+<p><code>traced_op</code> 定义在 <code>meta.py</code> 中:</p>
+
+<pre><code>def traced_op(op):
+    @wraps(op)
+    def wrapper(*args, **kwargs):
+        loc = kwargs.pop("loc", None)
+        if loc is None:
+            loc = _caller_location(depth=1)     # 1. 自动推断源码位置
+        args, kwargs = _flatten_args(args, kwargs)  # 2. 解包 DSL 对象
+        with loc:                                # 3. 设置 Location 上下文
+            return op(*args, **kwargs)           # 4. 调用真正的函数体
+    return wrapper</code></pre>
+
+<p>它做了三件关键的事:</p>
+
+<h4>4.2.1 <code>_caller_location(depth=1)</code> -- 自动推断源码位置</h4>
+
+<pre><code>def _caller_location(depth=1):
+    frame = inspect.currentframe()
+    for _ in range(depth + 1):
+        if frame is not None:
+            frame = frame.f_back
+    info = inspect.getframeinfo(frame)
+    line = info.lineno
+    col = info.col_offset or 0
+    file_loc = ir.Location.file(info.filename, line, col)
+
+    if info.code_context:
+        label = " ".join(ln.strip() for ln in info.code_context)
+    else:
+        label = info.function
+    return ir.Location.name(label, childLoc=file_loc)</code></pre>
+
+<p>这会生成一个<strong>复合 Location</strong>,例如:</p>
+
+<pre><code>loc("ta = fx.logical_divide(a, fx.make_layout(block_dim, 1))" at "01-vectorAdd.py":28:4)</code></pre>
+
+<p>外层是 <code>NameLoc</code>(包含源码文本),内层是 <code>FileLineColLoc</code>(文件名+行号+列号).这样在调试 IR 时可以直接看到每条 Op 对应的源代码.</p>
+
+<h4>4.2.2 <code>_flatten_args()</code> -- 解包 DSL 对象为 <code>ir.Value</code></h4>
+
+<p><strong>为什么需要解包?</strong> 因为 MLIR Op 构造器(如 <code>LogicalDivideOp.__init__</code>)只接受 <code>ir.Value</code>,不接受 <code>Tensor</code>,<code>Int32</code> 等 DSL 包装对象.<code>__extract_to_ir_values__</code> 协议就是桥梁.</p>
+
+<pre><code>def _to_raw_value(obj):
+    if isinstance(obj, ir.Value):
+        return obj                          # 已经是 ir.Value,直接用
+    if isinstance(obj, type):
+        return obj                          # 类型对象(如 fx.Float32),直接用
+    if hasattr(obj, "__extract_to_ir_values__"):
+        values = obj.__extract_to_ir_values__()  # 调用协议方法解包
+        if len(values) != 1:
+            raise ValueError(...)
+        return values[0]
+    if isinstance(obj, (tuple, list)):
+        return tuple(_to_raw_value(e) for e in obj)
+    return obj                              # 其他(int, None 等),原样返回</code></pre>
+
+<p>两类 DSL 对象的解包方式不同:</p>
+
+<table>
+  <tr><th>DSL 类型</th><th>基类</th><th><code>__extract_to_ir_values__</code> 实现</th><th>原因</th></tr>
+  <tr><td><code>Tensor</code>, <code>Layout</code>, <code>IntTuple</code>, <code>CopyAtom</code> 等</td><td><code>BuiltinDslType(ir.Value)</code></td><td><code>return [self]</code></td><td>自身就是 <code>ir.Value</code> 子类</td></tr>
+  <tr><td><code>Int32</code>, <code>Float32</code> 等 <code>Numeric</code></td><td><code>Numeric</code>(普通 Python 类)</td><td><code>return [self.ir_value()]</code></td><td>需物化为 <code>ir.Value</code></td></tr>
+</table>
+
+<div class="note">
+  <div class="note-title">隐含的 IR 插入点</div>
+  当 <code>Int32(0)</code> 或 <code>Float32(3.14)</code> 这样的 Numeric 对象被解包时,如果其内部值还是 Python 原生类型(<code>int</code>/<code>float</code>),<code>ir_value()</code> 会<strong>在此刻发射一个 <code>arith.constant</code> Op</strong>将其物化为 <code>ir.Value</code>.这也是 IR 插入的一个隐含点.
+</div>
+
+<h4>4.2.3 <code>with loc:</code> -- 设置 Location 上下文</h4>
+
+<p><code>ir.Location</code> 实现了 <code>__enter__</code>/<code>__exit__</code>,进入 <code>with</code> 块后,<code>ir.Location.current</code> 返回这个 Location.后续所有 Op 构造器都会读取这个 Location 作为默认位置.</p>
+
+<h3>4.3 第二层:DSL 函数体 -- 调用 Fly 方言 Op</h3>
+
+<p>以 <code>logical_divide</code> 为例(<code>primitive.py</code>):</p>
+
+<pre><code>@traced_op
+def logical_divide(layout, divisor, loc=None, ip=None):
+    if not isinstance(divisor, ir.Value):
+        divisor = make_tile(*divisor, loc=loc, ip=ip)
+    return fly.logical_divide(layout, divisor, loc=loc, ip=ip)</code></pre>
+
+<p><code>fly</code> 是 <code>from .._mlir.dialects import fly</code>,即 MLIR ODS 自动生成的 Python 绑定模块.</p>
+
+<h3>4.4 第三层:ODS 生成的 Python 绑定 -- 构造 Op 对象</h3>
+
+<p><code>fly.logical_divide</code> 是 ODS 自动生成的代码:</p>
+
+<pre><code>def logical_divide(layout, divisor, *, results=None, loc=None, ip=None):
+    return LogicalDivideOp(layout=layout, divisor=divisor,
+                           results=results, loc=loc, ip=ip).result</code></pre>
+
+<p><code>LogicalDivideOp</code> 也是自动生成的:</p>
+
+<pre><code>@_ods_cext.register_operation(_Dialect)
+class LogicalDivideOp(_ods_ir.OpView):
+    OPERATION_NAME = "fly.logical_divide"
+
+    def __init__(self, layout, divisor, *, results=None, loc=None, ip=None):
+        operands = []
+        operands.append(layout)      # 已经是 ir.Value(由 traced_op 解包)
+        operands.append(divisor)     # 已经是 ir.Value
+        # 真正插入 IR 的地方
+        super().__init__(
+            self.OPERATION_NAME, self._ODS_REGIONS,
+            self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS,
+            attributes=attributes, results=results, operands=operands,
+            successors=_ods_successors, regions=regions, loc=loc, ip=ip,
+        )</code></pre>
+
+<h3>4.5 OpView 背景:MLIR Python 绑定中的 Operation 视图</h3>
+
+<p>在深入 <code>OpView.__init__</code> 之前,有必要先理解 OpView 在 MLIR Python 绑定中的角色.</p>
+
+<p><strong>一句话概括</strong>:<code>OpView</code> 是每个 MLIR Operation 在 Python 侧的"视图对象"----它持有对 C++ <code>mlir::Operation</code> 的引用,并提供了 Python 友好的属性访问接口.</p>
+
+<p>OpView 存在两层实现:</p>
+
+<table>
+  <tr><th>层级</th><th>位置</th><th>说明</th></tr>
+  <tr>
+    <td><strong>C++ 绑定层</strong></td>
+    <td>LLVM 上游 <code>mlir/lib/Bindings/Python/IRCore.cpp</code> 中的 <code>PyOpView</code> 类</td>
+    <td>用 nanobind 暴露给 Python,提供 <code>operation</code> 属性,<code>__init__</code> 等</td>
+  </tr>
+  <tr>
+    <td><strong>Python 生成层</strong></td>
+    <td>构建时由 <code>mlir-tblgen --gen-python-op-bindings</code> 自动生成</td>
+    <td>每个具体 Op 继承 <code>_ods_ir.OpView</code>,生成 <code>__init__</code>,属性访问器等</td>
+  </tr>
+</table>
+
+<div class="warn">
+  <strong>注意</strong>:Python 生成层代码<strong>不在 Git 仓库中</strong>,只存在于 build 目录.例如:
+  <ul>
+    <li><code>build-fly/python_packages/flydsl/_mlir/dialects/_arith_ops_gen.py</code></li>
+    <li><code>build-fly/python/mlir_flydsl/dialects/_fly_ops_gen.py</code></li>
+  </ul>
+  它们由 <code>.td</code>(TableGen)定义驱动,在 CMake 构建时自动生成.
+</div>
+
+<p>OpView 的核心职责可以用下图表示:</p>
+
+<div style="display:flex; align-items:stretch; gap:0; margin:1.5rem 0; font-size:0.92rem;">
+  <div style="flex:1; background:var(--surface); border:2px solid var(--accent); border-radius:10px 0 0 10px; padding:1.25rem;">
+    <div style="font-weight:700; color:var(--accent); margin-bottom:0.75rem; font-size:1rem;">Python 世界</div>
+    <div style="font-family:'JetBrains Mono',monospace; font-size:0.88rem; line-height:2;">
+      <div style="padding:0.3rem 0.6rem; background:var(--surface2); border-radius:4px; margin-bottom:0.35rem;">
+        <span style="color:var(--purple); font-weight:600;">AddFOp</span><span style="color:var(--text2);">(OpView)</span>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--green); margin-left:0.5rem; margin-bottom:0.25rem;">
+        <code>.lhs</code> <span style="color:var(--text2);">--> operands[0]</span>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--green); margin-left:0.5rem; margin-bottom:0.25rem;">
+        <code>.rhs</code> <span style="color:var(--text2);">--> operands[1]</span>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--orange); margin-left:0.5rem; margin-bottom:0.25rem;">
+        <code>.result</code> <span style="color:var(--text2);">--> results[0]</span>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--accent); margin-left:0.5rem;">
+        <code>.operation</code> <span style="color:var(--text2);">--> 整个 Op 引用</span>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex; align-items:center; background:var(--surface2); border-top:2px solid var(--border); border-bottom:2px solid var(--border); padding:0 0.6rem; min-width:3.5rem; justify-content:center;">
+    <div style="text-align:center; color:var(--text2); font-size:0.78rem; line-height:1.4;">
+      <div style="color:var(--accent); font-size:1.2rem;">----></div>
+      <div>nanobind</div>
+      <div>绑定</div>
+    </div>
+  </div>
+  <div style="flex:1; background:var(--surface); border:2px solid var(--green); border-radius:0 10px 10px 0; padding:1.25rem;">
+    <div style="font-weight:700; color:var(--green); margin-bottom:0.75rem; font-size:1rem;">C++ MLIR 世界</div>
+    <div style="font-family:'JetBrains Mono',monospace; font-size:0.88rem; line-height:2;">
+      <div style="padding:0.3rem 0.6rem; background:var(--surface2); border-radius:4px; margin-bottom:0.35rem;">
+        <span style="color:var(--green); font-weight:600;">mlir::Operation</span> <span style="color:var(--text2);">"arith.addf"</span>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--green); margin-left:0.5rem; margin-bottom:0.25rem;">
+        <span style="color:var(--text2);">operands[0]</span> --> <code>Value(%12)</code>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--green); margin-left:0.5rem; margin-bottom:0.25rem;">
+        <span style="color:var(--text2);">operands[1]</span> --> <code>Value(%12)</code>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--orange); margin-left:0.5rem; margin-bottom:0.25rem;">
+        <span style="color:var(--text2);">results[0]</span> --> <code>Value(%13)</code>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--accent); margin-left:0.5rem;">
+        <span style="color:var(--text2);">完整 Operation 对象</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<ol>
+  <li><strong><code>__init__</code></strong>:收集 operands / attributes / results --> 调用 <code>super().__init__()</code> --> C++ 侧创建 <code>mlir::Operation</code> 并插入到当前 <code>InsertionPoint</code> 指向的 Block 中</li>
+  <li><strong>属性访问器</strong>(<code>@property</code>):如 <code>.lhs</code>,<code>.result</code>,从底层 <code>mlir::Operation</code> 的 operands/results 中读取对应的 <code>Value</code></li>
+  <li><strong><code>.operation</code></strong>:返回底层 <code>ir.Operation</code> 对象,可做更底层操作</li>
+</ol>
+
+<p>以 <code>AddFOp</code> 为例,ODS 自动生成的完整代码如下(位于 <code>_arith_ops_gen.py</code>):</p>
+
+<pre><code>@_ods_cext.register_operation(_Dialect)
+class AddFOp(_ods_ir.OpView):
+    OPERATION_NAME = "arith.addf"
+    _ODS_REGIONS = (0, True)
+
+    def __init__(self, lhs, rhs, *, fastmath=None, results=None, loc=None, ip=None):
+        operands = []
+        attributes = {}
+        regions = None
+        operands.append(lhs)
+        operands.append(rhs)
+        _ods_context = _ods_get_default_loc_context(loc)
+        if fastmath is not None:
+            attributes["fastmath"] = ...
+        if results is None:
+            results = [operands[0].type] * 1    # 结果类型 = 操作数类型(f32)
+        _ods_successors = None
+        super().__init__(
+            self.OPERATION_NAME, self._ODS_REGIONS,
+            self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS,
+            attributes=attributes, results=results, operands=operands,
+            successors=_ods_successors, regions=regions, loc=loc, ip=ip,
+        )
+
+    @builtins.property
+    def lhs(self) -&gt; _ods_ir.Value:
+        return self.operation.operands[0]
+
+    @builtins.property
+    def rhs(self) -&gt; _ods_ir.Value:
+        return self.operation.operands[1]
+
+    @builtins.property
+    def result(self) -&gt; _ods_ir.OpResult:
+        return self.operation.results[0]</code></pre>
+
+<p>可以看到,<code>AddFOp.__init__</code> 的工作就是:<strong>收集参数 --> 组装 operands/attributes/results --> 调用 <code>super().__init__()</code></strong>.所有 Fly 方言 Op(<code>LogicalDivideOp</code>,<code>MakeLayoutOp</code> 等)的生成模式完全一致.</p>
+
+<div class="note">
+  <div class="note-title">参考文档</div>
+  <ul>
+    <li><strong>MLIR Python Bindings 官方文档</strong>:<a href="https://mlir.llvm.org/docs/Bindings/Python/" target="_blank">https://mlir.llvm.org/docs/Bindings/Python/</a>(重点看 "Integration with ODS" 和 "Operation hierarchy" 两节)</li>
+    <li><strong>MLIR ODS 文档</strong>:<a href="https://mlir.llvm.org/docs/DefiningDialects/Operations/" target="_blank">https://mlir.llvm.org/docs/DefiningDialects/Operations/</a>(解释 <code>.td</code> 如何定义 Op,以及 <code>mlir-tblgen</code> 如何生成 Python 绑定)</li>
+    <li><strong>C++ 绑定源码</strong>:<a href="https://github.com/llvm/llvm-project/blob/main/mlir/lib/Bindings/Python/IRCore.cpp" target="_blank">IRCore.cpp</a>(<code>PyOpView</code> 的 nanobind 绑定实现)</li>
+  </ul>
+</div>
+
+<h3>4.6 第四层:OpView.__init__() -- 真正插入 IR 的地方</h3>
+
+<p><code>OpView.__init__</code> 是 MLIR Python C++ 绑定(nanobind)的实现,核心逻辑等价于:</p>
+
+<pre><code>// 伪代码 - MLIR Python C++ 绑定内部
+OpView::__init__(name, regions, ..., operands, loc, ip) {
+    // 1. 确定 Location
+    if (loc == None)
+        loc = Location.current();   // 读取 Python 线程局部状态
+
+    // 2. 确定 InsertionPoint
+    if (ip == None)
+        ip = InsertionPoint.current();  // 读取 Python 线程局部状态
+
+    // 3. 创建 MLIR Operation
+    OperationState state(loc, name);
+    state.addOperands(operands);
+    state.addTypes(result_types);
+    state.addAttributes(attributes);
+
+    // 4. 创建 Op 并插入到 Block
+    Operation *op = Operation::create(state);
+    ip.block.push_back(op);             // 追加到 Block 末尾
+
+    // 5. InsertionPoint 自动前进到 op 之后
+}</code></pre>
+
+<p><strong>两个关键的线程局部状态</strong>:</p>
+
+<table>
+  <tr><th>状态</th><th>类型</th><th>设置方式</th><th>读取时机</th></tr>
+  <tr><td><strong>InsertionPoint</strong></td><td><code>ir.InsertionPoint</code></td><td><code>with ir.InsertionPoint(block):</code></td><td><code>OpView.__init__</code> 中 <code>ip=None</code> 时</td></tr>
+  <tr><td><strong>Location</strong></td><td><code>ir.Location</code></td><td><code>with loc:</code></td><td><code>OpView.__init__</code> 中 <code>loc=None</code> 时</td></tr>
+</table>
+
+<div class="note">
+  <div class="note-title">InsertionPoint 的工作机制</div>
+  <p><code>InsertionPoint</code> 维护一个指向 Block 中某个位置的游标.每次 <code>OpView.__init__</code> 插入一个 Op 后,游标自动前进到该 Op 之后,保证 Op 按执行顺序排列.</p>
+  <p>InsertionPoint 在 <code>kernel_function.py</code> 中设置:</p>
+  <pre><code>with ir.InsertionPoint(entry_block), kernel_loc:
+    # ... construct_from_ir_values ...
+    self._func(**dsl_args)  # 所有 Op 都被插入到 entry_block 中</code></pre>
+</div>
+
+<h3>4.7 配合 traced_op 的 6 个接口体系</h3>
+
+<p>在列出具体接口之前,先回答一个根本问题:<strong>为什么需要 ir.Value <-> DSL 对象的互相转换?</strong></p>
+
+<p>MLIR 世界和 DSL 世界说的是两种"语言"----MLIR 只认识 <code>ir.Value</code>(SSA 值),而 DSL 对象需要方法调用(如 <code>.shape</code>,<code>.stride</code>).两个世界的"边界"就是下面这些转换接口:</p>
+
+<div style="display:flex; align-items:stretch; gap:0; margin:1.5rem 0; font-size:0.92rem;">
+  <div style="flex:1; background:var(--surface); border:2px solid var(--green); border-radius:10px 0 0 10px; padding:1.25rem;">
+    <div style="font-weight:700; color:var(--green); margin-bottom:0.75rem; font-size:1rem;">DSL 世界</div>
+    <div style="font-family:'JetBrains Mono',monospace; font-size:0.88rem; line-height:1.9;">
+      <div style="padding:0.3rem 0.6rem; background:var(--surface2); border-radius:4px; margin-bottom:0.35rem;">
+        <code>Tensor</code>,<code>Layout</code>,<code>Int32</code> ...
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--green); margin-left:0.5rem; margin-bottom:0.2rem;">
+        [Y] 可以调用 <code>.shape</code>,<code>.stride</code>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--green); margin-left:0.5rem; margin-bottom:0.2rem;">
+        [Y] 可以参与 DSL 运算
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--red); margin-left:0.5rem;">
+        [N] 不能直接传给 MLIR Op
+      </div>
+    </div>
+  </div>
+  <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--surface2); border-top:2px solid var(--border); border-bottom:2px solid var(--border); padding:0.5rem; min-width:5rem;">
+    <div style="text-align:center; font-size:0.78rem; line-height:1.6; margin-bottom:0.5rem;">
+      <div style="color:var(--green); font-weight:600;">__extract__</div>
+      <div style="color:var(--accent); font-size:1.1rem;">--></div>
+    </div>
+    <div style="text-align:center; font-size:0.78rem; line-height:1.6; margin-top:0.5rem;">
+      <div style="color:var(--accent); font-size:1.1rem;"><--</div>
+      <div style="color:var(--orange); font-weight:600;">__construct__</div>
+    </div>
+  </div>
+  <div style="flex:1; background:var(--surface); border:2px solid var(--accent); border-radius:0 10px 10px 0; padding:1.25rem;">
+    <div style="font-weight:700; color:var(--accent); margin-bottom:0.75rem; font-size:1rem;">MLIR 世界</div>
+    <div style="font-family:'JetBrains Mono',monospace; font-size:0.88rem; line-height:1.9;">
+      <div style="padding:0.3rem 0.6rem; background:var(--surface2); border-radius:4px; margin-bottom:0.35rem;">
+        <code>ir.Value</code>,<code>ir.OpResult</code>
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--accent); margin-left:0.5rem; margin-bottom:0.2rem;">
+        [Y] 可以作为 Op 的 operand/result
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--accent); margin-left:0.5rem; margin-bottom:0.2rem;">
+        [Y] 可以插入到 Block 中
+      </div>
+      <div style="padding:0.2rem 0.6rem; border-left:3px solid var(--red); margin-left:0.5rem;">
+        [N] 无法调用 DSL 方法
+      </div>
+    </div>
+  </div>
+</div>
+
+<p>转换发生在 4 个关键场景:</p>
+
+<table>
+  <tr><th>场景</th><th>方向</th><th>接口</th><th>触发时机</th></tr>
+  <tr>
+    <td><strong>traced_op 解包参数</strong></td>
+    <td>DSL --> ir.Value</td>
+    <td><code>__extract_to_ir_values__</code></td>
+    <td>每个 <code>fx.xxx()</code> 调用时,<code>_flatten_args</code> 解包 DSL 对象</td>
+  </tr>
+  <tr>
+    <td><strong>Kernel 参数重建</strong></td>
+    <td>ir.Value --> DSL</td>
+    <td><code>__construct_from_ir_values__</code></td>
+    <td><code>gpu.func</code> 的 Block 参数需重建为 DSL 对象才能传入函数体</td>
+  </tr>
+  <tr>
+    <td><strong>Kernel Launch 解包</strong></td>
+    <td>DSL --> ir.Value</td>
+    <td><code>__extract_to_ir_values__</code></td>
+    <td><code>KernelLauncher.launch()</code> 解包参数传给 <code>gpu.launch_func</code></td>
+  </tr>
+  <tr>
+    <td><strong>OpResult 自动转回</strong></td>
+    <td>ir.Value --> DSL</td>
+    <td><code>register_value_caster</code></td>
+    <td>Op 返回 <code>ir.OpResult</code> 时自动转为 DSL 对象,用户可链式调用</td>
+  </tr>
+</table>
+
+<div class="arch-box">
+  <div class="arch-box-title">traced_op 的接口配合全景图</div>
+
+  <div class="layer-box">
+    <div class="layer-box-title" style="color: var(--purple);">1. ir.InsertionPoint -- IR 插入位置</div>
+    <ul>
+      <li>设置:<code>with ir.InsertionPoint(block):</code>,在 kernel_function / jit_function 中</li>
+      <li>读取:<code>OpView.__init__</code> 中 <code>ip=None</code> 时读取 <code>ir.InsertionPoint.current</code></li>
+      <li>效果:新 Op 被插入到 InsertionPoint 指向的 Block 末尾,之后游标自动前进</li>
+    </ul>
+  </div>
+
+  <div class="layer-box">
+    <div class="layer-box-title" style="color: var(--purple);">2. ir.Location -- 调试位置</div>
+    <ul>
+      <li>设置方式 1:<code>with loc:</code>(traced_op 使用)</li>
+      <li>设置方式 2:显式传递 <code>fly.logical_divide(..., loc=loc)</code></li>
+      <li>效果:IR 中每个 Op 都带有 <code>loc("源码" at "文件:行:列")</code> 信息</li>
+    </ul>
+  </div>
+
+  <div class="layer-box">
+    <div class="layer-box-title" style="color: var(--green);">3. __extract_to_ir_values__ -- DSL 对象 --> ir.Value(解包)</div>
+    <ul>
+      <li><strong>BuiltinDslType</strong>(Tensor/Layout/IntTuple/CopyAtom 等):<code>return [self]</code>(自身就是 ir.Value)</li>
+      <li><strong>Numeric</strong>(Int32/Float32 等):<code>return [self.ir_value()]</code>(需物化为 ir.Value,可能触发 arith.constant)</li>
+      <li><strong>触发场景</strong>:traced_op 的 <code>_flatten_args</code> 和 KernelLauncher 的 <code>extract_to_ir_values</code></li>
+      <li><strong>为什么需要</strong>:MLIR Op 的 <code>__init__</code> 只接受 <code>ir.Value</code> 作为 operand,不接受 DSL 对象</li>
+    </ul>
+  </div>
+
+  <div class="layer-box">
+    <div class="layer-box-title" style="color: var(--green);">4. __construct_from_ir_values__ -- ir.Value --> DSL 对象(重建)</div>
+    <ul>
+      <li>Kernel 参数重建:gpu.func 的 Block 参数是 ir.Value,需重建为 DSL 对象</li>
+      <li>Host 函数参数重建:JIT 函数的 ir.Value 参数需重建为 DSL 对象</li>
+      <li>分派入口:<code>protocol.construct_from_ir_values</code>;典型实现:<code>BuiltinDslType.__construct_from_ir_values__</code> --> <code>cls(values[0])</code></li>
+      <li><strong>为什么需要</strong>:步骤 1 已改写好的函数体期望接收 DSL 对象(要调用 <code>.shape</code> 等方法),而非裸 <code>ir.Value</code></li>
+    </ul>
+  </div>
+
+  <div class="layer-box">
+    <div class="layer-box-title" style="color: var(--orange);">5. __get_ir_types__ -- 获取 MLIR 类型信息</div>
+    <ul>
+      <li>分派入口:<code>protocol.get_ir_types</code>;各类型的 <code>__get_ir_types__</code> 返回 MLIR 类型列表</li>
+      <li>用于创建 gpu.func / func.func 时推导参数类型</li>
+      <li><code>Tensor.__get_ir_types__</code> --> <code>[self.type]</code></li>
+      <li><code>Int32.__get_ir_types__</code> --> <code>[i32]</code></li>
+    </ul>
+  </div>
+
+  <div class="layer-box">
+    <div class="layer-box-title" style="color: var(--orange);">6. ir.register_value_caster -- 自动类型转换</div>
+    <ul>
+      <li>当 MLIR Op 返回 <code>ir.OpResult</code> 时,根据类型自动转换为 DSL 对象</li>
+      <li>例如:<code>@ir.register_value_caster(TensorType.static_typeid, replace=True)</code></li>
+      <li>效果:用户代码可直接调用 DSL 方法(如 <code>layout.shape</code>),无需手动包装</li>
+      <li><strong>为什么需要</strong>:Op 返回 <code>ir.OpResult</code>,但用户代码需要继续链式调用 DSL 方法(如 <code>fx.slice(ta, ...)</code>)</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================== Section 5 ===================== -->
+<h2 id="s5">5. 端到端示例:vector_add_kernel 的完整编译路径</h2>
+
+<p>让我们跟踪 <code>vector_add_kernel</code> 中一行代码的完整执行路径:</p>
+
+<pre><code>ta = fx.logical_divide(a, fx.make_layout(block_dim, 1))</code></pre>
+
+<h3>5.1 阶段一:AST 改写(装饰时)</h3>
+
+<p>由于 <code>vector_add_kernel</code> 和 <code>vector_add</code> 都没有控制流,5 个 Transformer 都不修改 AST.步骤 1 改写后的函数体与原始代码完全相同.</p>
+
+<h3>5.2 阶段二:Kernel 发射(调用时)</h3>
+
+<p>当 <code>vector_add_kernel(a, c, block_dim)</code> 在 JIT 函数内被调用时:</p>
+
+<ol>
+  <li><code>KernelFunction.__call__</code> --> <code>_emit_kernel()</code></li>
+  <li>创建 <code>gpu.func @vector_add_kernel_0</code>,参数类型为 <code>[TensorType, TensorType]</code></li>
+  <li>创建 entry_block,设置 <code>ir.InsertionPoint(entry_block)</code></li>
+  <li>将 Block 参数重建为 DSL 对象:<code>a = Tensor(%arg0)</code>, <code>c = Tensor(%arg1)</code></li>
+  <li><code>block_dim</code> 是 Constexpr,直接传入值 64</li>
+  <li>调用 <code>self._func(a=Tensor(...), c=Tensor(...), block_dim=64)</code></li>
+  <li>返回 <code>KernelLauncher</code> 对象(kernel 已定义但尚未启动)</li>
+</ol>
+
+<h3>5.3 阶段三:Tracing(函数体执行)</h3>
+
+<p>Tracing 的本质:执行步骤 1 已改写好的 Python 函数体,每遇到一个 <code>fx.xxx()</code> 调用,就实时插入一条 MLIR Op.函数体执行完毕时,<code>gpu.func</code> 的 body 也被填满了.</p>
+
+<div class="arch-box">
+  <div class="arch-box-title">Tracing 前后对比(简化示例)</div>
+
+  <p>假设 kernel 函数体只有两行:</p>
+
+  <div style="display:flex; gap:1.5rem; margin:1rem 0;">
+    <div style="flex:1;">
+      <div style="font-weight:700; color:var(--green); margin-bottom:0.5rem;">Tracing 前(Python 代码)</div>
+      <pre style="margin:0; background:var(--surface2); border-radius:8px; padding:1rem; font-size:0.85rem; line-height:1.8;"><code>def vector_add_kernel(a, c, block_dim):
+    ta = fx.logical_divide(a, fx.make_layout(block_dim, 1))
+    tc = fx.logical_divide(c, fx.make_layout(block_dim, 1))</code></pre>
+    </div>
+    <div style="flex:1;">
+      <div style="font-weight:700; color:var(--accent); margin-bottom:0.5rem;">Tracing 后(gpu.func 内的 IR)</div>
+      <pre style="margin:0; background:var(--surface2); border-radius:8px; padding:1rem; font-size:0.85rem; line-height:1.8;"><code>gpu.func @vector_add_kernel_0(%arg0, %arg1) {
+  %0 = fly.make_layout(...)       loc("fx.make_layout(...)")
+  %1 = fly.logical_divide(%arg0, %0) loc("ta = fx.logical_divide(...)")
+  %2 = fly.make_layout(...)       loc("fx.make_layout(...)")
+  %3 = fly.logical_divide(%arg1, %2) loc("tc = fx.logical_divide(...)")
+  gpu.return
+}</code></pre>
+    </div>
+  </div>
+
+  <p>对应关系:每一行 <code>fx.xxx()</code> 执行时,<code>traced_op</code> 解包参数 --> <code>OpView.__init__</code> 读取当前 InsertionPoint --> 创建 Op 并插入 Block --> InsertionPoint 自动前进到下一条 Op 之后.Python 变量(<code>ta</code>,<code>tc</code>)持有的是 OpResult 包装后的 DSL 对象,后续调用可以继续使用.</p>
+</div>
+
+<p><code>fx.logical_divide(a, fx.make_layout(block_dim, 1))</code> 的完整执行过程:</p>
+
+<div class="flow-box"><span class="comment">1. 先执行 fx.make_layout(block_dim, 1)</span>
+<span class="arrow">|</span>   --> traced_op 包装器
+<span class="arrow">|</span>   --> _caller_location() --> loc("fx.make_layout(block_dim, 1)" at "01-vectorAdd.py":28:28)
+<span class="arrow">|</span>   --> _flatten_args: block_dim=64 (int, 原样), 1 (int, 原样)
+<span class="arrow">|</span>   --> 进入 make_layout 函数体
+<span class="arrow">|</span>   --> fly.make_layout(...) --> MakeLayoutOp.__init__()
+<span class="arrow">|</span>   --> OpView.__init__ 读取 InsertionPoint.current --> 插入 Op
+<span class="arrow">|</span>   --> 返回 Layout(%0)
+<span class="arrow">|</span>
+<span class="comment">2. 执行 fx.logical_divide(a, layout_result)</span>
+<span class="arrow">|</span>   --> traced_op 包装器
+<span class="arrow">|</span>   --> _caller_location() --> loc("ta = fx.logical_divide(...)" at "01-vectorAdd.py":28:4)
+<span class="arrow">|</span>   --> _flatten_args:
+<span class="arrow">|</span>      a: Tensor --> __extract_to_ir_values__ --> [ir.Value(%arg0)]
+<span class="arrow">|</span>      layout_result: Layout --> __extract_to_ir_values__ --> [ir.Value(%0)]
+<span class="arrow">|</span>   --> with loc: --> 设置 Location 上下文
+<span class="arrow">|</span>   --> 进入 logical_divide 函数体
+<span class="arrow">|</span>   --> fly.logical_divide(%arg0, %0, loc=loc, ip=None)
+<span class="arrow">|</span>   --> LogicalDivideOp.__init__(layout=%arg0, divisor=%0, loc=loc, ip=None)
+<span class="arrow">|</span>   --> OpView.__init__:
+<span class="arrow">|</span>      loc 已提供(来自 traced_op)
+<span class="arrow">|</span>      ip=None --> 读取 ir.InsertionPoint.current(指向 entry_block)
+<span class="arrow">|</span>      创建 fly.logical_divide Operation
+<span class="arrow">|</span>      插入到 entry_block 末尾
+<span class="arrow">|</span>      InsertionPoint 自动前进
+<span class="arrow">|</span>   --> 返回 OpResult --> register_value_caster 自动转为 Tensor
+<span class="arrow">|</span>   --> ta = Tensor(%1)</div>
+
+<h3>5.4 阶段四:Kernel 启动(.launch() 调用时)</h3>
+
+<p>Tracing 完成后,<code>KernelFunction.__call__</code> 返回 <code>KernelLauncher</code>.用户调用 <code>.launch()</code> 时,在 host 函数(<code>func.func</code>)内发射 <code>gpu.launch_func</code>:</p>
+
+<pre><code># 用户代码
+vector_add_kernel(a, c, block_dim).launch(grid=(grid_x,1,1), block=[block_dim,1,1], stream=stream)
+
+# 生成的 IR(在 func.func 内部)
+func.func @vector_add(...) {
+  ...
+  gpu.launch_func @kernels::vector_add_kernel_0
+    grid_size = (%grid_x, %grid_y, %grid_z)
+    block_size = (%block_x, %block_y, %block_z)
+    args(%arg0, %arg1)
+  ...
+}</code></pre>
+
+<h3>5.5 阶段五:生成的第一个 IR</h3>
+
+<p>整个 JIT 函数执行完毕后,生成的 IR 包含两个区域:</p>
+
+<pre><code>gpu.module @kernels {
+  gpu.func @vector_add_kernel_0(%arg0: !fly.Tensor&lt;...&gt;, %arg1: !fly.Tensor&lt;...&gt;) kernel {
+    %0 = fly.make_layout(...) loc("fx.make_layout(block_dim, 1)" at "01-vectorAdd.py":28:28)
+    %1 = fly.logical_divide(%arg0, %0) loc("ta = fx.logical_divide(...)" at "01-vectorAdd.py":28:4)
+    %2 = fly.make_layout(...) loc(...)
+    %3 = fly.logical_divide(%arg1, %2) loc(...)
+    %4 = fly.slice(%1, ...) loc(...)
+    %5 = fly.slice(%3, ...) loc(...)
+    %6 = fly.make_layout(...) loc(...)
+    %7 = fly.logical_divide(%4, %6) loc(...)
+    %8 = fly.logical_divide(%5, %6) loc(...)
+    %9 = fly.memref_alloca(...) loc(...)
+    %10 = fly.memref_alloca(...) loc(...)
+    %11 = fly.copy_atom_call(...) loc(...)
+    %12 = fly.memref_load_vec(%9) loc(...)
+    %13 = fly.memref_load_vec(%9) loc(...)
+    %14 = arith.addf(%12, %13) : f32 loc(...)
+    fly.memref_store_vec(%14, %10) loc(...)
+    %15 = fly.copy_atom_call(...) loc(...)
+    gpu.return
+  }
+}
+
+func.func @vector_add(...) {
+  ...
+  gpu.launch_func @kernels::vector_add_kernel_0
+    grid_size = (%grid_x, %c1, %c1)
+    block_size = (%block_dim, %c1, %c1)
+    args(%a, %c)
+  ...
+}</code></pre>
+
+<p>这就是<strong>第一个 IR</strong>----由 Python tracing 直接生成.<code>gpu.module</code> 内是 kernel 定义(Fly 方言 IR),<code>func.func</code> 内是 host 代码(含 <code>gpu.launch_func</code>).后续 Pass Pipeline 会对其进行一系列变换(canonicalize,SSA 提升,lowering 等),最终生成硬件可执行的代码.</p>
+
+<!-- ===================== Section 6 ===================== -->
+<h2 id="s6">6. 总结</h2>
+
+<div class="note">
+<table>
+  <tr><th>阶段</th><th>发生时机</th><th>核心机制</th></tr>
+  <tr><td><strong>AST 改写</strong></td><td>装饰时(<code>@flyc.kernel</code> / <code>@flyc.jit</code>)</td><td>5 个 Transformer 将 Python 控制流(if/for/while/and/or/not)改写为 <code>scf_*_dispatch</code> / <code>dsl_*_</code> 调度函数;注入全局函数使改写后的代码可运行</td></tr>
+  <tr><td><strong>Kernel 发射</strong></td><td>kernel 被调用时</td><td>创建 gpu.func + entry_block;设置 InsertionPoint;将 Block 参数重建为 DSL 对象;执行步骤 1 已改写好的函数体触发 tracing;返回 KernelLauncher</td></tr>
+  <tr><td><strong>Kernel 启动</strong></td><td>用户调用 .launch() 时</td><td>KernelLauncher.launch() 发射 gpu.launch_func;解包参数,转换 grid/block 维度;在 func.func 内引用已定义的 gpu.func</td></tr>
+  <tr><td><strong>traced_op 搭台</strong></td><td>每个 fx.xxx() 调用时</td><td>自动推断 Location + 解包 DSL 对象为 ir.Value + 设置 Location 上下文</td></tr>
+  <tr><td><strong>OpView 插入 IR</strong></td><td>Op 构造器执行时</td><td>读取 InsertionPoint.current 确定插入位置;读取 Location.current 确定调试位置;创建 Operation 并插入 Block</td></tr>
+  <tr><td><strong>Pass Pipeline</strong></td><td>tracing 完成后(<code>MlirCompiler.compile</code>)</td><td>对 origin IR 运行 canonicalize、layout-lowering、GPU lowering 等,生成可执行代码</td></tr>
+  <tr><td><strong>6 个配合接口</strong></td><td>贯穿全流程</td><td>InsertionPoint,Location,__extract_to_ir_values__,__construct_from_ir_values__,__get_ir_types__,register_value_caster</td></tr>
+</table>
+</div>
+
+<p>一句话总结:<strong>AST 改写让 Python 控制流变成 scf 调度函数,Kernel 发射搭建 gpu.func 舞台,traced_op 搭台(Location + 解包),OpView 唱戏(真正插入 IR),KernelLauncher.launch() 发射 gpu.launch_func 启动 kernel,MlirCompiler.compile 运行 Pass 生成可执行代码,6 个接口贯穿始终.</strong></p>
+
+</div>

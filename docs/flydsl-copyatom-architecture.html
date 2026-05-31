@@ -1,0 +1,959 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlyDSL CopyAtom 体系:从 Python DSL 到硬件 Lowering</title>
+<style>
+  :root {
+    --bg: #f8f9fc;
+    --surface: #ffffff;
+    --surface2: #f0f2f7;
+    --border: #dde1ea;
+    --text: #1a1d2e;
+    --text2: #5a6078;
+    --accent: #3b6bff;
+    --accent2: #3b6bff;
+    --green: #1a8a5c;
+    --orange: #c47200;
+    --red: #d03030;
+    --purple: #7c3aed;
+    --cyan: #0e7e8a;
+    --code-bg: #f3f4f8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 2rem; margin-bottom: 2.5rem;
+  }
+  .toc h3 { margin-top: 0; color: var(--accent); }
+  .toc ol { margin-left: 1.2rem; }
+  .toc li { margin-bottom: 0.3rem; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  h1 {
+    font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text2); font-size: 1rem; margin-bottom: 2.5rem; }
+
+  h2 {
+    font-size: 1.5rem; font-weight: 700; margin-top: 3rem; margin-bottom: 1rem;
+    padding-bottom: 0.5rem; border-bottom: 2px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.15rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem;
+    color: var(--green);
+  }
+  h4 {
+    font-size: 1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem;
+    color: var(--orange);
+  }
+
+  p { margin-bottom: 1rem; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+
+  code {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px; font-size: 0.9em;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    color: #0e7e8a;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+    overflow-x: auto; font-size: 0.88rem; line-height: 1.6;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  pre code { background: none; border: none; padding: 0; color: var(--text); }
+
+  .highlight { color: var(--orange); font-weight: 600; }
+  .note {
+    background: var(--surface); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .note-title { font-weight: 700; color: var(--accent); margin-bottom: 0.3rem; }
+  .warn {
+    background: rgba(240,164,93,0.08); border-left: 4px solid var(--orange);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .warn-title { font-weight: 700; color: var(--orange); margin-bottom: 0.3rem; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 0.6rem 0.8rem; text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--surface); }
+
+  .flow-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1.25rem; margin: 1rem 0 1.5rem;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.88rem;
+    line-height: 1.8; white-space: pre; overflow-x: auto;
+  }
+  .flow-box .arrow { color: var(--accent); }
+  .flow-box .label { color: var(--green); }
+  .flow-box .comment { color: var(--text2); }
+
+  .conv-card {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 1.75rem; margin: 2rem 0;
+  }
+  .conv-card-title {
+    font-size: 1.2rem; font-weight: 700; color: var(--accent);
+    margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem;
+  }
+  .conv-card-title .conv-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 2rem; height: 2rem; border-radius: 50%; font-weight: 700;
+    font-size: 0.9rem; color: #fff; background: var(--accent); flex-shrink: 0;
+  }
+  .conv-card .conv-op {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;
+    color: var(--cyan); margin-bottom: 0.75rem;
+  }
+  .conv-card .conv-line {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.82rem;
+    color: var(--text2); margin-bottom: 1rem;
+  }
+  .conv-card p { margin-bottom: 0.75rem; }
+  .conv-card ul { margin: 0.3rem 0 0.75rem 1.2rem; }
+  .conv-card li { margin-bottom: 0.3rem; }
+
+  .ir-before-after {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;
+    margin: 1rem 0 1.5rem;
+  }
+  .ir-box {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; overflow-x: auto;
+  }
+  .ir-box-title {
+    font-weight: 700; font-size: 0.85rem; margin-bottom: 0.5rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .ir-box-title.before { color: var(--red); }
+  .ir-box-title.after { color: var(--green); }
+  .ir-box pre {
+    margin: 0; padding: 0; border: none; background: none;
+    font-size: 0.82rem; line-height: 1.6;
+  }
+  .ir-box pre code { color: var(--text); }
+
+  @media (max-width: 720px) {
+    .ir-before-after { grid-template-columns: 1fr; }
+  }
+</style>
+
+
+<div class="container">
+
+<h1>FlyDSL CopyAtom 体系:从 Python DSL 到硬件 Lowering</h1>
+<p class="subtitle">系统整理 CopyAtom 相关的 Python 绑定、Fly IR、Interface 与 ROCDL Lowering,理清各层职责与调用关系</p>
+
+<div class="toc">
+<h3>目录</h3>
+<ol>
+  <li><a href="#s1">整体架构:CopyAtom 四层模型与数据流</a></li>
+  <li><a href="#s2">Interface 体系:谁定义什么契约</a></li>
+  <li><a href="#s3">Fly Dialect:Types 与 Ops</a></li>
+  <li><a href="#s4">C++ 实现:转发、Recast 与 emit</a></li>
+  <li><a href="#s5">Python 绑定与 DSL 层</a></li>
+  <li><a href="#s6">TiledCopy 与 Layout 推导</a></li>
+  <li><a href="#s7">Pass Pipeline 与调用链</a></li>
+  <li><a href="#s8">FlyROCDL 后端:硬件 CopyOp 实现</a></li>
+  <li><a href="#s9">端到端示例</a></li>
+  <li><a href="#s10">符号速查表与总结</a></li>
+</ol>
+</div>
+
+<!-- ===================== Section 1 ===================== -->
+<h2 id="s1">1. 整体架构:CopyAtom 四层模型与数据流</h2>
+
+<p><strong>核心思想 — Type-erased Wrapper + Interface Dispatch:</strong> Fly Dialect 本身不编码任何硬件 load/store 指令.它只持有一个 <code>!fly.copy_atom&lt;InnerCopyOp, valBits&gt;</code> 包装类型.<code>InnerCopyOp</code> 是 Fly 通用类型(如 <code>!fly.universal_copy&lt;32&gt;</code>)或后端 Dialect(<code>fly_rocdl</code>)定义的<em>纯 MLIR 类型</em>,实现了 <code>Fly_CopyOpTypeInterface</code>,通过 <code>emitAtomCall</code> / <code>emitAtomCallSSA</code> 把自己 lower 成具体 IR(LLVM load/store、ROCDL buffer_load 等).</p>
+
+<p>因此<strong>新增一种硬件拷贝指令 = 在后端 Dialect 加一个 TypeDef + 实现 CopyOpTypeInterface</strong>,Fly Dialect 与上层 Python DSL 通常无需修改.</p>
+
+<h3>1.1 四层抽象(自上而下)</h3>
+
+<table>
+  <tr><th>层级</th><th>类型 / Op</th><th>表达内容</th><th>例子</th></tr>
+  <tr>
+    <td><strong>① 指令</strong></td>
+    <td>实现 <code>CopyOpTypeInterface</code> 的具体类型</td>
+    <td>一条拷贝指令的 thread 布局、bit-level TV 布局、如何 emit</td>
+    <td><code>!fly.universal_copy&lt;32&gt;</code><br><code>!fly_rocdl.cdna3.buffer_copy&lt;128&gt;</code></td>
+  </tr>
+  <tr>
+    <td><strong>② 原子</strong></td>
+    <td><code>!fly.copy_atom&lt;CopyOp, valBits&gt;</code></td>
+    <td>可调用的最小拷贝单元;对外屏蔽硬件差异;bit→value layout recast</td>
+    <td><code>!fly.copy_atom&lt;!fly.universal_copy&lt;32&gt;, 32&gt;</code></td>
+  </tr>
+  <tr>
+    <td><strong>③ 平铺</strong></td>
+    <td><code>!fly.tiled_copy&lt;atom, layoutTV, tileMN&gt;</code></td>
+    <td>一个 block 内多个 atom 的平铺方式与 partition 规则</td>
+    <td><code>!fly.tiled_copy&lt;atom, ((4,1):(1,1)), (8,24)&gt;</code></td>
+  </tr>
+  <tr>
+    <td><strong>④ 调用</strong></td>
+    <td><code>fly.copy_atom_call</code> / <code>fly.copy_atom_call_ssa</code> / <code>fly.copy</code></td>
+    <td>对 atom(或 partition 后的视图)发起实际数据搬运</td>
+    <td><code>fly.copy_atom_call(%atom, %src, %dst)</code></td>
+  </tr>
+</table>
+
+<h3>1.2 CopyAtom 相关组件总览</h3>
+
+<table>
+  <tr><th>#</th><th>组件</th><th>所在层</th><th>详见</th></tr>
+  <tr><td>1</td><td><code>Fly_CopyOpTypeInterface</code></td><td>Interface</td><td><a href="#card-copyop-interface">§2</a></td></tr>
+  <tr><td>2</td><td><code>CopyOpUniversalCopyType</code></td><td>Fly 通用 CopyOp</td><td><a href="#card-universal-copy">§4</a></td></tr>
+  <tr><td>3</td><td><code>CopyAtomType</code></td><td>Fly 包装类型</td><td><a href="#card-copy-atom-type">§3 / §4</a></td></tr>
+  <tr><td>4</td><td><code>TiledCopyType</code></td><td>Fly 平铺类型</td><td><a href="#card-tiled-copy">§6</a></td></tr>
+  <tr><td>5</td><td><code>fly.make_copy_atom</code></td><td>Fly Op</td><td><a href="#card-make-copy-atom">§3</a></td></tr>
+  <tr><td>6</td><td><code>fly.copy_atom_call</code></td><td>Fly Op</td><td><a href="#card-copy-atom-call">§7</a></td></tr>
+  <tr><td>7</td><td><code>fly-convert-atom-call-to-ssa-form</code></td><td>Pass</td><td><a href="#card-ssa-pass">§7</a></td></tr>
+  <tr><td>8</td><td><code>CopyAtomCallLowering</code></td><td>FlyToROCDL</td><td><a href="#card-copy-atom-call">§7</a></td></tr>
+  <tr><td>9</td><td><code>CopyOpCDNA3BufferCopyType</code></td><td>fly_rocdl</td><td><a href="#card-buffer-copy">§8</a></td></tr>
+  <tr><td>10</td><td><code>fx.make_copy_atom</code> / <code>CopyAtom</code></td><td>Python DSL</td><td><a href="#s5">§5</a></td></tr>
+</table>
+
+<h3>1.3 整体数据流(vectorAdd 为例)</h3>
+
+<div class="flow-box"><span class="comment">── Python DSL ──</span>
+<span class="label">fx.UniversalCopy32b()</span>           <span class="comment">→ CopyOp 类型(编译期常量,无 SSA value)</span>
+<span class="label">fx.make_copy_atom(..., f32)</span>     <span class="comment">→ fly.make_copy_atom</span>
+<span class="label">fx.copy_atom_call(atom, src, dst)</span> <span class="comment">→ fly.copy_atom_call</span>
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span>  <span class="comment">Pass: fly-convert-atom-call-to-ssa-form</span>
+<span class="label">Fly IR (SSA)</span>
+  fly.copy_atom_call_ssa(%atom, %src_ssa, %old_dst?, %pred?)
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span>  <span class="comment">Pass: convert-fly-to-rocdl</span>
+<span class="label">Lowering</span>
+  CopyAtomType::emitAtomCallSSA
+    <span class="arrow">→</span> CopyOpTypeInterface::emitAtomCallSSA
+    <span class="arrow">▼</span>
+<span class="label">Target IR</span>
+  UniversalCopy: llvm.load + llvm.store
+  BufferCopy:    rocdl.raw.ptr.buffer.load / store</div>
+
+<!-- ===================== Section 2 ===================== -->
+<h2 id="s2">2. Interface 体系:谁定义什么契约</h2>
+
+<p>Interface 是 FlyDSL Atom 设计的核心.TableGen 定义在 <code>include/flydsl/Dialect/Fly/IR/FlyInterfaces.td</code>,C++ 实现分散在各 CopyOp 类型对应的 <code>*.cpp</code> 中.</p>
+
+<h3>2.1 继承关系总览</h3>
+
+<pre><code>CopyOpUniversalCopyType / CopyOpCDNA3BufferCopyType / …
+  ├── Fly_MayStaticTypeInterface          ← 是否纯静态(编译期可重建)
+  │     ├── isStatic()
+  │     └── rebuildStaticValue()         ← fly-rewrite-func-signature Pass 用
+  │
+  ├── Fly_CopyOpTypeInterface             ← CopyOp 核心契约(必选)
+  │     ├── getThrLayout()
+  │     ├── getThrBitLayoutSrc/Dst/Ref()
+  │     ├── emitAtomCall(...)            ← MemRef 路径(×2:无/有 pred)
+  │     └── emitAtomCallSSA(...)         ← SSA 路径(×2:无/有 pred)
+  │
+  └── Fly_StatefulOpTypeInterface         ← 可选:有运行时 mutable state
+        ├── getConvertedType()           ← lower 后变成 LLVM struct
+        ├── getDefaultState()
+        └── setAtomState()               ← fly.atom.set_value 调用
+
+CopyAtomType
+  └── Fly_MayStaticTypeInterface
+        + 转发: getThrLayout / getThrValLayout* / emitAtomCall* / isStateful / setAtomState</code></pre>
+
+<!-- ========== CopyOpTypeInterface ========== -->
+<div class="conv-card" id="card-copyop-interface">
+  <div class="conv-card-title">
+    <span class="conv-num">IF</span>
+    Fly_CopyOpTypeInterface
+  </div>
+  <div class="conv-op">TableGen: FlyInterfaces.td:75–137 &nbsp;|&nbsp; 所有 CopyOp 类型必须实现</div>
+  <div class="conv-line">lib/Dialect/Fly/IR/FlyUniversalOps.cpp &nbsp;|&nbsp; lib/Dialect/FlyROCDL/CDNA3/CopyAtom.cpp &nbsp;|&nbsp; …</div>
+
+  <h4>每个方法的作用</h4>
+
+  <table>
+    <tr><th>方法</th><th>返回/行为</th><th>谁消费</th></tr>
+    <tr>
+      <td><code>getThrLayout()</code></td>
+      <td>参与单次 atom 调用的 thread 子布局,如 <code>(1):(1)</code> 或 <code>(16):(1)</code></td>
+      <td>TiledCopy layout 推导;理解协作 thread 数</td>
+    </tr>
+    <tr>
+      <td><code>getThrBitLayoutSrc/Dst/Ref()</code></td>
+      <td>bit 粒度的 (Thread, Value) layout;Value 维度单位是 <strong>bit</strong></td>
+      <td><code>CopyAtomType</code> 通过 <code>layoutRecast(..., valBits)</code> 转为 value-level</td>
+    </tr>
+    <tr>
+      <td><code>emitAtomCall</code></td>
+      <td>MemRef 指针形式:load/store 或 memcpy;可带 predicate</td>
+      <td><code>CopyAtomCallLowering</code>;尚未 SSA 提升时</td>
+    </tr>
+    <tr>
+      <td><code>emitAtomCallSSA</code></td>
+      <td>SSA 形式:src/dst 已是 vector/标量,返回 load 结果或 side-effect store</td>
+      <td><code>CopyAtomCallSSALowering</code>;SSA Pass 之后的主路径</td>
+    </tr>
+  </table>
+
+  <div class="note">
+    <div class="note-title">扩展点不变量</div>
+    <p>所有 lower 逻辑都在 <code>CopyOpTypeInterface::emitAtomCall*</code> 中.<code>CopyAtomType</code> 只做转发,不决定最终生成 LLVM 还是 ROCDL 指令.</p>
+  </div>
+</div>
+
+<h3>2.2 Fly_StatefulOpTypeInterface — 何时需要</h3>
+
+<p>硬件 buffer 指令常带 per-instruction 状态(如 CDNA3 <code>soffset</code>).Stateful CopyOp:</p>
+<ul>
+  <li><code>isStatic() == false</code>(不能从函数签名移除后自动重建)</li>
+  <li><code>fly.make_copy_atom</code> lower 为 <code>getDefaultState()</code> 返回的 LLVM struct,而非 <code>llvm.undef</code></li>
+  <li>Python 通过 <code>copy_atom.set_value("soffset", val)</code> &rarr; <code>fly.atom.set_value</code> &rarr; <code>setAtomState</code></li>
+</ul>
+
+<p>状态字段枚举:<code>include/flydsl/Dialect/FlyROCDL/IR/Atom.td</code> 中的 <code>AtomStateField</code>(<code>soffset</code>、<code>imm_offset</code>、<code>scale_a/b</code> 等).</p>
+
+<!-- ===================== Section 3 ===================== -->
+<h2 id="s3">3. Fly Dialect:Types 与 Ops</h2>
+
+<h3>3.1 核心 Types(<code>FlyTypeDefs.td</code>)</h3>
+
+<table>
+  <tr><th>MLIR 类型</th><th>参数</th><th>职责</th></tr>
+  <tr>
+    <td><code>!fly.copy_atom&lt;CopyOp, valBits&gt;</code></td>
+    <td>内嵌 CopyOp 类型 + 元素位宽</td>
+    <td>包装层;<code>emitAtomCall*</code> 转发给内嵌 CopyOp;提供 value-level TV layout</td>
+  </tr>
+  <tr>
+    <td><code>!fly.tiled_copy&lt;atom, layoutTV, tileMN&gt;</code></td>
+    <td>CopyAtom + 平铺 TV layout + MN tile</td>
+    <td>描述 block 级拷贝平铺;lower 时擦除为 CopyAtom</td>
+  </tr>
+  <tr>
+    <td><code>!fly.universal_copy&lt;bitSize&gt;</code></td>
+    <td>32, 64, 128…</td>
+    <td>通用 memcpy 语义;lower 为 LLVM load/store/memcpy</td>
+  </tr>
+  <tr>
+    <td><code>!fly.universal_atomic&lt;op, valTy&gt;</code></td>
+    <td>AtomicOp + 元素类型</td>
+    <td>通用 atomic;lower 为 <code>llvm.atomicrmw</code></td>
+  </tr>
+</table>
+
+<h3>3.2 核心 Ops(<code>FlyOps.td</code>)</h3>
+
+<table>
+  <tr><th>Op</th><th>Operands / Results</th><th>生成时机 / 用途</th></tr>
+  <tr>
+    <td><code>fly.make_copy_atom</code></td>
+    <td>attr <code>valBits</code> &rarr; <code>!fly.copy_atom</code></td>
+    <td><code>fx.make_copy_atom</code> tracing;Pure op,类型编码在 result type 中</td>
+  </tr>
+  <tr>
+    <td><code>fly.copy_atom_call</code></td>
+    <td>atom, src MemRef, dst MemRef, pred?</td>
+    <td>MemRef 形式拷贝;tracing 直接插入</td>
+  </tr>
+  <tr>
+    <td><code>fly.copy_atom_call_ssa</code></td>
+    <td>atom, src, dst?, pred? &rarr; result?</td>
+    <td>SSA Pass 生成;Register MemRef 提升后</td>
+  </tr>
+  <tr>
+    <td><code>fly.make_tiled_copy</code></td>
+    <td>atom, layoutThrVal, tileMN &rarr; tiled_copy</td>
+    <td><code>fx.make_tiled_copy</code></td>
+  </tr>
+  <tr>
+    <td><code>fly.tiled_copy.partition_src/dst</code></td>
+    <td>tiled_copy, tensor, coord</td>
+    <td>按 thread 坐标切分源/目标视图</td>
+  </tr>
+  <tr>
+    <td><code>fly.atom.set_value</code></td>
+    <td>atom, field name, value &rarr; atom</td>
+    <td>Stateful atom 设置 soffset 等</td>
+  </tr>
+  <tr>
+    <td><code>fly.copy</code></td>
+    <td>copyAtom(可为 stateful struct), src, dst, pred?</td>
+    <td><code>fx.copy</code>;接受 <code>copy_atom.set_value(...)</code> 链式结果</td>
+  </tr>
+</table>
+
+<!-- ========== MakeCopyAtomOp ========== -->
+<div class="conv-card" id="card-make-copy-atom">
+  <div class="conv-card-title">
+    <span class="conv-num">Op</span>
+    fly.make_copy_atom
+  </div>
+  <div class="conv-op">Python: fx.make_copy_atom(copy_op, elem_type) &rarr; fly.make_copy_atom</div>
+
+  <h4>Op 定义</h4>
+<pre><code>def Fly_MakeCopyAtomOp : Fly_Op&lt;"make_copy_atom", [Pure]&gt; {
+  let arguments = (ins I32Attr:$valBits);
+  let results = (outs Fly_CopyAtom:$result);
+}</code></pre>
+
+  <p><code>make_copy_atom</code> 做两件事:① 构造 <code>CopyAtomType.get(copyOp, valBits)</code>;② 插入 Pure op 产生 SSA 值.整个 atom 的语义(用哪种 CopyOp、元素位宽)全部编码在 result type 中.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Python DSL</div>
+      <pre><code>copy_atom = fx.make_copy_atom(
+    fx.UniversalCopy32b(), fx.Float32)</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">Tracing 生成的 Fly IR</div>
+      <pre><code>%atom = fly.make_copy_atom {valBits = 32}
+  : !fly.copy_atom&lt;
+      !fly.universal_copy&lt;32&gt;, 32&gt;</code></pre>
+    </div>
+  </div>
+
+  <p>Lowering(<code>MakeCopyAtomOpLowering</code>, <code>lib/Conversion/FlyToROCDL/FlyToROCDL.cpp</code>):stateful CopyOp &rarr; <code>getDefaultState()</code> 生成 LLVM struct;non-stateful &rarr; <code>llvm.undef</code> 空结构体占位.</p>
+</div>
+
+<div class="warn">
+  <div class="warn-title">fly.copy_atom_call vs fly.copy</div>
+  <p><code>fly.copy_atom_call</code> 的 operand 类型是 <code>Fly_CopyAtom</code>(包装类型);<code>fly.copy</code> 的 operand 是 <code>AnyType</code>,因为 stateful lower 后 atom 已是 LLVM struct value.GEMM 等 kernel 中 <code>fx.copy(copy_atom.set_value(...), src, dst)</code> 走 <code>fly.copy</code> 路径.</p>
+</div>
+
+<!-- ===================== Section 4 ===================== -->
+<h2 id="s4">4. C++ 实现:转发、Recast 与 emit</h2>
+
+<!-- ========== CopyAtomType ========== -->
+<div class="conv-card" id="card-copy-atom-type">
+  <div class="conv-card-title">
+    <span class="conv-num">T</span>
+    CopyAtomType
+  </div>
+  <div class="conv-op">FlyTypeDefs.td:256–295 &nbsp;|&nbsp; lib/Dialect/Fly/IR/FlyTypeDefs.cpp:424–495</div>
+
+  <h4>职责:纯转发 + layoutRecast</h4>
+
+<pre><code>// TV layout: bit → value
+Attribute CopyAtomType::getThrValLayoutSrc() {
+  auto copyOp = cast&lt;CopyOpTypeInterface&gt;(getCopyOp());
+  return layoutRecast(builder, copyOp.getThrBitLayoutSrc(), 1, getValBits());
+}
+
+// emit: 完全委托给内嵌 CopyOp
+LogicalResult CopyAtomType::emitAtomCall(...) const {
+  return cast&lt;CopyOpTypeInterface&gt;(getCopyOp())
+      .emitAtomCall(builder, loc, copyAtomTy, srcMemTy, dstMemTy, atomVal, src, dst);
+}</code></pre>
+
+  <p><strong>关键不变量:</strong> <code>CopyAtomType</code> 本身不决定 lower 目标;<code>getCopyOp()</code> 指向的类型决定是 LLVM 通用路径还是 ROCDL buffer 路径.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">CopyOp bit-level TV</div>
+      <pre><code>UniversalCopy32b:
+  getThrBitLayoutSrc()
+    = ((1, 32):(1, 1))
+  ; 1 thread, 32 bits</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">CopyAtom value-level TV (valBits=16)</div>
+      <pre><code>CopyAtomType(..., valBits=16):
+  getThrValLayoutSrc()
+    = layoutRecast(bitLayout, 1, 16)
+    = ((1, 2):(1, 1))
+  ; 1 thread, 2 个 f16 值</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== UniversalCopy ========== -->
+<div class="conv-card" id="card-universal-copy">
+  <div class="conv-card-title">
+    <span class="conv-num">U</span>
+    CopyOpUniversalCopyType
+  </div>
+  <div class="conv-op">FlyTypeDefs.td:335–343 &nbsp;|&nbsp; lib/Dialect/Fly/IR/FlyUniversalOps.cpp</div>
+
+  <table>
+    <tr><th>方法</th><th>UniversalCopy 行为</th></tr>
+    <tr><td><code>getThrLayout</code></td><td><code>(1):(1)</code> — 单 thread 独立</td></tr>
+    <tr><td><code>getThrBitLayout*</code></td><td><code>((1, bitSize):(1,1))</code></td></tr>
+    <tr><td><code>emitAtomCall</code></td><td><code>llvm.memcpy</code>(字节数 = bitSize/8)</td></tr>
+    <tr><td><code>emitAtomCallSSA</code></td><td>src 是 MemRef &rarr; <code>llvm.load</code>;dst 是 MemRef &rarr; <code>llvm.store</code></td></tr>
+    <tr><td><code>isStatic</code></td><td><code>true</code></td></tr>
+    <tr><td><code>rebuildStaticValue</code></td><td>插入 <code>fly.make_copy_atom</code></td></tr>
+  </table>
+
+  <h4>IR 变换示例(SSA 路径,Global &rarr; Register)</h4>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">After SSA Pass</div>
+      <pre><code>%src = ... : f32          ; Global load 结果
+%old = ... : f32          ; Register 旧值(可选)
+%r = fly.copy_atom_call_ssa
+  %atom, %src, %old
+  : vector&lt;1xf32&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After emitAtomCallSSA (UniversalCopy)</div>
+      <pre><code>%loaded = llvm.load %src_ptr : f32
+; 若有 dst: llvm.store %loaded, %dst_ptr
+; 返回 %loaded</code></pre>
+    </div>
+  </div>
+</div>
+
+<h3>4.1 TiledCopy layout 工具</h3>
+
+<p><code>include/flydsl/Dialect/Fly/Utils/TiledOpUtils.h</code> 中的 <code>layoutTiledCopyThrValView</code> 根据 CopyAtom 的 ref/src layout 与 tiled layout 推导 partition 后的 TV view.Python 绑定在 <code>lib/Bindings/Python/TiledOpTraits.cpp</code> 暴露为 <code>TiledCopyType.tiled_tv_layout_src/dst</code> 属性.</p>
+
+<!-- ===================== Section 5 ===================== -->
+<h2 id="s5">5. Python 绑定与 DSL 层</h2>
+
+<p>Python 侧分三层:<strong>MLIR 原生绑定</strong> &rarr; <strong>primitive 薄封装</strong> &rarr; <strong>typing 值_caster 增强</strong>.</p>
+
+<h3>5.1 分层对照表</h3>
+
+<table>
+  <tr><th>层级</th><th>模块 / 文件</th><th>内容</th></tr>
+  <tr>
+    <td><strong>MLIR Type 绑定</strong></td>
+    <td><code>lib/Bindings/Python/FlyExtension.cpp</code></td>
+    <td><code>CopyAtomType</code>、<code>TiledCopyType</code>、<code>CopyOpUniversalCopyType</code> 的 <code>.get()</code> 与 layout 属性</td>
+  </tr>
+  <tr>
+    <td><strong>ROCDL Type 绑定</strong></td>
+    <td><code>lib/Bindings/Python/FlyROCDLExtension.cpp</code></td>
+    <td><code>CopyOpCDNA3BufferCopyType</code>、<code>BufferCopyLDS</code>、<code>BufferAtomic</code>、<code>CopyOpCDNA4LdsReadTransposeType</code></td>
+  </tr>
+  <tr>
+    <td><strong>Fly Op 绑定</strong></td>
+    <td>MLIR 自动生成 + <code>flydsl._mlir.dialects.fly</code></td>
+    <td><code>make_copy_atom</code>、<code>copy_atom_call</code>、<code>make_tiled_copy</code> 等 Op 构造器</td>
+  </tr>
+  <tr>
+    <td><strong>DSL primitive</strong></td>
+    <td><code>python/flydsl/expr/primitive.py</code></td>
+    <td><code>@traced_op</code> 包装:<code>make_copy_atom</code>、<code>copy_atom_call</code>、<code>make_tiled_copy</code>、<code>copy</code></td>
+  </tr>
+  <tr>
+    <td><strong>DSL 便捷别名</strong></td>
+    <td><code>primitive.py</code>、<code>rocdl/universal.py</code>、<code>rocdl/cdna4.py</code></td>
+    <td><code>UniversalCopy32b</code>、<code>BufferCopy128b</code>、<code>LDSReadTrans4_64b</code> 等 lambda</td>
+  </tr>
+  <tr>
+    <td><strong>值_caster 类</strong></td>
+    <td><code>python/flydsl/expr/typing.py</code></td>
+    <td><code>CopyAtom</code>、<code>TiledCopy</code> — 附加 Python 属性与 <code>set_value</code> / <code>get_slice</code></td>
+  </tr>
+  <tr>
+    <td><strong>高层 helper</strong></td>
+    <td><code>python/flydsl/expr/derived.py</code></td>
+    <td><code>make_tiled_copy_A/B/C</code>、<code>ThrCopy.partition_S/D</code></td>
+  </tr>
+</table>
+
+<h3>5.2 Python API &rarr; IR 映射</h3>
+
+<table>
+  <tr><th>用户写法 (fx.*)</th><th>内部调用</th><th>生成的 Fly IR</th></tr>
+  <tr>
+    <td><code>fx.UniversalCopy32b()</code></td>
+    <td><code>CopyOpUniversalCopyType.get(32)</code></td>
+    <td>(纯类型,无 op;嵌入 copy_atom 类型参数)</td>
+  </tr>
+  <tr>
+    <td><code>fx.rocdl.BufferCopy128b()</code></td>
+    <td><code>CopyOpCDNA3BufferCopyType.get(128)</code></td>
+    <td><code>!fly_rocdl.cdna3.buffer_copy&lt;128&gt;</code></td>
+  </tr>
+  <tr>
+    <td><code>fx.make_copy_atom(op, fx.Float32)</code></td>
+    <td><code>CopyAtomType.get(op, 32)</code> + <code>fly.make_copy_atom</code></td>
+    <td><code>fly.make_copy_atom {valBits=32} : !fly.copy_atom&lt;...&gt;</code></td>
+  </tr>
+  <tr>
+    <td><code>fx.copy_atom_call(atom, src, dst)</code></td>
+    <td><code>fly.copy_atom_call</code></td>
+    <td><code>fly.copy_atom_call %atom, %src, %dst</code></td>
+  </tr>
+  <tr>
+    <td><code>atom.set_value("soffset", v)</code></td>
+    <td><code>fly.atom_set_value</code></td>
+    <td><code>fly.atom.set_value(%atom, "soffset", %v)</code></td>
+  </tr>
+  <tr>
+    <td><code>thr_copy.partition_S(tensor)</code></td>
+    <td><code>fly.tiled_copy_partition_src</code></td>
+    <td><code>fly.tiled_copy.partition_src(%tc, %t, %coord)</code></td>
+  </tr>
+  <tr>
+    <td><code>fx.copy(atom, src, dst)</code></td>
+    <td><code>fly.copy</code></td>
+    <td><code>fly.copy(%atom, %src, %dst)</code></td>
+  </tr>
+</table>
+
+<h3>5.3 CopyAtom / TiledCopy Python 类</h3>
+
+<table>
+  <tr><th>类</th><th>属性 / 方法</th><th>含义</th></tr>
+  <tr>
+    <td rowspan="4"><code>CopyAtom</code><br><code>typing.py</code></td>
+    <td><code>.val_bits</code></td>
+    <td>元素位宽,驱动 layoutRecast</td>
+  </tr>
+  <tr><td><code>.thr_layout</code> / <code>.layout_src_tv</code> 等</td><td>value-level TV layout(静态 Layout 对象)</td></tr>
+  <tr><td><code>.set_value(field, val)</code></td><td>Stateful atom 字段更新</td></tr>
+  <tr><td colspan="2"></td></tr>
+  <tr>
+    <td rowspan="3"><code>TiledCopy</code><br><code>typing.py</code></td>
+    <td><code>.layout_tv_tiled</code></td>
+    <td>用户传入的 block 级 TV layout</td>
+  </tr>
+  <tr><td><code>.layout_src_tv_tiled</code> / <code>_dst_</code></td><td>C++ 推导的 tiled TV view(partition 用)</td></tr>
+  <tr><td><code>.get_slice(thr_idx)</code></td><td>返回 <code>ThrCopy</code>,提供 <code>partition_S/D</code></td></tr>
+</table>
+
+<!-- ===================== Section 6 ===================== -->
+<h2 id="s6">6. TiledCopy 与 Layout 推导</h2>
+
+<!-- ========== TiledCopyType ========== -->
+<div class="conv-card" id="card-tiled-copy">
+  <div class="conv-card-title">
+    <span class="conv-num">T</span>
+    TiledCopyType
+  </div>
+  <div class="conv-op">!fly.tiled_copy&lt;atom, layoutThrVal, tileMN&gt; &nbsp;|&nbsp; fly.make_tiled_copy</div>
+
+  <p>TiledCopy 解决:<strong>一个 block 内多个 thread 如何协作完成更大的拷贝 tile</strong>.</p>
+
+  <div class="flow-box"><span class="label">CopyAtom</span>  — 最小单元:1 次 atom call 搬多少 data、哪些 thread 参与
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span> <span class="comment">+ layoutThrVal + tileMN</span>
+<span class="label">TiledCopy</span>  — 平铺描述:如何把大 tensor 切成 per-thread partition
+    <span class="arrow">│</span>
+    <span class="arrow">▼</span> <span class="comment">partition_src/dst(coord)</span>
+<span class="label">copy_atom_call / fly.copy</span>  — 对 partition 视图执行实际拷贝</div>
+
+  <p>Lowering 时 <code>MakeTiledCopyOpLowering</code>(<code>FlyToROCDL.cpp</code>) 直接透传 <code>copyAtom</code> 操作数——<code>FlyTypeConverter</code> 已将 <code>TiledCopyType</code> 映射为内部 CopyAtom 的转换后类型.<code>fly-layout-lowering</code> Pass 还会把高层 <code>fly.copy(tiled_copy, ...)</code> 展开为循环 + 多次 <code>copy_atom_call</code>(<code>LayoutLowering.cpp</code>).</p>
+</div>
+
+<!-- ===================== Section 7 ===================== -->
+<h2 id="s7">7. Pass Pipeline 与调用链</h2>
+
+<h3>7.1 编译阶段一览</h3>
+
+<table>
+  <tr><th>阶段</th><th>Pass / 组件</th><th>对 CopyAtom 做什么</th></tr>
+  <tr>
+    <td>Tracing</td>
+    <td><code>@traced_op</code> + InsertionPoint</td>
+    <td>插入 <code>make_copy_atom</code>、<code>copy_atom_call</code> 等 Fly ops</td>
+  </tr>
+  <tr>
+    <td>Layout</td>
+    <td><code>fly-layout-lowering</code></td>
+    <td>展开 tiled copy 为 atom call 循环</td>
+  </tr>
+  <tr>
+    <td>SSA 提升</td>
+    <td><code>fly-convert-atom-call-to-ssa-form</code></td>
+    <td>Register MemRef eligible 时:<code>copy_atom_call</code> &rarr; <code>copy_atom_call_ssa</code></td>
+  </tr>
+  <tr>
+    <td>Vector SSA</td>
+    <td><code>fly-promote-regmem-to-vectorssa</code></td>
+    <td>按 TV layout 将 register 标量提升为 vector SSA</td>
+  </tr>
+  <tr>
+    <td>Backend</td>
+    <td><code>convert-fly-to-rocdl</code></td>
+    <td><code>CopyAtomCall*Lowering</code> &rarr; <code>emitAtomCall*</code> &rarr; LLVM/ROCDL</td>
+  </tr>
+</table>
+
+<!-- ========== SSA Pass ========== -->
+<div class="conv-card" id="card-ssa-pass">
+  <div class="conv-card-title">
+    <span class="conv-num">P</span>
+    fly-convert-atom-call-to-ssa-form
+  </div>
+  <div class="conv-op">lib/Dialect/Fly/Transforms/ConvertAtomCallToSSAForm.cpp</div>
+
+  <p>当 src 或 dst 是 Register MemRef 且 layout 满足 <code>isEligibleToPromote</code> 条件时,Pass 将 MemRef 形式的 <code>copy_atom_call</code> 转为 SSA 形式:</p>
+
+  <ul>
+    <li>eligible src:先 <code>fly.ptr_load</code> 取出 SSA 值</li>
+    <li>eligible dst:先 load old value,执行 <code>copy_atom_call_ssa</code>,再 <code>fly.ptr_store</code> 写回</li>
+    <li>非 eligible 端:保持 MemRef 指针形式传给 SSA op</li>
+  </ul>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (MemRef 形式)</div>
+      <pre><code>fly.copy_atom_call %atom, %src, %dst
+  : !fly.copy_atom&lt;...&gt;,
+    !fly.memref&lt;f32, global, ...&gt;,
+    !fly.memref&lt;f32, register, ...&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After SSA Pass</div>
+      <pre><code>%src_ssa = fly.ptr_load %src : f32
+%old = fly.ptr_load %dst_iter : f32
+%new = fly.copy_atom_call_ssa
+  %atom, %src_ssa, %old : f32
+fly.ptr_store %new, %dst_iter</code></pre>
+    </div>
+  </div>
+
+  <p>Promotion 条件(<code>isEligibleToPromote</code>):Register 地址空间,且 layout coalesce 后为 leaf,shape 或 stride 为 1.</p>
+</div>
+
+<!-- ========== CopyAtomCall ========== -->
+<div class="conv-card" id="card-copy-atom-call">
+  <div class="conv-card-title">
+    <span class="conv-num">L</span>
+    CopyAtomCallLowering / CopyAtomCallSSALowering
+  </div>
+  <div class="conv-op">lib/Conversion/FlyToROCDL/FlyToROCDL.cpp:523–610</div>
+
+  <p>Lowering 不直接生成硬件指令,而是委托给 <code>CopyAtomType::emitAtomCall*</code>,再转发到内嵌 CopyOp 的 Interface 实现.</p>
+
+<pre><code>CopyAtomCallLowering::matchAndRewrite(CopyAtomCall op, ...) {
+  copyAtom.emitAtomCall(rewriter, loc, ..., copyAtomVal, src, dst);
+}
+
+CopyAtomCallSSALowering::matchAndRewrite(CopyAtomCallSSA op, ...) {
+  copyAtom.emitAtomCallSSA(rewriter, loc, resultTy, ..., src, dst);
+}</code></pre>
+
+  <p><code>CopyAtomCallLowering</code> 校验 src/dst 均为 MemRef 且元素类型一致,有 pred 时走 predicated <code>emitAtomCall</code>.<code>CopyAtomCallSSALowering</code> 有返回值则 <code>replaceOp</code>,否则 <code>eraseOp</code>.</p>
+</div>
+
+<h3>7.2 两种调用路径对比</h3>
+
+<table>
+  <tr><th></th><th><code>copy_atom_call</code>(MemRef)</th><th><code>copy_atom_call_ssa</code></th></tr>
+  <tr><td>操作数</td><td>MemRef src/dst</td><td>SSA value 或 MemRef;dst 可为 old value</td></tr>
+  <tr><td>典型场景</td><td>vectorAdd 初版;Global&harr;Register</td><td>SSA Pass 后;Register 已是 vector</td></tr>
+  <tr><td>emit 入口</td><td><code>emitAtomCall</code></td><td><code>emitAtomCallSSA</code></td></tr>
+  <tr><td>UniversalCopy lower</td><td><code>llvm.memcpy</code></td><td><code>llvm.load</code> / <code>llvm.store</code></td></tr>
+</table>
+
+<!-- ===================== Section 8 ===================== -->
+<h2 id="s8">8. FlyROCDL 后端:硬件 CopyOp 实现</h2>
+
+<h3>8.1 TableGen 基类(<code>FlyROCDL/IR/Dialect.td</code>)</h3>
+
+<table>
+  <tr><th>TableGen 基类</th><th>实现的 Interface</th><th>用途</th></tr>
+  <tr><td><code>FlyROCDL_CopyOp</code></td><td>MayStatic + CopyOpTypeInterface</td><td>无状态硬件 copy(如 LDS read transpose)</td></tr>
+  <tr><td><code>FlyROCDL_StatefulCopyOp</code></td><td>CopyOpTypeInterface + StatefulOpTypeInterface</td><td>Buffer copy / atomic(含 soffset)</td></tr>
+</table>
+
+<!-- ========== BufferCopy ========== -->
+<div class="conv-card" id="card-buffer-copy">
+  <div class="conv-card-title">
+    <span class="conv-num">R</span>
+    CopyOpCDNA3BufferCopyType
+  </div>
+  <div class="conv-op">!fly_rocdl.cdna3.buffer_copy&lt;N&gt; &nbsp;|&nbsp; lib/Dialect/FlyROCDL/CDNA3/CopyAtom.cpp</div>
+
+  <table>
+    <tr><th>项目</th><th>内容</th></tr>
+    <tr><td>Python</td><td><code>fx.rocdl.BufferCopy128b()</code> &rarr; <code>CopyOpCDNA3BufferCopyType.get(128)</code></td></tr>
+    <tr><td>Stateful</td><td>是;含 <code>soffset</code> 字段(<code>AtomStateField::Soffset</code>)</td></tr>
+    <tr><td>TV Layout</td><td><code>(1):(1)</code>;单 thread 搬运 bitSize bits</td></tr>
+    <tr><td>emitAtomCallSSA</td><td>Buffer &rarr; reg:<code>rocdl.raw.ptr.buffer.load</code>;reg &rarr; Buffer:<code>rocdl.raw.ptr.buffer.store</code></td></tr>
+  </table>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Buffer &rarr; Register</div>
+      <pre><code>src: !fly.memref&lt;..., buffer_desc&gt;
+dst: register SSA (f32 / vector)
+
+emitAtomCallSSA:
+  soffset = extract(atom, "soffset")
+  loaded = rocdl.raw.ptr.buffer.load
+    rsrc, offset, soffset, ...</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">Register &rarr; Buffer</div>
+      <pre><code>src: register SSA value
+dst: !fly.memref&lt;..., buffer_desc&gt;
+
+emitAtomCallSSA:
+  rocdl.raw.ptr.buffer.store
+    value, rsrc, offset, soffset, ...</code></pre>
+    </div>
+  </div>
+</div>
+
+<h3>8.2 全部 ROCm CopyOp 类型</h3>
+
+<table>
+  <tr><th>MLIR 类型</th><th>Python 入口</th><th>C++ 实现</th><th>Lower 目标</th></tr>
+  <tr>
+    <td><code>!fly_rocdl.cdna3.buffer_copy&lt;N&gt;</code></td>
+    <td><code>fx.rocdl.BufferCopy128b()</code></td>
+    <td><code>CDNA3/CopyAtom.cpp</code></td>
+    <td><code>rocdl.raw.ptr.buffer.load/store</code></td>
+  </tr>
+  <tr>
+    <td><code>!fly_rocdl.cdna3.buffer_copy_lds&lt;N&gt;</code></td>
+    <td><code>fx.rocdl.BufferCopyLDS128b()</code></td>
+    <td><code>CDNA3/CopyAtom.cpp</code></td>
+    <td>Buffer &rarr; LDS 路径</td>
+  </tr>
+  <tr>
+    <td><code>!fly_rocdl.cdna3.buffer_atomic&lt;op, ty&gt;</code></td>
+    <td><code>fx.rocdl.BufferAtomicAdd(f32)</code></td>
+    <td><code>CDNA3/CopyAtom.cpp</code></td>
+    <td>Buffer atomic 指令</td>
+  </tr>
+  <tr>
+    <td><code>!fly_rocdl.cdna4.lds_read_trans&lt;...&gt;</code></td>
+    <td><code>fx.rocdl.cdna4.LDSReadTrans4_64b()</code></td>
+    <td><code>CDNA4/CopyAtom.cpp</code></td>
+    <td>LDS 读 + 转置;16 thread 协作</td>
+  </tr>
+</table>
+
+<h3>8.3 新增硬件 Copy 指令 checklist</h3>
+
+<ol>
+  <li>在 <code>fly_rocdl</code> 的 <code>CopyAtom.td</code> 添加 TypeDef(选 CopyOp 或 StatefulCopyOp 基类)</li>
+  <li>在 <code>lib/Dialect/FlyROCDL/&lt;arch&gt;/CopyAtom.cpp</code> 实现 <code>getThrLayout</code>、<code>getThrBitLayout*</code>、<code>emitAtomCallSSA</code></li>
+  <li>在 <code>FlyROCDLExtension.cpp</code> 添加 Python Type 绑定 + <code>rocdl/*.py</code> 便捷 lambda</li>
+  <li>用户侧:<code>fx.make_copy_atom(fx.rocdl.NewCopyOp(...), elem_ty)</code> — Fly Dialect 无需改</li>
+</ol>
+
+<!-- ===================== Section 9 ===================== -->
+<h2 id="s9">9. 端到端示例</h2>
+
+<h3>9.1 简单路径:vectorAdd(<code>examples/01-vectorAdd.py</code>)</h3>
+
+<pre><code>copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+ra = fx.memref_alloca(reg_ty, ...)
+fx.copy_atom_call(copy_atom, fx.slice(ta, (None, tid)), ra)   # Global → Register
+...
+fx.copy_atom_call(copy_atom, rc, fx.slice(tc, (None, tid)))   # Register → Global</code></pre>
+
+<div class="ir-before-after">
+  <div class="ir-box">
+    <div class="ir-box-title before">Tracing 后(Fly IR 片段)</div>
+    <pre><code>%atom = fly.make_copy_atom {valBits=32}
+  : !fly.copy_atom&lt;!fly.universal_copy&lt;32&gt;, 32&gt;
+fly.copy_atom_call %atom, %src, %ra
+fly.copy_atom_call %atom, %rc, %dst</code></pre>
+  </div>
+  <div class="ir-box">
+    <div class="ir-box-title after">FlyToROCDL 后(UniversalCopy)</div>
+    <pre><code>%atom = llvm.undef : !llvm.struct&lt;&gt;
+%v = llvm.load %src_ptr : f32
+llvm.store %v, %ra_ptr : f32
+...
+llvm.store %rc_val, %dst_ptr : f32</code></pre>
+  </div>
+</div>
+
+<h3>9.2 平铺路径:tiledCopy(<code>examples/02-tiledCopy.py</code>)</h3>
+
+<pre><code>copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout, tile_mn)
+thr_copy = tiled_copy.get_slice(tid)
+partition_src = thr_copy.partition_S(bA)
+frag = fx.make_fragment_like(partition_src)
+fx.copy(copy_atom, partition_src, frag)
+fx.copy(copy_atom, frag, thr_copy.partition_D(bB))</code></pre>
+
+<p>相比 vectorAdd 多了:<strong>硬件 CopyOp</strong>(BufferCopy128b)、<strong>TiledCopy partition</strong>、<strong>fly.copy</strong>(兼容 stateful atom).Lower 后走 ROCDL buffer 指令而非 Universal memcpy.</p>
+
+<!-- ===================== Section 10 ===================== -->
+<h2 id="s10">10. 符号速查表与总结</h2>
+
+<h3>10.1 按职责分类</h3>
+
+<table>
+  <tr><th>职责</th><th>C++ / TableGen</th><th>Python</th></tr>
+  <tr><td><strong>Interface 定义</strong></td><td><code>Fly_CopyOpTypeInterface</code>、<code>Fly_StatefulOpTypeInterface</code></td><td>—</td></tr>
+  <tr><td><strong>包装类型</strong></td><td><code>CopyAtomType</code>、<code>TiledCopyType</code></td><td><code>CopyAtom</code>、<code>TiledCopy</code></td></tr>
+  <tr><td><strong>通用 CopyOp</strong></td><td><code>CopyOpUniversalCopyType</code></td><td><code>UniversalCopy32b</code></td></tr>
+  <tr><td><strong>ROCm CopyOp</strong></td><td><code>CopyOpCDNA3BufferCopyType</code> 等</td><td><code>fx.rocdl.BufferCopy128b</code></td></tr>
+  <tr><td><strong>构造 Op</strong></td><td><code>MakeCopyAtomOp</code>、<code>MakeTiledCopyOp</code></td><td><code>make_copy_atom</code>、<code>make_tiled_copy</code></td></tr>
+  <tr><td><strong>执行 Op</strong></td><td><code>CopyAtomCall</code>、<code>CopyAtomCallSSA</code></td><td><code>copy_atom_call</code>、<code>copy</code></td></tr>
+  <tr><td><strong>Lowering</strong></td><td><code>FlyToROCDL.cpp</code></td><td>—</td></tr>
+  <tr><td><strong>SSA Pass</strong></td><td><code>ConvertAtomCallToSSAForm.cpp</code></td><td>—</td></tr>
+</table>
+
+<h3>10.2 源文件索引</h3>
+
+<table>
+  <tr><th>文件</th><th>内容</th></tr>
+  <tr><td><code>include/flydsl/Dialect/Fly/IR/FlyInterfaces.td</code></td><td>Interface 声明</td></tr>
+  <tr><td><code>include/flydsl/Dialect/Fly/IR/FlyTypeDefs.td</code></td><td>CopyAtom、TiledCopy、UniversalCopy 类型</td></tr>
+  <tr><td><code>include/flydsl/Dialect/Fly/IR/FlyOps.td</code></td><td>make_copy_atom、copy_atom_call 等 Op</td></tr>
+  <tr><td><code>lib/Dialect/Fly/IR/FlyTypeDefs.cpp</code></td><td>CopyAtomType 转发 + layoutRecast</td></tr>
+  <tr><td><code>lib/Dialect/Fly/IR/FlyUniversalOps.cpp</code></td><td>UniversalCopy/Atomic emit</td></tr>
+  <tr><td><code>lib/Dialect/FlyROCDL/CDNA3/CopyAtom.cpp</code></td><td>BufferCopy / BufferAtomic emit</td></tr>
+  <tr><td><code>lib/Conversion/FlyToROCDL/FlyToROCDL.cpp</code></td><td>CopyAtomCall*Lowering</td></tr>
+  <tr><td><code>lib/Bindings/Python/FlyExtension.cpp</code></td><td>Fly CopyAtom Python 绑定</td></tr>
+  <tr><td><code>python/flydsl/expr/primitive.py</code></td><td>DSL 入口函数</td></tr>
+</table>
+
+<h3>10.3 总结</h3>
+
+<div class="note">
+<table>
+  <tr><th>要记住的 5 件事</th><th>说明</th></tr>
+  <tr>
+    <td><strong>1. 四层模型</strong></td>
+    <td>CopyOp(指令语义) &rarr; CopyAtom(包装+valBits) &rarr; TiledCopy(平铺) &rarr; copy_atom_call(执行)</td>
+  </tr>
+  <tr>
+    <td><strong>2. Interface 是扩展点</strong></td>
+    <td>所有 lower 逻辑在 <code>CopyOpTypeInterface::emitAtomCall*</code>;CopyAtomType 只转发</td>
+  </tr>
+  <tr>
+    <td><strong>3. bit vs value layout</strong></td>
+    <td>CopyOp 提供 bit-level TV;CopyAtom 用 <code>valBits</code> recast 为 value-level</td>
+  </tr>
+  <tr>
+    <td><strong>4. 两条执行路径</strong></td>
+    <td>MemRef:<code>copy_atom_call</code> + <code>emitAtomCall</code>;SSA:<code>copy_atom_call_ssa</code> + <code>emitAtomCallSSA</code></td>
+  </tr>
+  <tr>
+    <td><strong>5. Python 三层</strong></td>
+    <td>MLIR 绑定 &rarr; primitive(@traced_op) &rarr; typing(CopyAtom/TiledCopy 增强)</td>
+  </tr>
+</table>
+</div>
+
+<p>一句话:<strong>CopyAtom 是 Fly 方言对「拷贝指令」的类型擦除包装;具体怎么 load/store 完全由内嵌 CopyOp 类型的 Interface 实现决定;Python 侧通过 <code>make_copy_atom</code> 组装类型、通过 <code>copy_atom_call</code> / <code>copy</code> 插入 IR,再经 SSA Pass 与 FlyToROCDL 落到 LLVM/ROCDL.</strong></p>
+
+</div>

@@ -1,0 +1,1112 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlyDSL FlyIXDL MRAsyncCp:从 ROCm 对照到 IXDL 实现清单</title>
+<style>
+  :root {
+    --bg: #f8f9fc;
+    --surface: #ffffff;
+    --surface2: #f0f2f7;
+    --border: #dde1ea;
+    --text: #1a1d2e;
+    --text2: #5a6078;
+    --accent: #3b6bff;
+    --accent2: #3b6bff;
+    --green: #1a8a5c;
+    --orange: #c47200;
+    --red: #d03030;
+    --purple: #7c3aed;
+    --cyan: #0e7e8a;
+    --code-bg: #f3f4f8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 2rem; margin-bottom: 2.5rem;
+  }
+  .toc h3 { margin-top: 0; color: var(--accent); }
+  .toc ol { margin-left: 1.2rem; }
+  .toc li { margin-bottom: 0.3rem; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  h1 {
+    font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text2); font-size: 1rem; margin-bottom: 1rem; }
+
+  h2 {
+    font-size: 1.5rem; font-weight: 700; margin-top: 3rem; margin-bottom: 1rem;
+    padding-bottom: 0.5rem; border-bottom: 2px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.15rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem;
+    color: var(--green);
+  }
+  h4 {
+    font-size: 1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem;
+    color: var(--orange);
+  }
+
+  p { margin-bottom: 1rem; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+
+  code {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px; font-size: 0.9em;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    color: #0e7e8a;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+    overflow-x: auto; font-size: 0.88rem; line-height: 1.6;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  pre code { background: none; border: none; padding: 0; color: var(--text); }
+
+  .highlight { color: var(--orange); font-weight: 600; }
+  .ref-note { color: var(--text2); font-size: 0.92rem; margin: 0 0 1.5rem; }
+  .ref-note strong { color: var(--text); }
+  .note {
+    background: var(--surface); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .note-title { font-weight: 700; color: var(--accent); margin-bottom: 0.5rem; }
+  .warn {
+    background: rgba(240,164,93,0.08); border-left: 4px solid var(--orange);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .warn-title { font-weight: 700; color: var(--orange); margin-bottom: 0.5rem; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 0.6rem 0.8rem; text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--surface); }
+
+  .tag {
+    display: inline-block; font-size: 0.72rem; padding: 2px 8px;
+    border-radius: 10px; font-weight: 600; vertical-align: middle;
+  }
+  .tag-new { background: rgba(26,138,92,0.12); color: var(--green); }
+  .tag-mod { background: rgba(196,114,0,0.12); color: var(--orange); }
+  .tag-ref { background: rgba(59,107,255,0.1); color: var(--accent); }
+  .tag-info { background: rgba(14,126,138,0.1); color: var(--cyan); }
+  .tag-opt { background: rgba(124,58,237,0.1); color: var(--purple); }
+  .tag-warn { background: rgba(208,48,48,0.1); color: var(--red); }
+  .file-path {
+    font-family: 'JetBrains Mono', monospace; color: var(--cyan);
+    font-size: 0.88rem; word-break: break-all;
+  }
+
+  .conv-card {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 1.75rem; margin: 2rem 0;
+  }
+  .conv-card-title {
+    font-size: 1.2rem; font-weight: 700; color: var(--accent);
+    margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .conv-card-title .conv-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 2rem; height: 2rem; border-radius: 50%; font-weight: 700;
+    font-size: 0.9rem; color: #fff; background: var(--accent); flex-shrink: 0;
+  }
+  h3 .conv-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.65rem; height: 1.65rem; border-radius: 50%; font-weight: 700;
+    font-size: 0.78rem; color: #fff; background: var(--accent);
+    margin-right: 0.4rem; vertical-align: middle;
+  }
+  .conv-card p { margin-bottom: 0.75rem; }
+  .conv-card ul { margin: 0.3rem 0 0.75rem 1.2rem; }
+  .conv-card li { margin-bottom: 0.3rem; }
+  .conv-card pre { margin-top: 0.5rem; }
+
+  @media (max-width: 720px) {
+    body { padding: 1rem; }
+  }
+</style>
+
+
+<div class="container">
+
+<h1>FlyDSL FlyIXDL MRAsyncCp:实现改动清单</h1>
+<p class="subtitle">FlyIXDL Dialect · Iluvatar MR 架构（ivcore11）· SME Load 异步拷贝（MRAsyncCp）· 参照 FlyROCDL 工程模式 + CUTLASS IX11 语义 · 原型阶段</p>
+<p class="ref-note">说明：Iluvatar 侧统一称为 <strong>MRAsyncCp</strong>，不使用 BufferCopy 命名。ROCm 仅作 TableGen / emitAtomCall 工程模式参照。<strong>硬件语义以 CUTLASS <code>ivcore11</code> / ixcc <code>IXDLOps.td</code> 为准</strong>（2026-05 文档修订）。</p>
+
+<div class="toc">
+<h3>目录</h3>
+<ol>
+  <li><a href="#s1">1. 已确认的设计决策</a></li>
+  <li><a href="#s2">2. 背景参照：ROCm BufferCopy（工程模板）</a></li>
+  <li><a href="#s3">3. 背景参照：Iluvatar 目标语义</a>
+    <ol>
+      <li><a href="#s3-1">3.1–3.3 CUTLASS / SME 描述符</a></li>
+      <li><a href="#s3-4">3.4 SmeGmemFatPtr</a></li>
+      <li><a href="#s3-5">3.5 IXDL 与硬件速查</a></li>
+    </ol>
+  </li>
+  <li><a href="#s4">4. 实现改动指南</a></li>
+  <li><a href="#s5">5. 实现顺序（依赖拓扑）</a></li>
+  <li><a href="#s6">6. 仍待确认 / 需你决策项</a></li>
+  <li><a href="#s7">7. 参照文件索引</a></li>
+</ol>
+</div>
+
+<h2 id="s1">1. 已确认的设计决策</h2>
+
+<div class="note">
+<div class="note-title">决策总表</div>
+<table>
+<tr><th>项目</th><th>决策</th><th>ROCm 对应</th></tr>
+<tr><td>Dialect</td><td><code>FlyIXDL</code>（<code>fly_ixdl</code>）</td><td><code>FlyROCDL</code></td></tr>
+<tr><td>C++ 类名</td><td><code>CopyOpMRAsyncCp</code></td><td><code>CopyOpCDNA3BufferCopy</code>（仅工程模式参照）</td></tr>
+<tr><td>TableGen mnemonic</td><td><code>mr.async_copy</code></td><td><code>cdna3.buffer_copy</code></td></tr>
+<tr><td>参数化方案</td><td><code>CopyOpMRAsyncCp&lt;valBits, major, swizzleMod&gt;</code>（<strong>已确认</strong>，见 §3.5.3）；原型可先固定 <code>(32, 0, 0)</code></td><td><code>CopyOpCDNA3BufferCopy&lt;bitSize&gt;</code></td></tr>
+<tr><td><code>swizzleMod</code></td><td><code>0</code> = XOR swizzle（CUTLASS <code>Swizzle&lt;…&gt;</code>，含 <code>Col</code> / <code>Row16b</code> / <code>NoSwizzle</code> dst layout）；<code>1</code> = modular swizzle（CUTLASS <code>Swizzle_Mod&lt;…&gt;</code>，对应 <code>Row8b</code> / <code>rowxfb8</code>）</td><td>—</td></tr>
+<tr><td>Stateful</td><td>原型阶段 stateless（<code>FlyIXDL_CopyOp</code>）；后续如需运行时 stride/指针再扩展 Stateful</td><td>Stateful（soffset）</td></tr>
+<tr><td>getThrLayout</td><td><code>FxLayout(FxC(64), FxC(1))</code> — 1 warp = 64 thread 协作（SALU uniform）</td><td><code>FxLayout(FxC(1), FxC(1))</code></td></tr>
+<tr><td>ThrBitLayoutSrc</td><td><code>FxLayout(FxShape(FxC(64), FxC(128)), FxStride(FxC(1), FxC(1)))</code> — 16×64B = 1024 byte / 次 SME 指令</td><td>1 × bitSize</td></tr>
+<tr><td>拷贝方向</td><td>Global → Shared（异步，fire-and-forget）</td><td>BufferDesc ↔ Register</td></tr>
+<tr><td>底层指令</td><td><code>__ivcorex_sme_load_16x1b64*</code> → LLVM <code>int_bi_sme_load_16x1b64*</code></td><td><code>rocdl.raw.ptr.buffer.load/store</code></td></tr>
+<tr><td>原型范围</td><td><code>int_bi_sme_load_16x1b64</code>（b32 row，<code>SMESwizzle::NoSwizzle</code>）</td><td>ROCm 支持 8/16/32/64/128 bit</td></tr>
+<tr><td>指令级别</td><td>Warp 级 SALU；CUTLASS <code>ThrID = _1</code> 表示 issuing 为 warp-uniform</td><td>Per-thread (VGPR)</td></tr>
+<tr><td>Global 侧载体</td><td><strong><code>SmeGmemFatPtr</code></strong>（<a href="#s3-4">§3.4</a>）→ 发射为 <code>SmeDescriptor</code> / <code>v4i32</code></td><td><code>BufferFatPtr</code></td></tr>
+<tr><td>Fly global AS</td><td><code>#fly_ixdl.sme_gmem</code>（<code>FlyIXDL_SmeGmemAddressAttr</code>）</td><td><code>#fly_rocdl.buffer_desc</code></td></tr>
+<tr><td>Shared 地址</td><td><code>i32 sOffset</code>：smem <code>!llvm.ptr&lt;AS3&gt;</code> → <code>uint32</code>（§3.3）</td><td>LDS via buffer path</td></tr>
+<tr><td>emit 路径</td><td>优先 <code>IXDL::CpAsync_*Op</code>（ixcc 已有），非新建 sme_load op</td><td>ROCDL buffer ops</td></tr>
+<tr><td>同步</td><td><strong>两套均暴露</strong>：<code>cp.async.commit/wait</code>（简单 kernel）+ <code>ix_sl_waitmem</code> / <code>pipebar</code>（多 stage GEMM，§3.5.4）</td><td>同步，无需</td></tr>
+</table>
+</div>
+
+<div class="note">
+<div class="note-title">与 CUTLASS/ixcc 校正后的差异</div>
+<p><strong>与旧稿差异（已按 CUTLASS/ixcc 校正）：</strong></p>
+<ul>
+<li>SME load 为 <strong>4 参数</strong>（<code>sOffset, gBase(v4i32), gOffset, kop</code>），<strong>不是</strong> 5 参数的 <code>slbVaddr/glbVaddr/slbSoffset/glbSoffset</code> 形态（后者属于 <code>mllsa_async_*</code>，非本 CopyAtom）。</li>
+<li><code>gmem_ptr</code> 在描述符内为 <strong>完整指针</strong>，非 addr_lo/hi 拆分；ivcore11 上 <code>placeholder</code> 通常 unused（ix30 才置 <code>-1</code>）。</li>
+<li>xf 变种的 <strong>Dst swizzle layout</strong> 见 CUTLASS <code>copy_traits_ix11_sme.hpp</code>；原型 b32 row 可 <code>Dst = Src</code>。</li>
+<li>Global 侧采用 <strong><code>SmeGmemFatPtr</code></strong>（<code>gmem_ptr + stride_byte + byte_offset</code>），在 <code>FlyToIXDL</code> 与 <code>emitAtomCallSSA</code> 间传递，不再在 CopyAtom 内临时拼描述符。</li>
+</ul>
+<p class="ref-note" style="margin-top:0">TableGen 三参数 <code>(valBits, major, swizzleMod)</code> 已确认；其余工程细节见 <strong><a href="#s6">§6</a></strong>。</p>
+</div>
+
+
+
+<h2 id="s2">2. 背景参照：ROCm BufferCopy（工程模板）</h2>
+
+<p class="ref-note">本节描述已完成的 FlyROCDL 实现，作为 FlyIXDL 的对照模板。新实现应遵循相同的接口契约（<code>Fly_CopyOpTypeInterface</code> + <code>Fly_StatefulOpTypeInterface</code>），仅替换底层 intrinsic 和 fat pointer 构造逻辑。</p>
+
+<h3>2.1 整体数据流</h3>
+
+<div class="note">
+<div class="note-title">ROCm BufferCopy 数据流</div>
+<pre><code>Python 层
+  fx.rocdl.make_buffer_tensor(tensor)     → 构造 #fly_rocdl.buffer_desc pointer
+  fx.make_copy_atom(fx.rocdl.BufferCopy32b(), elem_bits)
+  fx.atom.set_value(atom, "soffset", offset)   → 运行时 per-call offset
+  fx.copy(atom, src_view, dst_view)            → fly.copy_atom_call
+
+Fly Dialect (target-neutral)
+  fly.make_copy_atom  → getDefaultState() = {soffset: 0}
+  fly.atom.set_value  → setAtomState("soffset", val)
+  fly.copy_atom_call  → CopyAtomType::emitAtomCall()  [多态分发]
+
+FlyROCDL Dialect (backend payload)
+  CopyOpCDNA3BufferCopyType::emitAtomCall()
+    → llvm.load(src) / llvm.store(dst)  [register side]
+    → emitAtomCallSSA()
+       → BufferFatPtr::bufferRsrc() + swizzleByteOffset()
+       → ROCDL::RawPtrBufferLoadOp / RawPtrBufferStoreOp
+
+ROCDL → LLVM
+  rocdl.raw.ptr.buffer.load/store → amdgcn buffer intrinsics</code></pre>
+</div>
+
+<h3>2.2 TableGen 定义</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">include/flydsl/Dialect/FlyROCDL/IR/CopyAtom.td</span>
+  <span class="tag tag-ref">参考</span>
+</div>
+<pre><code>def FlyROCDL_CopyOpBufferCopy : FlyROCDL_StatefulCopyOp&lt;
+    "CopyOpCDNA3BufferCopy", "cdna3.buffer_copy", []&gt; {
+  let parameters = (ins "int32_t":$bitSize);
+  let assemblyFormat = "`&lt;` $bitSize `&gt;`";
+}</code></pre>
+<p>关键点：使用 <code>FlyROCDL_StatefulCopyOp</code> 基类（同时声明 <code>CopyOpTypeInterface</code> + <code>StatefulOpTypeInterface</code>），而非 stateless 的 <code>FlyROCDL_CopyOp</code>。</p>
+</div>
+
+<h3>2.3 Stateful 接口实现</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">lib/Dialect/FlyROCDL/CDNA3/CopyAtom.cpp</span>
+  <span class="tag tag-ref">参考</span> · CopyOpCDNA3BufferCopyType
+</div>
+<table>
+<tr><th>方法</th><th>ROCm 实现</th><th>FlyIXDL 应对</th></tr>
+<tr><td><code>getFieldIndex(Soffset)</code></td><td>返回 0</td><td>同左</td></tr>
+<tr><td><code>getConvertedType</code></td><td><code>!llvm.struct&lt;(i32)&gt;</code></td><td>同左</td></tr>
+<tr><td><code>getDefaultState</code></td><td>undef + insert soffset=0</td><td>同左</td></tr>
+<tr><td><code>setAtomState</code></td><td>llvm.insertvalue 到 field index</td><td>同左</td></tr>
+<tr><td><code>getThrLayout</code></td><td><code>FxLayout(FxC(1), FxC(1))</code></td><td><code>FxLayout(FxC(64), FxC(1))</code>（warp 协作）</td></tr>
+<tr><td><code>getThrBitLayout*</code></td><td>1 × bitSize</td><td>16×64B tile（8192 bit）；xf 变种见 §3.5.3</td></tr>
+</table>
+</div>
+
+<h3>2.4 emitAtomCallSSA 核心逻辑</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">方向判定 + soffset 缩放 <span class="tag tag-ref">参考</span></div>
+<pre><code>// soffset 以 element index 存储，需按 elemBits 转换为 byte offset
+Value computeSoffset(int64_t elemBits) {
+  if (elemBits == 8)  return soffsetRaw;
+  if (elemBits % 8 == 0) return soffsetRaw * (elemBits / 8);
+  return (soffsetRaw * elemBits) / 8;
+}
+
+// 方向判定（SSA 路径）
+if (src is #fly_rocdl.buffer_desc) {
+  // buffer → register (load)
+  BufferFatPtr bp(srcPtrTy, src);
+  ROCDL::RawPtrBufferLoadOp(copyTy, bp.bufferRsrc(), bp.swizzleByteOffset(), soffset, ...);
+  return loaded;
+}
+if (dst is #fly_rocdl.buffer_desc) {
+  // register → buffer (store)
+  BufferFatPtr bp(dstPtrTy, dst);
+  ROCDL::RawPtrBufferStoreOp(stored, bp.bufferRsrc(), bp.swizzleByteOffset(), soffset, ...);
+  return stored;
+}</code></pre>
+</div>
+
+<h3>2.5 BufferFatPtr 工具类</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">include/flydsl/Dialect/FlyROCDL/Utils/BufferFatPtr.h</span>
+  <span class="tag tag-ref">参考</span>
+</div>
+<table>
+<tr><th>成员 / 方法</th><th>说明</th></tr>
+<tr><td>Struct 布局</td><td><code>{!llvm.ptr&lt;8&gt; rsrc, i32 voffset}</code></td></tr>
+<tr><td><code>bufferRsrc()</code></td><td>extractvalue [0] — AMD buffer resource descriptor</td></tr>
+<tr><td><code>valOffset()</code></td><td>extractvalue [1] — element-index offset</td></tr>
+<tr><td><code>byteOffset()</code></td><td>valOffset × elemBytes（或 bit 运算）</td></tr>
+<tr><td><code>swizzleByteOffset()</code></td><td>对 byteOffset 应用 <code>SwizzleAttr</code> XOR 变换</td></tr>
+<tr><td><code>addOffset(delta)</code></td><td>layout 偏移累加，用于 <code>fly.ptr.add_offset</code> lowering</td></tr>
+<tr><td><code>pack(rsrc, offset)</code></td><td>构造 fat pointer struct</td></tr>
+</table>
+<p class="ref-note">FlyToROCDL 中 <code>MakePtrOpLowering</code> 和 <code>PtrAddOffsetOpLowering</code> 对 <code>#fly_rocdl.buffer_desc</code> 有特殊路径，依赖 BufferFatPtr。</p>
+</div>
+
+<h3>2.6 Conversion Pass 适配</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">lib/Conversion/FlyToROCDL/FlyToROCDL.cpp</span>
+  <span class="tag tag-ref">参考</span>
+</div>
+<table>
+<tr><th>检查点</th><th>ROCm 做法</th></tr>
+<tr><td><code>MakePtrOpLowering</code></td><td><code>buffer_desc</code> → <code>rocdl.make.buffer.rsrc</code> + BufferFatPtr::pack</td></tr>
+<tr><td><code>PtrAddOffsetOpLowering</code></td><td><code>buffer_desc</code> → BufferFatPtr::addOffset</td></tr>
+<tr><td><code>MemRefTypeConverter</code></td><td><code>buffer_desc</code> memref → BufferFatPtr struct type</td></tr>
+<tr><td><code>CopyAtomCallLowering</code></td><td>通过 <code>copyAtom.emitAtomCall()</code> 多态分发，无需 per-type pattern</td></tr>
+</table>
+</div>
+
+<h3>2.7 Python API</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">python/flydsl/expr/rocdl/universal.py</span>
+  <span class="tag tag-ref">参考</span>
+</div>
+<pre><code>def BufferCopy(bit_size):
+    return CopyOpCDNA3BufferCopyType.get(bit_size)
+
+BufferCopy8b  = lambda: CopyOpCDNA3BufferCopyType.get(8)
+BufferCopy16b = lambda: CopyOpCDNA3BufferCopyType.get(16)
+BufferCopy32b = lambda: CopyOpCDNA3BufferCopyType.get(32)
+BufferCopy64b = lambda: CopyOpCDNA3BufferCopyType.get(64)
+BufferCopy128b = lambda: CopyOpCDNA3BufferCopyType.get(128)
+
+def make_buffer_tensor(tensor, max_size=True, *, num_records_bytes=None):
+    # 构造 #fly_rocdl.buffer_desc pointer
+    buf_ptr_ty = PointerType.get(
+        elem_ty=elem_ty.ir_type,
+        address_space=TargetAddressSpace.BufferDesc, ...)
+    buf_ptr = make_ptr(buf_ptr_ty, [ptr, stride, num_records, flags])
+    return make_view(buf_ptr, layout)</code></pre>
+</div>
+
+<h3>2.8 测试覆盖</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">现有 FileCheck 测试 <span class="tag tag-ref">参考</span></div>
+<table>
+<tr><th>文件</th><th>覆盖内容</th></tr>
+<tr><td><code>tests/mlir/Conversion/copy_atom_stateful.mlir</code></td><td>state struct、default soffset、set soffset、load/store 方向、soffset 缩放</td></tr>
+<tr><td><code>tests/mlir/Conversion/buffer_copy_lds.mlir</code></td><td>BufferCopyLDS（buffer→shared，后续扩展参考）</td></tr>
+<tr><td><code>tests/mlir/Transforms/promote_regmem_to_ssa_copy_pred.mlir</code></td><td>predicated copy_atom_call + soffset</td></tr>
+<tr><td><code>examples/02-tiledCopy.py</code></td><td>端到端 Python kernel 使用 BufferCopy</td></tr>
+</table>
+</div>
+
+
+
+<h2 id="s3">3. 背景参照：Iluvatar 目标语义</h2>
+
+<p class="ref-note">路径前缀：<code>/home/peter/sw_home/sdk/cutlass/</code>。目标芯片 <code>ivcore11</code>（MR），编译器 <code>ixcc 18.x</code>（见 <code>README_ILUVATAR.md</code>）。</p>
+
+<h3 id="s3-1">3.1 整体数据流（CuTe Copy Atom）</h3>
+
+<div class="note">
+<div class="note-title">CUTLASS 整体数据流</div>
+<pre><code>Python / Host
+  ix_00_mr_gemm_with_sme — Copy_Atom&lt;IX11_SME_I_16x512b&lt;SMESwizzle, CacheOP&gt;, Element&gt;{stride_byte}
+
+Device (copy_unpack in copy_traits_ix11_sme.hpp)
+  sme_desc.replace_gmem_ptr(raw_pointer_cast(src.data()))   // global 指针写入描述符
+  IX11_SME_I_16x512b::copy(desc, (uint32)dst_smem_ptr, goffset=0, pred)
+    → __ivcorex_sme_load_16x1b64(smem, gmem_desc, goffset, kop)
+
+MLIR / LLVM (FlyDSL 目标路径)
+  fly.make_ptr / layout  → #fly.ptr&lt;..., #fly_ixdl.sme_gmem&gt;   // 见 §3.4
+  fly.add_offset         → SmeGmemFatPtr::addByteOffset
+  fly.copy_atom_call     → CopyOpMRAsyncCpType::emitAtomCallSSA
+       SmeGmemFatPtr → gBase = desc(gmem_ptr + byte_offset)；<strong>gOffset = 0</strong>（已确认，§6）
+    → IXDL::CpAsync_16x16_b32_RowOp(sOffset, gBase, gOffset=0, kop)
+    → llvm.bi.sme.load.16x1b64</code></pre>
+</div>
+
+<h3 id="s3-2">3.2 <code>SmeDescriptor</code>（global 侧，对齐 CUTLASS）</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">cutlass/include/cute/arch/copy_ix11_desc.hpp</span>
+  <span class="tag tag-ref">CUTLASS</span>
+</div>
+<pre><code>struct SmeDescriptor {  // 16B, 可视为 v4u32
+  const void* gmem_ptr_;    // [0] global 基址指针（非 addr_lo/hi）
+  uint32_t    placeholder_; // [1] ix11: unused；ix30: -1u
+  uint32_t    stride_byte_; // [2] leading stride（字节）
+};
+// 运行时：replace_gmem_ptr(ptr); 可选 operator+=(byte_offset) 调整 gmem_ptr_</code></pre>
+</div>
+
+<h3 id="s3-3">3.3 Shared 侧地址</h3>
+
+<div class="conv-card">
+<p>CUTLASS 将 smem 指针 cast 为 <code>unsigned</code> 传入 builtin 第一个参数（<code>copy_ix11_sme.hpp</code>）。Iluvatar 上可用 AS3 指针转 <code>uint32</code>（<code>cute/arch/util.hpp</code> 中 <code>__ILUVATAR__</code> 分支）。Predication：<code>!pred</code> 时 <code>smem_ptr = 0xffffff</code>。</p>
+</div>
+
+<h3 id="s3-4">3.4 <code>SmeGmemFatPtr</code>（已确认：Iluvatar global fat pointer）</h3>
+
+<p class="ref-note">工程模式参照 <code>BufferFatPtr</code>（§2.5）；语义字段对齐 CUTLASS <code>SmeDescriptor</code>（§3.2）。<strong>已确认采用此方案</strong>，用于 <code>!fly.memref&lt;..., global&gt;</code> / <code>#fly_ixdl.sme_gmem</code> 在 <code>FlyToIXDL</code> 与 MRAsyncCp 之间的 lowering。</p>
+
+<h4>3.4.1 设计目标</h4>
+
+<div class="conv-card">
+<ul>
+<li>在 Fly 层区分「普通 global ptr」与「SME 异步拷贝用 global ptr」，避免 emit 时再从 bare <code>!llvm.ptr&lt;1&gt;</code> 反推 stride。</li>
+<li><code>stride_byte</code> 在 <code>make_ptr</code> / MemRef 降维时从 <strong>layout leading stride</strong> 写入 fat struct，与 CUTLASS <code>Copy_Traits(sme_desc_(stride_byte))</code> 一致。</li>
+<li><code>fly.add_offset</code> 累加 <strong>字节偏移</strong> 到 fat ptr 字段 <code>byte_offset</code>；<strong>发射时合并进 <code>gmem_ptr</code></strong>（<code>smeDescriptorVec</code> 用 bumped ptr），IXDL <code>gOffset</code> 恒为 <code>0</code>——避免硬件 <code>gOffset</code> 范围不足（对齐 CUTLASS <code>operator+</code> + <code>goffset=0</code>，§6 已确认）。</li>
+</ul>
+</div>
+
+<h4>3.4.2 Fly 地址空间（类比 <code>buffer_desc</code>）</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">include/flydsl/Dialect/FlyIXDL/IR/AttrDefs.td</span>
+  <span class="tag tag-new">新建</span>
+</div>
+<pre><code>// 类比 FlyROCDL_BufferDescAddressAttr
+def FlyIXDL_SmeGmemAddressAttr : FlyIXDL_Attr&lt;"SmeGmemAddress", "sme_gmem"&gt; {}</code></pre>
+<p>MRAsyncCp 的 <strong>src</strong> 视图应使用 <code>!fly.ptr&lt;ElemTy, #fly_ixdl.sme_gmem, Layout&gt;</code>（由 Python <code>make_sme_gmem_tensor</code> 或 layout API 构造，命名待定）。<strong>dst</strong> 仍为普通 shared <code>!fly.memref</code> / <code>!llvm.ptr&lt;3&gt;</code>。</p>
+</div>
+
+<h4>3.4.3 LLVM struct 布局（<code>FlyToIXDL</code> 转换后）</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">include/flydsl/Dialect/FlyIXDL/Utils/SmeGmemFatPtr.h</span>
+  <span class="tag tag-new">新建</span>
+</div>
+<table>
+<tr><th>字段 index</th><th>类型</th><th>含义</th><th>CUTLASS / IXDL 对应</th></tr>
+<tr><td>[0]</td><td><code>!llvm.ptr&lt;1&gt;</code></td><td><code>gmem_ptr</code> — global 基址</td><td><code>SmeDescriptor::gmem_ptr_</code></td></tr>
+<tr><td>[1]</td><td><code>i32</code></td><td><code>stride_byte</code> — leading stride（字节），make_ptr 时写入</td><td><code>SmeDescriptor::stride_byte_</code></td></tr>
+<tr><td>[2]</td><td><code>i32</code></td><td><code>byte_offset</code> — 累加偏移，<code>add_offset</code> 更新；<strong>发射时并入 [0]</strong></td><td>非 IXDL <code>gOffset</code>；发射 <code>gOffset=0</code></td></tr>
+</table>
+<pre><code>// 参照 BufferFatPtr 需提供：
+static LLVM::LLVMStructType getType(MLIRContext *ctx);
+static Value pack(OpBuilder &b, Location loc, Value gmemPtr, Value strideByte, Value byteOffset = 0);
+Value gmemPtr() / strideByte() / byteOffset();
+Value addByteOffset(OpBuilder &b, Location loc, Value deltaBytes);
+Value resolvedGmemPtr(OpBuilder &b, Location loc) const;
+  // gmem_ptr + byte_offset（i8* GEP），对齐 CUTLASS operator+
+Value smeDescriptorVec(OpBuilder &b, Location loc) const;
+  // 用 resolvedGmemPtr() 填 [0]；[1]=0 placeholder；[2]=stride_byte
+  // 实现细节：ptr→v4i32 bitcast 与 ixcc 约定一致（§6 #2）</code></pre>
+<p class="ref-note">ROCm 对照：<code>BufferFatPtr</code> = <code>{rsrc, voffset}</code>；Iluvatar SME = <code>{gmem_ptr, stride_byte, byte_offset}</code> + 发射时 bitcast 为 <code>v4i32</code>。</p>
+</div>
+
+<h4>3.4.4 <code>FlyToIXDL</code> lowering 职责（类比 FlyToROCDL + BufferFatPtr）</h4>
+
+<div class="conv-card">
+<table>
+<tr><th>Pattern</th><th>ROCm（BufferFatPtr）</th><th>Iluvatar（SmeGmemFatPtr）</th></tr>
+<tr><td><code>MakePtrOp</code></td><td><code>buffer_desc</code> → <code>make.buffer.rsrc</code> + pack</td><td><code>sme_gmem</code> → 取 underlying global ptr + 从 layout 算 <code>stride_byte</code> + pack</td></tr>
+<tr><td><code>AddOffsetOp</code></td><td>更新 struct 内 <code>voffset</code>（元素索引）</td><td>更新 struct 内 <code>byte_offset</code>（字节；按 layout 将 int_tuple 转为 byte delta）</td></tr>
+<tr><td><code>MemRefTypeConverter</code></td><td><code>buffer_desc</code> memref → BufferFatPtr struct</td><td><code>sme_gmem</code> ptr/memref → <code>SmeGmemFatPtr</code> struct；plain global 仍 → <code>llvm.ptr&lt;1&gt;</code></td></tr>
+<tr><td><code>CopyAtomCall</code></td><td><code>emitAtomCall</code> 从 BufferFatPtr 取 rsrc/offset</td><td><code>emitAtomCallSSA</code>：<code>smeDescriptorVec</code>（含 bumped ptr）+ <code>gOffset=0</code></td></tr>
+</table>
+</div>
+
+<h4>3.4.5 <code>emitAtomCallSSA</code> 与 fat pointer 的分工</h4>
+
+<div class="conv-card">
+<pre><code>// src 已是 SmeGmemFatPtr struct（FlyToIXDL 转换后）
+SmeGmemFatPtr srcFat(srcPtrTy, adaptor.getSrc());
+Value gBase = srcFat.smeDescriptorVec(rewriter, loc);   // ptr = gmem_ptr + byte_offset
+Value gOffset = zero;  // i32 0 — tile 偏移已并入描述符内指针（§6 已确认）
+Value sOffset = castSmemPtrToI32(adaptor.getDst());     // shared，不走 fat ptr
+IXDL::CpAsync_16x16_b32_RowOp::create(rewriter, loc, sOffset, gBase, gOffset, kop);</code></pre>
+<p class="ref-note">dst 不使用 fat pointer：仍为 <code>!llvm.ptr&lt;AS3&gt;</code> → <code>i32</code>（§3.3）。</p>
+</div>
+
+
+
+<h3 id="s3-5">3.5 IXDL 与硬件速查（ixcc + CUTLASS 对齐）</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">2.1 Clang / LLVM 签名（<code>int_bi_sme_load_16x1b64</code> 系列）</div>
+<pre><code>// CUTLASS / clang builtin（ivcore11）
+__ivcorex_sme_load_16x1b64(
+    unsigned smem_ptr,    // i32 — shared 虚拟地址 / offset
+    v4u32    gmem_desc,   // SmeDescriptor::desc_
+    unsigned goffset,     // i32 — global 字节偏移（tile 内常为 0）
+    int      kop);        // i32 — IX11::CacheOP（CacheAll=0 等）
+
+// LLVM IluvatarSMELoad（IntrinsicsIluvatar.td）— 与上一致
+//   arg0: i32 sOffset
+//   arg1: v4i32 gBase  (IluvatarRsrcIntrinsic rsrc at index 1)
+//   arg2: i32 gOffset
+//   arg3: i32 kop</code></pre>
+<p class="ref-note"><strong>勿与</strong> <code>IluvatarMLLSAAsyncCpQS</code>（<code>mllsa_async_*</code>：slbVaddr + rsrc(ptr) + glbVaddr + …）混淆；MRAsyncCp 走 SME 路径。</p>
+</div>
+
+<div class="conv-card">
+<div class="conv-card-title">2.2 ixcc IXDL MLIR Op（FlyIXDL 应优先 emit）</div>
+<p><code>ixcc/mlir/include/mlir/Dialect/LLVMIR/IXDLOps.td</code> 已定义 <code>IXDL_CpAsync_IntrOp</code>：</p>
+<pre><code>// 原型 b32 row：
+ixdl.cp_async.16x16.b32.row %sOffset, %gBase, %gOffset, %kop
+  : vector&lt;4xi32&gt;  → llvm.bi.sme.load.16x1b64
+
+// 同步（CUDA 风格命名）：
+ixdl.cp.async.commit.group
+ixdl.cp.async.wait.group %n</code></pre>
+<p><strong>结论：</strong> FlyIXDL 实现阶段<strong>无需修改 ixcc</strong> 新增 sme op；在 <code>emitAtomCallSSA</code> 中创建对应 <code>IXDL::CpAsync_*</code> 即可。</p>
+</div>
+
+<div class="conv-card">
+<div class="conv-card-title">2.3 变种映射（FlyDSL <code>(valBits, major, swizzleMod)</code> ↔ CUTLASS 参照 ↔ IXDL）</div>
+<p class="ref-note"><strong>FlyDSL 契约</strong>：TableGen / Python 使用三参数；<code>emitAtomCallSSA</code> 按三元组选 <code>IXDL::CpAsync_*</code>，<code>getThrBitLayoutDst</code> 选 <code>Layout_SME_*_{COLXFB*|ROWXFB*|INTER}_Atom</code>（<code>swizzleMod=1</code> 时用 <code>*_ROWXFB8_*</code> 的 <code>Swizzle_Mod</code> 公式）。<strong>CUTLASS <code>SMESwizzle</code> 仅作对照</strong>（其 <code>Col</code> 在 half 路径仍绑 <code>colxfb8</code>，与下表 b16 col → <code>colxfb16</code> 不同）。</p>
+<table>
+<tr><th>FlyDSL 参数</th><th>CUTLASS 参照</th><th>Dst layout（<code>copy_traits_ix11_sme.hpp</code>）</th><th>Clang / LLVM</th><th>IXDL op（16×64B tile）</th></tr>
+<tr><td><code>32, 0, 0</code></td><td><code>NoSwizzle</code></td><td><code>*_INTER_*</code>（<code>Swizzle&lt;0,0,0&gt;</code>）</td><td><code>__ivcorex_sme_load_16x1b64</code></td><td><code>ixdl.cp_async.16x16.b32.row</code></td></tr>
+<tr><td><code>32, 1, 0</code></td><td>（b32 col / xf32）</td><td><code>*_COLXFB8_*</code> 的 32b 语义 / ixcc 命名</td><td><code>..._colxfb32</code></td><td><code>ixdl.cp_async.16x16.b32.col</code></td></tr>
+<tr><td><code>16, 0, 0</code></td><td><code>Row16b</code></td><td><code>*_ROWXFB16_*</code></td><td><code>..._rowxfb16</code></td><td><code>ixdl.cp_async.16x32.b16.row</code></td></tr>
+<tr><td><code>16, 1, 0</code></td><td>（b16 col；非 CUTLASS half-B 的 <code>Col→colxfb8</code>）</td><td><code>*_COLXFB8_*</code> upcast 到 16b / 或 ixcc <code>colxfb16</code> layout</td><td><code>..._colxfb16</code></td><td><code>ixdl.cp_async.16x32.b16.col</code></td></tr>
+<tr><td><code>8, 0, 1</code></td><td><code>Row8b</code></td><td><code>*_ROWXFB8_*</code>（<code>Swizzle_Mod&lt;2,6,2&gt;</code>）</td><td><code>..._rowxfb8</code></td><td><code>ixdl.cp_async.16x64.b8.row</code></td></tr>
+<tr><td><code>8, 1, 0</code></td><td><code>Col</code>（int8 NN 等）</td><td><code>*_COLXFB8_*</code></td><td><code>..._colxfb8</code></td><td><code>ixdl.cp_async.16x64.b8.col</code></td></tr>
+</table>
+<p class="ref-note"><code>major</code>：SME 指令 / smem 原子布局的 row vs column swizzle 取向（对齐 IXDL <code>.row</code> / <code>.col</code> 后缀）。<code>IX11::Major::K/MN</code> 是<strong>另一层</strong>：GEMM 里 CTA tile 沿 K 还是 MN 贴 SME 块，在 <code>getThrBitLayoutDst</code> 或 kernel layout 工厂中单独选 <code>K_*</code> vs <code>MN_*</code> 变体（§6 #3），<strong>不</strong>并入 CopyAtom 的 <code>major</code> 字段。</p>
+<div class="note">
+<div class="note-title">已确认（2026-05）</div>
+<p>不采用 CUTLASS 四态枚举 <code>SMESwizzle</code> 作为 TableGen 主参数；用 <code>(valBits, major, swizzleMod)</code> 覆盖 ixcc 已暴露的 SME 变种，其中 <code>swizzleMod</code> 显式区分 XOR 与 <code>Swizzle_Mod</code>（<code>Row8b</code> 必须为 <code>8,0,1</code>）。原型实现仍可先只链 <code>32,0,0</code>。</p>
+</div>
+</div>
+
+<div class="conv-card">
+<div class="conv-card-title">2.4 同步机制（两套并存）</div>
+<table>
+<tr><th>场景</th><th>CUTLASS ix11 GEMM 做法</th><th>IXDL / intrinsic</th><th>FlyDSL 建议</th></tr>
+<tr><td>单条 / 简单 kernel</td><td>测试里 <code>__syncthreads</code> 后验</td><td><code>ixdl.cp.async.commit.group</code> + <code>wait.group 0</code></td><td>FlyDSL 暴露 <code>cp_async_commit/wait_group</code>（§4.5 方案 A）</td></tr>
+<tr><td>多 stage pipeline</td><td><code>ix_sl_waitmem&lt;N&gt;()</code> + <code>ix_sl_pipebar_arrive/wait</code></td><td><code>__ivcorex_sl_waitcnt</code> / <code>pipebar_*</code></td><td>FlyDSL 暴露 <code>sl_waitmem</code> / <code>pipebar_*</code>（§4.5 方案 B）</td></tr>
+</table>
+</div>
+
+<div class="conv-card">
+<div class="conv-card-title">3.5.5 MRAsyncCp ↔ ROCm BufferCopy 语义对照</div>
+<table>
+<tr><th>维度</th><th>MRAsyncCp（Iluvatar / ivcore11）</th><th>ROCm BufferCopy（工程参照）</th></tr>
+<tr><td>命名</td><td><code>MRAsyncCp</code> / <code>mr.async_copy</code></td><td><code>BufferCopy</code> / <code>cdna3.buffer_copy</code></td></tr>
+<tr><td>语义金标准</td><td>CUTLASS <code>IX11_SME_I_16x512b</code> + <code>SmeDescriptor</code></td><td>CDNA3 BufferCopy</td></tr>
+<tr><td>协作粒度</td><td>Warp 级 SALU（64 thread）</td><td>Per-thread VGPR</td></tr>
+<tr><td>Global 元数据</td><td>Fly <code>SmeGmemFatPtr</code> → 发射 <code>v4i32</code>（<code>SmeDescriptor</code>）</td><td><code>BufferFatPtr</code> → buffer rsrc</td></tr>
+<tr><td>参照关系</td><td colspan="2">ROCm 仅 CopyAtom <strong>工程壳</strong>；参数与 lowering 以 CUTLASS/ixcc 为准</td></tr>
+</table>
+</div>
+
+
+
+<h2 id="s4">4. 实现改动指南</h2>
+
+<p class="ref-note">按组件列出需新建/修改的文件与要点；<strong>推荐落地顺序见 <a href="#s5">§5</a></strong>（依赖拓扑），本节不按时间顺序排列。</p>
+
+<h3>4.0 文件改动一览</h3>
+<table>
+<tr><th>#</th><th>文件路径</th><th>操作</th><th>说明</th></tr>
+<tr><td>0</td><td><code>ixcc/.../IXDLOps.td</code></td><td><strong>无需修改</strong></td><td>已有 <code>ixdl.cp_async.*</code>；FlyIXDL 直接 emit</td></tr>
+<tr><td>1</td><td><code>include/flydsl/Dialect/FlyIXDL/IR/AttrDefs.td</code></td><td>新建</td><td><code>FlyIXDL_SmeGmemAddressAttr</code>（<code>sme_gmem</code>）</td></tr>
+<tr><td>2</td><td><code>include/flydsl/Dialect/FlyIXDL/Utils/SmeGmemFatPtr.h</code></td><td>新建</td><td>pack / addByteOffset / resolvedGmemPtr / smeDescriptorVec</td></tr>
+<tr><td>3</td><td><code>include/flydsl/Dialect/FlyIXDL/IR/Dialect.td</code></td><td>修改</td><td>新增 <code>FlyIXDL_CopyOp</code> 基类</td></tr>
+<tr><td>4</td><td><code>include/flydsl/Dialect/FlyIXDL/IR/CopyAtom.td</code></td><td>新建</td><td><code>FlyIXDL_CopyOpMRAsyncCp</code></td></tr>
+<tr><td>5</td><td><code>include/flydsl/Dialect/FlyIXDL/IR/CMakeLists.txt</code></td><td>修改</td><td>CopyAtom + AttrDefs tablegen</td></tr>
+<tr><td>6</td><td><code>include/flydsl/Dialect/FlyIXDL/IR/Dialect.h</code></td><td>修改</td><td>include CopyAtom.h.inc</td></tr>
+<tr><td>7</td><td><code>lib/Dialect/FlyIXDL/MR/CopyAtom.cpp</code></td><td>新建</td><td>emitAtomCallSSA 消费 <code>SmeGmemFatPtr</code></td></tr>
+<tr><td>8</td><td><code>lib/Dialect/FlyIXDL/Dialect.cpp</code></td><td>修改</td><td>注册新类型</td></tr>
+<tr><td>9</td><td><code>lib/Dialect/FlyIXDL/CMakeLists.txt</code></td><td>修改</td><td>源文件与依赖</td></tr>
+<tr><td>10</td><td><code>lib/Conversion/FlyToIXDL/FlyToIXDL.cpp</code></td><td>修改</td><td>MakePtr/AddOffset/MemRef 支持 <code>sme_gmem</code> → fat struct</td></tr>
+<tr><td>11</td><td><code>lib/Bindings/Python/FlyIXDLExtension.cpp</code></td><td>修改</td><td>Python 类型绑定</td></tr>
+<tr><td>12</td><td><code>python/flydsl/expr/ixdl/mr.py</code></td><td>新建</td><td>MRAsyncCp；后续 <code>make_sme_gmem_tensor</code></td></tr>
+<tr><td>13</td><td><code>python/flydsl/expr/ixdl/__init__.py</code></td><td>新建/修改</td><td>导出</td></tr>
+<tr><td>14</td><td><code>tests/mlir/Conversion/ixdl_mr_async_cp.mlir</code></td><td>新建</td><td>含 fat struct / cp_async FileCheck</td></tr>
+<tr><td>15</td><td><code>python/flydsl/expr/ixdl/sync.py</code>（或并入 <code>mr.py</code>）</td><td>新建</td><td>方案 A <code>cp_async_*</code> + 方案 B <code>sl_waitmem</code> / <code>pipebar_*</code></td></tr>
+</table>
+
+<h3>4.1 前置：确认 ixcc IXDL <code>cp_async.*</code>（无需改 ixcc）</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">ixcc/mlir/include/mlir/Dialect/LLVMIR/IXDLOps.td</span>
+  <span class="tag tag-info">已存在</span>
+</div>
+<p>ixcc 已将 SME load 映射为 <code>IXDL_CpAsync_IntrOp</code>（如 <code>ixdl.cp_async.16x16.b32.row</code> → <code>bi_sme_load_16x1b64</code>），并含 <code>ixdl.cp.async.commit.group</code> / <code>wait.group</code>。</p>
+<p><strong>FlyIXDL 推荐：</strong>在 <code>emitAtomCallSSA</code> 中 <code>rewriter.create&lt;IXDL::CpAsync_16x16_b32_RowOp&gt;(...)</code>（或按 §3.5.3 选变种），<strong>不</strong>新增 ixcc TableGen，也<strong>不</strong>直接裸调 LLVM intrinsic（除非 IXDL 链接不可用时的兜底）。</p>
+<pre><code>// 参数顺序与 CUTLASS builtin 一致：
+//   sOffset : i32   — dst shared 地址（uint32）
+//   gBase   : vector&lt;4xi32&gt; — SmeDescriptor
+//   gOffset : i32   — FlyDSL 路径恒 0；tile 偏移在 gBase 内 ptr（§6）
+//   kop     : i32   — CacheOP（原型 CacheAll = 0）</code></pre>
+</div>
+
+<!-- 4.2  Dialect 基类 ========== -->
+<h3>4.2 TableGen 类型定义</h3>
+
+<h4>4.2.1 新增 FlyIXDL Dialect 基础类定义</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">include/flydsl/Dialect/FlyIXDL/IR/Dialect.td</span>
+  <span class="tag tag-mod">修改</span>
+</div>
+<pre><code>// 在现有 FlyIXDL_Dialect 定义之后添加（参照 FlyROCDL Dialect.td）：
+
+class FlyIXDL_CopyOp&lt;string typeName, string typeMnemonic, list&lt;Trait&gt; traits = []&gt;
+    : TypeDef&lt;FlyIXDL_Dialect, typeName, !listconcat(traits, [
+        DeclareTypeInterfaceMethods&lt;Fly_MayStaticTypeInterface&gt;,
+        DeclareTypeInterfaceMethods&lt;Fly_CopyOpTypeInterface&gt;
+      ])&gt; {
+  let mnemonic = typeMnemonic;
+}</code></pre>
+</div>
+
+<h4>4.2.2 新增 CopyAtom 类型定义文件</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">include/flydsl/Dialect/FlyIXDL/IR/CopyAtom.td</span>
+  <span class="tag tag-new">新建</span>
+</div>
+<pre><code>// SPDX-License-Identifier: Apache-2.0
+
+#ifndef FLYIXDL_COPYATOM
+#define FLYIXDL_COPYATOM
+
+include "flydsl/Dialect/FlyIXDL/IR/Dialect.td"
+
+def FlyIXDL_CopyOpMRAsyncCp : FlyIXDL_CopyOp&lt;"CopyOpMRAsyncCp", "mr.async_copy"&gt; {
+  let parameters = (ins
+    "int32_t":$valBits,      // 8, 16, or 32 — selects xf granularity + IXDL tile shape
+    "int32_t":$major,       // 0 = row, 1 = column (IXDL .row / .col)
+    "int32_t":$swizzleMod   // 0 = XOR (Swizzle), 1 = modular (Swizzle_Mod, Row8b)
+  );
+  let assemblyFormat = "`&lt;` `val` `=` $valBits `b` `,` `major` `=` $major `,` `swizzle_mod` `=` $swizzleMod `&gt;`";
+  let genVerifyDecl = 1;
+}
+
+#endif // FLYIXDL_COPYATOM</code></pre>
+<p class="ref-note">参照: <code>include/flydsl/Dialect/FlyROCDL/IR/CopyAtom.td</code> 结构；Iluvatar 侧使用 <code>MRAsyncCp</code> 命名。C++ <code>verify()</code> 应拒绝非法三元组（仅 §3.5.3 表内组合）；<code>emitAtomCallSSA</code> / <code>getThrBitLayoutDst</code> 按 <code>(valBits, major, swizzleMod)</code> 分派。</p>
+</div>
+
+<h4>4.2.3 更新 CMakeLists.txt</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">include/flydsl/Dialect/FlyIXDL/IR/CMakeLists.txt</span>
+  <span class="tag tag-mod">修改</span>
+</div>
+<pre><code>set(LLVM_TARGET_DEFINITIONS CopyAtom.td)
+mlir_tablegen(CopyAtom.h.inc -gen-typedef-decls)
+mlir_tablegen(CopyAtom.cpp.inc -gen-typedef-defs)
+add_public_tablegen_target(MLIRFlyIXDLCopyAtomIncGen)</code></pre>
+</div>
+
+<!-- 4.3  ========== -->
+<h3>4.3 C++ CopyAtom 实现</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">lib/Dialect/FlyIXDL/MR/CopyAtom.cpp</span>
+  <span class="tag tag-new">新建</span>
+</div>
+<p>参照 <code>lib/Dialect/FlyROCDL/CDNA3/CopyAtom.cpp</code> 的<strong>工程结构</strong>（layout 方法 + emitAtomCall 分发 + predicated 路径），实现 <code>CopyOpMRAsyncCpType</code>：</p>
+
+<pre><code>// ---- getThrLayout ----
+Attribute CopyOpMRAsyncCpType::getThrLayout() const {
+  return FxLayout(FxC(64), FxC(1));  // 1 warp 协作
+}
+
+// ---- getThrBitLayoutSrc ----
+Attribute CopyOpMRAsyncCpType::getThrBitLayoutSrc() const {
+  return FxLayout(FxShape(FxC(64), FxC(128)), FxStride(FxC(1), FxC(1)));
+}
+
+// ---- getThrBitLayoutDst ----
+Attribute CopyOpMRAsyncCpType::getThrBitLayoutDst() const {
+  // 原型 (32,0,0)：Dst = Src；其余按 §3.5.3 选 COLXFB8/ROWXFB16/ROWXFB8/INTER Atom
+  // swizzleMod==1 → Swizzle_Mod layout（CUTLASS ROWXFB8_*_Atom_Bits）
+  return getThrBitLayoutSrc();
+}
+
+// ---- emitAtomCallSSA ----（src 为 SmeGmemFatPtr struct，见 §3.4）
+FailureOr&lt;Value&gt; CopyOpMRAsyncCpType::emitAtomCallSSA(...) const {
+  SmeGmemFatPtr srcFat(..., adaptor.getSrc());
+  Value gBase = srcFat.smeDescriptorVec(rewriter, loc);  // vector&lt;4xi32&gt;
+  Value gOffset = zero;  // tile 字节偏移已并入 gBase 内 gmem_ptr（§6）
+  Value sOffset = castSmemPtrToI32(adaptor.getDst());
+  // kop = CacheAll (0); switch (valBits, major, swizzleMod) → IXDL::CpAsync_*Op（§3.5.3）
+  return Value();
+}</code></pre>
+<p class="ref-note"><code>SmeGmemFatPtr</code> 在 <code>FlyToIXDL</code> 的 MakePtr/AddOffset/MemRef 转换中构造（§3.4），CopyAtom 只消费 struct，不再从 bare ptr 拼 stride。</p>
+</div>
+
+<h4>4.3.1 更新 Dialect 注册</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">lib/Dialect/FlyIXDL/Dialect.cpp</span> ·
+  <span class="file-path">include/flydsl/Dialect/FlyIXDL/IR/Dialect.h</span>
+  <span class="tag tag-mod">修改</span>
+</div>
+<pre><code>// Dialect.h — 新增 includes:
+#define GET_TYPEDEF_CLASSES
+#include "flydsl/Dialect/FlyIXDL/IR/CopyAtom.h.inc"
+
+// Dialect.cpp — initialize():
+addTypes&lt;
+#define GET_TYPEDEF_LIST
+#include "flydsl/Dialect/FlyIXDL/IR/CopyAtom.cpp.inc"
+&gt;();</code></pre>
+</div>
+
+<h4>4.3.2 更新 CMakeLists.txt</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">lib/Dialect/FlyIXDL/CMakeLists.txt</span>
+  <span class="tag tag-mod">修改</span>
+</div>
+<pre><code>add_mlir_dialect_library(MLIRFlyIXDLDialect
+  Dialect.cpp
+  MR/CopyAtom.cpp          # 新增
+
+  DEPENDS
+  MLIRFlyIXDLIncGen
+  MLIRFlyIXDLCopyAtomIncGen
+
+  LINK_LIBS PUBLIC
+  MLIRIXDLDialect
+  MLIRFlyDialect
+)</code></pre>
+</div>
+
+<!-- 4.4  Pass ========== -->
+<h3>4.4 Conversion Pass 适配</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">lib/Conversion/FlyToIXDL/FlyToIXDL.cpp</span>
+  <span class="tag tag-mod">修改</span>
+</div>
+<p><code>CopyAtomCall*</code> pattern 仍通过 <code>emitAtomCall()</code> 多态分发；<strong>需扩展</strong> global 侧 lowering 以支持 <code>SmeGmemFatPtr</code>（§3.4）。</p>
+<table>
+<tr><th>检查点</th><th>说明</th><th>是否需要改动</th></tr>
+<tr><td>类型合法性</td><td><code>ConversionTarget</code> 标记 <code>CopyOpMRAsyncCpType</code> 合法</td><td>是</td></tr>
+<tr><td><code>MakePtrOpLowering</code></td><td><code>#fly_ixdl.sme_gmem</code> → <code>SmeGmemFatPtr::pack(gmemPtr, stride_byte, 0)</code></td><td><strong>是</strong>（当前仅 register alloca）</td></tr>
+<tr><td><code>AddOffsetOpLowering</code></td><td><code>sme_gmem</code> → <code>SmeGmemFatPtr::addByteOffset</code></td><td><strong>是</strong></td></tr>
+<tr><td><code>MemRefTypeConverter</code></td><td><code>sme_gmem</code> → <code>SmeGmemFatPtr</code> struct；plain global 仍 <code>llvm.ptr&lt;1&gt;</code></td><td><strong>是</strong></td></tr>
+<tr><td><code>CopyAtomCallLowering</code></td><td><code>emitAtomCallSSA</code>：<code>gBase</code>（bumped ptr）+ <code>gOffset=0</code></td><td>在 CopyAtom.cpp 实现</td></tr>
+</table>
+<p class="ref-note">工程模式：<code>FlyToROCDL</code> + <code>BufferFatPtr</code>；语义：<code>SmeGmemFatPtr</code> + ixcc <code>IXDLOps.td</code>。</p>
+</div>
+
+<!-- ========== 3.4 commit/wait ========== -->
+<h3>4.5 Commit / Wait 机制</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">方案概述 <span class="tag tag-info">ixcc 已有底层 op</span></div>
+<h4>方案 A：CUDA 风格（ixdl.cp.async.*）</h4>
+<table>
+<tr><th>IXDL op</th><th>LLVM intrinsic</th><th>适用</th></tr>
+<tr><td><code>ixdl.cp.async.commit.group</code></td><td><code>int_bi_cp_async_commit_group</code></td><td>单 kernel 手动流水线</td></tr>
+<tr><td><code>ixdl.cp.async.wait.group</code> N</td><td><code>int_bi_cp_async_wait_group</code></td><td>等待前 N 组</td></tr>
+</table>
+<pre><code># Python 原型（命名待定，可挂在 flydsl.expr.ixdl.mr）
+fx.ixdl.cp_async_commit_group()
+fx.ixdl.cp_async_wait_group(n=0)</code></pre>
+<h4>方案 B：CUTLASS GEMM 风格（多 stage）</h4>
+<p>参照 <code>cutlass/include/cute/arch/copy_ix11.hpp</code> 与 <code>ix11_mma_multistage.hpp</code>：<code>ix_sl_waitmem&lt;未完成SME条数&gt;()</code> + <code>ix_sl_pipebar_arrive/wait</code>。生产 GEMM 主循环常按 outstanding SME load 计数 wait，而非 per-tile <code>commit_group</code>。</p>
+<pre><code># Python（命名待定，与方案 A 并列暴露）
+fx.ixdl.sl_waitmem(n)          # → ix_sl_waitmem / 对应 IXDL intrinsic
+fx.ixdl.sl_pipebar_arrive()
+fx.ixdl.sl_pipebar_wait()</code></pre>
+<p class="ref-note"><strong>已确认</strong>：FlyDSL <strong>同时暴露</strong> 方案 A 与 B（§6）；kernel 作者按场景选用，非二选一。</p>
+</div>
+
+<!-- ========== 3.5 Python ========== -->
+<h3>4.6 Python Bindings + 高层 API</h3>
+
+<h4>4.6.1 C++ Python Extension</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">lib/Bindings/Python/FlyIXDLExtension.cpp</span>
+  <span class="tag tag-mod">修改</span>
+</div>
+<pre><code>struct PyCopyOpMRAsyncCpType : PyConcreteType&lt;PyCopyOpMRAsyncCpType&gt; {
+  FLYDSL_REGISTER_TYPE_BINDING(CopyOpMRAsyncCpType, "CopyOpMRAsyncCpType");
+
+  static void bindDerived(ClassTy &c) {
+    c.def_static(
+        "get",
+        [](int32_t valBits, int32_t major, int32_t swizzleMod,
+           DefaultingPyMlirContext context) {
+          MLIRContext *ctx = unwrap(context.get()-&gt;get());
+          return PyCopyOpMRAsyncCpType(
+              context-&gt;getRef(),
+              wrap(CopyOpMRAsyncCpType::get(ctx, valBits, major, swizzleMod)));
+        },
+        "val_bits"_a, "major"_a, "swizzle_mod"_a, nb::kw_only(),
+        "context"_a = nb::none(),
+        "Create CopyOpMRAsyncCpType (val_bits, major, swizzle_mod)");
+  }
+};</code></pre>
+<p class="ref-note">参照: <code>FlyROCDLExtension.cpp</code> 中 <code>PyCopyOpCDNA3BufferCopyType</code> 的绑定模式</p>
+</div>
+
+<h4>4.6.2 Python 高层 API</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">python/flydsl/expr/ixdl/mr.py</span>
+  <span class="tag tag-new">新建</span>
+</div>
+<pre><code># SPDX-License-Identifier: Apache-2.0
+
+from ..._mlir._mlir_libs._mlirDialectsFlyIXDL import CopyOpMRAsyncCpType
+
+
+def MRAsyncCp(val_bits, major, swizzle_mod=0):
+    """Create an Iluvatar MR async copy atom (SME Load series).
+
+    Args:
+        val_bits: 8, 16, or 32 (xf / IXDL tile granularity).
+        major: 0 = row, 1 = column (IXDL .row / .col).
+        swizzle_mod: 0 = XOR swizzle; 1 = Swizzle_Mod (Row8b / rowxfb8 only).
+    """
+    return CopyOpMRAsyncCpType.get(val_bits, major, swizzle_mod)
+
+
+# 便捷别名（§3.5.3 合法三元组）
+MRAsyncCp32bRow = lambda: CopyOpMRAsyncCpType.get(32, 0, 0)
+MRAsyncCp32bCol = lambda: CopyOpMRAsyncCpType.get(32, 1, 0)
+MRAsyncCp16bRow = lambda: CopyOpMRAsyncCpType.get(16, 0, 0)
+MRAsyncCp16bCol = lambda: CopyOpMRAsyncCpType.get(16, 1, 0)
+MRAsyncCp8bRowMod = lambda: CopyOpMRAsyncCpType.get(8, 0, 1)   # Row8b
+MRAsyncCp8bCol = lambda: CopyOpMRAsyncCpType.get(8, 1, 0)</code></pre>
+<p class="ref-note">Python 侧统一使用 <code>MRAsyncCp</code> 命名，不使用 BufferCopy。</p>
+</div>
+
+<h4>4.6.3 导出</h4>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">python/flydsl/expr/ixdl/__init__.py</span> ·
+  <span class="file-path">python/mlir_flydsl/dialects/fly_ixdl.py</span>
+  <span class="tag tag-mod">修改</span>
+</div>
+<pre><code># python/flydsl/expr/ixdl/__init__.py
+from .mr import MRAsyncCp, MRAsyncCp32bRow, MRAsyncCp32bCol</code></pre>
+</div>
+
+<!-- ========== 3.6 Tests ========== -->
+<h3>4.7 测试</h3>
+
+<div class="conv-card">
+<div class="conv-card-title">
+  <span class="file-path">tests/mlir/Conversion/ixdl_mr_async_cp.mlir</span>
+  <span class="tag tag-new">新建</span>
+</div>
+<pre><code>// RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize \
+// RUN:     --fly-layout-lowering --convert-fly-to-ixdl | FileCheck %s
+
+// CHECK-LABEL: @test_mr_async_cp_type
+func.func @test_mr_async_cp_type(
+    %atom: !fly.copy_atom&lt;!fly_ixdl.mr.async_copy&lt;val = 32 b, major = 0, swizzle_mod = 0&gt;, 128&gt;) {
+  return
+}
+
+// CHECK-LABEL: @test_mr_async_cp_global_to_shared
+func.func @test_mr_async_cp_global_to_shared(
+    %src: !fly.memref&lt;f32, global, 64:128&gt;,
+    %dst: !fly.memref&lt;f32, shared, 64:128&gt;) {
+  %atom = fly.make_copy_atom {valBits = 128 : i32}
+      : !fly.copy_atom&lt;!fly_ixdl.mr.async_copy&lt;val = 32 b, major = 0, swizzle_mod = 0&gt;, 128&gt;
+  // CHECK: ixdl.cp_async.16x16.b32.row
+  fly.copy_atom_call(%atom, %src, %dst) : (...)
+  return
+}</code></pre>
+</div>
+
+
+
+<h2 id="s5">5. 实现顺序（依赖拓扑）</h2>
+
+<p>下列顺序满足<strong>依赖关系原则</strong>：每一档的输入类型、Interface、TableGen 产物与链接库，在动手前均已存在。MRAsyncCp 主路径以 <code>SmeGmemFatPtr</code> + b32 row 原型为准；同步 API 与 CopyAtom 解耦，可并行。</p>
+
+<h3>5.1 阶段 0：环境与契约（无 FlyIXDL 新代码）</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>依赖</th></tr>
+<tr><td>0.1</td><td>确认构建已链 <code>MLIRIXDLDialect</code>；ixcc 中 <code>ixdl.cp_async.*</code> 可解析</td><td>现有 FlyDSL + ixcc</td></tr>
+<tr><td>0.2</td><td>手写最小 IXDL MLIR（如 <code>ixdl.cp_async.16x16.b32.row</code>）过 <code>fly-opt</code></td><td>0.1</td></tr>
+<tr><td>0.3</td><td>确认 Fly 侧稳定：<code>Fly_CopyOpTypeInterface</code>、<code>CopyAtomType</code>、<code>make_copy_atom</code>、<code>copy_atom_call</code> / <code>copy_atom_call_ssa</code></td><td>Fly 方言（已有）</td></tr>
+</table>
+<p class="ref-note"><strong>里程碑</strong>：硬件 op 与 Fly CopyAtom 壳可用，再动 FlyIXDL。</p>
+
+<h3>5.2 阶段 1：FlyIXDL 方言基础设施</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>被谁依赖</th></tr>
+<tr><td>1.1</td><td>扩展 <code>Dialect.td</code>：<code>FlyIXDL_Attr</code>、<code>FlyIXDL_CopyOp</code> 基类（对齐 FlyROCDL）</td><td>AttrDefs、CopyAtom.td</td></tr>
+<tr><td>1.2</td><td>新建 <code>AttrDefs.td</code>：<code>FlyIXDL_SmeGmemAddressAttr</code>（<code>#fly_ixdl.sme_gmem</code>）</td><td>MakePtr、MemRef 转换、Python AS</td></tr>
+<tr><td>1.3</td><td><code>include/.../FlyIXDL/IR/CMakeLists.txt</code>：AttrDefs + CopyAtom tablegen target</td><td>编译</td></tr>
+<tr><td>1.4</td><td><code>Dialect.cpp</code>：注册 attribute（随后注册 typedef）</td><td>解析/打印 <code>#fly_ixdl.sme_gmem</code></td></tr>
+<tr><td>1.5</td><td>新建 <code>CopyAtom.td</code>：<code>FlyIXDL_CopyOpMRAsyncCp</code>（<code>valBits, major, swizzleMod</code>；原型默认 <code>32,0,0</code>）</td><td>C++ 类型、ConversionTarget</td></tr>
+<tr><td>1.6</td><td><code>Dialect.h</code> / <code>Dialect.cpp</code>：include 并 <code>addTypes</code> 注册 <code>CopyOpMRAsyncCp</code></td><td>Pass、emit</td></tr>
+</table>
+<p class="ref-note"><strong>里程碑</strong>：<code>!fly_ixdl.mr.async_copy&lt;32, 0&gt;</code> 可 parse/print；<strong>尚不要求</strong> lower。</p>
+<p class="ref-note"><strong>可与 1.4 并行</strong>：<code>SmeGmemFatPtr.h</code> 骨架（<code>pack</code> / <code>addByteOffset</code> / <code>resolvedGmemPtr</code>），仅依赖 LLVM 类型。</p>
+
+<h3>5.3 阶段 2：Fat pointer 工具</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>被谁依赖</th></tr>
+<tr><td>2.1</td><td>完成 <code>SmeGmemFatPtr.h</code>：<code>getType</code>、<code>pack</code>、<code>addByteOffset</code>、<code>resolvedGmemPtr</code>、<code>smeDescriptorVec</code>（Fly 路径 <code>gOffset=0</code>，§6）</td><td>MakePtr / AddOffset / <code>emitAtomCallSSA</code></td></tr>
+<tr><td>2.2</td><td>（可选）极小验证：pack → <code>vector&lt;4xi32&gt;</code> 形状与字段语义</td><td>降低 3.2 / 4.3 风险</td></tr>
+</table>
+<p class="ref-note"><strong>里程碑</strong>：不经 Fly op，C++ 即可从 <code>{ptr, stride, byte_offset}</code> 构造 <code>gBase</code>。</p>
+
+<h3>5.4 阶段 3：CopyAtom C++（消费 fat struct，不构造 fat struct）</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>被谁依赖</th></tr>
+<tr><td>3.1</td><td><code>MR/CopyAtom.cpp</code>：<strong>layout 接口</strong>（<code>getThrLayout</code> / <code>getThrBitLayoutSrc</code> / <code>Dst</code>）</td><td><code>make_tiled_copy</code>、layout 推导</td></tr>
+<tr><td>3.2</td><td>同文件：<strong><code>emitAtomCallSSA</code></strong>（<code>src</code> 为 <code>SmeGmemFatPtr</code>）→ <code>IXDL::CpAsync_16x16_b32_RowOp</code>，<code>gOffset=0</code>，smem → <code>i32</code></td><td><code>CopyAtomCallSSA</code> lowering</td></tr>
+<tr><td>3.3</td><td>若走 MemRef 路径：补 <code>emitAtomCall</code>（或确认 IXDL 仅 SSA，与 ROCm 策略对齐）</td><td><code>copy_atom_call</code></td></tr>
+<tr><td>3.4</td><td><code>lib/Dialect/FlyIXDL/CMakeLists.txt</code>：链 <code>MLIRIXDLDialect</code>、Fly layout 工具</td><td>链接</td></tr>
+</table>
+<p class="ref-note"><strong>里程碑</strong>：手写 LLVM 函数内联 fat struct + <code>copy_atom_call_ssa</code> 可生成 <code>ixdl.cp_async.*</code>（仍可无 FlyToIXDL）。<strong>3.2 必须在 2.1 之后</strong>；3.1 可与 2.1 并行。</p>
+
+<h3>5.5 阶段 4：FlyToIXDL（构造 fat struct，再调用阶段 3）</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>被谁依赖</th></tr>
+<tr><td>4.1</td><td><code>ConversionTarget</code> / type converter：<code>CopyOpMRAsyncCpType</code> 合法；<code>CopyAtomType</code> 透传内层 op</td><td>全 pass</td></tr>
+<tr><td>4.2</td><td>MemRef / pointer 转换：<code>#fly_ixdl.sme_gmem</code> → <code>SmeGmemFatPtr</code> struct；plain global 仍 <code>!llvm.ptr&lt;1&gt;</code></td><td>global 视图</td></tr>
+<tr><td>4.3</td><td><code>MakePtrOpLowering</code>：取 global ptr + layout 写 <code>stride_byte</code> + <code>pack</code></td><td>Python <code>make_ptr</code></td></tr>
+<tr><td>4.4</td><td><code>AddOffsetOpLowering</code>：累加 <code>byte_offset</code>（发射并入 ptr，§6）</td><td>tile 遍历</td></tr>
+<tr><td>4.5</td><td>确认 <code>MakeCopyAtomOpLowering</code> 对 MRAsyncCp 透传（通常逻辑不变，需能解析新类型）</td><td><code>make_copy_atom</code></td></tr>
+<tr><td>4.6</td><td><code>CopyAtomCallSSALowering</code>：类型转换后调用 <code>emitAtomCallSSA</code>（实现在 3.2）</td><td>端到端</td></tr>
+</table>
+<p class="ref-note"><strong>里程碑</strong>：<code>tests/mlir/Conversion/ixdl_mr_async_cp.mlir</code> FileCheck 通过。实现 4.3 时需落实 §6 中 <code>stride_byte</code> 提取规则与 <code>smeDescriptorVec</code> ptr 打包约定。</p>
+
+<h3>5.6 阶段 5：Python 与端到端</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>被谁依赖</th></tr>
+<tr><td>5.1</td><td><code>FlyIXDLExtension.cpp</code>：导出 <code>SmeGmem</code> 地址空间 + <code>MRAsyncCp</code> 类型构造</td><td>DSL</td></tr>
+<tr><td>5.2</td><td><code>python/flydsl/expr/ixdl/mr.py</code>：<code>MRAsyncCp32bRow()</code> 等工厂</td><td>kernel</td></tr>
+<tr><td>5.3</td><td><code>make_sme_gmem_tensor</code> / layout API：<code>make_ptr(..., #fly_ixdl.sme_gmem)</code> + stride</td><td>真实 kernel</td></tr>
+<tr><td>5.4</td><td>示例或 <code>tests/kernels/</code> 最小 copy kernel（可晚于 FileCheck）</td><td>验收</td></tr>
+</table>
+<p class="ref-note"><strong>里程碑</strong>：Python 写出与 CUTLASS 同构的 <code>copy_atom_call</code> + 可选 wait。</p>
+
+<h3>5.7 阶段 6：同步 API（与 CopyAtom 解耦，可并行）</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>依赖</th></tr>
+<tr><td>6.1</td><td>Python 暴露 <code>cp.async.commit</code> / <code>wait.group</code>（§4.5 方案 A）</td><td>IXDL 已链</td></tr>
+<tr><td>6.2</td><td>Python 暴露 <code>sl_waitmem</code> / <code>pipebar_*</code>（方案 B）</td><td>同上</td></tr>
+</table>
+<p class="ref-note">可在<strong>阶段 1 完成后</strong>与阶段 3–4 并行，不必等 <code>emitAtomCallSSA</code>。</p>
+
+<h3>5.8 阶段 7：后续（不阻塞 b32 row 原型）</h3>
+
+<table>
+<tr><th>顺序</th><th>做什么</th><th>前置</th></tr>
+<tr><td>7.1</td><td>按 §3.5.3 补全 <code>emitAtomCallSSA</code> + <code>getThrBitLayoutDst</code> 六路分派（含 <code>swizzleMod</code>）</td><td>§3.5.3 映射表</td></tr>
+<tr><td>7.2</td><td>Predicated <code>copy_atom_call</code>（<code>smem_ptr=0xffffff</code>）</td><td>原型稳定</td></tr>
+<tr><td>7.3</td><td>Stateful / 运行时 stride</td><td>可选</td></tr>
+</table>
+
+<h3>5.9 依赖简图</h3>
+
+<div class="note">
+<pre><code>[ixcc IXDL ops] ──────────────────────────────┐
+                                               │
+[Fly CopyAtom 壳 + Interface] ────┐            │
+                                  v            v
+Dialect.td 基类 ──► AttrDefs (sme_gmem) ──► Dialect 注册
+                                  │
+SmeGmemFatPtr.h ◄─────────────────┘
+         │
+         ├──► FlyToIXDL: MemRef / MakePtr / AddOffset
+         │
+         └──► CopyAtom.cpp: layout + emitAtomCallSSA ──► ixdl.cp_async
+                      ▲
+                      └── CopyAtomCallSSA lowering (FlyToIXDL)
+
+Python 绑定 / make_sme_gmem_tensor ──► 示例 kernel
+
+（并行）sync: cp.async.wait + sl_waitmem / pipebar</code></pre>
+</div>
+
+<h3>5.10 建议 PR 切片</h3>
+
+<div class="conv-card">
+<table>
+<tr><th>PR</th><th>范围</th><th>可验证点</th></tr>
+<tr><td><strong>PR1</strong></td><td>§5.2 阶段 1 + §5.3 阶段 2 + §5.5 的 4.1–4.4（CopyAtom <code>emitAtomCallSSA</code> 可先 stub）</td><td><code>sme_gmem</code> → LLVM fat struct lowering 正确</td></tr>
+<tr><td><strong>PR2</strong></td><td>§5.4 阶段 3 + §5.5 的 4.6</td><td>FileCheck 出现 <code>ixdl.cp_async.*</code></td></tr>
+<tr><td><strong>PR3</strong></td><td>§5.6 阶段 5 + §5.7 阶段 6</td><td>Python 端到端 + 同步 API</td></tr>
+</table>
+<p class="ref-note">每一 PR 均满足「前置依赖已实现」，且 PR1 可单独验证 fat pointer 路径。</p>
+</div>
+
+
+<h2 id="s6">6. 仍待确认 / 需你决策项</h2>
+
+<p class="ref-note">CopyAtom 三参数已拍板（§1 / §3.5.3）；下列为仍待落实的<strong>工程细节</strong>，不阻塞 <code>(32,0,0)</code> 原型。</p>
+
+<div class="conv-card">
+<div class="conv-card-title">阻塞 b32 row 原型（工程细节）</div>
+<table>
+<tr><th>#</th><th>问题</th><th>已知线索</th><th>影响</th></tr>
+<tr><td>1</td><td><strong><code>stride_byte</code> 在 Fly 层的提取规则</strong></td><td>拟从 layout leading stride × elemBytes 写入 fat ptr [1]；多维 layout 需约定取哪一维</td><td><code>MakePtrOpLowering</code></td></tr>
+<tr><td>2</td><td><strong><code>smeDescriptorVec</code>：ptr 填入 <code>v4i32</code> 的 bitcast/ptrtoint 约定</strong></td><td>需与 ixcc/后端对 <code>gBase</code> 的 lowering 一致；描述符内 ptr 为 <code>gmem_ptr + byte_offset</code></td><td>首条 FileCheck 能否过</td></tr>
+</table>
+</div>
+
+<div class="conv-card">
+<div class="conv-card-title">不阻塞原型</div>
+<table>
+<tr><th>#</th><th>问题</th><th>已知线索</th><th>影响</th></tr>
+<tr><td>3</td><td><strong><code>IX11::Major::K/MN</code> 在 kernel / layout 层的选用</strong></td><td>与 CopyAtom 的 <code>major</code>（row/col swizzle）<strong>正交</strong>；同一 <code>(valBits, major, swizzleMod)</code> 需再选 <code>K_*</code> 或 <code>MN_*</code> smem atom（§3.5.3）</td><td>GEMM mainloop smem tiling</td></tr>
+<tr><td>4</td><td><strong>Predicated <code>copy_atom_call</code></strong></td><td>CUTLASS <code>smem_ptr=0xffffff</code> when !pred</td><td>首版是否支持</td></tr>
+</table>
+</div>
+
+<div class="note">
+<div class="note-title">已确认项</div>
+<p>设计决策总表见 <strong><a href="#s1">§1</a></strong>；<code>SmeGmemFatPtr</code> 见 <strong><a href="#s3-4">§3.4</a></strong>；CopyAtom 参数化 <code>(valBits, major, swizzleMod)</code> 与 §3.5.3 映射表见 <strong><a href="#s3-5">§3.5.3</a></strong>（不采用 CUTLASS <code>SMESwizzle</code> 枚举作为主 API）。</p>
+</div>
+
+<div class="conv-card">
+<div class="conv-card-title">已从 CUTLASS/ixcc 澄清（无需再查）</div>
+<ul>
+<li>无需新建 ixcc sme op；<code>v4i32</code> 语义同 CUTLASS <code>SmeDescriptor</code>（非 MLLSA 五元组）。</li>
+</ul>
+</div>
+
+<div class="conv-card">
+<div class="conv-card-title">后续扩展</div>
+<table>
+<tr><th>方向</th><th>参照</th></tr>
+<tr><td>Stateful（运行时 stride / gmem 基址）</td><td>ROCm StatefulCopyOp；CUTLASS <code>Copy_Traits::sme_desc_</code></td></tr>
+<tr><td>5 种 xf + 正确 <code>getThrBitLayoutDst</code></td><td><code>copy_traits_ix11_sme.hpp</code></td></tr>
+<tr><td>多 stage <code>sl_waitmem</code> 集成</td><td><code>ix11_mma_multistage.hpp</code></td></tr>
+</table>
+</div>
+
+
+
+
+<h2 id="s7">7. 参照文件索引</h2>
+
+<table>
+<tr><th>参照对象</th><th>文件路径</th><th>参照原因</th></tr>
+<tr><td><strong>ROCm BufferCopy TableGen</strong></td><td><code>include/flydsl/Dialect/FlyROCDL/IR/CopyAtom.td</code></td><td>CopyOp 基类 / StatefulCopyOp 工程模式</td></tr>
+<tr><td><strong>ROCm BufferCopy C++ 实现</strong></td><td><code>lib/Dialect/FlyROCDL/CDNA3/CopyAtom.cpp</code></td><td>emitAtomCall 分发结构、soffset 缩放逻辑</td></tr>
+<tr><td><strong>ROCm BufferFatPtr</strong></td><td><code>include/flydsl/Dialect/FlyROCDL/Utils/BufferFatPtr.h</code></td><td><strong>SmeGmemFatPtr 工程模板</strong></td></tr>
+<tr><td><strong>Iluvatar SmeGmemFatPtr</strong></td><td><code>include/flydsl/Dialect/FlyIXDL/Utils/SmeGmemFatPtr.h</code>（计划）</td><td>§3.4 设计</td></tr>
+<tr><td><strong>ROCm Conversion Pass</strong></td><td><code>lib/Conversion/FlyToROCDL/FlyToROCDL.cpp</code></td><td>CopyAtomCallLowering 多态分发</td></tr>
+<tr><td><strong>ROCm Python API</strong></td><td><code>python/flydsl/expr/rocdl/universal.py</code></td><td>Python 绑定与工厂函数模式（ROCm 侧仍称 BufferCopy）</td></tr>
+<tr><td><strong>ROCm Python 绑定</strong></td><td><code>lib/Bindings/Python/FlyROCDLExtension.cpp</code></td><td>PyCopyOp 绑定模板</td></tr>
+<tr><td><strong>ROCm FileCheck 测试</strong></td><td><code>tests/mlir/Conversion/copy_atom_stateful.mlir</code></td><td>CopyAtom lowering 测试结构</td></tr>
+<tr><td><strong>Iluvatar SME LLVM Intrinsics</strong></td><td><code>ixcc/llvm/include/llvm/IR/IntrinsicsIluvatar.td</code></td><td><code>IluvatarSMELoad</code> 4-arg 定义</td></tr>
+<tr><td><strong>IXDL MLIR Ops</strong></td><td><code>ixcc/mlir/include/mlir/Dialect/LLVMIR/IXDLOps.td</code></td><td><code>ixdl.cp_async.*</code> emit 目标</td></tr>
+<tr><td><strong>Clang builtin 测试</strong></td><td><code>ixcc/clang/test/CodeGen/Iluvatar/builtin/async-copy-sme.cu</code></td><td>ivcore11 codegen 示例</td></tr>
+<tr><td><strong>CUTLASS SME copy</strong></td><td><code>cutlass/include/cute/arch/copy_ix11_sme.hpp</code></td><td>builtin 调用方式</td></tr>
+<tr><td><strong>CUTLASS SmeDescriptor</strong></td><td><code>cutlass/include/cute/arch/copy_ix11_desc.hpp</code></td><td>v4u32 布局</td></tr>
+<tr><td><strong>CUTLASS Copy traits + layouts</strong></td><td><code>cutlass/include/cute/atom/copy_traits_ix11_sme.hpp</code></td><td>copy_unpack、Dst swizzle</td></tr>
+<tr><td><strong>CUTLASS GEMM 示例</strong></td><td><code>cutlass/examples/ix_00_mr_gemm_with_sme/</code></td><td>端到端 SME GEMM</td></tr>
+<tr><td><strong>CUTLASS SME 单测</strong></td><td><code>cutlass/test/unit/cute/iluvatar/ix11/sme_copy_atom.cuh</code></td><td>最小 copy atom kernel</td></tr>
+<tr><td><strong>CUTLASS pipeline wait</strong></td><td><code>cutlass/include/cutlass/gemm/collective/ix11_mma_multistage.hpp</code></td><td><code>ix_sl_waitmem</code> 计数</td></tr>
+<tr><td><strong>CopyOpTypeInterface</strong></td><td><code>include/flydsl/Dialect/Fly/IR/FlyInterfaces.td</code></td><td>接口契约</td></tr>
+<tr><td><strong>add-target-atom-op Skill</strong></td><td><code>.claude/skills/add-target-atom-op/SKILL.md</code></td><td>通用 CopyAtom 添加流程</td></tr>
+<tr><td><strong>FlyToIXDL Pass</strong></td><td><code>lib/Conversion/FlyToIXDL/FlyToIXDL.cpp</code></td><td>IXDL conversion pass（当前 global make_ptr 受限）</td></tr>
+</table>
+
+
+
+
+</div>

@@ -1,0 +1,1542 @@
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlyDSL 编译全流程:FlyToROCDL Conversion 详解</title>
+<style>
+  :root {
+    --bg: #f8f9fc;
+    --surface: #ffffff;
+    --surface2: #f0f2f7;
+    --border: #dde1ea;
+    --text: #1a1d2e;
+    --text2: #5a6078;
+    --accent: #3b6bff;
+    --accent2: #3b6bff;
+    --green: #1a8a5c;
+    --orange: #c47200;
+    --red: #d03030;
+    --purple: #7c3aed;
+    --cyan: #0e7e8a;
+    --code-bg: #f3f4f8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+
+  .toc {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 2rem; margin-bottom: 2.5rem;
+  }
+  .toc h3 { margin-top: 0; color: var(--accent); }
+  .toc ol { margin-left: 1.2rem; }
+  .toc li { margin-bottom: 0.3rem; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  h1 {
+    font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text2); font-size: 1rem; margin-bottom: 2.5rem; }
+
+  h2 {
+    font-size: 1.5rem; font-weight: 700; margin-top: 3rem; margin-bottom: 1rem;
+    padding-bottom: 0.5rem; border-bottom: 2px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.15rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem;
+    color: var(--green);
+  }
+  h4 {
+    font-size: 1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem;
+    color: var(--orange);
+  }
+
+  p { margin-bottom: 1rem; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+
+  code {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px; font-size: 0.9em;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    color: #0e7e8a;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+    overflow-x: auto; font-size: 0.88rem; line-height: 1.6;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  pre code { background: none; border: none; padding: 0; color: var(--text); }
+
+  .highlight { color: var(--orange); font-weight: 600; }
+  .note {
+    background: var(--surface); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .note-title { font-weight: 700; color: var(--accent); margin-bottom: 0.3rem; }
+  .warn {
+    background: rgba(240,164,93,0.08); border-left: 4px solid var(--orange);
+    border-radius: 0 8px 8px 0; padding: 1rem 1.25rem; margin: 1rem 0 1.5rem;
+  }
+  .warn-title { font-weight: 700; color: var(--orange); margin-bottom: 0.3rem; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem;
+    font-size: 0.92rem;
+  }
+  th, td {
+    border: 1px solid var(--border); padding: 0.6rem 0.8rem; text-align: left;
+  }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--surface); }
+
+  .flow-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1.25rem; margin: 1rem 0 1.5rem;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.88rem;
+    line-height: 1.8; white-space: pre; overflow-x: auto;
+  }
+  .flow-box .arrow { color: var(--accent); }
+  .flow-box .label { color: var(--green); }
+  .flow-box .comment { color: var(--text2); }
+
+  .conv-card {
+    background: var(--surface); border: 2px solid var(--border);
+    border-radius: 12px; padding: 1.5rem 1.75rem; margin: 2rem 0;
+  }
+  .conv-card-title {
+    font-size: 1.2rem; font-weight: 700; color: var(--accent);
+    margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem;
+  }
+  .conv-card-title .conv-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 2rem; height: 2rem; border-radius: 50%; font-weight: 700;
+    font-size: 0.9rem; color: #fff; background: var(--accent); flex-shrink: 0;
+  }
+  .conv-card .conv-op {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;
+    color: var(--cyan); margin-bottom: 0.75rem;
+  }
+  .conv-card .conv-line {
+    font-family: 'JetBrains Mono', monospace; font-size: 0.82rem;
+    color: var(--text2); margin-bottom: 1rem;
+  }
+  .conv-card p { margin-bottom: 0.75rem; }
+  .conv-card ul { margin: 0.3rem 0 0.75rem 1.2rem; }
+  .conv-card li { margin-bottom: 0.3rem; }
+
+  .ir-before-after {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;
+    margin: 1rem 0 1.5rem;
+  }
+  .ir-box {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem; overflow-x: auto;
+  }
+  .ir-box-title {
+    font-weight: 700; font-size: 0.85rem; margin-bottom: 0.5rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .ir-box-title.before { color: var(--red); }
+  .ir-box-title.after { color: var(--green); }
+  .ir-box pre {
+    margin: 0; padding: 0; border: none; background: none;
+    font-size: 0.82rem; line-height: 1.6;
+  }
+  .ir-box pre code { color: var(--text); }
+
+  @media (max-width: 720px) {
+    .ir-before-after { grid-template-columns: 1fr; }
+  }
+</style>
+
+
+<div class="container">
+
+<h1>FlyDSL 编译全流程:FlyToROCDL Conversion 详解</h1>
+<p class="subtitle">深入理解 FlyToROCDL.cpp 中 21 个 Conversion Pattern 的原理与实现</p>
+
+<div class="toc">
+<h3>目录</h3>
+<ol>
+  <li><a href="#s1">整体架构:FlyToROCDL Conversion Pass 概览</a></li>
+  <li><a href="#s2">FlyTypeConverter:类型转换基础设施</a></li>
+  <li><a href="#s3">指针创建与内存分配类 Conversion</a></li>
+  <li><a href="#s4">指针类型转换类 Conversion</a></li>
+  <li><a href="#s5">指针变换与遍历类 Conversion</a></li>
+  <li><a href="#s6">内存读写类 Conversion</a></li>
+  <li><a href="#s7">Copy/MMA Atom 构造类 Conversion</a></li>
+  <li><a href="#s8">Atom 状态与调用类 Conversion</a></li>
+  <li><a href="#s9">GPU 运行时与辅助类 Conversion</a></li>
+</ol>
+</div>
+
+<!-- ===================== Section 1 ===================== -->
+<h2 id="s1">1. 整体架构:FlyToROCDL Conversion Pass 概览</h2>
+
+<p><code>FlyToROCDLConversionPass</code> 是 FlyDSL 编译器后端的核心 Pass 之一,负责将 Fly 方言(<code>fly</code>)的高层 Op lowering 到 ROCDL/LLVM.它使用 MLIR 的 <code>DialectConversion</code> 框架,通过 <code>applyPartialConversion</code> 逐步替换非法方言中的 Op.</p>
+
+<p><code>fly_rocdl</code> 也被标为 illegal,但 IR 中通常<strong>不出现独立的 <code>fly_rocdl.*</code> Op</strong>----Copy/MMA 的 <code>fly_rocdl</code> 类型信息编码在 <code>!fly.copy_atom</code> / <code>!fly.mma_atom</code> 里,在 <code>copy_atom_call</code> / <code>mma_atom_call</code> lowering 时由 <code>emitAtomCall</code> / <code>emitAtomCallSSA</code> 直接生成 <code>rocdl.*</code> 或 <code>llvm.*</code>,而非单独的 fly_rocdl pattern.</p>
+
+<h3>1.1 合法性规则</h3>
+
+<p>Pass 定义了以下合法性规则:</p>
+
+<table>
+  <tr><th>类别</th><th>方言/Op</th><th>状态</th></tr>
+  <tr><td>合法方言</td><td><code>arith</code>, <code>scf</code>, <code>vector</code>, <code>gpu</code>, <code>func</code>, <code>llvm</code>, <code>rocdl</code></td><td>保留</td></tr>
+  <tr><td>非法方言</td><td><code>fly</code>, <code>fly_rocdl</code></td><td>必须被转换</td></tr>
+  <tr><td>合法 Op(例外)</td><td><code>StaticOp</code>, <code>MakeIntTupleOp</code>, <code>MakeLayoutOp</code>, <code>MakeComposedLayoutOp</code></td><td>构造器保留</td></tr>
+  <tr><td>动态合法</td><td><code>func.func</code>, <code>gpu.func</code></td><td>函数签名必须已类型转换</td></tr>
+  <tr><td>动态合法</td><td><code>gpu.launch_func</code></td><td>内核操作数类型必须合法</td></tr>
+</table>
+
+<h3>1.2 21 个 Conversion 总览</h3>
+
+<table>
+  <tr><th>#</th><th>类名</th><th>转换的 Op</th><th>类别</th></tr>
+  <tr><td>1</td><td><a href="#conv-make-ptr"><code>MakePtrOpLowering</code></a></td><td><code>fly.make_ptr</code></td><td><a href="#s3">指针创建/内存分配</a></td></tr>
+  <tr><td>2</td><td><a href="#conv-get-dyn-shared"><code>GetDynSharedOpLowering</code></a></td><td><code>fly.get_dyn_shared</code></td><td><a href="#s3">指针创建/内存分配</a></td></tr>
+  <tr><td>3</td><td><a href="#conv-int-to-ptr"><code>IntToPtrOpLowering</code></a></td><td><code>fly.int_to_ptr</code></td><td><a href="#s4">指针类型转换</a></td></tr>
+  <tr><td>4</td><td><a href="#conv-ptr-to-int"><code>PtrToIntOpLowering</code></a></td><td><code>fly.ptr_to_int</code></td><td><a href="#s4">指针类型转换</a></td></tr>
+  <tr><td>5</td><td><a href="#conv-apply-swizzle"><code>ApplySwizzleOpLowering</code></a></td><td><code>fly.apply_swizzle</code></td><td><a href="#s5">指针变换/遍历</a></td></tr>
+  <tr><td>6</td><td><a href="#conv-recast-iter"><code>RecastIterOpLowering</code></a></td><td><code>fly.recast_iter</code></td><td><a href="#s5">指针变换/遍历</a></td></tr>
+  <tr><td>7</td><td><a href="#conv-add-offset"><code>AddOffsetOpLowering</code></a></td><td><code>fly.add_offset</code></td><td><a href="#s5">指针变换/遍历</a></td></tr>
+  <tr><td>8</td><td><a href="#conv-make-view"><code>MakeViewOpLowering</code></a></td><td><code>fly.make_view</code></td><td><a href="#s5">指针变换/遍历</a></td></tr>
+  <tr><td>9</td><td><a href="#conv-ptr-load"><code>PtrLoadOpLowering</code></a></td><td><code>fly.ptr_load</code></td><td><a href="#s6">内存读写</a></td></tr>
+  <tr><td>10</td><td><a href="#conv-ptr-store"><code>PtrStoreOpLowering</code></a></td><td><code>fly.ptr_store</code></td><td><a href="#s6">内存读写</a></td></tr>
+  <tr><td>11</td><td><a href="#conv-make-copy-atom"><code>MakeCopyAtomOpLowering</code></a></td><td><code>fly.make_copy_atom</code></td><td><a href="#s7">Atom 构造</a></td></tr>
+  <tr><td>12</td><td><a href="#conv-make-mma-atom"><code>MakeMmaAtomOpLowering</code></a></td><td><code>fly.make_mma_atom</code></td><td><a href="#s7">Atom 构造</a></td></tr>
+  <tr><td>13</td><td><a href="#conv-make-tiled-copy"><code>MakeTiledCopyOpLowering</code></a></td><td><code>fly.make_tiled_copy</code></td><td><a href="#s7">Atom 构造</a></td></tr>
+  <tr><td>14</td><td><a href="#conv-make-tiled-mma"><code>MakeTiledMmaOpLowering</code></a></td><td><code>fly.make_tiled_mma</code></td><td><a href="#s7">Atom 构造</a></td></tr>
+  <tr><td>15</td><td><a href="#conv-atom-set-value"><code>AtomSetValueOpLowering</code></a></td><td><code>fly.atom.set_value</code></td><td><a href="#s8">Atom 状态/调用</a></td></tr>
+  <tr><td>16</td><td><a href="#conv-copy-atom-call"><code>CopyAtomCallLowering</code></a></td><td><code>fly.copy_atom_call</code></td><td><a href="#s8">Atom 状态/调用</a></td></tr>
+  <tr><td>17</td><td><a href="#conv-copy-atom-call-ssa"><code>CopyAtomCallSSALowering</code></a></td><td><code>fly.copy_atom_call_ssa</code></td><td><a href="#s8">Atom 状态/调用</a></td></tr>
+  <tr><td>18</td><td><a href="#conv-mma-atom-call"><code>MmaAtomCallLowering</code></a></td><td><code>fly.mma_atom_call</code></td><td><a href="#s8">Atom 状态/调用</a></td></tr>
+  <tr><td>19</td><td><a href="#conv-mma-atom-call-ssa"><code>MmaAtomCallSSALowering</code></a></td><td><code>fly.mma_atom_call_ssa</code></td><td><a href="#s8">Atom 状态/调用</a></td></tr>
+  <tr><td>20</td><td><a href="#conv-gpu-launch-func"><code>GpuLaunchFuncOpLowering</code></a></td><td><code>gpu.launch_func</code></td><td><a href="#s9">GPU 运行时/辅助</a></td></tr>
+  <tr><td>21</td><td><a href="#conv-extract-aligned-ptr"><code>ExtractAlignedPointerAsIndexLowering</code></a></td><td><code>fly.extract_aligned_pointer_as_index</code></td><td><a href="#s9">GPU 运行时/辅助</a></td></tr>
+</table>
+
+<!-- ===================== Section 2 ===================== -->
+<h2 id="s2">2. FlyTypeConverter:类型转换基础设施</h2>
+
+<p>所有 Conversion Pattern 共享同一个 <code>FlyTypeConverter</code>,它定义了 Fly DSL 类型到 LLVM/ROCDL 类型的映射规则:</p>
+
+<table>
+  <tr><th>Fly DSL 类型</th><th>LLVM/ROCDL 类型</th><th>说明</th></tr>
+  <tr><td><code>FloatType</code> (width &lt; 16)</td><td><code>IntegerType</code>(同位宽)</td><td>fp8/fp6/fp4 在 LLVM 中无对应浮点类型,退化为等位宽整数</td></tr>
+  <tr><td><code>VectorType</code> (含 sub-byte float)</td><td><code>VectorType</code>(元素类型已转换)</td><td>递归应用元素类型转换</td></tr>
+  <tr><td><code>fly::MemRefType</code> (BufferDesc)</td><td><code>BufferFatPtr</code> 结构体类型</td><td>Buffer Resource 描述符打包</td></tr>
+  <tr><td><code>fly::MemRefType</code> (其他)</td><td><code>LLVMPointerType</code></td><td>裸指针</td></tr>
+  <tr><td><code>fly::PointerType</code> (BufferDesc)</td><td><code>BufferFatPtr</code> 结构体类型</td><td>同 MemRef 的 BufferDesc 路径</td></tr>
+  <tr><td><code>fly::PointerType</code> (其他)</td><td><code>LLVMPointerType</code></td><td>裸指针</td></tr>
+  <tr><td><code>fly::CopyAtomType</code> (stateful)</td><td><code>getConvertedType()</code></td><td>Atom 的运行时状态结构体</td></tr>
+  <tr><td><code>fly::CopyAtomType</code> (non-stateful)</td><td><code>LLVMStructType{}</code>(空)</td><td>无运行时数据</td></tr>
+  <tr><td><code>fly::MmaAtomType</code></td><td>同 CopyAtomType 逻辑</td><td>同上</td></tr>
+  <tr><td><code>fly::TiledCopyType</code></td><td><code>convertType(copyAtom)</code></td><td>透传到内部 atom 类型</td></tr>
+  <tr><td><code>fly::TiledMmaType</code></td><td><code>convertType(mmaAtom)</code></td><td>透传到内部 atom 类型</td></tr>
+</table>
+
+<div class="note">
+  <div class="note-title">为什么 fp8/fp6/fp4 要转为整数?</div>
+  <p>LLVM IR 不存在 <code>f8</code>/<code>f6</code>/<code>f4</code> 这样的一等浮点类型.AMD GPU 硬件约定 sub-byte 浮点数据在内存和寄存器中以整数形式存储和搬运,MFMA intrinsic 在操作数位置期望整数类型,硬件内部将 bit pattern 解释为浮点进行计算.因此 lowering 时必须将 <code>f8</code> -> <code>i8</code>,<code>f6</code> -> <code>i6</code>,<code>f4</code> -> <code>i4</code>.</p>
+</div>
+
+<!-- ===================== Section 3 ===================== -->
+<h2 id="s3">3. 指针创建与内存分配类 Conversion</h2>
+
+<!-- ========== MakePtrOpLowering ========== -->
+<div class="conv-card" id="conv-make-ptr">
+  <div class="conv-card-title">
+    <span class="conv-num">1</span>
+    MakePtrOpLowering
+  </div>
+  <div class="conv-op">fly.make_ptr -> llvm.alloca / llvm.addressof / BufferFatPtr</div>
+
+  <p><code>MakePtrOpLowering</code> 是最复杂的 conversion 之一,根据指针的<strong>地址空间</strong>走三条完全不同的路径:</p>
+
+  <table>
+    <tr><th>地址空间</th><th>Lowering 方式</th><th>用途</th></tr>
+    <tr>
+      <td><code>Register</code></td>
+      <td><code>LLVM::AllocaOp</code></td>
+      <td>寄存器分配,后续被 PromoteRegMemToVectorSSA 提升为标量/vector SSA</td>
+    </tr>
+    <tr>
+      <td><code>Shared</code></td>
+      <td><code>LLVM::GlobalOp</code> + <code>LLVM::AddressOfOp</code></td>
+      <td>静态 LDS 共享内存分配</td>
+    </tr>
+    <tr>
+      <td><code>BufferDesc</code></td>
+      <td><code>ROCDL::MakeBufferRsrcOp</code> + <code>BufferFatPtr::pack</code></td>
+      <td>GPU 全局显存 Buffer Resource 描述符构造</td>
+    </tr>
+  </table>
+
+  <h4>路径 1:Register -> llvm.alloca</h4>
+
+  <p>Register 地址空间对应 GPU 的私有地址空间(AS=5).<code>fly.make_ptr</code> 的 <code>dictAttrs</code> 中必须包含 <code>allocSize</code> 属性,表示需要分配的元素数量.</p>
+
+  <p>Lowering 生成一个 <code>llvm.alloca</code>,分配 <code>allocSize</code> 个 <code>elemTy</code> 元素的连续空间:</p>
+
+  <ul>
+    <li><code>allocSize == 1</code>:分配单个元素,后续被提升为标量 SSA 值(如 <code>f16</code>)</li>
+    <li><code>allocSize &gt; 1</code>:分配多个元素,后续被提升为 vector SSA 值(如 <code>vector&lt;8xf16&gt;</code>)</li>
+  </ul>
+
+  <p><code>alloca</code> 只是中间表示,后续 <code>PromoteRegMemToVectorSSA</code> pass 会将其完全消除,直接使用寄存器.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.make_ptr {allocSize = 8}
+  : !fly.pointer&lt;f16, register&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakePtrOpLowering</div>
+      <pre><code>%nElems = arith.constant 8 : i64
+%ptr = llvm.alloca %nElems :
+  !llvm.ptr&lt;5&gt;, f16</code></pre>
+    </div>
+  </div>
+
+  <h4>路径 2:Shared -> LDS Global</h4>
+
+  <p>Shared 地址空间对应 GPU 的本地数据共享(LDS)内存(AS=3).每个 <code>fly.make_ptr</code> 会在模块中创建一个唯一的 LDS 全局变量 <code>@__shared_alloc_&lt;n&gt;</code>,然后取其地址.</p>
+
+  <p><code>dictAttrs</code> 中必须包含 <code>allocBytes</code>(分配字节数)和 <code>allocAlign</code>(对齐字节数).</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.make_ptr
+  {allocBytes = 2048, allocAlign = 256}
+  : !fly.pointer&lt;f16, shared&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakePtrOpLowering</div>
+      <pre><code>; 模块级新增全局变量(external linkage, dso_local):
+llvm.mlir.global external @__shared_alloc_0
+  {addr_space = 3 : i32, dso_local}
+  = zeroinitializer : !llvm.array&lt;2048 x i8&gt;
+
+; op 替换为取地址:
+%ptr = llvm.addressof
+  @__shared_alloc_0 : !llvm.ptr&lt;3&gt;</code></pre>
+    </div>
+  </div>
+
+  <h4>路径 3:BufferDesc -> BufferFatPtr</h4>
+
+  <p>BufferDesc 地址空间对应 AMD GPU 的 Buffer Resource 机制.需要 4 个参数构造:</p>
+
+  <ul>
+    <li><code>base</code>:buffer 基地址</li>
+    <li><code>stride</code>:元素步长</li>
+    <li><code>numRecords</code>:记录数</li>
+    <li><code>flags</code>:buffer 标志位</li>
+  </ul>
+
+  <p>Lowering 先用 <code>ROCDL::MakeBufferRsrcOp</code> 将 4 个参数打包为 buffer 描述符,再用 <code>BufferFatPtr::pack</code> 将其与零偏移量打包为 <code>BufferFatPtr</code> 结构体 <code>{ptr&lt;8&gt;, i32}</code>.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.make_ptr(%base, %stride,
+  %numRecords, %flags)
+  : !fly.pointer&lt;f32, buffer_desc&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakePtrOpLowering</div>
+      <pre><code>; 1. 构造 buffer resource:
+%rsrc = rocdl.make.buffer.rsrc
+  %base, %stride,
+  %numRecords, %flags
+  : !llvm.ptr&lt;8&gt;
+
+; 2. 打包为 BufferFatPtr:
+%zero = arith.constant 0 : i32
+%ptr = llvm.insertvalue %rsrc, 0
+  : {!llvm.ptr&lt;8&gt;, i32}
+%ptr = llvm.insertvalue %zero, 1
+  : {!llvm.ptr&lt;8&gt;, i32}</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== GetDynSharedOpLowering ========== -->
+<div class="conv-card" id="conv-get-dyn-shared">
+  <div class="conv-card-title">
+    <span class="conv-num">2</span>
+    GetDynSharedOpLowering
+  </div>
+  <div class="conv-op">fly.get_dyn_shared -> llvm.addressof + llvm.getelementptr</div>
+
+  <h4>行为:获取动态共享内存基址</h4>
+
+  <p><code>GetDynSharedOpLowering</code> 将 <code>fly.get_dyn_shared</code> lowering 为动态共享内存的基址指针.与 <a href="#conv-make-ptr">MakePtrOpLowering 的 Shared 路径</a>不同,动态共享内存的大小在编译期未知,由 kernel launch 时指定.</p>
+
+  <h4>核心逻辑:复用同一个全局变量</h4>
+
+  <p>动态共享内存每个 kernel 只有一个逻辑区域.代码会先在模块中查找是否已存在符合条件的 LDS 全局变量:</p>
+
+  <ul>
+    <li>地址空间为 shared(AS=3)</li>
+    <li>类型为 <code>!llvm.array&lt;0 x i8&gt;</code>(零长度数组,表示大小动态)</li>
+    <li>对齐为 1024 字节</li>
+  </ul>
+
+  <p>如果找到则复用,否则创建一个新的 <code>@__dynamic_shared</code> 全局变量.这保证了同一个 kernel 中多个 <code>get_dyn_shared</code> 调用返回的是<strong>同一个基址</strong>.</p>
+
+  <h4>为什么需要 GEP?</h4>
+
+  <p>全局变量的类型是 <code>!llvm.array&lt;0 x i8&gt;</code>,取地址得到指向该数组的 <code>!llvm.ptr&lt;3&gt;</code>.实现中对 <code>addressof</code> 结果再做一次<strong>单索引</strong> GEP(<code>gep i8, ptr, 0</code>),使指针语义与后续 offset / recast 路径一致:</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.get_dyn_shared
+  : !fly.pointer&lt;f16, shared&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After GetDynSharedOpLowering</div>
+      <pre><code>; 模块级(仅首次创建, external + dso_local):
+llvm.mlir.global external @__dynamic_shared
+  {addr_space = 3 : i32, alignment = 1024, dso_local}
+  = zeroinitializer
+  : !llvm.array&lt;0 x i8&gt;
+
+; op 替换:
+%base = llvm.addressof
+  @__dynamic_shared : !llvm.ptr&lt;3&gt;
+%ptr = llvm.getelementptr %base[0]
+  : (!llvm.ptr&lt;3&gt;, !llvm.array&lt;0 x i8&gt;), i8</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== Section 4 ===================== -->
+<h2 id="s4">4. 指针类型转换类 Conversion</h2>
+
+<!-- ========== IntToPtrOpLowering ========== -->
+<div class="conv-card" id="conv-int-to-ptr">
+  <div class="conv-card-title">
+    <span class="conv-num">3</span>
+    IntToPtrOpLowering
+  </div>
+  <div class="conv-op">fly.int_to_ptr -> llvm.inttoptr</div>
+
+  <h4>行为:整数转指针,类型由 FlyTypeConverter 决定</h4>
+
+  <p>将 <code>fly.int_to_ptr</code> 直接转换为 <code>llvm.inttoptr</code>.关键点在于结果类型:Fly DSL 的 <code>!fly.pointer</code> 类型通过 <code>FlyTypeConverter</code> 转换为对应的 <code>!llvm.ptr&lt;AS&gt;</code> 或 <code>BufferFatPtr</code> 结构体类型,转换逻辑与指针的地址空间相关.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.int_to_ptr %int_val
+  : !fly.pointer&lt;f16, shared&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After IntToPtrOpLowering</div>
+      <pre><code>%ptr = llvm.inttoptr %int_val
+  : !llvm.ptr&lt;3&gt;</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== PtrToIntOpLowering ========== -->
+<div class="conv-card" id="conv-ptr-to-int">
+  <div class="conv-card-title">
+    <span class="conv-num">4</span>
+    PtrToIntOpLowering
+  </div>
+  <div class="conv-op">fly.ptr_to_int -> llvm.ptrtoint</div>
+
+  <h4>行为:指针转整数,与 IntToPtrOpLowering 对称</h4>
+
+  <p>将 <code>fly.ptr_to_int</code> 直接转换为 <code>llvm.ptrtoint</code>.结果类型同样通过 <code>FlyTypeConverter</code> 转换.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%int_val = fly.ptr_to_int %ptr
+  : i64</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After PtrToIntOpLowering</div>
+      <pre><code>%int_val = llvm.ptrtoint %ptr
+  : i64</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== Section 5 ===================== -->
+<h2 id="s5">5. 指针变换与遍历类 Conversion</h2>
+
+<!-- ========== ApplySwizzleOpLowering ========== -->
+<div class="conv-card" id="conv-apply-swizzle">
+  <div class="conv-card-title">
+    <span class="conv-num">5</span>
+    ApplySwizzleOpLowering
+  </div>
+  <div class="conv-op">fly.apply_swizzle -> 透传指针</div>
+  <h4>行为:直接消除,透传原始指针</h4>
+
+  <p><code>ApplySwizzleOpLowering</code> 的实现极其简单:将 <code>fly.apply_swizzle</code> op 直接消除,用原始指针替换它.看起来好像 swizzle 被完全丢弃了,但实际上并非如此----<span class="highlight">swizzle 的效果被延迟到了 load/store 时才真正应用</span>.</p>
+
+  <h4>为什么可以这样做?</h4>
+
+  <p>关键在于理解 Fly DSL 中 swizzle 的设计哲学:<strong>swizzle 是指针类型上的元数据,而不是指针值上的变换</strong>.</p>
+
+  <p>在 Fly DSL 中,<code>fly.apply_swizzle</code> 的作用是给一个 <code>!fly.pointer&lt;elemTy, swizzle=...&gt;</code> 类型的指针附加上 swizzle 信息.swizzle 信息编码在<strong>指针类型</strong>的 <code>SwizzleAttr</code> 中,而不是改变指针的数值.所以 lowering 时:</p>
+
+  <ul>
+    <li><code>ApplySwizzleOp</code> 本身不需要修改指针值,只需透传</li>
+    <li>swizzle 信息随指针类型一起传播,后续使用者(load/store)可以从<strong>原始 op 的指针类型</strong>中读取到</li>
+  </ul>
+
+  <h4>IR 变换示例</h4>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.make_ptr ... :
+  !fly.pointer&lt;f16, shared,
+    swizzle=&lt;base=4,mask=3,shift=0&gt;&gt;
+%swizzled = fly.apply_swizzle %ptr :
+  !fly.pointer&lt;f16, shared,
+    swizzle=&lt;base=4,mask=3,shift=0&gt;&gt;
+%val = fly.ptr_load %swizzled : vector&lt;4xf16&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After (LLVM/ROCDL)</div>
+      <pre><code>%ptr = llvm.alloca ... : !llvm.ptr&lt;3&gt;
+; apply_swizzle 被消除,
+; %ptr 直接透传到 load
+; swizzle 在 ptr_load 时应用:
+%addr = applySwizzleOnPtr(%ptr,
+          base=4,mask=3,shift=0)
+%val = llvm.load %addr :
+         vector&lt;4xf16&gt;</code></pre>
+    </div>
+  </div>
+
+  <h4>Swizzle 真正生效的地方</h4>
+
+  <p>swizzle 的实际计算发生在 <strong>load/store lowering</strong> 时:</p>
+
+  <p><strong>普通地址空间的 load</strong>(PtrLoadOpLowering):</p>
+<pre><code>ptr = applySwizzleOnPtr(rewriter, loc, ptr, flyPtrTy.getSwizzle());
+Value loaded = LLVM::LoadOp::create(rewriter, loc, loadTy, ptr);</code></pre>
+
+  <p><strong>普通地址空间的 store</strong>(PtrStoreOpLowering):</p>
+<pre><code>ptr = applySwizzleOnPtr(rewriter, loc, ptr, flyPtrTy.getSwizzle());
+LLVM::StoreOp::create(rewriter, loc, value, ptr);</code></pre>
+
+  <p>而 <code>applySwizzleOnPtr</code>(定义在 PointerUtils.cpp)才是真正做位运算的地方:</p>
+
+<pre><code>TypedValue&lt;LLVM::LLVMPointerType&gt; applySwizzleOnPtr(...) {
+  if (swizzle.isTrivialSwizzle())
+    return ptr;                                    // 无 swizzle,直接返回
+  Value ptrInt = LLVM::PtrToIntOp::create(...);    // 指针转整数
+  int64_t bitMaskValue = ((1 &lt;&lt; mask) - 1) &lt;&lt; (base + shift);
+  Value bitMask = arith::ConstantIntOp::create(..., bitMaskValue);
+  Value masked = arith::AndIOp::create(..., ptrInt, bitMask);  // 提取 swizzle 位
+  Value shifted = arith::ShRUIOp::create(..., masked, shiftAmt); // 右移
+  Value swizzled = arith::XOrIOp::create(..., ptrInt, shifted); // XOR 得到新地址
+  return LLVM::IntToPtrOp::create(..., ptrTy, swizzled);        // 整数转回指针
+}</code></pre>
+
+  <p>这是一个 <strong>XOR swizzle</strong>:<code>address ^= (address &amp; mask) &gt;&gt; shift</code>,用于 AMD GPU 共享内存的 bank conflict 消除.</p>
+
+  <h4>设计思路总结</h4>
+
+  <div class="flow-box"><span class="label">Fly DSL 层面:</span>
+%ptr_with_swizzle = fly.apply_swizzle %ptr      <span class="comment"><- 标记类型,不改变值</span>
+%val = fly.ptr_load %ptr_with_swizzle           <span class="comment"><- 使用带 swizzle 信息的指针</span>
+
+<span class="label">Lowering 后:</span>
+ApplySwizzleOp -> 直接透传指针值                    <span class="comment"><- swizzle 信息在类型中</span>
+PtrLoadOp -> applySwizzleOnPtr(ptr, swizzle)       <span class="comment"><- 此处才计算 swizzle 地址</span>
+         + llvm.load</div>
+
+  <div class="note">
+    <div class="note-title">延迟应用设计的两个好处</div>
+    <ul>
+      <li><strong>避免重复计算</strong>:如果同一个指针被 load 多次,swizzle 只需在 load 时计算一次.如果 <code>apply_swizzle</code> 就修改了指针值,后续每次 <code>add_offset</code> 等操作都需要额外处理 swizzle 的传播.</li>
+      <li><strong>BufferDesc 路径天然兼容</strong>:对于 buffer resource 指针,swizzle 偏移是作为 <code>RawPtrBufferLoadOp</code> 的独立参数传入的,不需要修改指针值本身.把 swizzle 逻辑集中在 load/store 处理,可以统一两种地址空间的代码路径.</li>
+    </ul>
+  </div>
+
+  <h4>BufferDesc 地址空间的 swizzle 处理</h4>
+
+  <p>对于 BufferDesc 地址空间,swizzle 不通过 <code>applySwizzleOnPtr</code> 处理,而是作为 <code>BufferFatPtr</code> 的 <code>swizzleByteOffset</code> 参数直接传入 buffer load/store intrinsic:</p>
+
+<pre><code>// PtrLoadOpLowering 中 BufferDesc 路径:
+BufferFatPtr bp(flyPtrTy, ptr);
+Value loaded = ROCDL::RawPtrBufferLoadOp::create(
+    rewriter, loc, loadTy,
+    bp.bufferRsrc(rewriter, loc),       // buffer 描述符
+    bp.swizzleByteOffset(rewriter, loc), // swizzle 偏移(独立参数)
+    zero, zero, noAttrs, noAttrs, noAttrs);</code></pre>
+
+  <p>这进一步说明了为什么 <code>ApplySwizzleOpLowering</code> 只需透传:不同地址空间的 swizzle 处理方式完全不同,统一在 load/store 时根据地址空间分发才是最合理的.</p>
+
+  <h4>对已有 swizzle 的指针再次 apply_swizzle:覆盖而非组合</h4>
+
+  <p><code>ApplySwizzleOp</code> 的类型推断逻辑(FlyOps.cpp)揭示了关键语义:</p>
+
+<pre><code>FLY_INFER_RETURN_TYPES(ApplySwizzleOp) {
+  auto ptrTy = dyn_cast&lt;PointerType&gt;(operands[0].getType());
+  auto swizzleTy = dyn_cast&lt;SwizzleType&gt;(operands[1].getType());
+  int32_t valDiv = ptrTy.getValueDivisibility();
+  int32_t newValDiv = utils::divisibilityApplySwizzle(valDiv, swizzleTy.getAttr());
+  inferredReturnTypes.assign(
+      {PointerType::get(ptrTy.getElemTy(), ptrTy.getAddressSpace(),
+                        AlignAttr::get(ptrTy.getElemTy(), newValDiv),
+                        swizzleTy.getAttr())});   // &lt;- 新 swizzle 直接覆盖,不与旧 swizzle 组合
+  return success();
+}</code></pre>
+
+  <p>结果指针类型中的 swizzle 属性<strong>直接设为新的 <code>swizzleTy.getAttr()</code></strong>,而非与旧 swizzle 做组合.旧的 swizzle 被完全丢弃.</p>
+
+  <h4>具体例子</h4>
+
+<pre><code>%ptr1 = fly.make_ptr ... : !fly.pointer&lt;f16, shared, swizzle=&lt;base=4,mask=3,shift=0&gt;&gt;
+%sw1  = fly.static : !fly.swizzle&lt;base=4,mask=3,shift=0&gt;
+%ptr2 = fly.apply_swizzle %ptr1, %sw1
+       -&gt; swizzle = &lt;base=4,mask=3,shift=0&gt;   // 覆盖,但恰好相同
+
+%sw2  = fly.static : !fly.swizzle&lt;base=8,mask=2,shift=1&gt;
+%ptr3 = fly.apply_swizzle %ptr2, %sw2
+       -&gt; swizzle = &lt;base=8,mask=2,shift=1&gt;   // 旧的 &lt;4,3,0&gt; 被丢弃!</code></pre>
+
+  <p>在 lowering 时,<code>ApplySwizzleOpLowering</code> 直接透传指针值,而 <code>PtrLoadOpLowering</code>/<code>PtrStoreOpLowering</code> 从指针<strong>类型</strong>中读取 swizzle 并在 load/store 时应用.所以最终只有最后一次 <code>apply_swizzle</code> 设置的 swizzle 会在 load/store 时生效.</p>
+
+  <div class="warn">
+    <div class="warn-title">这不是 bug,而是设计意图</div>
+    <p>Fly DSL 的 swizzle 语义是<strong>描述性</strong>的,而非<strong>变换性</strong>的:</p>
+    <ul>
+      <li><code>apply_swizzle</code> 不是"对指针做一次 swizzle 变换",而是"声明这个指针当前具有的 swizzle 模式"</li>
+      <li>指针类型上的 swizzle 是一个<strong>当前状态标记</strong>,告诉后续 load/store 如何解释地址</li>
+      <li>如果需要组合两个 swizzle,应该在类型层面预先计算好组合后的 swizzle,然后一次性 <code>apply_swizzle</code></li>
+    </ul>
+    <p>这也解释了为什么 <code>ApplySwizzleOpLowering</code> 可以放心地直接透传指针----因为 swizzle 只是类型元数据,不存在"累积变换"的语义.</p>
+  </div>
+</div>
+
+<!-- ========== RecastIterOpLowering ========== -->
+<div class="conv-card" id="conv-recast-iter">
+  <div class="conv-card-title">
+    <span class="conv-num">6</span>
+    RecastIterOpLowering
+  </div>
+  <div class="conv-op">fly.recast_iter -> 透传指针</div>
+
+  <h4>行为:直接消除,透传原始指针</h4>
+
+  <p><code>RecastIterOpLowering</code> 将 <code>fly.recast_iter</code> 直接消除,用源操作数替换结果.与 <code>ApplySwizzleOpLowering</code> 一样,这看起来像是丢弃了信息,但实际上 <span class="highlight">被改变的信息编码在指针类型中,而类型在 lowering 后会被抹平</span>.</p>
+
+  <h4>RecastIterOp 的本质:指针的 reinterpret_cast</h4>
+
+  <p>从 op 定义可以看到:</p>
+
+<pre><code>def Fly_RecastIterOp : Fly_Op&lt;"recast_iter", [Pure]&gt; {
+  let arguments = (ins Fly_Pointer:$src);
+  let results = (outs Fly_Pointer:$result);
+}</code></pre>
+
+  <p>它接受一个 <code>!fly.pointer&lt;A, ...&gt;</code> 输入,产生一个 <code>!fly.pointer&lt;B, ...&gt;</code> 输出.<strong>运行时值完全不变</strong>,变的是指针类型中的 <code>elemTy</code>(元素类型).</p>
+
+  <p>Python 端的用法也印证了这一点:</p>
+
+<pre><code># 把共享内存指针从默认类型"重铸"为 f32 指针
+smem_f32 = recast_iter(fx.Float32, get_dyn_shared())
+
+# 从指针 peek 一个值:先 recast 成目标类型,再 load
+typed_ptr = recast_iter(cls, ptr)
+return cls(ptr_load(typed_ptr, cls))
+
+# 往指针 poke 一个值:先 recast,再 store
+typed_ptr = recast_iter(cls, ptr)
+ptr_store(coerced.ir_value(), typed_ptr)</code></pre>
+
+  <p><code>recast_iter</code> 就是 C++ 中的 <code>reinterpret_cast</code>----只改变指针的类型标签,不改变指针的地址值.</p>
+
+  <h4>IR 变换示例</h4>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr_f16 = fly.make_ptr ... :
+  !fly.pointer&lt;f16, shared&gt;
+%ptr_f32 = fly.recast_iter %ptr_f16 :
+  !fly.pointer&lt;f32, shared&gt;
+%val = fly.ptr_load %ptr_f32 : f32</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After RecastIterOpLowering</div>
+      <pre><code>%ptr_f16 = fly.make_ptr ... :
+  !fly.pointer&lt;f16, shared&gt;
+; recast_iter 被消除,
+; %ptr_f16 直接透传
+%val = fly.ptr_load %ptr_f16 : f32
+; 注意:ptr_load 的指针操作数类型
+; 仍是 !fly.pointer&lt;f16, shared&gt;,
+; 但 load 结果类型不受影响</code></pre>
+    </div>
+  </div>
+
+  <p><span class="highlight">经过 RecastIterOpLowering 后,<code>fly.recast_iter</code> 被消除,源指针 <code>%ptr_f16</code> 直接透传到 <code>fly.ptr_load</code>.后续 <a href="#conv-ptr-load">PtrLoadOpLowering</a> 会进一步将 <code>fly.ptr_load</code> lowering 为 <code>applySwizzleOnPtr + llvm.load</code>,此时指针类型中的 <code>elemTy</code> 已不再影响 load 行为.</span></p>
+
+  <h4>地址空间可以不同吗?</h4>
+
+  <p><strong>不可以.</strong> Python 端 <code>recast_iter</code> 构造结果类型时,显式复用了源指针的地址空间和对齐:</p>
+
+<pre><code>result_type = PointerType.get(result_type, src.memspace, src.alignment)</code></pre>
+
+  <p>结果指针的 <code>memspace</code>(地址空间)和 <code>alignment</code> 与源指针完全相同,只有 <code>elemTy</code>(元素类型)被替换.这是合理的:<code>recast_iter</code> 是对<strong>同一块内存</strong>的类型重解释,不可能把 shared memory 的指针"重铸"成 global memory 的指针----那需要地址空间转换,而非类型重铸.</p>
+
+  <h4>地址空间校验现状</h4>
+
+  <p>目前<strong>程序上没有强制限制,也没有报错</strong>:</p>
+
+  <ul>
+    <li><strong>MLIR 层面</strong>:<code>RecastIterOp</code> 的 <code>.td</code> 定义没有声明 <code>InferTypeOpInterface</code>,也没有自定义 verifier.结果类型完全由调用者提供,MLIR 不会校验结果指针的地址空间是否与源指针一致.</li>
+    <li><strong>Python API 层面</strong>:有两条路径----
+      <ul>
+        <li><strong>快捷路径</strong>(传 <code>Numeric</code> 类):<code>PointerType.get(result_type, src.memspace, src.alignment)</code> 自动复用源指针的地址空间,<strong>不可能出错</strong>.</li>
+        <li><strong>显式路径</strong>(传 <code>PointerType</code>):如 <code>fp8_gemm_utils.py</code> 和 <code>preshuffle_gemm_v2.py</code> 中的用法,用户自己构造 <code>PointerType</code> 传入,此时地址空间由用户指定,<strong>Python API 不会校验</strong>是否与源指针一致.</li>
+      </ul>
+    </li>
+  </ul>
+
+  <p>如果用户错误地给了不同地址空间,<code>RecastIterOpLowering</code> 仍然直接透传指针值,不会报错.但后续 lowering 时地址空间会被编码到 <code>llvm.ptr&lt;AS&gt;</code> 中,可能导致语义错误----比如把 shared memory 的地址当作 global memory 使用,运行时行为未定义.</p>
+
+  <div class="note" style="border-left-color: #e74c3c;">
+    <div class="note-title" style="color: #e74c3c;">TODO: 需要向社区提交 Patch</div>
+    <p>应为 <code>RecastIterOp</code> 添加 verifier,校验结果指针的地址空间与源指针一致.如果不一致,应在编译期报错而非静默通过.同时,Python API 的显式路径也应增加校验.</p>
+  </div>
+
+  <h4>为什么 Lowering 可以直接透传</h4>
+
+  <p>Lowering 后所有 <code>!fly.pointer&lt;elemTy, ...&gt;</code> 都变成了 <code>!llvm.ptr&lt;AS&gt;</code>,<strong>元素类型信息被剥离</strong>.所以 <code>recast_iter</code> 改变的那个 <code>elemTy</code> 在底层已经没有意义,直接透传指针值即可.</p>
+
+  <div class="note">
+    <div class="note-title">类型级操作的设计模式</div>
+    <p><code>RecastIterOp</code> 和 <code>ApplySwizzleOp</code> 都属于同一类设计模式----<strong>类型级操作</strong>:在 Fly DSL 高层 IR 中用于类型推导和语义约束,但在 lowering 到 LLVM 后,类型差异被抹平,op 本身变成了 no-op,只需透传运行时值.</p>
+  </div>
+</div>
+
+<!-- ========== AddOffsetOpLowering ========== -->
+<div class="conv-card" id="conv-add-offset">
+  <div class="conv-card-title">
+    <span class="conv-num">7</span>
+    AddOffsetOpLowering
+  </div>
+  <div class="conv-op">fly.add_offset -> BufferFatPtr.addOffset / llvm.getelementptr</div>
+
+  <h4>AddOffsetOp 定义</h4>
+<pre><code>def Fly_AddOffsetOp : Fly_Op&lt;"add_offset", [Pure, ...]&gt; {
+  let arguments = (ins Fly_IteratorLikeType:$ptr, Fly_IntTuple:$offset);
+  let results = (outs Fly_IteratorLikeType:$result);
+}</code></pre>
+
+  <p>注意 offset 参数的类型是 <code>Fly_IntTuple</code>----Fly DSL 中整数元组类型.<code>IntTupleAttr</code> 是递归嵌套结构,可以是标量(leaf)也可以是元组(non-leaf).<code>add_offset</code> 要求 offset 必须是 <strong>leaf IntTuple</strong>(即标量整数),否则 lowering 会失败.</p>
+
+  <h4>行为:按地址空间分两条路径</h4>
+
+  <table>
+    <tr><th>地址空间</th><th>Lowering 方式</th><th>说明</th></tr>
+    <tr>
+      <td><code>BufferDesc</code></td>
+      <td><code>BufferFatPtr::addOffset()</code></td>
+      <td>修改结构体中的 valOffset 字段,返回新的 BufferFatPtr</td>
+    </tr>
+    <tr>
+      <td>其他</td>
+      <td><code>LLVM::GEPOp</code></td>
+      <td>标准 LLVM getelementptr,按元素类型计算字节偏移</td>
+    </tr>
+  </table>
+
+  <h4>Offset 值的提取</h4>
+
+  <p>offset 参数是 <code>IntTupleType</code>,但 lowering 需要一个具体的整数值.提取逻辑分两种情况:</p>
+
+  <ul>
+    <li><strong>静态 offset</strong>(编译期已知):<code>offsetAttr.extractIntFromLeaf()</code> 得到 <code>IntAttr</code>,如果 <code>isStatic()</code> 为 true,直接用 <code>arith.ConstantIntOp</code> 生成常量.</li>
+    <li><strong>动态 offset</strong>(运行时值):offset 的定义 op 的第一个操作数就是实际的运行时整数值,直接取 <code>defOp-&gt;getOperand(0)</code>.</li>
+  </ul>
+
+  <h4>IR 变换示例 (普通地址空间)</h4>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%offset = fly.static 4 : !fly.int_tuple&lt;4&gt;
+%new_ptr = fly.add_offset %ptr, %offset
+  : !fly.pointer&lt;f16, shared&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After AddOffsetOpLowering</div>
+      <pre><code>%offset_val = arith.constant 4 : i32
+%new_ptr = llvm.getelementptr %ptr[%offset_val]
+  : !llvm.ptr&lt;3&gt;, f16</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== MakeViewOpLowering ========== -->
+<div class="conv-card" id="conv-make-view">
+  <div class="conv-card-title">
+    <span class="conv-num">8</span>
+    MakeViewOpLowering
+  </div>
+  <div class="conv-op">fly.make_view -> 透传迭代器 / 消除 op</div>
+
+  <h4>MakeViewOp 定义</h4>
+<pre><code>def Fly_MakeViewOp : Fly_Op&lt;"make_view", [Pure, ...]&gt; {
+  let arguments = (ins Fly_IteratorLikeType:$iter, Fly_NarrowLayoutType:$layout);
+  let results = (outs Fly_TensorLikeType:$result);
+}</code></pre>
+
+  <p><code>fly.make_view</code> 接受一个迭代器(<code>Pointer</code> 或 <code>IntTuple</code>)和一个 layout,将它们组合成一个"视图"----一个带 layout 信息的张量描述符.类型推断规则:</p>
+
+  <ul>
+    <li><code>iter</code> 是 <code>IntTupleType</code> -> 结果是 <code>CoordTensorType</code>(坐标张量)</li>
+    <li><code>iter</code> 是 <code>PointerType</code> -> 结果是 <code>MemRefType</code>(内存引用)</li>
+  </ul>
+
+  <p>关键点:<code>make_view</code> 的所有信息都编码在<strong>类型</strong>中----layout 成为 <code>MemRefType</code> 或 <code>CoordTensorType</code> 的属性,迭代器本身(指针值/坐标值)不变.</p>
+
+  <h4>两条路径</h4>
+
+  <table>
+    <tr><th>结果类型</th><th>Lowering 方式</th><th>原因</th></tr>
+    <tr>
+      <td><code>CoordTensorType</code></td>
+      <td><code>eraseOp</code>(直接删除)</td>
+      <td>CoordTensor 是纯编译期信息,无运行时表示;且结果不应有使用者</td>
+    </tr>
+    <tr>
+      <td><code>MemRefType</code></td>
+      <td><code>replaceOp</code>(透传迭代器)</td>
+      <td>MemRef 的 layout 信息编码在类型中,运行时只需指针值</td>
+    </tr>
+  </table>
+
+  <h4>IR 变换示例 (MemRef 路径)</h4>
+
+  <p>DSL 端典型用法:将 shared memory 指针 + layout 组合成视图,再经 layout 索引 load.在 ROCm pipeline 中,<code>fly-layout-lowering</code> 通常<strong>先于</strong> <code>convert-fly-to-rocdl</code>,会把 <code>fly.memref.load</code> 改写成 <code>fly.ptr.load</code> + <code>fly.add_offset</code> 等;本 Pass 里的 <code>MakeViewOpLowering</code> 只负责消除 <code>fly.make_view</code> 本身:</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言,进入 FlyToROCDL 前)</div>
+      <pre><code>%ptr = fly.make_ptr ...
+  : !fly.pointer&lt;f16, shared&gt;
+%layout = fly.make_layout ...
+  : !fly.layout&lt;(8):(1)&gt;
+%view = fly.make_view %ptr, %layout
+  : !fly.memref&lt;f16, shared,
+      layout=(8):(1)&gt;
+%val = fly.ptr.load %ptr
+  : vector&lt;4xf16&gt;
+; (layout-lowering 通常已将 memref.load 展开为 ptr 路径)</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakeViewOpLowering</div>
+      <pre><code>%ptr = fly.make_ptr ...
+  : !fly.pointer&lt;f16, shared&gt;
+%layout = fly.make_layout ...
+  : !fly.layout&lt;(8):(1)&gt;
+; make_view 被消除,
+; 迭代器 %ptr 直接透传到后续 ptr.load
+%val = fly.ptr.load %ptr
+  : vector&lt;4xf16&gt;</code></pre>
+    </div>
+  </div>
+
+  <h4>IR 变换示例 (CoordTensor 路径)</h4>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%coords = fly.make_int_tuple ...
+  : !fly.int_tuple&lt;128&gt;
+%layout = fly.make_layout ...
+  : !fly.layout&lt;(128):(1)&gt;
+%view = fly.make_view %coords, %layout
+  : !fly.coord_tensor&lt;(128), (128):(1)&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakeViewOpLowering</div>
+      <pre><code>%coords = fly.make_int_tuple ...
+  : !fly.int_tuple&lt;128&gt;
+%layout = fly.make_layout ...
+  : !fly.layout&lt;(128):(1)&gt;
+; make_view 被直接删除
+; (CoordTensor 无运行时表示,
+;  且结果不应有使用者)</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== Section 6 ===================== -->
+<h2 id="s6">6. 内存读写类 Conversion</h2>
+
+<!-- ========== PtrLoadOpLowering ========== -->
+<div class="conv-card" id="conv-ptr-load">
+  <div class="conv-card-title">
+    <span class="conv-num">9</span>
+    PtrLoadOpLowering
+  </div>
+  <div class="conv-op">fly.ptr_load -> applySwizzleOnPtr + llvm.load / RawPtrBufferLoad</div>
+
+  <h4>整体行为:swizzle 在此处真正生效</h4>
+
+  <p>与 <a href="#conv-apply-swizzle">ApplySwizzleOpLowering</a> 和 <a href="#conv-recast-iter">RecastIterOpLowering</a> 的"透传"不同,<code>PtrLoadOpLowering</code> 是 swizzle 元信息<strong>真正产生运行时效果</strong>的地方.指针类型中携带的 <code>SwizzleAttr</code> 在此处被读取,用于变换指针地址或计算 swizzle offset.</p>
+
+  <h4>两条路径:按地址空间分流</h4>
+
+  <p>根据指针的地址空间,<code>PtrLoadOpLowering</code> 走两条完全不同的 lowering 路径:</p>
+
+  <table>
+    <tr><th>地址空间</th><th>Lowering 方式</th><th>Swizzle 处理</th></tr>
+    <tr>
+      <td><code>BufferDesc</code> (全局显存)</td>
+      <td><code>ROCDL::RawPtrBufferLoadOp</code></td>
+      <td>通过 <code>BufferFatPtr::swizzleByteOffset()</code> 计算 swizzle 后的 byte offset,作为 buffer load 的参数</td>
+    </tr>
+    <tr>
+      <td>其他 (shared memory 等)</td>
+      <td><code>LLVM::LoadOp</code></td>
+      <td>通过 <code>applySwizzleOnPtr()</code> 对指针地址做 XOR 变换后再 load</td>
+    </tr>
+  </table>
+
+  <h4>路径 1:BufferDesc -> RawPtrBufferLoad</h4>
+
+  <p>BufferDesc 地址空间对应 AMD GPU 的 <strong>Buffer Resource</strong> 机制.指针被表示为一个 <code>BufferFatPtr</code> 结构体,包含:</p>
+  <ul>
+    <li><code>bufferRsrc</code>:4 个 32 位寄存器组成的 buffer 描述符(地址空间 8)</li>
+    <li><code>valOffset</code>:32 位偏移量(元素为单位)</li>
+  </ul>
+
+  <p><code>BufferFatPtr::swizzleByteOffset()</code> 将偏移量转为字节数后,对其应用 XOR swizzle 计算,结果传给 <code>RawPtrBufferLoadOp</code> 的 swizzle offset 参数.硬件在执行 buffer load 时会根据此 offset 做 swizzle 地址变换.</p>
+
+  <h4>路径 2:其他地址空间 -> applySwizzleOnPtr + LLVM Load</h4>
+
+  <p>对于 shared memory 等地址空间,swizzle 通过软件实现:<code>applySwizzleOnPtr()</code> 对指针地址做 XOR 变换:</p>
+
+<pre><code>// applySwizzleOnPtr 的核心逻辑:
+ptrInt  = ptr_to_int(ptr)
+mask    = ((1 &lt;&lt; mask_bits) - 1) &lt;&lt; (base + shift)
+masked  = ptrInt &amp; mask
+shifted = masked &gt;&gt; shift
+swizzled = ptrInt ^ shifted          // XOR swizzle
+result  = int_to_ptr(swizzled)</code></pre>
+
+  <p>变换后的指针直接传给 <code>llvm.load</code>.如果 swizzle 是 trivial(mask==0),则 <code>applySwizzleOnPtr</code> 直接返回原指针,不做任何变换.</p>
+
+  <h4>Swizzle 粒度合法性校验</h4>
+
+  <p>在 lowering 之前,代码会校验向量 load 的字节大小与 swizzle base 粒度的关系:</p>
+
+<pre><code>int64_t vecBytes = vecTy.getNumElements()
+                  * vecTy.getElementType().getIntOrFloatBitWidth() / 8;
+int64_t baseBytes = 1 &lt;&lt; swizzle.getBase();
+if (baseBytes % vecBytes != 0)
+  return matchFailure;</code></pre>
+
+  <p><code>SwizzleAttr</code> 有三个参数:<code>mask</code>,<code>base</code>,<code>shift</code>.其中 <code>base</code> 定义了 swizzle 的最小粒度----<code>baseBytes = 1 &lt;&lt; base</code> 表示 swizzle 以 <code>baseBytes</code> 字节为最小交换单位,在比这更小的粒度上地址不会被 swizzle 打乱.</p>
+
+  <p>校验要求 <code>baseBytes % vecBytes == 0</code>,即 <strong>swizzle 粒度必须是向量 load 大小的整数倍</strong>.如果向量 load 大小不能整除 swizzle 粒度,load 可能跨越两个被 swizzle 打乱的区域,读取结果不可预测.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">合法:baseBytes=16, vecBytes=4</div>
+      <pre><code>swizzle 粒度: |---16B---|---16B---|
+向量 load:    |-4B-|
+16 % 4 == 0 OK
+load 不会跨越 swizzle 边界</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title before" style="color:var(--red);">非法:baseBytes=16, vecBytes=24</div>
+      <pre><code>swizzle 粒度: |---16B---|---16B---|
+向量 load:    |------24B------|
+16 % 24 != 0 NG
+load 跨越 swizzle 边界,
+数据被部分打乱!</code></pre>
+    </div>
+  </div>
+
+  <h4>IR 变换示例 (shared memory 路径)</h4>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.make_ptr ...
+  : !fly.pointer&lt;f16, shared,
+      swizzle=S&lt;2,4,0&gt;&gt;
+%val = fly.ptr_load %ptr
+  : vector&lt;8xf16&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After PtrLoadOpLowering</div>
+      <pre><code>; 1. applySwizzleOnPtr:
+%ptr_i64 = llvm.ptrtoint %ptr : i64
+%mask = arith.constant 0x3F0 : i64
+%masked = arith.andi %ptr_i64, %mask
+%shifted = arith.shrui %masked, 0
+%swizzled = arith.xori %ptr_i64, %shifted
+%swizzled_ptr = llvm.inttoptr %swizzled
+    : !llvm.ptr&lt;3&gt;
+
+; 2. llvm.load:
+%val = llvm.load %swizzled_ptr
+    : vector&lt;8xf16&gt;</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== PtrStoreOpLowering ========== -->
+<div class="conv-card" id="conv-ptr-store">
+  <div class="conv-card-title">
+    <span class="conv-num">10</span>
+    PtrStoreOpLowering
+  </div>
+  <div class="conv-op">fly.ptr_store -> applySwizzleOnPtr + llvm.store / RawPtrBufferStore</div>
+
+  <h4>行为:与 PtrLoadOpLowering 完全对称</h4>
+
+  <p><code>PtrStoreOpLowering</code> 的逻辑与 <a href="#conv-ptr-load">PtrLoadOpLowering</a> 完全对称,只是将 load 换成 store:</p>
+
+  <table>
+    <tr><th>地址空间</th><th>Lowering 方式</th><th>Swizzle 处理</th></tr>
+    <tr>
+      <td><code>BufferDesc</code></td>
+      <td><code>ROCDL::RawPtrBufferStoreOp</code></td>
+      <td><code>BufferFatPtr::swizzleByteOffset()</code></td>
+    </tr>
+    <tr>
+      <td>其他</td>
+      <td><code>LLVM::StoreOp</code></td>
+      <td><code>applySwizzleOnPtr()</code> XOR 变换</td>
+    </tr>
+  </table>
+
+  <p>swizzle 粒度校验逻辑也完全相同----向量 store 的字节大小必须整除 swizzle base 粒度.</p>
+
+  <h4>与 PtrLoadOpLowering 的差异</h4>
+
+  <ul>
+    <li><strong>Op 消除方式</strong>:Load 使用 <code>replaceOp</code>(用 loaded value 替换),Store 使用 <code>eraseOp</code>(store 无返回值,直接删除).</li>
+    <li><strong>操作数顺序</strong>:Store 多一个 <code>value</code> 操作数,作为写入数据传给 <code>RawPtrBufferStoreOp</code> 或 <code>LLVM::StoreOp</code>.</li>
+  </ul>
+
+  <h4>IR 变换示例 (shared memory 路径)</h4>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%ptr = fly.make_ptr ...
+  : !fly.pointer&lt;f16, shared,
+      swizzle=S&lt;2,4,0&gt;&gt;
+fly.ptr_store %val, %ptr
+  : vector&lt;8xf16&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After PtrStoreOpLowering</div>
+      <pre><code>; 1. applySwizzleOnPtr:
+%swizzled_ptr = ... (同 PtrLoad)
+
+; 2. llvm.store:
+llvm.store %val, %swizzled_ptr
+  : vector&lt;8xf16&gt;, !llvm.ptr&lt;3&gt;</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== Section 7 ===================== -->
+<h2 id="s7">7. Copy/MMA Atom 构造类 Conversion</h2>
+
+<!-- ========== MakeCopyAtomOpLowering ========== -->
+<div class="conv-card" id="conv-make-copy-atom">
+  <div class="conv-card-title">
+    <span class="conv-num">11</span>
+    MakeCopyAtomOpLowering
+  </div>
+  <div class="conv-op">fly.make_copy_atom -> stateful 默认状态 / llvm.undef</div>
+
+  <h4>MakeCopyAtomOp 定义</h4>
+<pre><code>def Fly_MakeCopyAtomOp : Fly_Op&lt;"make_copy_atom", [Pure]&gt; {
+  let arguments = (ins I32Attr:$valBits);
+  let results = (outs Fly_CopyAtom:$result);
+  let assemblyFormat = "attr-dict `:` qualified(type($result))";
+}</code></pre>
+
+  <p>TableGen 只列出显式属性 <code>valBits</code>;完整的 <code>!fly.copy_atom&lt;copyOp, valBits&gt;</code> 由 assembly 的 <code>qualified(type($result))</code> 携带(与 Python <code>make_copy_atom(copy_op, elem_type)</code> 的两参数对应).例如:</p>
+
+<pre><code>%atom = fly.make_copy_atom {valBits = 32 : i32}
+  : !fly.copy_atom&lt;!fly.universal_copy&lt;32&gt;, 32&gt;</code></pre>
+
+  <p><code>fly.make_copy_atom</code> 构造一个 CopyAtom----数据搬运的最小执行单元描述符.CopyAtom 的信息全部编码在类型中(如搬运指令、vector 宽度等),运行时可能需要也可能不需要状态数据.</p>
+
+  <h4>两条路径</h4>
+
+  <table>
+    <tr><th>条件</th><th>Lowering 方式</th><th>说明</th></tr>
+    <tr>
+      <td>CopyAtom 的 copyOp 实现了 <code>StatefulOpTypeInterface</code></td>
+      <td><code>getDefaultState()</code></td>
+      <td>有状态:需要运行时数据(如 buffer 描述符),调用 copyOp 的默认状态构造</td>
+    </tr>
+    <tr>
+      <td>CopyAtom 的 copyOp 未实现该接口</td>
+      <td><code>llvm.undef</code></td>
+      <td>无状态:所有信息在类型中,运行时不需要数据,生成空结构体</td>
+    </tr>
+  </table>
+
+  <p>结果类型由 <a href="#s2"><code>FlyTypeConverter</code></a> 决定:stateful -> 运行时状态结构体,non-stateful -> 空结构体 <code>!llvm.struct&lt;&gt;</code>.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>; 无状态 CopyAtom:
+%atom = fly.make_copy_atom {valBits = 32 : i32}
+  : !fly.copy_atom&lt;!fly.universal_copy&lt;32&gt;, 32&gt;
+
+; 有状态 CopyAtom:
+%atom = fly.make_copy_atom {valBits = 32 : i32}
+  : !fly.copy_atom&lt;!fly_rocdl.cdna3.buffer_copy&lt;...&gt;, 32&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakeCopyAtomOpLowering</div>
+      <pre><code>; 无状态 -&gt; llvm.undef:
+%atom = llvm.undef : !llvm.struct&lt;&gt;
+
+; 有状态 -&gt; 默认状态:
+%atom = ... : !llvm.struct&lt;...&gt;
+  ; (由 copyOp.getDefaultState 生成)</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== MakeMmaAtomOpLowering ========== -->
+<div class="conv-card" id="conv-make-mma-atom">
+  <div class="conv-card-title">
+    <span class="conv-num">12</span>
+    MakeMmaAtomOpLowering
+  </div>
+  <div class="conv-op">fly.make_mma_atom -> stateful 默认状态 / llvm.undef</div>
+
+  <h4>MakeMmaAtomOp 定义</h4>
+<pre><code>def Fly_MakeMmaAtomOp : Fly_Op&lt;"make_mma_atom", [Pure]&gt; {
+  let arguments = (ins);
+  let results = (outs Fly_MmaAtom:$result);
+}</code></pre>
+
+  <p>逻辑与 <a href="#conv-make-copy-atom">MakeCopyAtomOpLowering</a> 完全对称,只是操作对象从 CopyAtom 变为 MmaAtom----矩阵乘法的最小执行单元描述符.</p>
+
+  <table>
+    <tr><th>条件</th><th>Lowering 方式</th></tr>
+    <tr>
+      <td>MmaAtom 的 mmaOp 实现了 <code>StatefulOpTypeInterface</code></td>
+      <td><code>getDefaultState()</code></td>
+    </tr>
+    <tr>
+      <td>未实现该接口</td>
+      <td><code>llvm.undef</code></td>
+    </tr>
+  </table>
+</div>
+
+<!-- ========== MakeTiledCopyOpLowering ========== -->
+<div class="conv-card" id="conv-make-tiled-copy">
+  <div class="conv-card-title">
+    <span class="conv-num">13</span>
+    MakeTiledCopyOpLowering
+  </div>
+  <div class="conv-op">fly.make_tiled_copy -> 透传 copyAtom</div>
+
+  <h4>MakeTiledCopyOp 定义</h4>
+<pre><code>def Fly_MakeTiledCopyOp : Fly_Op&lt;"make_tiled_copy", [Pure, ...]&gt; {
+  let arguments = (ins Fly_CopyAtom:$copyAtom,
+                       Fly_Layout:$layoutThrVal,
+                       Fly_Tile:$tileMN);
+  let results = (outs Fly_TiledCopy:$result);
+}</code></pre>
+
+  <p><code>fly.make_tiled_copy</code> 将 CopyAtom + layout + tile 组合成 TiledCopy----一个完整的分块搬运描述符.与 <a href="#conv-make-view">MakeViewOpLowering</a> 类似,layout 和 tile 信息全部编码在 <code>TiledCopyType</code> 中,运行时只需要 CopyAtom 的值.</p>
+
+  <p>Lowering 极其简单:直接透传 <code>copyAtom</code> 操作数.因为 <a href="#s2"><code>FlyTypeConverter</code></a> 将 <code>TiledCopyType</code> 转换为 <code>convertType(copyAtom)</code>,即 TiledCopy 的运行时表示就是其内部 CopyAtom 的运行时表示.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%tiled = fly.make_tiled_copy(%atom, %layout, %tile)
+  : (!fly.copy_atom&lt;...&gt;, !fly.layout&lt;...&gt;, !fly.tile&lt;...&gt;)
+  -&gt; !fly.tiled_copy&lt;...&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakeTiledCopyOpLowering</div>
+      <pre><code>; make_tiled_copy 消除,
+; %atom 直接透传
+; TiledCopyType -&gt; CopyAtom 的转换后类型</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== MakeTiledMmaOpLowering ========== -->
+<div class="conv-card" id="conv-make-tiled-mma">
+  <div class="conv-card-title">
+    <span class="conv-num">14</span>
+    MakeTiledMmaOpLowering
+  </div>
+  <div class="conv-op">fly.make_tiled_mma -> 透传 mmaAtom</div>
+
+  <h4>MakeTiledMmaOp 定义</h4>
+<pre><code>def Fly_MakeTiledMmaOp : Fly_Op&lt;"make_tiled_mma", [Pure, ...]&gt; {
+  let arguments = (ins AnyType:$mmaAtom,
+                       Fly_Layout:$atomLayout,
+                       Optional&lt;Fly_Tile&gt;:$permutation);
+  let results = (outs Fly_TiledMma:$result);
+}</code></pre>
+
+  <p>逻辑与 <a href="#conv-make-tiled-copy">MakeTiledCopyOpLowering</a> 完全对称:将 MmaAtom + layout + 可选 permutation 组合成 TiledMma,运行时只需 MmaAtom 的值,直接透传 <code>mmaAtom</code> 操作数.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%tiled = fly.make_tiled_mma(%atom, %layout)
+  : (!fly.mma_atom&lt;...&gt;, !fly.layout&lt;...&gt;)
+  -&gt; !fly.tiled_mma&lt;...&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MakeTiledMmaOpLowering</div>
+      <pre><code>; make_tiled_mma 消除,
+; %atom 直接透传
+; TiledMmaType -&gt; MmaAtom 的转换后类型</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== Section 8 ===================== -->
+<h2 id="s8">8. Atom 状态与调用类 Conversion</h2>
+
+<!-- ========== AtomSetValueOpLowering ========== -->
+<div class="conv-card" id="conv-atom-set-value">
+  <div class="conv-card-title">
+    <span class="conv-num">15</span>
+    AtomSetValueOpLowering
+  </div>
+  <div class="conv-op">fly.atom.set_value -> llvm.insertvalue</div>
+
+  <h4>AtomSetValueOp 定义</h4>
+<pre><code>def Fly_AtomSetValueOp : Fly_Op&lt;"atom.set_value", [Pure, ...]&gt; {
+  let arguments = (ins AnyType:$atom, StrAttr:$field, AnyType:$value);
+  let results = (outs AnyType:$result);
+}</code></pre>
+
+  <p>设置 Atom(CopyAtom 或 MmaAtom)结构体中某个字段的值.只有 <strong>stateful</strong> 的 Atom 才有运行时状态可以设置,non-stateful 的 Atom 会匹配失败.</p>
+
+  <p>Lowering 调用 <code>setAtomState()</code> 方法,该方法根据 Atom 类型和字段名生成对应的 <code>llvm.insertvalue</code> 操作,将新值插入结构体的对应位置.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%atom2 = fly.atom.set_value(%atom, "base", %newBase)
+  : (!fly.copy_atom&lt;..., buffer_load&gt;, i64)
+  -&gt; !fly.copy_atom&lt;..., buffer_load&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After AtomSetValueOpLowering</div>
+      <pre><code>%atom2 = llvm.insertvalue %newBase, 0
+  : !llvm.struct&lt;{i64, ...}&gt;</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ========== CopyAtomCallLowering ========== -->
+<div class="conv-card" id="conv-copy-atom-call">
+  <div class="conv-card-title">
+    <span class="conv-num">16</span>
+    CopyAtomCallLowering
+  </div>
+  <div class="conv-op">fly.copy_atom_call -> 实际搬运指令(由 CopyAtomType.emitAtomCall 生成)</div>
+
+  <h4>CopyAtomCall 定义</h4>
+<pre><code>def Fly_CopyAtomCall : Fly_Op&lt;"copy_atom_call"&gt; {
+  let arguments = (ins Fly_CopyAtom:$copyAtom,
+                       Fly_MemRef:$src, Fly_MemRef:$dst,
+                       Optional&lt;Fly_MemRef&gt;:$pred);
+}</code></pre>
+
+  <p>执行数据搬运操作.CopyAtom 的类型信息决定了具体的搬运方式(如 <code>buffer_load</code>、<code>ds_read</code>、<code>flat_load</code> 等),src/dst 是源和目标的 MemRef,pred 是可选的条件掩码.</p>
+
+  <h4>Lowering 逻辑</h4>
+
+  <p>Lowering 委托给 <code>CopyAtomType::emitAtomCall()</code>,该方法根据 CopyAtom 的具体类型生成对应的底层指令:</p>
+
+  <ul>
+    <li>验证 src/dst 的元素类型一致</li>
+    <li>从原始 op 获取 src/dst/pred 的 <code>fly::MemRefType</code>(用于确定地址空间、layout 等)</li>
+    <li>调用 <code>emitAtomCall()</code> 生成实际的 load/store 或 intrinsic 指令</li>
+    <li>原 op 被删除(无返回值)</li>
+  </ul>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>fly.copy_atom_call %atom, %src, %dst
+  : !fly.copy_atom&lt;..., buffer_load&gt;, ...</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After CopyAtomCallLowering</div>
+      <pre><code>; 由 emitAtomCall 生成的实际指令,
+; 例如 buffer_load + buffer_store:
+%val = rocdl.buffer.load %rsrc, %idx ...
+rocdl.buffer.store %val, %rsrc, %idx ...</code></pre>
+    </div>
+  </div>
+  <p class="note" style="border-left:4px solid var(--orange);padding:0.5rem 0.75rem;font-size:0.9rem;"><strong>示意 IR</strong>:具体指令由 <code>fly_rocdl</code> 中 CopyOp 的 <code>emitAtomCall</code> 决定(可能是 buffer intrinsic、LDS load/store、<code>llvm.memcpy</code> 等),上例仅为一种可能形态.</p>
+</div>
+
+<!-- ========== CopyAtomCallSSALowering ========== -->
+<div class="conv-card" id="conv-copy-atom-call-ssa">
+  <div class="conv-card-title">
+    <span class="conv-num">17</span>
+    CopyAtomCallSSALowering
+  </div>
+  <div class="conv-op">fly.copy_atom_call_ssa -> 实际搬运指令(返回 SSA 值)</div>
+
+  <h4>CopyAtomCallSSA 定义</h4>
+<pre><code>def Fly_CopyAtomCallSSA : Fly_Op&lt;"copy_atom_call_ssa", [AttrSizedOperandSegments]&gt; {
+  let arguments = (ins Fly_CopyAtom:$copyAtom, AnyType:$src,
+                       Optional&lt;AnyType&gt;:$dst, Optional&lt;AnyType&gt;:$pred);
+  let results = (outs Variadic&lt;AnyType&gt;:$results);
+}</code></pre>
+
+  <p>与 <a href="#conv-copy-atom-call">CopyAtomCallLowering</a> 的区别在于:SSA 版本的 src/dst 不是 MemRef(指针),而是 SSA 值(如 vector),且搬运结果以 SSA 值返回而非直接写入内存.</p>
+
+  <p>Lowering 委托给 <code>CopyAtomType::emitAtomCallSSA()</code>.如果有返回值则 <code>replaceOp</code>,否则 <code>eraseOp</code>.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%result = fly.copy_atom_call_ssa %atom, %src_vec
+  : (!fly.copy_atom&lt;...&gt;, vector&lt;4xf16&gt;)
+  -&gt; vector&lt;4xf16&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After CopyAtomCallSSALowering</div>
+      <pre><code>; 由 emitAtomCallSSA 生成,
+; 例如 intrinsic load 返回 vector:
+%result = rocdl.global.load.tr.b128
+  %rsrc, %offset ... : vector&lt;4xf16&gt;</code></pre>
+    </div>
+  </div>
+  <p class="note" style="border-left:4px solid var(--orange);padding:0.5rem 0.75rem;font-size:0.9rem;"><strong>示意 IR</strong>:SSA 路径的实际 intrinsic 名与 operand 布局因 CopyOp 类型而异.</p>
+</div>
+<div class="conv-card" id="conv-mma-atom-call">
+  <div class="conv-card-title">
+    <span class="conv-num">18</span>
+    MmaAtomCallLowering
+  </div>
+  <div class="conv-op">fly.mma_atom_call -> MFMA intrinsic(由 MmaAtomType.emitAtomCall 生成)</div>
+
+  <h4>MmaAtomCall 定义</h4>
+<pre><code>def Fly_MmaAtomCall : Fly_Op&lt;"mma_atom_call"&gt; {
+  let arguments = (ins Fly_MmaAtom:$mmaAtom,
+                       Fly_MemRef:$d, Fly_MemRef:$a,
+                       Fly_MemRef:$b, Fly_MemRef:$c);
+}</code></pre>
+
+  <p>执行矩阵乘法操作.d/a/b/c 分别是累加器、A 矩阵、B 矩阵、C 矩阵的 MemRef 指针.与 CopyAtomCall 类似,Lowering 委托给 <code>MmaAtomType::emitAtomCall()</code>,根据 MmaAtom 的具体类型生成对应的 MFMA intrinsic.</p>
+
+  <p>验证步骤:确认 d/a/b/c 经过类型转换后都是 <code>llvm.ptr</code> 类型,且原始 op 中都是 <code>fly::MemRefType</code>.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>fly.mma_atom_call %atom, %d, %a, %b, %c
+  : !fly.mma_atom&lt;..., mfma_f32_16x16x16f16&gt;, ...</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MmaAtomCallLowering</div>
+      <pre><code>; 由 emitAtomCall 生成的 MFMA intrinsic:
+%d_val = llvm.load %d : !llvm.ptr&lt;5&gt;
+%a_val = llvm.load %a : !llvm.ptr&lt;5&gt;
+%b_val = llvm.load %b : !llvm.ptr&lt;5&gt;
+%c_val = llvm.load %c : !llvm.ptr&lt;5&gt;
+%acc = rocdl.mfma.f32.16x16x16f16
+  %a_val, %b_val, %c_val
+llvm.store %acc, %d : !llvm.ptr&lt;5&gt;</code></pre>
+    </div>
+  </div>
+  <p class="note" style="border-left:4px solid var(--orange);padding:0.5rem 0.75rem;font-size:0.9rem;"><strong>示意 IR</strong>:MemRef 路径的 <code>emitAtomCall</code> 可能直接生成 MFMA intrinsic,也可能先 load 再 MFMA 再 store,取决于 MmaOp 实现.</p>
+</div>
+<div class="conv-card" id="conv-mma-atom-call-ssa">
+  <div class="conv-card-title">
+    <span class="conv-num">19</span>
+    MmaAtomCallSSALowering
+  </div>
+  <div class="conv-op">fly.mma_atom_call_ssa -> MFMA intrinsic(返回 SSA 值)</div>
+
+  <h4>MmaAtomCallSSA 定义</h4>
+<pre><code>def Fly_MmaAtomCallSSA : Fly_Op&lt;"mma_atom_call_ssa"&gt; {
+  let arguments = (ins Fly_MmaAtom:$mmaAtom,
+                       Optional&lt;AnyType&gt;:$d,
+                       AnyType:$a, AnyType:$b, AnyType:$c);
+  let results = (outs Variadic&lt;AnyType&gt;:$results);
+}</code></pre>
+
+  <p>与 <a href="#conv-mma-atom-call">MmaAtomCallLowering</a> 的区别在于:SSA 版本的 a/b/c 是 SSA 值(如 vector),d 可以是指针(SSA 值形式)或省略,结果以 SSA 值返回.</p>
+
+  <p>Lowering 委托给 <code>MmaAtomType::emitAtomCallSSA()</code>.如果有返回值则 <code>replaceOp</code>,否则 <code>eraseOp</code>.</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%acc = fly.mma_atom_call_ssa %atom, %a, %b, %c
+  : (!fly.mma_atom&lt;..., mfma_f32_16x16x16f16&gt;,
+     vector&lt;4xf16&gt;, vector&lt;4xf16&gt;, vector&lt;4xf32&gt;)
+  -&gt; vector&lt;4xf32&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After MmaAtomCallSSALowering</div>
+      <pre><code>; 由 emitAtomCallSSA 生成:
+%acc = rocdl.mfma.f32.16x16x16f16
+  %a, %b, %c : vector&lt;4xf32&gt;</code></pre>
+    </div>
+  </div>
+  <p class="note" style="border-left:4px solid var(--orange);padding:0.5rem 0.75rem;font-size:0.9rem;"><strong>示意 IR</strong>:SSA MFMA 的 intrinsic 名与 accumulator 布局由具体 MmaOp 类型决定.</p>
+</div>
+<h2 id="s9">9. GPU 运行时与辅助类 Conversion</h2>
+
+<!-- ========== GpuLaunchFuncOpLowering ========== -->
+<div class="conv-card" id="conv-gpu-launch-func">
+  <div class="conv-card-title">
+    <span class="conv-num">20</span>
+    GpuLaunchFuncOpLowering
+  </div>
+  <div class="conv-op">gpu.launch_func -> gpu.launch_func(操作数类型已转换)</div>
+
+  <h4>问题:host 端与 kernel 端类型不匹配</h4>
+
+  <p><code>gpu.launch_func</code> 是 host 端调用 GPU kernel 的 op,不属于 Fly 方言.但它的 <code>kernel_operands</code> 可能仍然是 Fly DSL 类型(如 <code>!fly.pointer</code>),而 kernel 内部经过 FlyToROCDL 转换后参数类型已变为 LLVM 类型(如 <code>BufferFatPtr</code>),导致类型不匹配:</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (类型不匹配)</div>
+      <pre><code>; kernel 内部(已转换):
+gpu.func @my_kernel(
+  %arg0: {!llvm.ptr&lt;8&gt;, i32}  &lt;- 期望 BufferFatPtr
+)
+
+; host 端(未转换):
+gpu.launch_func @my_kernel
+  kernel_operands(
+    %buf : !fly.pointer&lt;f32, buffer_desc&gt;  &lt;- 传的 Fly 类型
+  )</code></pre>
+    </div>
+  </div>
+
+  <h4>解决:用已转换的操作数重建 op</h4>
+
+  <p><code>GpuLaunchFuncOpLowering</code> 用 <code>adaptor</code>(已由 <a href="#s2"><code>FlyTypeConverter</code></a> 转换过的操作数)重建 <code>gpu.launch_func</code>,使 host 端操作数类型与 kernel 内部一致:</p>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>gpu.launch_func @my_kernel
+  kernel_operands(
+    %buf : !fly.pointer&lt;f32, buffer_desc&gt;
+  )
+  grid_size(%gx, %gy, %gz)
+  block_size(%bx, %by, %bz)</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After GpuLaunchFuncOpLowering</div>
+      <pre><code>gpu.launch_func @my_kernel
+  kernel_operands(
+    %buf : {!llvm.ptr&lt;8&gt;, i32}  &lt;- 类型已对齐
+  )
+  grid_size(%gx, %gy, %gz)
+  block_size(%bx, %by, %bz)</code></pre>
+    </div>
+  </div>
+
+  <h4>关键说明</h4>
+
+  <ul>
+    <li><strong>op 逻辑不变</strong>:grid/block 大小、kernel 引用、动态共享内存大小等全部保留,唯一变化是操作数类型</li>
+    <li><strong>类型转换由 <a href="#s2">FlyTypeConverter</a> 统一完成</strong>:本 Lowering 只是消费转换后的结果,本身不做类型转换;具体类型映射规则见<a href="#s2">第 2 节</a></li>
+    <li><strong>异步语义处理</strong>:支持两种异步模式----<code>asyncObject</code> 和 <code>asyncTokenType + asyncDependencies</code>,二者互斥</li>
+    <li><strong>cluster 大小</strong>:如果原始 op 有 cluster 维度信息,也会保留到新 op 中</li>
+  </ul>
+</div>
+
+<!-- ========== ExtractAlignedPointerAsIndexLowering ========== -->
+<div class="conv-card" id="conv-extract-aligned-ptr">
+  <div class="conv-card-title">
+    <span class="conv-num">21</span>
+    ExtractAlignedPointerAsIndexLowering
+  </div>
+  <div class="conv-op">fly.extract_aligned_pointer_as_index -> llvm.addrspacecast / 透传</div>
+
+  <p><em>注:源码中该 pattern 带有 <code>// TODO: deprecated in the future</code> 标记,后续可能移除.</em></p>
+
+  <h4>ExtractAlignedPointerAsIndexOp 定义</h4>
+<pre><code>def Fly_ExtractAlignedPointerAsIndexOp
+  : Fly_Op&lt;"extract_aligned_pointer_as_index", [Pure]&gt; {
+  let arguments = (ins Fly_MemRef:$source);
+  let results = (outs AnyType:$result);
+}</code></pre>
+
+  <p>从 <code>fly.memref</code> 中提取底层裸指针.在 Fly DSL 中,<code>MemRef</code> 是带 layout/swizzle 等元信息的复合类型,但某些场景(如构造 Buffer Resource)需要拿到原始指针值.</p>
+
+  <h4>Lowering 逻辑</h4>
+
+  <p>经过 <a href="#s2"><code>FlyTypeConverter</code></a> 转换后,<code>fly.memref</code> 已变为 <code>!llvm.ptr&lt;AS&gt;</code> 裸指针.因此提取操作本身很简单----源操作数已经是裸指针了.唯一需要处理的是<strong>地址空间不匹配</strong>:</p>
+
+  <ul>
+    <li>源指针的地址空间与结果类型期望的地址空间<strong>相同</strong> -> 直接透传</li>
+    <li>地址空间<strong>不同</strong> -> 插入 <code>llvm.addrspacecast</code> 进行地址空间转换</li>
+  </ul>
+
+  <div class="ir-before-after">
+    <div class="ir-box">
+      <div class="ir-box-title before">Before (Fly 方言)</div>
+      <pre><code>%base = fly.extract_aligned_pointer_as_index %memref
+  : !fly.memref&lt;f16, shared&gt; -&gt; !llvm.ptr&lt;0&gt;</code></pre>
+    </div>
+    <div class="ir-box">
+      <div class="ir-box-title after">After ExtractAlignedPointerAsIndexLowering</div>
+      <pre><code>; memref 已被 FlyTypeConverter 转为 llvm.ptr&lt;3&gt;
+; 结果期望 llvm.ptr&lt;0&gt;,地址空间不同
+; -&gt; 插入 addrspacecast:
+%base = llvm.addrspacecast %memref
+  : !llvm.ptr&lt;3&gt; to !llvm.ptr&lt;0&gt;</code></pre>
+    </div>
+  </div>
+
+  <h4>典型使用场景</h4>
+
+  <p>在构造 AMD GPU Buffer Resource 时,需要将 shared memory 或 global memory 的指针提取出来作为 base 地址传入 <code>rocdl.make.buffer.rsrc</code>.此时需要从 <code>fly.memref</code> 中提取裸指针,并可能需要转换到通用地址空间(AS=0).</p>
+</div>
+
+</div>
