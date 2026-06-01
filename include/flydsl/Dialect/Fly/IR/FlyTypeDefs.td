@@ -81,6 +81,19 @@ def Fly_Swizzle : Fly_Type<"Swizzle", "swizzle", [
   ];
 }
 
+def Fly_ModSwizzle : Fly_Type<"ModSwizzle", "mod_swizzle", [
+    DeclareTypeInterfaceMethods<Fly_MayStaticTypeInterface>
+]> {
+  let parameters = (ins Fly_ModSwizzleAttr:$attr);
+  let assemblyFormat = "`<` $attr `>`";
+
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "ModSwizzleAttr":$attr), [{
+      return $_get(attr.getContext(), attr);
+    }]>
+  ];
+}
+
 def Fly_CoordSwizzle : Fly_Type<"CoordSwizzle", "coord_swizzle", [
     DeclareTypeInterfaceMethods<Fly_MayStaticTypeInterface>
 ]> {

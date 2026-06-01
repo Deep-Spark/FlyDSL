@@ -13,6 +13,7 @@ namespace mlir::fly {
 bool BasisType::isStatic() const { return getAttr().isStatic(); }
 bool IntTupleType::isStatic() const { return getAttr().isStatic(); }
 bool SwizzleType::isStatic() const { return true; }
+bool ModSwizzleType::isStatic() const { return true; }
 bool CoordSwizzleType::isStatic() const { return true; }
 bool LayoutType::isStatic() const { return getAttr().isStatic(); }
 bool ComposedLayoutType::isStatic() const { return getAttr().isStatic(); }
@@ -50,6 +51,13 @@ Value SwizzleType::rebuildStaticValue(OpBuilder &builder, Location loc, Value cu
   return StaticOp::create(builder, loc, *this);
 }
 
+Value ModSwizzleType::rebuildStaticValue(OpBuilder &builder, Location loc,
+                                         Value currentValue) const {
+  if (currentValue)
+    return nullptr;
+  return StaticOp::create(builder, loc, *this);
+}
+
 Value CoordSwizzleType::rebuildStaticValue(OpBuilder &builder, Location loc,
                                            Value currentValue) const {
   if (currentValue)
@@ -70,6 +78,8 @@ Value ComposedLayoutType::rebuildStaticValue(OpBuilder &builder, Location loc,
     inner = ComposedLayoutType::get(composedAttr).rebuildStaticValue(builder, loc, nullptr);
   else if (auto swizzleAttr = dyn_cast<SwizzleAttr>(innerAttr))
     inner = SwizzleType::get(swizzleAttr).rebuildStaticValue(builder, loc, nullptr);
+  else if (auto modSwizzleAttr = dyn_cast<ModSwizzleAttr>(innerAttr))
+    inner = ModSwizzleType::get(modSwizzleAttr).rebuildStaticValue(builder, loc, nullptr);
   else if (auto coordSwizzleAttr = dyn_cast<CoordSwizzleAttr>(innerAttr))
     inner = CoordSwizzleType::get(coordSwizzleAttr).rebuildStaticValue(builder, loc, nullptr);
   if (!inner)
@@ -436,17 +446,17 @@ Attribute CopyAtomType::getThrLayout() {
 Attribute CopyAtomType::getThrValLayoutSrc() {
   auto copyOp = cast<CopyOpTypeInterface>(getCopyOp());
   LayoutBuilder<LayoutAttr> builder(getContext());
-  return layoutRecast(builder, cast<LayoutAttr>(copyOp.getThrBitLayoutSrc()), 1, getValBits());
+  return layoutRecast(builder, copyOp.getThrBitLayoutSrc(), 1, getValBits());
 }
 Attribute CopyAtomType::getThrValLayoutDst() {
   auto copyOp = cast<CopyOpTypeInterface>(getCopyOp());
   LayoutBuilder<LayoutAttr> builder(getContext());
-  return layoutRecast(builder, cast<LayoutAttr>(copyOp.getThrBitLayoutDst()), 1, getValBits());
+  return layoutRecast(builder, copyOp.getThrBitLayoutDst(), 1, getValBits());
 }
 Attribute CopyAtomType::getThrValLayoutRef() {
   auto copyOp = cast<CopyOpTypeInterface>(getCopyOp());
   LayoutBuilder<LayoutAttr> builder(getContext());
-  return layoutRecast(builder, cast<LayoutAttr>(copyOp.getThrBitLayoutRef()), 1, getValBits());
+  return layoutRecast(builder, copyOp.getThrBitLayoutRef(), 1, getValBits());
 }
 
 LogicalResult CopyAtomType::emitAtomCall(OpBuilder &builder, Location loc, Type copyAtomTy,

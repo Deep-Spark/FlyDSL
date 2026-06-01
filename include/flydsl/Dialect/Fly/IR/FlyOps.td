@@ -80,7 +80,7 @@ def Fly_MakeOrderedLayoutOp : Fly_Op<"make_ordered_layout", [Pure, DeclareOpInte
 }
 
 def Fly_MakeComposedLayoutOp : Fly_Op<"make_composed_layout", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
-  let arguments = (ins AnyTypeOf<[Fly_Layout, Fly_Swizzle, Fly_CoordSwizzle, Fly_ComposedLayout]>:$inner,
+  let arguments = (ins AnyTypeOf<[Fly_Layout, Fly_Swizzle, Fly_ModSwizzle, Fly_CoordSwizzle, Fly_ComposedLayout]>:$inner,
                        Fly_IntTuple:$offset,
                        Fly_NarrowLayoutType:$outer);
   let results = (outs Fly_ComposedLayout:$result);

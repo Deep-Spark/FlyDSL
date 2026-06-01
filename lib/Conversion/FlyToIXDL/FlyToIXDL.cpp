@@ -22,6 +22,7 @@
 #include "flydsl/Dialect/Fly/Utils/LayoutUtils.h"
 #include "flydsl/Dialect/Fly/Utils/PointerUtils.h"
 #include "flydsl/Dialect/FlyIXDL/IR/Dialect.h"
+#include "flydsl/Dialect/FlyIXDL/Utils/SmeGmemFatPtr.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_FLYTOIXDLCONVERSIONPASS
@@ -51,7 +52,9 @@ unsigned mapToLLVMAddressSpace(AddressSpace addrSpace) {
 unsigned mapAttrToLLVMAddressSpace(Attribute attr) {
   if (auto e = dyn_cast<AddressSpaceAttr>(attr))
     return mapToLLVMAddressSpace(e.getValue());
-  return 0; // default to generic address space
+  if (isTargetAddressSpace<SmeGmemAddressAttr>(attr))
+    return 1; // underlying global pointer lives in addrspace 1
+  return 0;   // default to generic address space
 }
 
 class MakePtrOpLowering : public OpConversionPattern<MakePtrOp> {
@@ -81,6 +84,44 @@ public:
       Type elemTy = projectToLLVMCompatibleElemTy(flyPtrTy.getElemTy());
       Value ptr = LLVM::AllocaOp::create(rewriter, loc, llvmPtrTy, elemTy, nElems, 0);
       rewriter.replaceOp(op, ptr);
+      return success();
+    } else if (isTargetAddressSpace<SmeGmemAddressAttr>(addrSpaceAttr)) {
+      // sme_gmem make_ptr takes 2 positional args: [base_global_ptr, leading_stride].
+      // Assumption (design doc §6 #1): the second arg is the leading (outermost)
+      // stride in *element* units; stride_byte = leading_stride * elemBytes.
+      auto args = adaptor.getArgs();
+      if (args.size() != 2)
+        return rewriter.notifyMatchFailure(
+            op, "sme_gmem make_ptr expects 2 args: base, leading_stride");
+
+      Value base = args[0];
+      Value strideElems = args[1];
+
+      // Normalize the stride to i32 (element units).
+      Type i32Ty = rewriter.getI32Type();
+      if (strideElems.getType() != i32Ty) {
+        if (strideElems.getType().isIndex())
+          strideElems = arith::IndexCastOp::create(rewriter, loc, i32Ty, strideElems);
+        else if (strideElems.getType().getIntOrFloatBitWidth() < 32)
+          strideElems = arith::ExtSIOp::create(rewriter, loc, i32Ty, strideElems);
+        else if (strideElems.getType().getIntOrFloatBitWidth() > 32)
+          strideElems = arith::TruncIOp::create(rewriter, loc, i32Ty, strideElems);
+      }
+
+      int64_t elemBits = flyPtrTy.getElemTy().getIntOrFloatBitWidth();
+      Value strideByte;
+      if (elemBits % 8 == 0) {
+        Value elemBytes = arith::ConstantIntOp::create(rewriter, loc, elemBits / 8, 32);
+        strideByte = arith::MulIOp::create(rewriter, loc, strideElems, elemBytes);
+      } else {
+        // Sub-byte element types: stride_byte = (stride * elemBits) / 8.
+        Value bits = arith::ConstantIntOp::create(rewriter, loc, elemBits, 32);
+        Value scaled = arith::MulIOp::create(rewriter, loc, strideElems, bits);
+        Value eight = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+        strideByte = arith::DivUIOp::create(rewriter, loc, scaled, eight);
+      }
+
+      rewriter.replaceOp(op, fly_ixdl::SmeGmemFatPtr::pack(rewriter, loc, base, strideByte));
       return success();
     }
 
@@ -236,6 +277,25 @@ public:
     } else {
       Operation *defOp = offset.getDefiningOp();
       offsetVal = defOp->getOperand(0);
+    }
+
+    if (isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace())) {
+      // The offset is an element-index delta; convert to a byte delta before
+      // accumulating into the fat pointer's byte_offset field.
+      int64_t elemBits = flyPtrTy.getElemTy().getIntOrFloatBitWidth();
+      Value deltaBytes;
+      if (elemBits % 8 == 0) {
+        Value elemBytes = arith::ConstantIntOp::create(rewriter, loc, elemBits / 8, 32);
+        deltaBytes = arith::MulIOp::create(rewriter, loc, offsetVal, elemBytes);
+      } else {
+        Value bits = arith::ConstantIntOp::create(rewriter, loc, elemBits, 32);
+        Value scaled = arith::MulIOp::create(rewriter, loc, offsetVal, bits);
+        Value eight = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+        deltaBytes = arith::DivUIOp::create(rewriter, loc, scaled, eight);
+      }
+      fly_ixdl::SmeGmemFatPtr fp(flyPtrTy, base);
+      rewriter.replaceOp(op, fp.addByteOffset(rewriter, loc, deltaBytes));
+      return success();
     }
 
     auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(base.getType());
@@ -658,10 +718,14 @@ public:
       return VectorType::get(vecTy.getShape(), convertedElem, vecTy.getScalableDims());
     });
     addConversion([&](fly::MemRefType flyMemRefTy) -> Type {
+      if (isTargetAddressSpace<SmeGmemAddressAttr>(flyMemRefTy.getAddressSpace()))
+        return SmeGmemFatPtr::getType(flyMemRefTy.getContext());
       unsigned as = mapAttrToLLVMAddressSpace(flyMemRefTy.getAddressSpace());
       return LLVM::LLVMPointerType::get(flyMemRefTy.getContext(), as);
     });
     addConversion([&](fly::PointerType flyPtrTy) -> Type {
+      if (isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace()))
+        return SmeGmemFatPtr::getType(flyPtrTy.getContext());
       unsigned as = mapAttrToLLVMAddressSpace(flyPtrTy.getAddressSpace());
       return LLVM::LLVMPointerType::get(flyPtrTy.getContext(), as);
     });
