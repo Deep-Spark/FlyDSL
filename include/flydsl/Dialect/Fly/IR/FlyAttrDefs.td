@@ -147,6 +147,24 @@ def Fly_SwizzleAttr : Fly_Attr<"Swizzle", "swizzle", []> {
   }];
 }
 
+// Modular ("add") swizzle, aligned with cute::Swizzle_Mod<BBits, MBase, SShift>.
+// Only used by the Iluvatar (ivcore11/MR) SME shared-memory layouts; the regular
+// XOR Fly_SwizzleAttr is unaffected. apply:
+//   yyy = ((1<<mask)-1) << (base + shift)
+//   zb  = (1 << (mask + base)) - 1
+//   result = (off & ~zb) | ((off + ((off & yyy) >> shift)) & zb)
+def Fly_SwizzleModAttr : Fly_Attr<"SwizzleMod", "swizzle_mod", []> {
+  let parameters = (ins "int32_t":$mask, "int32_t":$base, "int32_t":$shift);
+  let assemblyFormat = "`` `SM` `` `<` $mask `` `,` `` $base `` `,` `` $shift `` `>`";
+
+  let extraClassDeclaration = [{
+    bool isTrivialSwizzleMod() const;
+    static SwizzleModAttr getTrivialSwizzleMod(MLIRContext *context);
+
+    int32_t period() const { return 1 << (getMask() + getBase() + getShift()); }
+  }];
+}
+
 def Fly_CoordSwizzleAttr : Fly_Attr<"CoordSwizzle", "coord_swizzle", []> {
   let parameters = (ins
     "int32_t":$mask,

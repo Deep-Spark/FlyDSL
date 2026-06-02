@@ -25,6 +25,11 @@ inline int32_t divisibilityMax(int32_t lhs, int32_t rhs) { return std::gcd(lhs, 
 inline int32_t divisibilityApplySwizzle(int32_t lhs, SwizzleAttr swizzle) {
   return std::gcd(lhs, 1 << swizzle.getBase());
 }
+inline int32_t divisibilityApplySwizzleMod(int32_t lhs, SwizzleModAttr swizzle) {
+  // The lowest `base` bits are never touched by the modular add, so the
+  // divisibility argument mirrors the XOR swizzle case.
+  return std::gcd(lhs, 1 << swizzle.getBase());
+}
 inline int32_t divisibilityApplyCoordSwizzle(int32_t row [[maybe_unused]], int32_t col,
                                              CoordSwizzleAttr swizzle) {
   return std::gcd(col, 1 << swizzle.getBaseCol());
@@ -59,6 +64,7 @@ IntAttr intSafeDiv(IntAttr lhs, IntAttr rhs);
 IntAttr intCeilDiv(IntAttr lhs, IntAttr rhs);
 IntAttr intShapeDiv(IntAttr lhs, IntAttr rhs);
 IntAttr intApplySwizzle(IntAttr v, SwizzleAttr swizzle);
+IntAttr intApplySwizzleMod(IntAttr v, SwizzleModAttr swizzle);
 IntAttr intApplyCoordSwizzle(IntAttr row, IntAttr col, CoordSwizzleAttr swizzle);
 
 bool isDivisibleBy(IntAttr attr, int32_t divisor);

@@ -250,6 +250,24 @@ IntAttr intApplySwizzle(IntAttr v, SwizzleAttr swizzle) {
                              utils::divisibilityApplySwizzle(v.getDivisibility(), swizzle));
 }
 
+IntAttr intApplySwizzleMod(IntAttr v, SwizzleModAttr swizzle) {
+  auto *ctx = v.getContext();
+  if (swizzle.isTrivialSwizzleMod()) {
+    return v;
+  }
+  if (v.isStatic()) {
+    int32_t S = swizzle.getShift();
+    int32_t val = v.getValue();
+    int32_t yyyMsk = ((1 << swizzle.getMask()) - 1) << (swizzle.getBase() + S);
+    int32_t zbMsk = (1 << (swizzle.getMask() + swizzle.getBase())) - 1;
+    int32_t shifted = (val & yyyMsk) >> S;
+    int32_t result = (val & ~zbMsk) | ((val + shifted) & zbMsk);
+    return IntAttr::getStatic(ctx, result);
+  }
+  return IntAttr::getDynamic(ctx, v.getWidth(),
+                             utils::divisibilityApplySwizzleMod(v.getDivisibility(), swizzle));
+}
+
 IntAttr intApplyCoordSwizzle(IntAttr row, IntAttr col, CoordSwizzleAttr swizzle) {
   auto *ctx = col.getContext();
   if (swizzle.isTrivialCoordSwizzle()) {

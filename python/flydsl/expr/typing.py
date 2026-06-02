@@ -267,6 +267,7 @@ __all__ = [
     "IntTuple",
     "Layout",
     "Swizzle",
+    "SwizzleMod",
     "ComposedLayout",
     "Tensor",
     "CopyAtom",
@@ -576,6 +577,21 @@ class Layout(BuiltinDslType):
 
 @ir.register_value_caster(SwizzleType.static_typeid, replace=True)
 class Swizzle(BuiltinDslType):
+    @property
+    def mask(self) -> int:
+        return self.type.mask
+
+    @property
+    def base(self) -> int:
+        return self.type.base
+
+    @property
+    def shift(self) -> int:
+        return self.type.shift
+
+
+@ir.register_value_caster(SwizzleModType.static_typeid, replace=True)
+class SwizzleMod(BuiltinDslType):
     @property
     def mask(self) -> int:
         return self.type.mask

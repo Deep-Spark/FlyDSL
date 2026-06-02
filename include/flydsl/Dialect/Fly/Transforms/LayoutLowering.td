@@ -173,11 +173,12 @@ def : Pat<(Fly_RakedProductOp Fly_ComposedLayout:$layout, $tile),
                                     (Fly_ComposedGetOffsetOp $layout),
                                     (Fly_RakedProductOp (Fly_ComposedGetOuterOp $layout), $tile))>;
 
-// RecastLayoutOp patterns
-def : Pat<(Fly_RecastLayoutOp $new_bits, $old_bits, Fly_ComposedLayout:$layout),
-          (Fly_MakeComposedLayoutOp (Fly_ComposedGetInnerOp $layout),
-                                    (Fly_ComposedGetOffsetOp $layout),
-                                    (Fly_RecastLayoutOp $new_bits, $old_bits, (Fly_ComposedGetOuterOp $layout)))>;
+// RecastLayoutOp patterns:
+// Composed layouts are handled by RecastLayoutOpLowering (C++), which recasts
+// via layoutRecast so the inner swizzle base is rescaled together with the
+// outer. A DRR decomposition that preserved the inner swizzle would contradict
+// RecastLayoutOp::inferReturnTypes for swizzled composed layouts (FlyDSL has no
+// `smem_ptr_flag` specialization).
 
 // TileToShapeOp patterns
 def : Pat<(Fly_TileToShapeOp Fly_ComposedLayout:$block, $trg_shape, $ord_shape),

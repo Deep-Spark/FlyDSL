@@ -219,6 +219,12 @@ IntTupleAttr IntTupleBuilder<IntTupleAttr>::applySwizzle(IntTupleAttr v,
   return IntTupleAttr::get(intApplySwizzle(v.getLeafAsInt(), swizzle));
 }
 
+IntTupleAttr IntTupleBuilder<IntTupleAttr>::applySwizzleMod(IntTupleAttr v,
+                                                            SwizzleModAttr swizzle) const {
+  assert(v.isLeafInt() && "applySwizzleMod only supports leafInt IntTupleAttr");
+  return IntTupleAttr::get(intApplySwizzleMod(v.getLeafAsInt(), swizzle));
+}
+
 IntTupleAttr IntTupleBuilder<IntTupleAttr>::applyCoordSwizzle(IntTupleAttr coord,
                                                               CoordSwizzleAttr swizzle) const {
   if (swizzle.isTrivialCoordSwizzle()) {
@@ -591,6 +597,40 @@ IntTupleBuilder<IntTupleValueAdaptor>::applySwizzle(IntTupleValueAdaptor v,
   auto masked = arith::AndIOp::create(builder, loc, input, bitMask).getResult();
   auto shifted = arith::ShRUIOp::create(builder, loc, masked, shiftAmount).getResult();
   auto result = arith::XOrIOp::create(builder, loc, input, shifted).getResult();
+  return IntTupleValueAdaptor{result, retAttr};
+}
+
+IntTupleValueAdaptor
+IntTupleBuilder<IntTupleValueAdaptor>::applySwizzleMod(IntTupleValueAdaptor v,
+                                                       SwizzleModAttr swizzle) const {
+  assert(v.isLeafInt() && "applySwizzleMod only supports leaf IntTupleValueAdaptor");
+
+  auto retAttr = attrBuilder.applySwizzleMod(v.attr, swizzle);
+
+  // shortcut for trivial swizzle and static value
+  if (swizzle.isTrivialSwizzleMod()) {
+    return IntTupleValueAdaptor{v.value, retAttr};
+  }
+  if (retAttr.isStatic()) {
+    return materializeConstantLeaf(retAttr.getLeafAsInt());
+  }
+
+  auto intType =
+      v.attr.getLeafAsInt().getWidth() == 64 ? builder.getI64Type() : builder.getI32Type();
+  auto input = extendToIntType(v.value, intType);
+  int32_t S = swizzle.getShift();
+  int64_t yyyMaskValue = ((int64_t{1} << swizzle.getMask()) - 1) << (swizzle.getBase() + S);
+  int64_t zbMaskValue = (int64_t{1} << (swizzle.getMask() + swizzle.getBase())) - 1;
+  auto yyyMask = arith::ConstantIntOp::create(builder, loc, intType, yyyMaskValue).getResult();
+  auto zbMask = arith::ConstantIntOp::create(builder, loc, intType, zbMaskValue).getResult();
+  auto nzbMask = arith::ConstantIntOp::create(builder, loc, intType, ~zbMaskValue).getResult();
+  auto shiftAmount = arith::ConstantIntOp::create(builder, loc, intType, S).getResult();
+  auto masked = arith::AndIOp::create(builder, loc, input, yyyMask).getResult();
+  auto shifted = arith::ShRUIOp::create(builder, loc, masked, shiftAmount).getResult();
+  auto added = arith::AddIOp::create(builder, loc, input, shifted).getResult();
+  auto lowBits = arith::AndIOp::create(builder, loc, added, zbMask).getResult();
+  auto highBits = arith::AndIOp::create(builder, loc, input, nzbMask).getResult();
+  auto result = arith::OrIOp::create(builder, loc, highBits, lowBits).getResult();
   return IntTupleValueAdaptor{result, retAttr};
 }
 

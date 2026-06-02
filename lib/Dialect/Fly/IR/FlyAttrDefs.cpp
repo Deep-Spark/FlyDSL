@@ -52,6 +52,15 @@ bool SwizzleAttr::isTrivialSwizzle() const { return getMask() == 0; }
 SwizzleAttr SwizzleAttr::getTrivialSwizzle(MLIRContext *context) { return get(context, 0, 0, 0); }
 
 //===----------------------------------------------------------------------===//
+// SwizzleModAttr
+//===----------------------------------------------------------------------===//
+
+bool SwizzleModAttr::isTrivialSwizzleMod() const { return getMask() == 0; }
+SwizzleModAttr SwizzleModAttr::getTrivialSwizzleMod(MLIRContext *context) {
+  return get(context, 0, 0, 0);
+}
+
+//===----------------------------------------------------------------------===//
 // CoordSwizzleAttr
 //===----------------------------------------------------------------------===//
 
@@ -244,6 +253,8 @@ bool ComposedLayoutAttr::isStaticInner() const {
   } else if (auto layout = dyn_cast<LayoutAttr>(getInner())) {
     return layout.isStatic();
   } else if (auto basis = dyn_cast<SwizzleAttr>(getInner())) {
+    return true;
+  } else if (auto swizzleMod = dyn_cast<SwizzleModAttr>(getInner())) {
     return true;
   } else if (auto coordSwizzle = dyn_cast<CoordSwizzleAttr>(getInner())) {
     return true;
@@ -622,6 +633,9 @@ static void printComposedFlat(::mlir::AsmPrinter &odsPrinter, ComposedLayoutAttr
     if (auto swizzle = dyn_cast<SwizzleAttr>(inner)) {
       odsPrinter << "S<" << swizzle.getMask() << "," << swizzle.getBase() << ","
                  << swizzle.getShift() << ">";
+    } else if (auto swizzleMod = dyn_cast<SwizzleModAttr>(inner)) {
+      odsPrinter << "SM<" << swizzleMod.getMask() << "," << swizzleMod.getBase() << ","
+                 << swizzleMod.getShift() << ">";
     } else if (auto coordSwizzle = dyn_cast<CoordSwizzleAttr>(inner)) {
       coordSwizzle.print(odsPrinter);
     } else if (auto layout = dyn_cast<LayoutAttr>(inner)) {
@@ -652,6 +666,13 @@ static void printComposedFlat(::mlir::AsmPrinter &odsPrinter, ComposedLayoutAttr
         odsParser.parseGreater())
       return {};
     inner = SwizzleAttr::get(ctx, mask, base, shift);
+  } else if (odsParser.parseOptionalKeyword("SM").succeeded()) {
+    int32_t mask, base, shift;
+    if (odsParser.parseLess() || odsParser.parseInteger(mask) || odsParser.parseComma() ||
+        odsParser.parseInteger(base) || odsParser.parseComma() || odsParser.parseInteger(shift) ||
+        odsParser.parseGreater())
+      return {};
+    inner = SwizzleModAttr::get(ctx, mask, base, shift);
   } else if (odsParser.parseOptionalKeyword("CS").succeeded()) {
     inner = parseCoordSwizzleBody(odsParser, ctx);
     if (!inner)

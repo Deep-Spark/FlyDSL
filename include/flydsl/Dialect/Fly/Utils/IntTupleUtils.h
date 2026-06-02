@@ -148,6 +148,7 @@ public:
   IntTupleAttr ceilDiv(IntTupleAttr lhs, IntTupleAttr rhs) const;
   IntTupleAttr shapeDiv(IntTupleAttr lhs, IntTupleAttr rhs) const;
   IntTupleAttr applySwizzle(IntTupleAttr v, SwizzleAttr swizzle) const;
+  IntTupleAttr applySwizzleMod(IntTupleAttr v, SwizzleModAttr swizzle) const;
   IntTupleAttr applyCoordSwizzle(IntTupleAttr coord, CoordSwizzleAttr swizzle) const;
 
   IntTupleAttr getAttr(IntTupleAttr attr) const { return attr; }
@@ -257,6 +258,7 @@ public:
   IntTupleValueAdaptor ceilDiv(IntTupleValueAdaptor lhs, IntTupleValueAdaptor rhs) const;
   IntTupleValueAdaptor shapeDiv(IntTupleValueAdaptor lhs, IntTupleValueAdaptor rhs) const;
   IntTupleValueAdaptor applySwizzle(IntTupleValueAdaptor v, SwizzleAttr swizzle) const;
+  IntTupleValueAdaptor applySwizzleMod(IntTupleValueAdaptor v, SwizzleModAttr swizzle) const;
   IntTupleValueAdaptor applyCoordSwizzle(IntTupleValueAdaptor coord,
                                          CoordSwizzleAttr swizzle) const;
 

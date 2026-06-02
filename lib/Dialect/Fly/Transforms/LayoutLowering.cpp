@@ -1130,6 +1130,14 @@ public:
       IntTupleValueAdaptor result = layoutBuilder.applySwizzle(coordAdaptor, swizzleTy.getAttr());
       rewriter.replaceOp(op, layoutBuilder.finalize(result));
       return success();
+    } else if (auto swizzleModTy = dyn_cast<SwizzleModType>(layout.getType())) {
+      LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
+      IntTupleValueAdaptor coordAdaptor =
+          IntTupleValueAdaptor::create(layoutBuilder, coord, coordTy.getAttr());
+      IntTupleValueAdaptor result =
+          layoutBuilder.applySwizzleMod(coordAdaptor, swizzleModTy.getAttr());
+      rewriter.replaceOp(op, layoutBuilder.finalize(result));
+      return success();
     } else if (auto coordSwizzleTy = dyn_cast<CoordSwizzleType>(layout.getType())) {
       LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
       IntTupleValueAdaptor coordAdaptor =
@@ -1514,21 +1522,41 @@ public:
   LogicalResult matchAndRewrite(RecastLayoutOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value layoutValue = op.getSrc();
-    auto layoutTy = dyn_cast<LayoutType>(layoutValue.getType());
-    if (!layoutTy)
-      return failure();
-    if (!isNormalForm(cast<TypedValue<LayoutType>>(layoutValue)))
-      return failure();
 
     int32_t newTypeBits = op.getNewTypeBits();
     int32_t oldTypeBits = op.getOldTypeBits();
-
     LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
-    LayoutValueAdaptor layoutAdaptor(layoutValue, layoutTy.getAttr());
-    LayoutValueAdaptor result =
-        layoutRecast(layoutBuilder, layoutAdaptor, oldTypeBits, newTypeBits);
-    rewriter.replaceOp(op, result.getValue());
-    return success();
+
+    // Plain layout: recast shape/stride.
+    if (auto layoutTy = dyn_cast<LayoutType>(layoutValue.getType())) {
+      if (!isNormalForm(cast<TypedValue<LayoutType>>(layoutValue)))
+        return failure();
+      LayoutValueAdaptor layoutAdaptor(layoutValue, layoutTy.getAttr());
+      LayoutValueAdaptor result =
+          layoutRecast(layoutBuilder, layoutAdaptor, oldTypeBits, newTypeBits);
+      rewriter.replaceOp(op, result.getValue());
+      return success();
+    }
+
+    // Composed layout (Swizzle . Offset . Outer): recast via the SAME
+    // layoutRecast used by RecastLayoutOp::inferReturnTypes, so the lowered
+    // value matches the inferred type. In particular the inner swizzle base is
+    // rescaled by log2(factor) -- FlyDSL has no `smem_ptr_flag` specialization,
+    // so the swizzle acts on element offsets and MUST be recast with the layout.
+    // (The previous TD pattern decomposed this into make_composed_layout while
+    // preserving the inner swizzle unchanged, which contradicted the inferred
+    // type for swizzled composed layouts.)
+    if (auto composedTy = dyn_cast<ComposedLayoutType>(layoutValue.getType())) {
+      if (!isNormalForm(cast<TypedValue<ComposedLayoutType>>(layoutValue)))
+        return failure();
+      LayoutValueAdaptor layoutAdaptor(layoutValue, composedTy.getAttr());
+      LayoutValueAdaptor result =
+          layoutRecast(layoutBuilder, layoutAdaptor, oldTypeBits, newTypeBits);
+      rewriter.replaceOp(op, result.getValue());
+      return success();
+    }
+
+    return failure();
   }
 };
 
@@ -2496,6 +2524,8 @@ class DecompositionOpLowering : public OpRewritePattern<DecompositionOp> {
     IntTupleValueAdaptor currentOffset;
     if (builder.isSwizzle(inner)) {
       currentOffset = builder.applySwizzle(inputOffset, builder.getSwizzleAttr(inner));
+    } else if (builder.isSwizzleMod(inner)) {
+      currentOffset = builder.applySwizzleMod(inputOffset, builder.getSwizzleModAttr(inner));
     } else if (builder.isCoordSwizzle(inner)) {
       currentOffset = builder.applyCoordSwizzle(inputOffset, builder.getCoordSwizzleAttr(inner));
     } else {

@@ -85,6 +85,8 @@ std::pair<LayoutAttr, IntTupleAttr> decomposeComposedLayoutAttr(LayoutBuilder<La
   IntTupleAttr currentOffset;
   if (auto swizzleInner = dyn_cast<SwizzleAttr>(inner))
     currentOffset = builder.applySwizzle(inputOffset, swizzleInner);
+  else if (auto swizzleModInner = dyn_cast<SwizzleModAttr>(inner))
+    currentOffset = builder.applySwizzleMod(inputOffset, swizzleModInner);
   else if (auto coordSwizzleInner = dyn_cast<CoordSwizzleAttr>(inner))
     currentOffset = builder.applyCoordSwizzle(inputOffset, coordSwizzleInner);
   else
@@ -263,12 +265,15 @@ FLY_INFER_RETURN_TYPES(MakeComposedLayoutOp) {
     innerAttr = innerComposedTy.getAttr();
   } else if (auto innerSwizzleTy = dyn_cast<SwizzleType>(operands[0].getType())) {
     innerAttr = innerSwizzleTy.getAttr();
+  } else if (auto innerSwizzleModTy = dyn_cast<SwizzleModType>(operands[0].getType())) {
+    innerAttr = innerSwizzleModTy.getAttr();
   } else if (auto innerCoordSwizzleTy = dyn_cast<CoordSwizzleType>(operands[0].getType())) {
     innerAttr = innerCoordSwizzleTy.getAttr();
   } else {
     return emitOptionalError(
         location,
-        "MakeComposedLayoutOp: expected Layout/ComposedLayout/Swizzle/CoordSwizzle for inner, got ",
+        "MakeComposedLayoutOp: expected "
+        "Layout/ComposedLayout/Swizzle/SwizzleMod/CoordSwizzle for inner, got ",
         operands[0].getType());
   }
   auto composedAttr = ComposedLayoutAttr::get(context, innerAttr, offsetTy.getAttr(), outerAttr);
@@ -478,6 +483,9 @@ FLY_INFER_RETURN_TYPES(ComposedGetInnerOp) {
   auto innerAttr = inputTy.getAttr().getInner();
   if (auto swizzleAttr = dyn_cast<SwizzleAttr>(innerAttr)) {
     inferredReturnTypes.assign({SwizzleType::get(context, swizzleAttr)});
+    return success();
+  } else if (auto swizzleModAttr = dyn_cast<SwizzleModAttr>(innerAttr)) {
+    inferredReturnTypes.assign({SwizzleModType::get(context, swizzleModAttr)});
     return success();
   } else if (auto coordSwizzleAttr = dyn_cast<CoordSwizzleAttr>(innerAttr)) {
     inferredReturnTypes.assign({CoordSwizzleType::get(context, coordSwizzleAttr)});
@@ -1016,6 +1024,10 @@ FLY_INFER_RETURN_TYPES(Crd2IdxOp) {
     IntTupleAttr result = builder.applySwizzle(coordAttr, swizzleTy.getAttr());
     inferredReturnTypes.assign({IntTupleType::get(result)});
     return success();
+  } else if (auto swizzleModTy = dyn_cast<SwizzleModType>(operands[1].getType())) {
+    IntTupleAttr result = builder.applySwizzleMod(coordAttr, swizzleModTy.getAttr());
+    inferredReturnTypes.assign({IntTupleType::get(result)});
+    return success();
   } else if (auto coordSwizzleTy = dyn_cast<CoordSwizzleType>(operands[1].getType())) {
     IntTupleAttr result = builder.applyCoordSwizzle(coordAttr, coordSwizzleTy.getAttr());
     inferredReturnTypes.assign({IntTupleType::get(result)});
@@ -1023,8 +1035,8 @@ FLY_INFER_RETURN_TYPES(Crd2IdxOp) {
   }
 
   return emitOptionalError(location,
-                           "Crd2IdxOp: expected LayoutType, ComposedLayoutType, SwizzleType or "
-                           "CoordSwizzleType for layout, got ",
+                           "Crd2IdxOp: expected LayoutType, ComposedLayoutType, SwizzleType, "
+                           "SwizzleModType or CoordSwizzleType for layout, got ",
                            operands[1].getType());
 }
 
