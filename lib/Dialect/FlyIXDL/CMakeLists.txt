@@ -1,5 +1,8 @@
 add_mlir_dialect_library(MLIRFlyIXDLDialect
   Dialect.cpp
+  MR/MmaAtom.cpp
+  MR/CopyAtom.cpp
+  Utils/CpAsyncUtils.cpp
 
   DEPENDS
   MLIRFlyIXDLIncGen
