@@ -1,0 +1,401 @@
+h1. 基于 ixcc LLVM 22.x 搭建 FlyDSL 开发环境
+
+*与 Git 中 Markdown 同步：* 权威全文见仓库 *docs/ixcc_llvm22_flydsl_dev_setup.md*。本页为 Wiki 版本；若 Confluence 转换报错，请仅保留本文 *{code}* 块与标题，或改为富文本 + 附件 MD 文件。
+
+本文说明如何从 *ixcc SDK*（LLVM/MLIR 22.1.x，见 ixcc 中 *cmake/Modules/LLVMVersion.cmake*）编译 *mlir_install*，再编译 *FlyDSL*，以及如何配置环境并运行测试（pytest：*tests/unit*、*tests/system*；FileCheck：*tests/mlir*）。
+
+bq. 历史上曾有 *tests/pyir* 目录；当前主线可能已空。IR/编译向测试以 *tests/unit*、*tests/system*、*tests/mlir* 与 *tests/README.md* 为准。
+
+适用于：ixcc 与 *llvm-project* 类似布局（*llvm*、*mlir*、*clang* 同级）。
+
+h3. 与仓库版本对齐
+
+拉取代码后请 *git pull*，并确认包含 *第 4 节*所列 MLIR 22 适配改动，否则在 ixcc LLVM 22.x 上可能无法编译或通过 FileCheck。
+
+----
+
+h2. 1. 前置条件
+
+h3. 1.1 系统与工具
+
+* Linux（x86_64 常见环境）。
+* *CMake* 3.20+、*Ninja* 或 Make、C/C++ 编译器。
+* *Python* 3.10+。
+* 磁盘：完整构建常需 *数十 GB*；仅 LLVM/MLIR 常 *30–90 分钟*（视机器而定）。
+
+h3. 1.2 ixcc 目录布局
+
+应存在 *IXCC_ROOT/llvm/CMakeLists.txt*（源码根在 *llvm*，非 ixcc 仓根）。同级有 *mlir*、*clang* 等。
+
+目录树示例：
+
+{code}
+IXCC_ROOT/
+  cmake/
+  llvm/
+  mlir/
+  clang/
+{code}
+
+h3. 1.3 Python 虚拟环境
+
+{code:bash}
+cd /path/to/FlyDSL
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install 'nanobind>=2.0' 'pybind11>=2.10' numpy cmake pytest
+{code}
+
+后续 *scripts/build_ixcc_llvm.sh* 若发现 *.venv*，会对该环境 *source*。
+
+----
+
+h2. 2. 从 ixcc 源码构建 LLVM/MLIR（22.x）
+
+脚本：*scripts/build_ixcc_llvm.sh*。
+
+概要：
+
+* 删除 *IXCC_ROOT/build*（可用 *IXCC_BUILD_DIR* 覆盖）。
+* 用 *IXCC_ROOT/llvm* 作 CMake *-S*，启用 *mlir*、*clang*、MLIR Python 绑定，安装到 *IXCC_ROOT/mlir_install*（可用 *IXCC_MLIR_INSTALL* 覆盖）。
+
+h3. 2.1 标准命令
+
+{code:bash}
+export IXCC_ROOT=/path/to/ixcc
+cd /path/to/FlyDSL
+source .venv/bin/activate
+bash scripts/build_ixcc_llvm.sh -j$(nproc)
+{code}
+
+成功后默认前缀：
+
+{code}
+IXCC_ROOT/mlir_install
+{code}
+
+其中应有 *lib/cmake/mlir*、*lib/cmake/llvm*，以及 *bin/mlir-tblgen*、*bin/FileCheck*。
+
+h3. 2.2 常用环境变量
+
+||变量||含义||默认||
+|IXCC_ROOT|ixcc 根目录|HOME 下常见 sw_home/sdk/ixcc，见脚本|
+|IXCC_BUILD_DIR|LLVM 构建目录（会先删后建）|IXCC_ROOT/build|
+|IXCC_MLIR_INSTALL|cmake install 前缀|IXCC_ROOT/mlir_install|
+|IXCC_MLIR_ENABLE_ROCM_RUNNER|HIP ROCm runner|OFF；有 ROCm 时可设 1|
+|IXCC_LLVM_TARGETS|LLVM_TARGETS_TO_BUILD|X86 与 NVPTX 等|
+
+h3. 2.3 已知规避（脚本已设）
+
+# MLIR_ENABLE_ROCM_RUNNER：无 ROCm HIP 时保持 OFF。
+# LLVM_TARGETS_TO_BUILD：部分 ixcc 在 AMDGPU TableGen 上会冲突；默认可仅用 X86 与 NVPTX。
+
+{code:bash}
+export IXCC_LLVM_TARGETS="X86;NVPTX;AMDGPU"
+{code}
+
+# LLVM_TOOL_DYNAMIC_COMPILE_BUILD：ixcc 的 dynamic-compile 在无 Iluvatar 目标时会链接失败；脚本默认关。
+
+h3. 2.4 版本确认
+
+{code:bash}
+grep -E 'LLVM_VERSION|set\(LLVM_VERSION' "$IXCC_MLIR_INSTALL/lib/cmake/mlir/MLIRConfig.cmake" | head -5
+grep LLVM_PACKAGE_VERSION "$IXCC_MLIR_INSTALL/lib/cmake/llvm/LLVMConfig.cmake" | head -3
+{code}
+
+应与 ixcc 22.x 一致（如 *22.1.0git*）。
+
+----
+
+h2. 3. 构建 FlyDSL
+
+h3. 3.1 MLIR 前缀
+
+{code:bash}
+export MLIR_PATH=/path/to/ixcc/mlir_install
+{code}
+
+勿将 *MLIR_PATH* 指到无 *lib/cmake/mlir* 的目录。
+
+h3. 3.2 LLVM CMake 路径
+
+*scripts/build.sh* 等价传入（代码块内变量用美元符接变量名，勿在 Wiki 正文单独写花括号变量）：
+
+{code:bash}
+# -DMLIR_DIR="$MLIR_PATH/lib/cmake/mlir"
+# -DLLVM_DIR="$MLIR_PATH/lib/cmake/llvm"
+{code}
+
+避免系统其它 LLVM 抢走 *find_package(LLVM)*。
+
+h3. 3.3 MLIR_MAIN_SRC_DIR（可选）
+
+根目录 *CMakeLists.txt*：若 *find_package MLIR* 提供 *MLIR_MAIN_SRC_DIR*，会把其下 *cmake/modules* 前置到 *CMAKE_MODULE_PATH*，以便 *AddMLIR.cmake* 等。
+
+h3. 3.4 执行构建
+
+{code:bash}
+cd /path/to/FlyDSL
+source .venv/bin/activate
+export MLIR_PATH=/path/to/ixcc/mlir_install
+export FLY_BUILD_DIR=/path/to/FlyDSL/build-fly
+
+bash scripts/build.sh -j$(nproc)
+{code}
+
+产物：*FLY_BUILD_DIR/python_packages*、*FLY_BUILD_DIR/bin/fly-opt*。
+
+修改 *python/flydsl* 后若未重跑 *build.sh*，测试可能仍用旧 *build-fly*；可重编、手动 cp，或 *pip install -e .*。
+
+{code:bash}
+pip install -e .
+{code}
+
+----
+
+h2. 4. 适配 MLIR 22.x（ixcc）的改动
+
+缺下列改动时可能出现 CMake 失败、C++ 错误、Python 导入失败或 FileCheck 不匹配。
+
+h3. 4.1 CMake / 构建
+
+||位置||说明||
+|CMakeLists.txt 根|find_package MLIR 后前置 MLIR_MAIN_SRC_DIR 下 cmake/modules|
+|scripts/build.sh|传入 LLVM_DIR 指向 MLIR_PATH 下 lib/cmake/llvm|
+|python/mlir_flydsl/CMakeLists.txt|FLY_BUILD_JIT_RUNTIME；无 hip 时跳过 FlyJitRuntime|
+
+h3. 4.2 C++
+
+||位置||说明||
+|lib/Dialect/Fly/IR/FlyOps.cpp|PtrToIntOp 推断里 AddressSpace 诊断改为 static_cast 整型|
+|lib/Dialect/FlyROCDL/CDNA3/MmaAtom.cpp|DISPATCH_MFMA_SSA 使用 ValueRange 与 arith 常量|
+|lib/Dialect/FlyROCDL/CDNA4/MmaAtom.cpp|mfma_scale create 使用 ValueRange|
+|lib/Conversion/FlyToROCDL/FlyToROCDL.cpp|MFMA 相关 create 与分支对齐（以 diff 为准）|
+
+h3. 4.3 Python
+
+||位置||说明||
+|python/flydsl/expr/rocdl/__init__.py|wave_id 等与 globals().get；缺失时 AttributeError|
+|python/flydsl/compiler/kernel_function.py|LaunchFuncOp 与 cluster 关键字兼容|
+
+h3. 4.4 FileCheck
+
+||位置||说明||
+|tests/mlir/Conversion/mma_atom_stateful.mlir|mfma.scale 的 SSA 打印与 CHECK 对齐|
+
+h3. 4.5 脚本
+
+||脚本||用途||
+|scripts/build_ixcc_llvm.sh|重建 ixcc mlir_install|
+|scripts/run_mlir_filecheck.sh|仅跑 tests/mlir|
+
+h3. 4.6 改动涉及的文件与代码区域（便于 diff / 评审）
+
+下列路径均相对于 FlyDSL 仓库根。行号会随分支漂移，请在本地用符号名或注释搜索核对。
+
+h4. 汇总：变更文件清单
+
+* CMakeLists.txt
+* scripts/build.sh
+* python/mlir_flydsl/CMakeLists.txt
+* lib/Dialect/Fly/IR/FlyOps.cpp
+* lib/Dialect/FlyROCDL/CDNA3/MmaAtom.cpp
+* lib/Dialect/FlyROCDL/CDNA4/MmaAtom.cpp
+* lib/Conversion/FlyToROCDL/FlyToROCDL.cpp（若主线已含 MLIR 22 MFMA 对齐则才有对应 diff）
+* python/flydsl/expr/rocdl/__init__.py
+* python/flydsl/compiler/kernel_function.py
+* tests/mlir/Conversion/mma_atom_stateful.mlir
+* scripts/run_mlir_filecheck.sh
+* docs/ixcc_llvm22_flydsl_dev_setup.md、docs/ixcc_llvm22_flydsl_dev_setup_confluence.wiki（文档维护）
+
+h4. 分文件说明
+
+* *CMakeLists.txt*（仓库根）  
+** find_package(MLIR) 之后：若存在 MLIR_MAIN_SRC_DIR，把该路径下 cmake/modules 前置加入 CMAKE_MODULE_PATH。
+
+* *scripts/build.sh*  
+** 调用 cmake 时传入 LLVM_DIR 指向 MLIR_PATH 下 lib/cmake/llvm（与 MLIR_DIR 成对）。
+
+* *python/mlir_flydsl/CMakeLists.txt*  
+** 选项 FLY_BUILD_JIT_RUNTIME（默认 ON）。  
+** FlyJitRuntime 段：find_package(hip CONFIG QUIET PATHS …)；仅当 hip_FOUND 时 add_library FlyJitRuntime、add_dependencies FlyPythonCAPI FlyJitRuntime；否则打印跳过信息。
+
+* *lib/Dialect/Fly/IR/FlyOps.cpp*  
+** FLY_INFER_RETURN_TYPES(PtrToIntOp)：default 分支里 emitOptionalError 中 addrSpace 改为 static_cast 到 int32（AddressSpace 枚举不能直接流入诊断流）。
+
+* *lib/Dialect/FlyROCDL/CDNA3/MmaAtom.cpp*  
+** MmaOpCDNA3_MFMAType::emitAtomCallSSA 中的宏 DISPATCH_MFMA_SSA：每个分支内用 arith::ConstantIntOp 生成三个 i32 0，ROCDL::mfma 变体的 create 使用 builder、loc、accTy 与 ValueRange，含 a、b、c 与三个零常量。  
+** 文件头部增加 mlir/Dialect/Arith/IR/Arith.h（若尚未包含）。
+
+* *lib/Dialect/FlyROCDL/CDNA4/MmaAtom.cpp*  
+** MmaOpCDNA4_MFMAScaleType::emitAtomCallSSA 中 mfma_scale_f32_16x16x128_f8f6f4、mfma_scale_f32_32x32x64_f8f6f4：create(builder, loc, accTy, ValueRange scaleOperands)，操作数顺序为 a, b, c, vCbsz, vBlgp, vOpselA, scaleA, vOpselB, scaleB（v* 由 arith::ConstantIntOp 得到）。
+
+* *lib/Conversion/FlyToROCDL/FlyToROCDL.cpp*  
+** 与 ROCDL mfma、mfma.scale 的 create 签名、ValueRange 操作数对齐相关的 lowering（以当前分支 git diff 为准）。
+
+* *python/flydsl/expr/rocdl/__init__.py*  
+** 模块级：_ods_wave_id、_ods_cluster_workgroup_id_*、_ods_cluster_load_async_to_lds_*、_ods_s_wait_asynccnt、_ods_readfirstlane 使用 globals().get（字符串名, None）。  
+** 函数 wave_id、cluster_workgroup_id_*、cluster_load_async_to_lds、s_wait_asynccnt、readfirstlane：在对应 _ods_* 为 None 时 raise AttributeError。
+
+* *python/flydsl/compiler/kernel_function.py*  
+** 新增 _gpu_launch_func_cluster_kwargs（与 gpu.LaunchFuncOp.__init__ 的 inspect.signature 对齐）。  
+** KernelLauncher.launch：调用 gpu.LaunchFuncOp 时传入 **_gpu_launch_func_cluster_kwargs(cluster_size)，不再向构造函数传入未支持的 cluster_size 关键字。
+
+* *tests/mlir/Conversion/mma_atom_stateful.mlir*  
+** 函数 test_mma_scale_atom_call_16x16x128、test_mma_scale_atom_call_32x32x64_mixed、test_mma_scale_atom_call_with_opsel 下方的 CHECK / CHECK-DAG：匹配 MLIR 22 打印出的 rocdl.mfma.scale SSA 形式（arith.constant），而非旧版行内整数字面量。
+
+* *scripts/run_mlir_filecheck.sh*  
+** 遍历 tests/mlir 下所有 .mlir，执行首行 RUN 行，汇总失败数后 exit。
+
+----
+
+h2. 5. 运行环境变量
+
+{code:bash}
+export FLY_BUILD_DIR=/path/to/FlyDSL/build-fly
+export PYTHONPATH="$FLY_BUILD_DIR/python_packages:/path/to/FlyDSL:$PYTHONPATH"
+export LD_LIBRARY_PATH="$FLY_BUILD_DIR/python_packages/flydsl/_mlir/_mlir_libs:$LD_LIBRARY_PATH"
+export FLYDSL_RUN_QUANT=1
+{code}
+
+可选：
+
+{code:bash}
+export FLYDSL_RUNTIME_ENABLE_CACHE=0
+{code}
+
+----
+
+h2. 6. 运行测试
+
+分层见 *tests/README.md*。需已设第 5 节环境且存在 *build-fly/bin/fly-opt*。
+
+h3. 6.1 Pytest（示例）
+
+{code:bash}
+cd /path/to/FlyDSL
+source .venv/bin/activate
+
+python3 -m pytest tests/unit/ tests/system/ \
+  -m "l0_backend_agnostic or l1a_compile_no_target_dialect or l1b_target_dialect" \
+  -v --tb=short
+{code}
+
+更多：
+
+{code:bash}
+python3 -m pytest tests/kernels/ tests/unit/ tests/system/ tests/python/examples/ \
+  -m "not large_shape" -v --tb=short
+{code}
+
+h3. 6.2 conftest 与 build-fly
+
+*tests/conftest.py* 会把 *build-fly/python_packages* 插到 *sys.path* 前面；改 Python 后请重编或 pip install -e。
+
+h3. 6.3 FileCheck（推荐）
+
+{code:bash}
+export FLY_BUILD_DIR=/path/to/FlyDSL/build-fly
+export PATH="$MLIR_PATH/bin:$PATH"
+bash scripts/run_mlir_filecheck.sh
+{code}
+
+FileCheck 需与 *MLIR_PATH* 同属 ixcc *mlir_install*。
+
+h3. 6.4 勿在交互 shell 粘贴含 exit 1 的循环
+
+优先 *bash scripts/run_mlir_filecheck.sh*。
+
+h3. 6.5 全量
+
+{code:bash}
+FLY_BUILD_DIR=/path/to/FlyDSL/build-fly bash scripts/run_tests.sh
+{code}
+
+h3. 6.6 端到端示例
+
+{code:bash}
+export IXCC_ROOT="$HOME/sw_home/sdk/ixcc"
+export MLIR_PATH="$IXCC_ROOT/mlir_install"
+
+cd /path/to/FlyDSL
+source .venv/bin/activate
+export MLIR_PATH
+bash scripts/build.sh -j$(nproc)
+
+export FLY_BUILD_DIR=/path/to/FlyDSL/build-fly
+export PYTHONPATH="$FLY_BUILD_DIR/python_packages:$PWD:$PYTHONPATH"
+export LD_LIBRARY_PATH="$FLY_BUILD_DIR/python_packages/flydsl/_mlir/_mlir_libs:$LD_LIBRARY_PATH"
+export FLYDSL_RUN_QUANT=1
+export PATH="$MLIR_PATH/bin:$PATH"
+
+bash scripts/run_mlir_filecheck.sh
+python3 -m pytest tests/unit/ tests/system/ \
+  -m "l0_backend_agnostic or l1a_compile_no_target_dialect or l1b_target_dialect" \
+  -v --tb=short
+{code}
+
+----
+
+h2. 7. 故障排查
+
+h3. 7.1 find_package(LLVM) 找到错误版本
+
+确保设置 MLIR_PATH 为 ixcc 的 mlir_install，且使用已更新的 scripts/build.sh（含 LLVM_DIR）。不要在同一环境中混用系统 LLVM 与 ixcc LLVM。
+
+h3. 7.2 ixcc 构建树 CMake 里出现他人机器路径
+
+若 SDK 从别处拷贝，LLVMConfig.cmake 可能仍包含旧绝对路径，导致 include LLVMExports.cmake 失败。需要在本机统一替换为当前路径（示例，谨慎操作）：
+
+{code:bash}
+grep -rl '/home/olduser/sw_home/sdk/ixcc' /path/to/ixcc/build/lib/cmake \
+  | xargs sed -i 's|/home/olduser|'"$HOME"'|g'
+{code}
+
+优先使用 mlir_install（安装前缀），路径一般由 CMake 按前缀生成，更可移植。
+
+h3. 7.3 AMDGPU / ROCm
+
+默认 build_ixcc_llvm.sh 不编 AMDGPU、不开 ROCm runner，以降低环境与源码缺陷概率。若需完整 GPU 后端与 ROCm，需在 ixcc 源码修复 AMDGPU TableGen、安装 HIP/ROCm，并相应调整 IXCC_LLVM_TARGETS 与 IXCC_MLIR_ENABLE_ROCM_RUNNER。
+
+构建 FlyDSL 时若已安装 ROCm/HIP（find_package hip 成功），将生成 libfly_jit_runtime.so；否则在包含 4.1 改动的分支上会跳过 FlyJitRuntime，属预期行为。
+
+h3. 7.4 Python 导入与 gpu.LaunchFuncOp
+
+* NameError: wave_id is not defined（flydsl.expr.rocdl）：当前 MLIR 的 ROCDL Python 绑定可能未导出部分 intrinsic；需 4.3 的 globals().get 写法，并确保 build-fly 与源码同步（见 6.2）。
+* LaunchFuncOp.__init__() got an unexpected keyword argument cluster_size：MLIR 22 绑定不再接受该关键字；需 4.3 的 kernel_function 修复。
+
+h3. 7.5 FileCheck 与 rocdl.mfma.scale 打印格式
+
+MLIR 22 将 mfma.scale 的操作数印为 SSA（arith.constant），旧 CHECK 中的行内整数会失败；属 IR 文本格式变化，不是硬件后端错误。需 4.4 的测试更新或等价放宽 CHECK。
+
+----
+
+h2. 8. 检查清单
+
+* MLIR_PATH 下 lib/cmake/mlir 与 lib/cmake/llvm 存在
+* scripts/build.sh 成功，FLY_BUILD_DIR/bin/fly-opt 存在
+* 已设 PYTHONPATH、LD_LIBRARY_PATH
+* PATH 含 MLIR_PATH/bin，run_mlir_filecheck.sh 通过
+* pytest 目标 marker 子集可通过
+* 分支含第 4 节改动
+
+----
+
+h2. 9. 参考脚本
+
+||脚本||用途||
+|scripts/build_ixcc_llvm.sh|ixcc 安装 mlir_install|
+|scripts/build.sh|编译 FlyDSL|
+|scripts/run_mlir_filecheck.sh|仅 tests/mlir|
+|scripts/run_tests.sh|全量测试|
+
+----
+
+h2. 附录：Wiki 粘贴说明
+
+* 避免在正文使用单花括号开头片段（易被当成宏）。
+* 技术命令一律放在 *code* 宏块内。
+* 表格单元格避免尖括号与复杂 C++ 模板字面量。
+* 若本页仍无法导入，请改用 Markdown 附件或富文本 + 代码块。
