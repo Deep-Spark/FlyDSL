@@ -16,17 +16,9 @@ using namespace mlir::fly;
 
 namespace mlir::fly_ixdl {
 
-namespace {
-
-Attribute makeSmeAtomBitsLayout(MLIRContext *ctx, Attribute swizzle, Attribute outer) {
-  return ComposedLayoutAttr::get(ctx, swizzle, IntTupleAttr::getLeafStatic(ctx, 0), outer);
-}
-
-} // namespace
-
 LogicalResult CopyOpMRAsyncCpType::verify(function_ref<InFlightDiagnostic()> emitError,
                                           int32_t smeSwizzle) {
-  // CUTLASS IX11::SMESwizzle four-state enum: 0=NoSwizzle, 1=Col, 2=Row8b, 3=Row16b.
+  // MR SME swizzle encoding: 0=NoSwizzle, 1=Col, 2=Row8b, 3=Row16b.
   if (smeSwizzle < 0 || smeSwizzle > 3)
     return emitError() << "unsupported smeSwizzle = " << smeSwizzle
                        << " for MRAsyncCp (expected 0..3)";
@@ -54,37 +46,13 @@ Attribute CopyOpMRAsyncCpType::getThrBitLayoutSrc() const {
 }
 
 Attribute CopyOpMRAsyncCpType::getThrBitLayoutDst() const {
-  auto *ctx = getContext();
-  switch (getSmeSwizzle()) {
-  case 0: // CUTLASS Layout_SME_I_16x512b_MN_INTER_Atom_Bits.
-    return makeSmeAtomBitsLayout(
-        ctx, SwizzleAttr::get(ctx, 0, 0, 0),
-        FxLayout(FxShape(FxC(512), FxC(16)), FxStride(FxC(1), FxC(512))));
-  case 1: // CUTLASS Layout_SME_I_16x512b_K_COLXFB8_Atom_Bits.
-    return makeSmeAtomBitsLayout(
-        ctx, SwizzleAttr::get(ctx, 2, 4, 4),
-        FxLayout(FxShape(FxShape(FxC(4), FxC(4)), FxShape(FxC(32), FxC(4), FxC(4))),
-                 FxStride(FxStride(FxC(32), FxC(2048)),
-                          FxStride(FxC(1), FxC(512), FxC(128)))));
-  case 2: // CUTLASS Layout_SME_I_16x512b_MN_ROWXFB8_Atom_Bits.
-    return makeSmeAtomBitsLayout(
-        ctx, ModSwizzleAttr::get(ctx, 2, 6, 2),
-        FxLayout(FxShape(FxShape(FxC(8), FxC(4), FxC(4), FxC(4)),
-                         FxShape(FxC(4), FxC(4))),
-                 FxStride(FxStride(FxC(1), FxC(32), FxC(128), FxC(2048)),
-                          FxStride(FxC(8), FxC(512)))));
-  case 3: // CUTLASS Layout_SME_I_16x512b_MN_ROWXFB16_Atom_Bits.
-    return makeSmeAtomBitsLayout(
-        ctx, SwizzleAttr::get(ctx, 1, 7, 2),
-        FxLayout(FxShape(FxShape(FxC(16), FxC(16), FxC(2)), FxShape(FxC(2), FxC(8))),
-                 FxStride(FxStride(FxC(1), FxC(32), FxC(4096)),
-                          FxStride(FxC(16), FxC(512)))));
-  default:
-    llvm_unreachable("CopyOpMRAsyncCpType::verify should reject unsupported swizzle values");
-  }
+  // This describes the copy atom footprint, not the SME physical shared-memory
+  // swizzle. Swizzled shared layouts are modeled separately on the destination
+  // shared-memory view.
+  return getThrBitLayoutSrc();
 }
 
-Attribute CopyOpMRAsyncCpType::getThrBitLayoutRef() const { return getThrBitLayoutDst(); }
+Attribute CopyOpMRAsyncCpType::getThrBitLayoutRef() const { return getThrBitLayoutSrc(); }
 
 // MRAsyncCp lowers a one-directional async copy global(#fly_ixdl.sme_gmem) ->
 // shared into the ixcc `ixdl.cp_async.*` op family. The core lives in the
@@ -108,7 +76,7 @@ LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc
       !isGenericAddressSpace<fly::AddressSpace::Shared>(dstMemTy.getAddressSpace()))
     return failure();
 
-  // dst shared pointer -> i32 sOffset (CUTLASS casts the smem pointer to uint32).
+  // dst shared pointer -> i32 sOffset consumed by the MR SME async-copy op.
   Value sOffset = LLVM::PtrToIntOp::create(builder, loc, builder.getI32Type(), dst);
 
   // src SmeGmemFatPtr -> vector<4xi32> SmeDescriptor. The gmem pointer already
@@ -118,7 +86,7 @@ LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc
 
   Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
   Value gOffset = zero; // tile byte offset already merged into the gBase pointer
-  Value kop = zero;     // IX11::CacheOP::CacheAll
+  Value kop = zero;     // MR SME cache-all policy
 
   int32_t valBits = copyAtomTy.getValBits();
   switch (getSmeSwizzle()) {

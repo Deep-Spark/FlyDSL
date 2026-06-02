@@ -1146,6 +1146,16 @@ auto layoutUpcastImpl(LayoutBuilder<Layout> &builder, ModSwizzleAttr swizzle, in
 }
 
 template <class Layout>
+auto layoutUpcastImpl(LayoutBuilder<Layout> &builder, ModSwizzleAttr swizzle, int32_t factor) {
+  assert(utils::isPowerOf2(factor) && "layoutUpcast: factor must be a power of 2");
+  int32_t log_factor = std::log2(factor);
+  int32_t base = swizzle.getBase();
+  assert(base >= log_factor);
+  return builder.materializeModSwizzle(ModSwizzleAttr::get(
+      swizzle.getContext(), swizzle.getMask(), base - log_factor, swizzle.getShift()));
+}
+
+template <class Layout>
 auto layoutUpcastImpl(LayoutBuilder<Layout> &builder, CoordSwizzleAttr coordSwizzle,
                       int32_t factor) {
   assert(utils::isPowerOf2(factor) && "layoutUpcast: factor must be a power of 2");

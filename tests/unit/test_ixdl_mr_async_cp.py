@@ -42,7 +42,7 @@ def test_copy_atom_call_lowers_to_cp_async_with_sync():
                 # Scheme A: CUDA-style commit / wait group.
                 ixdl.cp_async_commit_group()
                 ixdl.cp_async_wait_group(0)
-                # Scheme B: CUTLASS multi-stage pipeline.
+                # Scheme B: SL wait + pipeline barrier.
                 ixdl.sl_waitmem(0)
                 ixdl.sl_pipebar_arrive()
                 ixdl.sl_pipebar_wait()
@@ -96,17 +96,43 @@ def test_copy_atom_call_lowers_all_supported_swizzles(factory, dtype, elem_ir, e
 @pytest.mark.parametrize(
     "factory,dtype,expected",
     [
-        (ixdl.MRAsyncCpNoSwizzle, fx.Float32, "S<0,0,0>"),
-        (ixdl.MRAsyncCpCol, fx.Int8, "S<2,1,4>"),
-        (ixdl.MRAsyncCpRow8b, fx.Int8, "MS<2,3,2>"),
-        (ixdl.MRAsyncCpRow16b, fx.Float16, "S<1,3,2>"),
+        (ixdl.MRAsyncCpNoSwizzle, fx.Float32, "(2,4):(1,1)"),
+        (ixdl.MRAsyncCpCol, fx.Int8, "(8,16):(1,1)"),
+        (ixdl.MRAsyncCpRow8b, fx.Int8, "(8,16):(1,1)"),
+        (ixdl.MRAsyncCpRow16b, fx.Float16, "(4,8):(1,1)"),
     ],
 )
-def test_copy_atom_dst_layout_models_supported_swizzles(factory, dtype, expected):
+def test_copy_atom_dst_layout_is_flat_footprint(factory, dtype, expected):
     with ir.Context():
         atom = fx.make_copy_atom(factory(), dtype)
         assert expected in str(atom.type.tv_layout_dst)
         assert expected in str(atom.type.tv_layout_ref)
+
+
+@pytest.mark.parametrize(
+    "swizzle,dtype,expected",
+    [
+        (ixdl.SMESwizzle.NoSwizzle, fx.Float32, "S<0,0,0> o 0 o (16,16):(1,16)"),
+        (ixdl.SMESwizzle.Col, fx.Int8, "S<2,1,4>"),
+        (ixdl.SMESwizzle.Row8b, fx.Int8, "MS<2,3,2>"),
+        (ixdl.SMESwizzle.Row16b, fx.Float16, "S<1,3,2>"),
+    ],
+)
+def test_make_sme_shared_layout_models_physical_swizzle(swizzle, dtype, expected):
+    with ir.Context(), ir.Location.unknown():
+        m = ir.Module.create()
+        with ir.InsertionPoint(m.body):
+            layout = ixdl.make_sme_shared_layout(swizzle, dtype, major=ixdl.SMEMajor.MN)
+
+    assert expected in str(layout.type)
+    assert "composed_layout" in str(layout.type)
+
+
+def test_make_sme_shared_layout_rejects_sub_element_swizzle_upcast():
+    with ir.Context(), ir.Location.unknown():
+        m = ir.Module.create()
+        with ir.InsertionPoint(m.body), pytest.raises(ValueError, match="sub-element swizzle bits"):
+            ixdl.make_sme_shared_layout(ixdl.SMESwizzle.Col, fx.Float32, major=ixdl.SMEMajor.MN)
 
 
 def test_make_sme_gmem_tensor_emits_sme_gmem_make_ptr():

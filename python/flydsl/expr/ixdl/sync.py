@@ -8,7 +8,7 @@ design doc §4.5):
 
 * Scheme A (CUDA-style, simple kernels): :func:`cp_async_commit_group` /
   :func:`cp_async_wait_group`.
-* Scheme B (CUTLASS multi-stage pipeline): :func:`sl_waitmem` /
+* Scheme B (SL wait + pipeline barrier): :func:`sl_waitmem` /
   :func:`sl_pipebar_arrive` / :func:`sl_pipebar_wait`.
 
 The ixcc ``ixdl.*`` sync ops have no Python op bindings in the ``flydsl._mlir``
@@ -44,7 +44,7 @@ def cp_async_wait_group(n=0):
     return _llvm.call_intrinsic(None, "llvm.bi.cp.async.wait.group", [_const_i32(n)], [], [])
 
 
-# --- Scheme B: CUTLASS multi-stage pipeline (sl_waitmem + pipebar) ---
+# --- Scheme B: SL wait + pipeline barrier ---
 
 
 def sl_waitmem(n):

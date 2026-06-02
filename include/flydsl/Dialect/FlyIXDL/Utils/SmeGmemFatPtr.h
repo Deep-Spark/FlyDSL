@@ -15,7 +15,7 @@
 namespace mlir::fly_ixdl {
 
 // Iluvatar SME global "fat pointer". Engineering template: FlyROCDL BufferFatPtr.
-// Semantic fields align with the CUTLASS SmeDescriptor (cute/arch/copy_ix11_desc.hpp):
+// The packed descriptor keeps the fields consumed by MR SME async-copy lowering:
 //
 //   struct { !llvm.ptr<1> gmem_ptr;   // [0] global base pointer
 //            i32          stride_byte; // [1] leading stride in bytes (make_ptr)
@@ -26,7 +26,7 @@ namespace mlir::fly_ixdl {
 // hardware gOffset is always 0 (see design doc §3.4).
 class SmeGmemFatPtr {
   static constexpr unsigned kGmemAddrSpace = 1;   // global
-  static constexpr unsigned kStrideBitWidth = 32; // SmeDescriptor::stride_byte_
+  static constexpr unsigned kStrideBitWidth = 32; // leading stride in bytes
   static constexpr unsigned kOffsetBitWidth = 32; // accumulated byte offset
 
   fly::PointerType ptrTy;
@@ -82,7 +82,7 @@ public:
     return pack(b, loc, gmemPtr(b, loc), strideByte(b, loc), newOff);
   }
 
-  // gmem_ptr + byte_offset as an i8* GEP (aligns with CUTLASS SmeDescriptor::operator+).
+  // gmem_ptr + byte_offset as an i8* GEP for the emitted descriptor base.
   Value resolvedGmemPtr(OpBuilder &b, Location loc) const {
     auto ptrTy = LLVM::LLVMPointerType::get(b.getContext(), kGmemAddrSpace);
     auto i8Ty = IntegerType::get(b.getContext(), 8);

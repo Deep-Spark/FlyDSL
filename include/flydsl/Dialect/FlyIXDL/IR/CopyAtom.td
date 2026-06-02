@@ -8,7 +8,7 @@ include "flydsl/Dialect/FlyIXDL/IR/Dialect.td"
 
 def FlyIXDL_CopyOpMRAsyncCp : FlyIXDL_CopyOp<"CopyOpMRAsyncCp", "mr.async_copy"> {
   let parameters = (ins
-    // CUTLASS IX11::SMESwizzle: 0=NoSwizzle, 1=Col, 2=Row8b, 3=Row16b
+    // MR SME swizzle encoding: 0=NoSwizzle, 1=Col, 2=Row8b, 3=Row16b.
     "int32_t":$smeSwizzle
   );
   let assemblyFormat = "`<` `swizzle` `=` $smeSwizzle `>`";

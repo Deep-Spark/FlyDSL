@@ -8,6 +8,8 @@ from .mr import (
     MRAsyncCpRow8b,
     MRAsyncCpRow16b,
     SMESwizzle,
+    SMEMajor,
+    make_sme_shared_layout,
     make_sme_gmem_tensor,
 )
 from .sync import (
@@ -25,7 +27,9 @@ __all__ = [
     "MRAsyncCpCol",
     "MRAsyncCpRow8b",
     "MRAsyncCpRow16b",
+    "SMEMajor",
     "make_sme_gmem_tensor",
+    "make_sme_shared_layout",
     "cp_async_commit_group",
     "cp_async_wait_group",
     "sl_waitmem",
