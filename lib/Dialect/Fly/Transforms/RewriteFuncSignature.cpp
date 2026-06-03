@@ -373,6 +373,8 @@ Value unpackComposedLayoutFromStruct(OpBuilder &builder, Location loc, Value str
       innerTy = ComposedLayoutType::get(composed);
     if (auto swizzle = dyn_cast<SwizzleAttr>(innerAttr))
       innerTy = SwizzleType::get(swizzle);
+    if (auto modSwizzle = dyn_cast<ModSwizzleAttr>(innerAttr))
+      innerTy = ModSwizzleType::get(modSwizzle);
     if (auto coordSwizzle = dyn_cast<CoordSwizzleAttr>(innerAttr))
       innerTy = CoordSwizzleType::get(coordSwizzle);
     inner = StaticOp::create(builder, loc, innerTy);

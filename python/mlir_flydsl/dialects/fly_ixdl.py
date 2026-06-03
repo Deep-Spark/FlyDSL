@@ -7,3 +7,14 @@ from ._fly_ixdl_ops_gen import *
 from ._fly_ixdl_ops_gen import _Dialect
 
 from .._mlir_libs._mlirDialectsFlyIXDL import *
+
+
+class _TargetAddressSpace:
+    @property
+    def SmeGmem(self):
+        from .. import ir
+
+        return ir.Attribute.parse("#fly_ixdl.sme_gmem")
+
+
+TargetAddressSpace = _TargetAddressSpace()

@@ -322,11 +322,13 @@ struct PyComposedLayoutType : PyConcreteType<PyComposedLayoutType> {
             innerAttr = composed.getAttr();
           else if (auto swizzle = dyn_cast<SwizzleType>(innerTy))
             innerAttr = swizzle.getAttr();
+          else if (auto modSwizzle = dyn_cast<ModSwizzleType>(innerTy))
+            innerAttr = modSwizzle.getAttr();
           else if (auto coordSwizzle = dyn_cast<CoordSwizzleType>(innerTy))
             innerAttr = coordSwizzle.getAttr();
           else
             throw std::invalid_argument("inner must be a LayoutType, ComposedLayoutType, "
-                                        "SwizzleType, or CoordSwizzleType");
+                                        "SwizzleType, ModSwizzleType, or CoordSwizzleType");
 
           IntTupleAttrBuilder builder{ctx};
           auto offsetAttr = getIntTupleAttrFromHandle(offset, builder);
@@ -352,10 +354,12 @@ struct PyComposedLayoutType : PyConcreteType<PyComposedLayoutType> {
         return wrap(ComposedLayoutType::get(composed));
       if (auto swizzle = dyn_cast<SwizzleAttr>(innerAttr))
         return wrap(SwizzleType::get(swizzle));
+      if (auto modSwizzle = dyn_cast<ModSwizzleAttr>(innerAttr))
+        return wrap(ModSwizzleType::get(modSwizzle));
       if (auto coordSwizzle = dyn_cast<CoordSwizzleAttr>(innerAttr))
         return wrap(CoordSwizzleType::get(coordSwizzle));
       throw std::invalid_argument(
-          "Expected LayoutAttr, ComposedLayoutAttr, SwizzleAttr, or CoordSwizzleAttr");
+          "Expected LayoutAttr, ComposedLayoutAttr, SwizzleAttr, ModSwizzleAttr, or CoordSwizzleAttr");
     });
     c.def_prop_ro("offset", [](PyComposedLayoutType &self) -> MlirType {
       return wrap(IntTupleType::get(self.toCppType().getAttr().getOffset()));
@@ -403,6 +407,32 @@ struct PySwizzleType : PyConcreteType<PySwizzleType> {
     c.def_prop_ro("base", [](PySwizzleType &self) { return self.toCppType().getAttr().getBase(); });
     c.def_prop_ro("shift",
                   [](PySwizzleType &self) { return self.toCppType().getAttr().getShift(); });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// ModSwizzleType
+// ---------------------------------------------------------------------------
+struct PyModSwizzleType : PyConcreteType<PyModSwizzleType> {
+  FLYDSL_REGISTER_TYPE_BINDING(::mlir::fly::ModSwizzleType, "ModSwizzleType");
+
+  static void bindDerived(ClassTy &c) {
+    c.def_static(
+        "get",
+        [](int32_t mask, int32_t base, int32_t shift, DefaultingPyMlirContext context) {
+          MLIRContext *ctx = unwrap(context.get()->get());
+          auto attr = ModSwizzleAttr::get(ctx, mask, base, shift);
+          return PyModSwizzleType(context->getRef(), wrap(ModSwizzleType::get(attr)));
+        },
+        "mask"_a, "base"_a, "shift"_a, nb::kw_only(), "context"_a = nb::none(),
+        "Create a ModSwizzleType");
+
+    c.def_prop_ro("mask",
+                  [](PyModSwizzleType &self) { return self.toCppType().getAttr().getMask(); });
+    c.def_prop_ro("base",
+                  [](PyModSwizzleType &self) { return self.toCppType().getAttr().getBase(); });
+    c.def_prop_ro("shift",
+                  [](PyModSwizzleType &self) { return self.toCppType().getAttr().getShift(); });
   }
 };
 
@@ -939,6 +969,7 @@ NB_MODULE(_mlirDialectsFly, m) {
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyTileType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyLayoutType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PySwizzleType::bind(m);
+  ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyModSwizzleType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyCoordSwizzleType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyComposedLayoutType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly::PyPointerType::bind(m);
