@@ -145,12 +145,14 @@ def _binary_op(self, other, op, *, loc=None, ip=None):
     if op in _ARITH_OPS:
         float_fn, int_fn = _ARITH_OPS[op]
         if self.is_float:
-            return float_fn(self, other, loc=loc, ip=ip)
+            return float_fn(self, other, fastmath=arith.FastMathFlags.contract,
+                            loc=loc, ip=ip)
         return int_fn(self, other, loc=loc, ip=ip)
 
     if op == "div":
         if self.is_float:
-            return arith.divf(self, other, loc=loc, ip=ip)
+            return arith.divf(self, other, fastmath=arith.FastMathFlags.contract,
+                              loc=loc, ip=ip)
         et = element_type(self.type)
         if isinstance(et, ir.IndexType):
             return arith.divui(self, other, loc=loc, ip=ip)
@@ -279,7 +281,8 @@ def _neg_op(self, *, loc=None, ip=None):
     if self.type == T.bool():
         raise TypeError("negation is not supported for boolean type")
     if self.is_float:
-        return arith.negf(self, loc=loc, ip=ip)
+        return arith.negf(self, fastmath=arith.FastMathFlags.contract,
+                          loc=loc, ip=ip)
     c0 = arith_const(0, self.type, loc=loc, ip=ip)
     return arith.subi(c0, self, loc=loc, ip=ip)
 
@@ -395,6 +398,10 @@ class ArithValue(ir.Value):
         """Float maximum (NaN-propagating)."""
         return arith.maximumf(self, _to_raw(other), loc=loc)
 
+    def maxnumf(self, other, *, loc=None):
+        """Float maximum (NaN-ignoring, IEEE 754 maxNum)."""
+        return arith.maxnumf(self, _to_raw(other), loc=loc)
+
     def rsqrt(self, *, fastmath=None, loc=None):
         """Reciprocal square root: 1/sqrt(self)."""
         from ..._mlir.dialects import math as _math
@@ -410,6 +417,24 @@ class ArithValue(ir.Value):
         from ..._mlir.dialects.gpu import ShuffleOp
         return ShuffleOp(_to_raw(self), _to_raw(offset),
                          _to_raw(width), mode="xor", loc=loc).shuffleResult
+
+    def shuffle_idx(self, src_lane, width, *, loc=None):
+        """GPU warp shuffle with index mode — read from *src_lane*."""
+        from ..._mlir.dialects.gpu import ShuffleOp
+        return ShuffleOp(_to_raw(self), _to_raw(src_lane),
+                         _to_raw(width), mode="idx", loc=loc).shuffleResult
+
+    def shuffle_up(self, delta, width, *, loc=None):
+        """GPU warp shuffle up — read from lane ``lane_id - delta``."""
+        from ..._mlir.dialects.gpu import ShuffleOp
+        return ShuffleOp(_to_raw(self), _to_raw(delta),
+                         _to_raw(width), mode="up", loc=loc).shuffleResult
+
+    def shuffle_down(self, delta, width, *, loc=None):
+        """GPU warp shuffle down — read from lane ``lane_id + delta``."""
+        from ..._mlir.dialects.gpu import ShuffleOp
+        return ShuffleOp(_to_raw(self), _to_raw(delta),
+                         _to_raw(width), mode="down", loc=loc).shuffleResult
 
     def index_cast(self, target_type, *, loc=None):
         """Cast between index and integer types."""

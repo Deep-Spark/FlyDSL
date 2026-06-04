@@ -240,6 +240,55 @@ def sl_waitcnt(cnt=None, *, vm=False, sm=False, lm=False, g2s=False, s2g=False,
     return _sl_waitcnt(cnt, loc=loc, ip=ip)
 
 
+def shuffle_xor(val, offset, width, *, loc=None):
+    """Warp shuffle XOR (butterfly).  ``val`` from lane ``lane_id ^ offset``.
+
+    Lowers to ``gpu.shuffle xor`` → ``ixdl.shfl bfly``.
+    """
+    from .numeric import _to_raw, Float32, Int32
+    from .._mlir.dialects.gpu import ShuffleOp
+    res = ShuffleOp(_to_raw(val), _to_raw(offset),
+                    _to_raw(width), mode="xor", loc=loc).shuffleResult
+    return type(val)(res) if hasattr(val, 'ir_value') else res
+
+
+def shuffle_idx(val, src_lane, width, *, loc=None):
+    """Warp shuffle index — read ``val`` from ``src_lane`` (modulo ``width``).
+
+    Lowers to ``gpu.shuffle idx`` → ``ixdl.shfl idx``.
+    This is the IXDL equivalent of CUDA ``__shfl(val, src_lane, width)``.
+    """
+    from .numeric import _to_raw
+    from .._mlir.dialects.gpu import ShuffleOp
+    res = ShuffleOp(_to_raw(val), _to_raw(src_lane),
+                    _to_raw(width), mode="idx", loc=loc).shuffleResult
+    return type(val)(res) if hasattr(val, 'ir_value') else res
+
+
+def shuffle_up(val, delta, width, *, loc=None):
+    """Warp shuffle up — read ``val`` from lane ``lane_id - delta``.
+
+    Lowers to ``gpu.shuffle up`` → ``ixdl.shfl up``.
+    """
+    from .numeric import _to_raw
+    from .._mlir.dialects.gpu import ShuffleOp
+    res = ShuffleOp(_to_raw(val), _to_raw(delta),
+                    _to_raw(width), mode="up", loc=loc).shuffleResult
+    return type(val)(res) if hasattr(val, 'ir_value') else res
+
+
+def shuffle_down(val, delta, width, *, loc=None):
+    """Warp shuffle down — read ``val`` from lane ``lane_id + delta``.
+
+    Lowers to ``gpu.shuffle down`` → ``ixdl.shfl down``.
+    """
+    from .numeric import _to_raw
+    from .._mlir.dialects.gpu import ShuffleOp
+    res = ShuffleOp(_to_raw(val), _to_raw(delta),
+                    _to_raw(width), mode="down", loc=loc).shuffleResult
+    return type(val)(res) if hasattr(val, 'ir_value') else res
+
+
 def sched_barrier(loc=None, ip=None):
     """Prevent the Iluvatar backend scheduler from moving instructions across this point.
 
@@ -258,6 +307,37 @@ def sched_barrier(loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
+
+
+def rcpf(val, *, loc=None, ip=None):
+    """Hardware fast reciprocal: ``1.0 / val`` using the Iluvatar SFU.
+
+    Lowers to the ``llvm.bi.rcp`` intrinsic (``__ivcorex_rcpf``). Single
+    precision only. The result is an approximation — sufficient for softmax
+    normalization but not bit-exact to ``arith.divf``.
+
+    Args:
+        val: An f32 scalar (FlyDSL numeric or raw MLIR value).
+
+    Returns:
+        An f32 value containing ``1.0 / val``.
+    """
+    from .numeric import _to_raw
+    from .._mlir.dialects import llvm as _llvm
+    from .._mlir import ir as _ir
+
+    raw = _to_raw(val)
+    f32_ty = _ir.F32Type.get()
+    result = _llvm.call_intrinsic(
+        f32_ty,
+        "llvm.bi.rcp",
+        [raw],
+        [],
+        [],
+        loc=loc,
+        ip=ip,
+    )
+    return result
 
 
 def SMELayout16x512b(elem_type, transpose=False, target_shape=None):
@@ -399,6 +479,10 @@ __all__ = [
     "pipebar_wait",
     "sl_waitcnt",
     "sched_barrier",
+    "shuffle_xor",
+    "shuffle_idx",
+    "shuffle_up",
+    "shuffle_down",
     "SMELayout16x512b",
     "SMELayout16x512b_T",
     "SMEView16x512b",

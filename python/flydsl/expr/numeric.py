@@ -433,6 +433,10 @@ class Numeric(metaclass=NumericMeta):
         """Float maximum — delegates to ArithValue.maximumf."""
         return type(self)(self.ir_value().maximumf(_to_raw(other), loc=loc))
 
+    def maxnumf(self, other, *, loc=None):
+        """Float maximum (NaN-ignoring) — delegates to ArithValue.maxnumf."""
+        return type(self)(self.ir_value().maxnumf(_to_raw(other), loc=loc))
+
     def minimumf(self, other, *, loc=None):
         """Float minimum — delegates to ArithValue.minimumf."""
         return type(self)(self.ir_value().minimumf(_to_raw(other), loc=loc))
@@ -444,6 +448,18 @@ class Numeric(metaclass=NumericMeta):
     def shuffle_xor(self, offset, width, *, loc=None):
         """GPU warp shuffle XOR — delegates to ArithValue.shuffle_xor."""
         return type(self)(self.ir_value().shuffle_xor(offset, width, loc=loc))
+
+    def shuffle_idx(self, src_lane, width, *, loc=None):
+        """GPU warp shuffle index — read value from *src_lane*."""
+        return type(self)(self.ir_value().shuffle_idx(src_lane, width, loc=loc))
+
+    def shuffle_up(self, delta, width, *, loc=None):
+        """GPU warp shuffle up — read from lane ``lane_id - delta``."""
+        return type(self)(self.ir_value().shuffle_up(delta, width, loc=loc))
+
+    def shuffle_down(self, delta, width, *, loc=None):
+        """GPU warp shuffle down — read from lane ``lane_id + delta``."""
+        return type(self)(self.ir_value().shuffle_down(delta, width, loc=loc))
 
     def shrui(self, amount, *, loc=None):
         """Unsigned right shift — delegates to ArithValue.shrui."""
