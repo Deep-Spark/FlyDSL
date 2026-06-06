@@ -532,6 +532,10 @@ class Numeric(metaclass=NumericMeta):
         """GPU warp shuffle XOR — delegates to ArithValue.shuffle_xor."""
         return type(self)(self.ir_value().shuffle_xor(offset, width, loc=loc))
 
+    def shuffle_idx(self, src_lane, width, *, loc=None):
+        """GPU warp shuffle index — delegates to ArithValue.shuffle_idx."""
+        return type(self)(self.ir_value().shuffle_idx(src_lane, width, loc=loc))
+
     def shrui(self, amount, *, loc=None):
         """Unsigned right shift — delegates to ArithValue.shrui."""
         return type(self)(self.ir_value().shrui(amount, loc=loc))

@@ -80,7 +80,7 @@ def Fly_MakeOrderedLayoutOp : Fly_Op<"make_ordered_layout", [Pure, DeclareOpInte
 }
 
 def Fly_MakeComposedLayoutOp : Fly_Op<"make_composed_layout", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
-  let arguments = (ins AnyTypeOf<[Fly_Layout, Fly_Swizzle, Fly_CoordSwizzle, Fly_ComposedLayout]>:$inner,
+  let arguments = (ins AnyTypeOf<[Fly_Layout, Fly_Swizzle, Fly_ModSwizzle, Fly_CoordSwizzle, Fly_ComposedLayout]>:$inner,
                        Fly_IntTuple:$offset,
                        Fly_NarrowLayoutType:$outer);
   let results = (outs Fly_ComposedLayout:$result);
@@ -262,7 +262,7 @@ def Fly_CosizeOp : Fly_Op<"cosize", [Pure, DeclareOpInterfaceMethods<InferTypeOp
 }
 
 def Fly_Crd2IdxOp : Fly_Op<"crd2idx", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
-  let arguments = (ins Fly_IntTuple:$coord, AnyTypeOf<[Fly_NarrowLayoutType, Fly_Swizzle, Fly_CoordSwizzle]>:$layout);
+  let arguments = (ins Fly_IntTuple:$coord, AnyTypeOf<[Fly_NarrowLayoutType, Fly_Swizzle, Fly_ModSwizzle, Fly_CoordSwizzle]>:$layout);
   let results = (outs Fly_IntTuple:$index);
 }
 def Fly_Idx2CrdOp : Fly_Op<"idx2crd", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
