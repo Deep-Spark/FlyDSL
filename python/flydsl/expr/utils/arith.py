@@ -425,6 +425,16 @@ class ArithValue(ir.Value):
             width = constant(width, type=T.i32(), loc=loc)
         return ShuffleOp(_to_raw(self), _to_raw(offset), _to_raw(width), mode="xor", loc=loc).shuffleResult
 
+    def shuffle_idx(self, src_lane, width, *, loc=None):
+        """GPU warp shuffle: read ``val`` from lane ``src_lane`` (CUDA ``__shfl``)."""
+        from ..._mlir.dialects.gpu import ShuffleOp
+
+        if isinstance(src_lane, int):
+            src_lane = constant(src_lane, type=T.i32(), loc=loc)
+        if isinstance(width, int):
+            width = constant(width, type=T.i32(), loc=loc)
+        return ShuffleOp(_to_raw(self), _to_raw(src_lane), _to_raw(width), mode="idx", loc=loc).shuffleResult
+
     def index_cast(self, target_type, *, loc=None):
         """Cast between index and integer types."""
         if self.type == target_type:

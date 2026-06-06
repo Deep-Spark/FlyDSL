@@ -5,3 +5,7 @@
 if("rocdl" IN_LIST FLYDSL_BACKENDS)
   add_subdirectory(ROCm)
 endif()
+
+if("iluvatar" IN_LIST FLYDSL_BACKENDS)
+  add_subdirectory(Iluvatar)
+endif()

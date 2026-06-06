@@ -238,6 +238,8 @@ auto layoutCrd2Idx(LayoutBuilder<Layout> &builder, typename LayoutBuilder<Layout
     auto inner = builder.getInner(layout);
     if (builder.isSwizzle(inner)) {
       return builder.applySwizzle(intermediate, builder.getSwizzleAttr(inner));
+    } else if (builder.isModSwizzle(inner)) {
+      return builder.applyModSwizzle(intermediate, builder.getModSwizzleAttr(inner));
     } else if (builder.isCoordSwizzle(inner)) {
       return builder.applyCoordSwizzle(intermediate, builder.getCoordSwizzleAttr(inner));
     } else {
@@ -276,8 +278,10 @@ public:
 
   bool isComposedLayout(Attribute attr) const { return isa<ComposedLayoutAttr>(attr); }
   bool isSwizzle(Attribute attr) const { return isa<SwizzleAttr>(attr); }
+  bool isModSwizzle(Attribute attr) const { return isa<ModSwizzleAttr>(attr); }
   bool isCoordSwizzle(Attribute attr) const { return isa<CoordSwizzleAttr>(attr); }
   SwizzleAttr getSwizzleAttr(Attribute attr) const { return cast<SwizzleAttr>(attr); }
+  ModSwizzleAttr getModSwizzleAttr(Attribute attr) const { return cast<ModSwizzleAttr>(attr); }
   CoordSwizzleAttr getCoordSwizzleAttr(Attribute attr) const {
     return cast<CoordSwizzleAttr>(attr);
   }
@@ -300,6 +304,7 @@ public:
     return attr;
   }
   Attribute materializeSwizzle(SwizzleAttr swizzle) const { return swizzle; }
+  Attribute materializeModSwizzle(ModSwizzleAttr swizzle) const { return swizzle; }
   Attribute materializeCoordSwizzle(CoordSwizzleAttr coordSwizzle) const { return coordSwizzle; }
 
   LayoutAttr makeLayout(IntTupleAttr shape, IntTupleAttr stride) const {
@@ -319,12 +324,16 @@ public:
     return isa<ComposedLayoutAttr>(adaptor.attr);
   }
   bool isSwizzle(LayoutValueAdaptor adaptor) const { return isa<SwizzleAttr>(adaptor.attr); }
+  bool isModSwizzle(LayoutValueAdaptor adaptor) const { return isa<ModSwizzleAttr>(adaptor.attr); }
   bool isCoordSwizzle(LayoutValueAdaptor adaptor) const {
     return isa<CoordSwizzleAttr>(adaptor.attr);
   }
 
   SwizzleAttr getSwizzleAttr(LayoutValueAdaptor adaptor) const {
     return cast<SwizzleAttr>(adaptor.attr);
+  }
+  ModSwizzleAttr getModSwizzleAttr(LayoutValueAdaptor adaptor) const {
+    return cast<ModSwizzleAttr>(adaptor.attr);
   }
   CoordSwizzleAttr getCoordSwizzleAttr(LayoutValueAdaptor adaptor) const {
     return cast<CoordSwizzleAttr>(adaptor.attr);
@@ -372,6 +381,11 @@ public:
   }
   LayoutValueAdaptor materializeSwizzle(SwizzleAttr swizzle) const {
     auto value = StaticOp::create(this->builder, this->loc, SwizzleType::get(swizzle)).getResult();
+    return LayoutValueAdaptor(value, swizzle);
+  }
+  LayoutValueAdaptor materializeModSwizzle(ModSwizzleAttr swizzle) const {
+    auto value =
+        StaticOp::create(this->builder, this->loc, ModSwizzleType::get(swizzle)).getResult();
     return LayoutValueAdaptor(value, swizzle);
   }
   LayoutValueAdaptor materializeCoordSwizzle(CoordSwizzleAttr coordSwizzle) const {
@@ -1107,10 +1121,28 @@ template <class Layout>
 auto layoutUpcastImpl(LayoutBuilder<Layout> &builder, SwizzleAttr swizzle, int32_t factor) {
   assert(utils::isPowerOf2(factor) && "layoutUpcast: factor must be a power of 2");
   int32_t log_factor = std::log2(factor);
-  int32_t base = swizzle.getBase();
-  assert(base >= log_factor);
-  return builder.materializeSwizzle(SwizzleAttr::get(swizzle.getContext(), swizzle.getMask(),
-                                                     base - log_factor, swizzle.getShift()));
+  int32_t newBase = swizzle.getBase() - log_factor;
+  int32_t newMask = swizzle.getMask();
+  if (newBase < 0) {
+    newMask = std::max(swizzle.getMask() + newBase, 0);
+    newBase = 0;
+  }
+  return builder.materializeSwizzle(
+      SwizzleAttr::get(swizzle.getContext(), newMask, newBase, swizzle.getShift()));
+}
+
+template <class Layout>
+auto layoutUpcastImpl(LayoutBuilder<Layout> &builder, ModSwizzleAttr swizzle, int32_t factor) {
+  assert(utils::isPowerOf2(factor) && "layoutUpcast: factor must be a power of 2");
+  int32_t log_factor = std::log2(factor);
+  int32_t newBase = swizzle.getBase() - log_factor;
+  int32_t newMask = swizzle.getMask();
+  if (newBase < 0) {
+    newMask = std::max(swizzle.getMask() + newBase, 0);
+    newBase = 0;
+  }
+  return builder.materializeModSwizzle(
+      ModSwizzleAttr::get(swizzle.getContext(), newMask, newBase, swizzle.getShift()));
 }
 
 template <class Layout>
@@ -1170,6 +1202,14 @@ auto layoutDowncastImpl(LayoutBuilder<Layout> &builder, SwizzleAttr swizzle, int
 }
 
 template <class Layout>
+auto layoutDowncastImpl(LayoutBuilder<Layout> &builder, ModSwizzleAttr swizzle, int32_t factor) {
+  assert(utils::isPowerOf2(factor) && "layoutDowncast: factor must be a power of 2");
+  int32_t log_factor = std::log2(factor);
+  return builder.materializeModSwizzle(ModSwizzleAttr::get(
+      swizzle.getContext(), swizzle.getMask(), swizzle.getBase() + log_factor, swizzle.getShift()));
+}
+
+template <class Layout>
 auto layoutDowncastImpl(LayoutBuilder<Layout> &builder, CoordSwizzleAttr coordSwizzle,
                         int32_t factor) {
   assert(utils::isPowerOf2(factor) && "layoutDowncast: factor must be a power of 2");
@@ -1208,6 +1248,8 @@ auto layoutUpcast(LayoutBuilder<Layout> &builder, NarrowLayout layout, int32_t f
 
       if (builder.isSwizzle(inner)) {
         inner = detail::layoutUpcastImpl(builder, builder.getSwizzleAttr(inner), factor);
+      } else if (builder.isModSwizzle(inner)) {
+        inner = detail::layoutUpcastImpl(builder, builder.getModSwizzleAttr(inner), factor);
       } else if (builder.isCoordSwizzle(inner)) {
         inner = detail::layoutUpcastImpl(builder, builder.getCoordSwizzleAttr(inner), factor);
       } else {
@@ -1244,6 +1286,8 @@ auto layoutDowncast(LayoutBuilder<Layout> &builder, NarrowLayout layout, int32_t
 
       if (builder.isSwizzle(inner)) {
         inner = detail::layoutDowncastImpl(builder, builder.getSwizzleAttr(inner), factor);
+      } else if (builder.isModSwizzle(inner)) {
+        inner = detail::layoutDowncastImpl(builder, builder.getModSwizzleAttr(inner), factor);
       } else if (builder.isCoordSwizzle(inner)) {
         inner = detail::layoutDowncastImpl(builder, builder.getCoordSwizzleAttr(inner), factor);
       } else {

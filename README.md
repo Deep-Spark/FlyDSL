@@ -386,6 +386,12 @@ See `examples/` for more examples including tiled copy (`02-tiledCopy.py`), tile
 *   AMD MI300X/MI308X (gfx942), AMD MI350/MI355X (gfx950), AMD MI450 (gfx1250), Radeon AI PRO R9700 (gfx1201)
 *   Linux / ROCm 6.x, 7.x
 
+## Iluvatar backend
+
+FlyDSL also targets Iluvatar GPUs through the **FlyIXDL** backend (ivcore11 - MR-50, MR-100, BI-V150 and BI-V150s
+class). Features, build flags, examples, and HGEMM performance notes are in
+[**README_Iluvatar.md**](README_Iluvatar.md).
+
 ## 🙏 Acknowledgements
 
 FlyDSL's design is inspired by ideas from several projects:

@@ -5,6 +5,9 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 namespace mlir::fly {
 
 namespace {
@@ -217,6 +220,12 @@ IntTupleAttr IntTupleBuilder<IntTupleAttr>::applySwizzle(IntTupleAttr v,
                                                          SwizzleAttr swizzle) const {
   assert(v.isLeafInt() && "applySwizzle only supports leafInt IntTupleAttr");
   return IntTupleAttr::get(intApplySwizzle(v.getLeafAsInt(), swizzle));
+}
+
+IntTupleAttr IntTupleBuilder<IntTupleAttr>::applyModSwizzle(IntTupleAttr v,
+                                                            ModSwizzleAttr swizzle) const {
+  assert(v.isLeafInt() && "applyModSwizzle only supports leafInt IntTupleAttr");
+  return IntTupleAttr::get(intApplyModSwizzle(v.getLeafAsInt(), swizzle));
 }
 
 IntTupleAttr IntTupleBuilder<IntTupleAttr>::applyCoordSwizzle(IntTupleAttr coord,
@@ -591,6 +600,45 @@ IntTupleBuilder<IntTupleValueAdaptor>::applySwizzle(IntTupleValueAdaptor v,
   auto masked = arith::AndIOp::create(builder, loc, input, bitMask).getResult();
   auto shifted = arith::ShRUIOp::create(builder, loc, masked, shiftAmount).getResult();
   auto result = arith::XOrIOp::create(builder, loc, input, shifted).getResult();
+  return IntTupleValueAdaptor{result, retAttr};
+}
+
+IntTupleValueAdaptor
+IntTupleBuilder<IntTupleValueAdaptor>::applyModSwizzle(IntTupleValueAdaptor v,
+                                                       ModSwizzleAttr swizzle) const {
+  assert(v.isLeafInt() && "applyModSwizzle only supports leaf IntTupleValueAdaptor");
+
+  auto retAttr = attrBuilder.applyModSwizzle(v.attr, swizzle);
+
+  if (swizzle.isTrivialModSwizzle()) {
+    return IntTupleValueAdaptor{v.value, retAttr};
+  }
+  if (retAttr.isStatic()) {
+    return materializeConstantLeaf(retAttr.getLeafAsInt());
+  }
+
+  auto intType =
+      v.attr.getLeafAsInt().getWidth() == 64 ? builder.getI64Type() : builder.getI32Type();
+  auto input = extendToIntType(v.value, intType);
+  int64_t mask = (int64_t{1} << swizzle.getMask()) - 1;
+  int32_t shift = swizzle.getShift();
+  int64_t yyyMaskValue = mask << (swizzle.getBase() + std::max(0, shift));
+  int64_t zbMaskValue = (int64_t{1} << (swizzle.getMask() + swizzle.getBase())) - 1;
+  int64_t nzbMaskValue = ~zbMaskValue;
+
+  auto yyyMask = arith::ConstantIntOp::create(builder, loc, intType, yyyMaskValue).getResult();
+  auto zbMask = arith::ConstantIntOp::create(builder, loc, intType, zbMaskValue).getResult();
+  auto nzbMask = arith::ConstantIntOp::create(builder, loc, intType, nzbMaskValue).getResult();
+  auto shiftAmount =
+      arith::ConstantIntOp::create(builder, loc, intType, std::abs(shift)).getResult();
+  auto masked = arith::AndIOp::create(builder, loc, input, yyyMask).getResult();
+  Value shifted = shift >= 0
+                      ? arith::ShRUIOp::create(builder, loc, masked, shiftAmount).getResult()
+                      : arith::ShLIOp::create(builder, loc, masked, shiftAmount).getResult();
+  auto lowBits = arith::AndIOp::create(
+      builder, loc, arith::AddIOp::create(builder, loc, input, shifted), zbMask);
+  auto highBits = arith::AndIOp::create(builder, loc, input, nzbMask);
+  auto result = arith::OrIOp::create(builder, loc, highBits, lowBits).getResult();
   return IntTupleValueAdaptor{result, retAttr};
 }
 

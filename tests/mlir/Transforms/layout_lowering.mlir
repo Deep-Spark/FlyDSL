@@ -262,6 +262,29 @@ func.func @test_crd2idx_dynamic(%c0: i32, %c1: i32) -> i32 {
   return %scalar : i32
 }
 
+// Dynamic crd2idx on a standalone ModSwizzle MS<2,3,2> lowers to the additive
+// wrap-around sequence (v & 96)>>2 ; (v + shifted) & 31 ; (v & ~31) | low.
+// The arith.addi (not arith.xori) distinguishes ModSwizzle from plain Swizzle.
+// CHECK-LABEL: @test_crd2idx_dynamic_mod_swizzle
+// CHECK-SAME: (%[[V:.*]]: i32)
+func.func @test_crd2idx_dynamic_mod_swizzle(%v: i32) -> i32 {
+  %coord = fly.make_int_tuple(%v) : (i32) -> !fly.int_tuple<?>
+  %ms = fly.static : !fly.mod_swizzle<MS<2,3,2>>
+  %idx = fly.crd2idx(%coord, %ms) : (!fly.int_tuple<?>, !fly.mod_swizzle<MS<2,3,2>>) -> !fly.int_tuple<?>
+  // CHECK-DAG: %[[M96:.*]] = arith.constant 96 : i32
+  // CHECK-DAG: %[[M31:.*]] = arith.constant 31 : i32
+  // CHECK: %[[AND:.*]] = arith.andi %[[V]], %[[M96]] : i32
+  // CHECK: %[[SHR:.*]] = arith.shrui %[[AND]], %{{.*}} : i32
+  // CHECK: %[[SUM:.*]] = arith.addi %[[V]], %[[SHR]] : i32
+  // CHECK: %[[LOW:.*]] = arith.andi %[[SUM]], %[[M31]] : i32
+  // CHECK: %[[HIGH:.*]] = arith.andi %[[V]], %{{.*}} : i32
+  // CHECK: %[[OR:.*]] = arith.ori %[[HIGH]], %[[LOW]] : i32
+  // CHECK-NOT: arith.xori
+  // CHECK: return %[[OR]]
+  %scalar = fly.get_scalar(%idx) : (!fly.int_tuple<?>) -> i32
+  return %scalar : i32
+}
+
 // -----
 
 // === IntTuple Binary Ops Lowering ===

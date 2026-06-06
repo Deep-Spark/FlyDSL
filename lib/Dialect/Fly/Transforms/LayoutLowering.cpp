@@ -1130,6 +1130,14 @@ public:
       IntTupleValueAdaptor result = layoutBuilder.applySwizzle(coordAdaptor, swizzleTy.getAttr());
       rewriter.replaceOp(op, layoutBuilder.finalize(result));
       return success();
+    } else if (auto modSwizzleTy = dyn_cast<ModSwizzleType>(layout.getType())) {
+      LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
+      IntTupleValueAdaptor coordAdaptor =
+          IntTupleValueAdaptor::create(layoutBuilder, coord, coordTy.getAttr());
+      IntTupleValueAdaptor result =
+          layoutBuilder.applyModSwizzle(coordAdaptor, modSwizzleTy.getAttr());
+      rewriter.replaceOp(op, layoutBuilder.finalize(result));
+      return success();
     } else if (auto coordSwizzleTy = dyn_cast<CoordSwizzleType>(layout.getType())) {
       LayoutBuilder<LayoutValueAdaptor> layoutBuilder(rewriter, loc);
       IntTupleValueAdaptor coordAdaptor =
@@ -2496,6 +2504,8 @@ class DecompositionOpLowering : public OpRewritePattern<DecompositionOp> {
     IntTupleValueAdaptor currentOffset;
     if (builder.isSwizzle(inner)) {
       currentOffset = builder.applySwizzle(inputOffset, builder.getSwizzleAttr(inner));
+    } else if (builder.isModSwizzle(inner)) {
+      currentOffset = builder.applyModSwizzle(inputOffset, builder.getModSwizzleAttr(inner));
     } else if (builder.isCoordSwizzle(inner)) {
       currentOffset = builder.applyCoordSwizzle(inputOffset, builder.getCoordSwizzleAttr(inner));
     } else {
