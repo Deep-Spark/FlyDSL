@@ -1,0 +1,37 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_DEFAULT_TIMEOUT=180
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    pkg-config \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    retry() { \
+      n=0; \
+      until [ "$n" -ge 5 ]; do \
+        "$@" && break; \
+        n=$((n+1)); \
+        echo "retry $n/5: $*"; \
+        sleep $((5*n)); \
+      done; \
+      [ "$n" -lt 5 ]; \
+    }; \
+    retry python3 -m pip install --upgrade pip --retries 10 --timeout 180; \
+    retry python3 -m pip install --no-cache-dir --retries 10 --timeout 180 \
+      nanobind \
+      pybind11 \
+      numpy \
+      pytest
+
+WORKDIR /workspace
