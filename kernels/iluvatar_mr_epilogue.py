@@ -22,6 +22,22 @@ EPILOGUE_STORE_TILED = "tiled"
 EPILOGUE_STORE_READ_C_ACCUM = "read_c_accum"
 
 
+def _byte_perm(a, b, sel: int):
+    """CUDA ``__byte_perm(a, b, sel)`` equivalent on two ``fx.Int32`` values.
+
+    Source bytes are indexed 0-3 = bytes of ``a`` (low->high), 4-7 = bytes of ``b``.
+    Each of ``sel``'s 4 nibbles selects one source byte for the matching output byte.
+    ``sel`` is a Python compile-time constant, so this unrolls to fixed shift/mask ops.
+    """
+    out = fx.Int32(0)
+    for j in fx.range_constexpr(4):
+        idx = (sel >> (4 * j)) & 0xF
+        src = a if idx < 4 else b
+        byte = src.shrui(fx.Int32(8 * (idx % 4))) & fx.Int32(0xFF)
+        out = out | (byte << fx.Int32(8 * j))
+    return out
+
+
 def mr_hgemm_epilogue_store_shfl(
     *,
     lane_id,
@@ -142,6 +158,118 @@ def mr_hgemm_epilogue_store_read_c_accum(
                 pred=None,
             )
 
+
+def mr_igemm_epilogue_store_i32(
+    *,
+    lane_id,
+    accs,
+    gC_warp,
+    tiled_mma,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+):
+    """i32 direct ``make_tiled_copy_C`` store (int8 GEMM, ``D = A @ B.T``)."""
+    gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
+
+    copy_atom_c_i32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
+    tiled_copy_c_i32 = fx.make_tiled_copy_C(copy_atom_c_i32, tiled_mma)
+    thr_copy_c_i32 = tiled_copy_c_i32.get_slice(lane_id)
+    for im in fx.range_constexpr(warp_atoms_m):
+        for jn in fx.range_constexpr(warp_atoms_n):
+            c_tile = fx.slice(gC_atoms, (None, None, im, jn))
+            acc = accs[im][jn]
+            fx.copy(
+                copy_atom_c_i32,
+                thr_copy_c_i32.retile(acc),
+                thr_copy_c_i32.partition_S(c_tile),
+                pred=None,
+            )
+
+
+def mr_igemm_epilogue_store_i8_packed(
+    *,
+    lane_id,
+    warp_id,
+    accs,
+    gC_warp,
+    smem_base,
+    tiled_mma,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    c_global_n: int,
+):
+    """int8 packed store (int8 GEMM, ``D = A @ B.T``, truncating cast).
+    Per lane each MMA atom owns 4 rows {r, r+4, r+8, r+12} x 1
+    For every group of 4 N-atoms (64 cols):
+      1. pack each atom's 4 i8 rows into one i32 (truncating cast, wrap on overflow);
+      2. scatter the 4 i32 into SMEM (32-bit writes,
+         bank-conflict free) -> read back 4 i32 with the transpose swizzle;
+      3. 6x ``__byte_perm`` recombine -> 4 i32, each = 4 contiguous-N i8 of one row;
+      4. one coalesced 32-bit global store per output row.
+
+    Avoids the byte-granular SMEM writes / warp-shfl that are slow on ivcore.
+    No quant scale/bias/relu fusion.
+    """
+    if fx.const_expr(warp_atoms_n % 4 != 0):
+        raise ValueError("i8 packed epilogue requires warp_atoms_n %% 4 == 0")
+    warp_m = ATOM_M * warp_atoms_m
+    warp_n = ATOM_N * warp_atoms_n
+    groups_n = warp_atoms_n // 4
+
+    lane_row = lane_id // fx.Int32(TCU_LANE_COLS)  # 0..3
+    lane_col = lane_id % fx.Int32(TCU_LANE_COLS)  # 0..15
+    lane01 = lane_col % fx.Int32(4)
+    lane23 = lane_col // fx.Int32(4)
+
+    smem_warp_i32 = fx.recast_iter(
+        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared),
+        smem_base,
+    )
+    warp_base = warp_id * fx.Int32(warp_m * warp_n // 4)
+
+    def _pack_i32(acc):
+        acc_vec = acc.load()
+        i8_vec = fx.arith.trunci(fx.T.VectorType.get(list(acc_vec.type.shape), fx.T.i8()), acc_vec)
+        return Vec(i8_vec).bitcast(fx.Int32)[0]
+
+    # Mainloop has finished reading the pipeline smem; safe to reuse for staging.
+    fx.gpu.barrier()
+    # Phase 1: scatter-write all (im, group) blocks.
+    for im in fx.range_constexpr(warp_atoms_m):
+        for g in fx.range_constexpr(groups_n):
+            block = warp_base + fx.Int32((im * groups_n + g) * 256)
+            for e in fx.range_constexpr(4):
+                src_e = _pack_i32(accs[im][g * 4 + e])
+                idx = block + lane01 * fx.Int32(64) + lane_row * fx.Int32(16) + (lane01 ^ fx.Int32(e)) * fx.Int32(4) + lane23
+                fx.ptr_store(src_e, fx.add_offset(smem_warp_i32, fx.make_int_tuple(idx)))
+
+    fx.gpu.barrier()
+
+    # Phase 2: transpose-read + byte_perm recombine + coalesced global store.
+    c_warp_ptr = fx.get_iter(gC_warp)
+    i32_global_ty = fx.PointerType.get(fx.Int32.ir_type, c_warp_ptr.memspace)
+    for im in fx.range_constexpr(warp_atoms_m):
+        for g in fx.range_constexpr(groups_n):
+            block = warp_base + fx.Int32((im * groups_n + g) * 256)
+            val = []
+            for e in fx.range_constexpr(4):
+                idx = block + fx.Int32(e * 64) + (lane_id ^ fx.Int32(e * 4))
+                val.append(fx.ptr_load(fx.add_offset(smem_warp_i32, fx.make_int_tuple(idx))))
+            t0 = _byte_perm(val[0], val[1], 0x5140)
+            t1 = _byte_perm(val[2], val[3], 0x5140)
+            ret0 = _byte_perm(t0, t1, 0x5410)
+            ret1 = _byte_perm(t0, t1, 0x7632)
+            t0 = _byte_perm(val[0], val[1], 0x7362)
+            t1 = _byte_perm(val[2], val[3], 0x7362)
+            ret2 = _byte_perm(t0, t1, 0x5410)
+            ret3 = _byte_perm(t0, t1, 0x7632)
+            rets = (ret0, ret1, ret2, ret3)
+            col = fx.Int32(g * 64) + lane_col * fx.Int32(4)
+            for k in fx.range_constexpr(4):
+                row = fx.Int32(im * 16 + k * 4) + lane_row
+                byte_off = row * fx.Int32(c_global_n) + col
+                store_ptr = fx.recast_iter(i32_global_ty, fx.add_offset(c_warp_ptr, fx.make_int_tuple(byte_off)))
+                fx.ptr_store(rets[k], store_ptr)
 
 def mr_hgemm_epilogue_store(
     *,

@@ -46,6 +46,33 @@ def sme_values_per_row(elem_bits: int) -> int:
     return SME_BITS_PER_ROW // elem_bits
 
 
+def mr_swizzle_cta_shape(
+    warps_m: int,
+    warps_n: int,
+    k_rep: int,
+    *,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    atom_k: int,
+    elem_bytes: int,
+    stages: int = 2,
+) -> tuple[int, int, int, int, int]:
+    """Swizzle-mode CTA geometry shared by the f16/i8 MR GEMM kernels.
+
+    Returns ``(bm, bn, bk, threads, pipeline_smem_bytes)``. ``pipeline_smem_bytes``
+    is the double-buffered G2S staging size; the i8 packed epilogue may need
+    ``max(pipeline_smem, bm * bn)`` and applies that at its call site.
+    """
+    warp_m = ATOM_M * warp_atoms_m
+    warp_n = ATOM_N * warp_atoms_n
+    bm = warp_m * warps_m
+    bn = warp_n * warps_n
+    bk = atom_k * k_rep
+    threads = warps_m * warps_n * WARP_SIZE
+    smem_bytes = (bm + bn) * bk * elem_bytes * stages
+    return bm, bn, bk, threads, smem_bytes
+
+
 def pattern_sme_atom_counts(
     pattern_id: int,
     bm: int,
@@ -88,6 +115,7 @@ __all__ = [
     "TCU_LANE_COLS",
     "WARP_SIZE",
     "major_pattern_id",
+    "mr_swizzle_cta_shape",
     "pattern_sme_atom_counts",
     "sme_values_per_row",
 ]

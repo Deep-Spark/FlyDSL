@@ -10,8 +10,13 @@
 
 import flydsl.expr as fx
 
-from kernels.iluvatar_mr_common import ATOM_K, ATOM_M, ATOM_N, SMEM_F16_PER_ROW
-from kernels.iluvatar_mr_operand_copy import MrG2sSmeConfig, mr_g2s_brick_layout, mr_sme_shared_view
+from kernels.iluvatar_mr_common import ATOM_K, ATOM_M, ATOM_N, SMEM_F16_PER_ROW, SMEM_ROWS, WARP_SIZE
+from kernels.iluvatar_mr_operand_copy import (
+    MrG2sSmeConfig,
+    mr_g2s_brick_layout,
+    mr_sme_shared_view,
+    mr_sme_shared_view_k_spanning,
+)
 
 
 def mr_hgemm_s2r_copy_a(*, copy_atom, thr_copy_a, thr_mma, smem_a_tile):
@@ -71,22 +76,42 @@ def mr_hgemm_s2r_a_tile(
         ki_brick = ki // 2
         ki_in_tile = ki % 2
     else:
-        ki_brick = ki
+        # MN-major A: each MMA atom consumes K=atom_k, but an SME brick only holds
+        # K=SMEM_ROWS, so one atom spans atom_k//SMEM_ROWS contiguous K-bricks.
+        ki_brick = ki * (atom_k // SMEM_ROWS)
         ki_in_tile = 0
 
     if fx.const_expr(pattern_id == 1 or pattern_id == 3):
+        # An MN-major SME brick spans `values_per_sme_row` MN values, i.e.
+        # `values_per_sme_row // atom_m` MMA M-atoms (f16: 32/16=2, i8: 64/16=4).
+        # The SME 16xB64 col load is atomic over the full brick MN, so a warp
+        # M-atom maps to (which brick, which 16-slice within the brick).
+        atoms_per_brick = values_per_sme_row // atom_m
         w_mi = fx.Int32(warp_m_id) * fx.Int32(warp_atoms_m) + fx.Int32(im)
-        g2s_mi = w_mi // fx.Int32(2)
-        m_half = w_mi % fx.Int32(2)
+        g2s_mi = w_mi // fx.Int32(atoms_per_brick)
+        m_half = w_mi % fx.Int32(atoms_per_brick)
         linear = g2s_mi * fx.Int32(a_smem_k_bricks) + fx.Int32(ki_brick)
         off = stage_base + linear * fx.Int32(brick_elems)
-        smem_view = mr_sme_shared_view(
-            smem_base,
-            off,
-            g2s_sme.a_sme_sw,
-            elem_dtype,
-            major=g2s_sme.a_smem_major,
-        )
+        if fx.const_expr(atom_k > SMEM_ROWS):
+            # i8 MN-major A: one brick holds K=SMEM_ROWS(16); the MMA atom needs
+            # K=atom_k(32) -> span contiguous K-bricks.
+            smem_view = mr_sme_shared_view_k_spanning(
+                smem_base,
+                off,
+                g2s_sme.a_sme_sw,
+                elem_dtype,
+                major=g2s_sme.a_smem_major,
+                mn_extent=values_per_sme_row,
+                k_total=atom_k,
+            )
+        else:
+            smem_view = mr_sme_shared_view(
+                smem_base,
+                off,
+                g2s_sme.a_sme_sw,
+                elem_dtype,
+                major=g2s_sme.a_smem_major,
+            )
         return fx.slice(fx.zipped_divide(smem_view, tile_atom_a), (None, m_half))
 
     off = stage_base + warp_a_base + fx.Int32((im * a_smem_k_bricks + ki_brick) * brick_elems)
@@ -130,25 +155,45 @@ def mr_hgemm_s2r_b_tile(
     warp_b_base = fx.Int32(warp_n_id) * fx.Int32(warp_atoms_n * b_smem_k_bricks * brick_elems)
 
     if fx.const_expr(pattern_id == 0 or pattern_id == 1):
-        ki_brick = ki
+        # MN-major B: each MMA atom consumes K=atom_k, but an SME brick only holds
+        # K=SMEM_ROWS, so one atom spans atom_k//SMEM_ROWS contiguous K-bricks.
+        ki_brick = ki * (atom_k // SMEM_ROWS)
         ki_in_tile = 0
     else:
         ki_brick = ki // 2
         ki_in_tile = ki % 2
 
     if fx.const_expr(pattern_id == 0 or pattern_id == 1):
+        # An MN-major SME brick spans `values_per_sme_row` MN values, i.e.
+        # `values_per_sme_row // atom_n` MMA N-atoms (f16: 32/16=2, i8: 64/16=4).
+        atoms_per_brick = values_per_sme_row // atom_n
         w_ni = fx.Int32(warp_n_id) * fx.Int32(warp_atoms_n) + fx.Int32(jn)
-        g2s_ni = w_ni // fx.Int32(2)
-        n_half = w_ni % fx.Int32(2)
-        linear = fx.Int32(ki_brick) * fx.Int32(b_n_chunks) + g2s_ni
+        g2s_ni = w_ni // fx.Int32(atoms_per_brick)
+        n_half = w_ni % fx.Int32(atoms_per_brick)
+        # N-outer / K-contiguous brick order (symmetric with A) so an MMA atom's
+        # K-bricks are contiguous in shared and k_spanning can read them.
+        linear = g2s_ni * fx.Int32(b_smem_k_bricks) + fx.Int32(ki_brick)
         off = stage_base + fx.Int32(bm * bk) + linear * fx.Int32(brick_elems)
-        smem_view = mr_sme_shared_view(
-            smem_base,
-            off,
-            g2s_sme.b_sme_sw,
-            elem_dtype,
-            major=g2s_sme.b_smem_major,
-        )
+        if fx.const_expr(atom_k > SMEM_ROWS):
+            # i8 MN-major B: one brick holds K=SMEM_ROWS(16); the MMA atom needs
+            # K=atom_k(32) -> span contiguous K-bricks.
+            smem_view = mr_sme_shared_view_k_spanning(
+                smem_base,
+                off,
+                g2s_sme.b_sme_sw,
+                elem_dtype,
+                major=g2s_sme.b_smem_major,
+                mn_extent=values_per_sme_row,
+                k_total=atom_k,
+            )
+        else:
+            smem_view = mr_sme_shared_view(
+                smem_base,
+                off,
+                g2s_sme.b_sme_sw,
+                elem_dtype,
+                major=g2s_sme.b_smem_major,
+            )
         return fx.slice(fx.zipped_divide(smem_view, tile_atom_b), (None, n_half))
 
     off = stage_base + warp_b_base + fx.Int32(bm * bk + (jn * b_smem_k_bricks + ki_brick) * brick_elems)
@@ -182,6 +227,7 @@ def mr_hgemm_s2r_load_ki(
     bm: int,
     bn: int,
     bk: int,
+    atom_k: int = ATOM_K,
     values_per_sme_row: int = SMEM_F16_PER_ROW,
 ):
     """Load all warp A/B MMA operand fragments for one Ki slice from shared memory."""
@@ -205,6 +251,7 @@ def mr_hgemm_s2r_load_ki(
                     bm=bm,
                     bn=bn,
                     bk=bk,
+                    atom_k=atom_k,
                     values_per_sme_row=values_per_sme_row,
                 ),
             )
@@ -229,6 +276,7 @@ def mr_hgemm_s2r_load_ki(
                     bm=bm,
                     bn=bn,
                     bk=bk,
+                    atom_k=atom_k,
                     values_per_sme_row=values_per_sme_row,
                 ),
             )

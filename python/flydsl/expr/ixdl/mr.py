@@ -202,6 +202,48 @@ def make_sme_shared_layout(sme_swizzle, elem_type, *, major=SMEMajor.MN):
     return recast_layout(byte_layout, 8, elem_bits)
 
 
+def make_sme_shared_layout_k_spanning(sme_swizzle, elem_type, *, major=SMEMajor.MN, mn_extent, k_total):
+    """SME shared layout whose K mode spans several consecutive SME bricks.
+
+    For 8-bit MN-major operands one SME brick only holds K = ``SMEM_ROWS`` (16),
+    but the i8 MMA atom needs K = 32. The MMA A/B fragment TV layout decodes K as
+    ``(within_brick_K, brick)`` -- the brick selector must be a **clean outer K
+    sub-mode**, not folded into the within-brick K factors. So we extend the
+    single-brick bit-spec K mode by appending an extra ``(k_bricks, brick_stride)``
+    sub-mode *after* the brick's own K sub-modes, keeping the within-brick K shape
+    intact (e.g. i8 Col gives K = ``((4,4), 2)`` not ``(4, 8)``).
+
+    ``mn_extent`` is the brick MN span (``values_per_sme_row``); ``k_total`` is the
+    spanned K (``SMEM_ROWS * k_bricks``). The K-bricks must be contiguous in shared
+    (stride = one brick = ``mn_extent * SMEM_ROWS`` elements). When ``k_total``
+    equals one brick's K this reduces to :func:`make_sme_shared_layout`.
+    """
+    sme_swizzle = int(sme_swizzle)
+    elem_bits = _elem_bits(elem_type)
+    is_mn = _normalize_major(major) == SMEMajor.MN
+    if not is_mn:
+        raise ValueError("k-spanning shared layout is only defined for MN-major operands")
+
+    shape, stride, swz = _sme_bit_spec(sme_swizzle, elem_bits, is_mn)
+    mn_mode, k_mode = shape
+    mn_str, k_str = stride
+    # One MN-major brick is SMEM_ROWS(16) x mn_extent; its K extent is SMEM_ROWS.
+    brick_k = 16
+    k_bricks = int(k_total) // brick_k
+    if k_bricks > 1:
+        brick_elems = int(mn_extent) * brick_k
+        brick_bits = brick_elems * elem_bits
+        # Append the brick selector as a clean OUTER K sub-mode, preserving the
+        # within-brick K shape so the MMA TV K-decode stays (within_K, brick).
+        shape = (mn_mode, (k_mode, int(k_bricks)))
+        stride = (mn_str, (k_str, brick_bits))
+
+    byte_layout = recast_layout(make_layout(shape, stride), 1, 8)
+    if swz is not None:
+        byte_layout = make_composed_layout(_make_swizzle(*swz), byte_layout)
+    return recast_layout(byte_layout, 8, elem_bits)
+
+
 def make_sme_gmem_tensor(tensor: Tensor, *, leading_stride=None) -> Tensor:
     """Wrap ``tensor`` in an SME global-memory view (``#fly_ixdl.sme_gmem``).
 

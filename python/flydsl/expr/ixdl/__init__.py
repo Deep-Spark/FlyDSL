@@ -12,6 +12,7 @@ from .mr import (
     SMESwizzle,
     make_sme_gmem_tensor,
     make_sme_shared_layout,
+    make_sme_shared_layout_k_spanning,
 )
 from .sync import (
     cp_async_commit_group,
@@ -31,6 +32,7 @@ __all__ = [
     "MRMma",
     "SMEMajor",
     "make_sme_shared_layout",
+    "make_sme_shared_layout_k_spanning",
     "make_sme_gmem_tensor",
     "cp_async_commit_group",
     "cp_async_wait_group",

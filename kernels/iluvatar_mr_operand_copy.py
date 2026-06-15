@@ -95,6 +95,21 @@ def mr_sme_shared_view(smem_base, elem_offset, swizzle, elem_dtype, *, major):
     return fx.make_view(smem_ptr, layout)
 
 
+def mr_sme_shared_view_k_spanning(smem_base, elem_offset, swizzle, elem_dtype, *, major, mn_extent, k_total):
+    """SME shared view whose K mode spans several contiguous SME bricks.
+
+    For 8-bit MN-major operands one brick only holds K = ``SMEM_ROWS``; an i8 MMA
+    atom needs K = 32 = 2 bricks. ``tile_to_shape`` replicates the single-brick
+    swizzled atom up to ``(mn_extent, k_total)`` (CUTLASS semantics). The spanned
+    K-bricks must be contiguous in shared starting at ``elem_offset``.
+    """
+    smem_ptr = fx.add_offset(smem_base, fx.make_int_tuple(fx.Int32(elem_offset)))
+    layout = ixdl.make_sme_shared_layout_k_spanning(
+        swizzle, elem_dtype, major=major, mn_extent=mn_extent, k_total=k_total
+    )
+    return fx.make_view(smem_ptr, layout)
+
+
 def mr_hgemm_g2s_issue_a_warp(
     *,
     pattern_id: int,
@@ -170,10 +185,12 @@ def mr_hgemm_g2s_issue_b_warp(
     for t in fx.range_constexpr(b_per_warp):
         atom_idx = warp_b_start + fx.Int32(t)
         if fx.const_expr(pattern_id == 0 or pattern_id == 1):
-            ni = atom_idx % fx.Int32(b_n_chunks)
-            ki = atom_idx // fx.Int32(b_n_chunks)
+            # N-outer / K-contiguous brick order (symmetric with A) so an MMA
+            # atom's K-bricks are contiguous for the S2R k_spanning read.
+            ni = atom_idx // fx.Int32(b_smem_k_bricks)
+            ki = atom_idx % fx.Int32(b_smem_k_bricks)
             b_src = fx.slice(g_B_div, (None, (ni, ki)))
-            b_linear = ki * fx.Int32(b_n_chunks) + ni
+            b_linear = ni * fx.Int32(b_smem_k_bricks) + ki
             b_off = stage_base + fx.Int32(b_storage_base) + b_linear * fx.Int32(brick_elems)
         else:
             ni = atom_idx // fx.Int32(b_smem_k_bricks)
