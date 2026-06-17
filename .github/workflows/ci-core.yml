@@ -66,10 +66,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-          pip install -e .
 
       - name: Run A (L0/L1a common)
         env:
+          PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}
           CORE_A_TESTS_JSON: ${{ needs.load-config.outputs.core_a_tests_json }}
         run: |
           mkdir -p logs reports
@@ -113,10 +113,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-          pip install -e .
 
       - name: Run B (Iluvatar compile-tier)
         env:
+          PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}
           FLYDSL_COMPILE_BACKEND: iluvatar
           FLYDSL_RUNTIME_KIND: iluvatar
           COMPILE_ONLY: "1"
