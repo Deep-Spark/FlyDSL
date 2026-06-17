@@ -1,0 +1,167 @@
+name: ci-core
+
+on:
+  pull_request:
+    branches:
+      - iluvatar
+      - main
+      - release/**
+
+permissions: read-all
+
+concurrency:
+  group: ci-core-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  load-config:
+    name: load-config
+    runs-on: ubuntu-latest
+    outputs:
+      python_version: ${{ steps.cfg.outputs.python_version }}
+      core_a_timeout: ${{ steps.cfg.outputs.core_a_timeout }}
+      core_b_timeout: ${{ steps.cfg.outputs.core_b_timeout }}
+      core_a_tests_json: ${{ steps.cfg.outputs.core_a_tests_json }}
+      core_b_tests_json: ${{ steps.cfg.outputs.core_b_tests_json }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read CI config
+        id: cfg
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          cfg = json.loads(Path(".github/ci-config.yaml").read_text())
+          timeouts = cfg.get("timeouts", {})
+          core = cfg.get("core", {})
+          core_a_tests = core.get("a_tests", [])
+          core_b_tests = core.get("b_tests", [])
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"python_version={cfg.get('python_version', '3.10')}\n")
+              out.write(f"core_a_timeout={int(timeouts.get('core_a_minutes', 30))}\n")
+              out.write(f"core_b_timeout={int(timeouts.get('core_b_minutes', 45))}\n")
+              out.write(f"core_a_tests_json={json.dumps(core_a_tests)}\n")
+              out.write(f"core_b_tests_json={json.dumps(core_b_tests)}\n")
+          PY
+
+  core-a:
+    name: core-a
+    runs-on: ubuntu-latest
+    needs: [load-config]
+    timeout-minutes: ${{ fromJSON(needs.load-config.outputs.core_a_timeout) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.load-config.outputs.python_version }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run A (L0/L1a common)
+        env:
+          CORE_A_TESTS_JSON: ${{ needs.load-config.outputs.core_a_tests_json }}
+        run: |
+          mkdir -p logs reports
+          set -o pipefail
+          mapfile -t tests < <(python3 - <<'PY'
+          import json
+          import os
+          tests = json.loads(os.environ["CORE_A_TESTS_JSON"] or "[]")
+          for t in tests:
+              print(t)
+          PY
+          )
+          python -m pytest "${tests[@]}" -v --junitxml=reports/core-a.xml 2>&1 | tee logs/core-a.log
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-core-a-failure
+          retention-days: 7
+          path: |
+            logs/core-a.log
+            reports/core-a.xml
+
+  core-b:
+    name: core-b
+    runs-on: ubuntu-latest
+    needs: [load-config]
+    timeout-minutes: ${{ fromJSON(needs.load-config.outputs.core_b_timeout) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.load-config.outputs.python_version }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run B (Iluvatar compile-tier)
+        env:
+          FLYDSL_COMPILE_BACKEND: iluvatar
+          FLYDSL_RUNTIME_KIND: iluvatar
+          COMPILE_ONLY: "1"
+          ARCH: ivcore11
+          FLYDSL_RUNTIME_ENABLE_CACHE: "0"
+          CORE_B_TESTS_JSON: ${{ needs.load-config.outputs.core_b_tests_json }}
+        run: |
+          mkdir -p logs reports
+          set -o pipefail
+          mapfile -t tests < <(python3 - <<'PY'
+          import json
+          import os
+          tests = json.loads(os.environ["CORE_B_TESTS_JSON"] or "[]")
+          for t in tests:
+              print(t)
+          PY
+          )
+          python -m pytest "${tests[@]}" -v --junitxml=reports/core-b.xml 2>&1 | tee logs/core-b.log
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-core-b-failure
+          retention-days: 7
+          path: |
+            logs/core-b.log
+            reports/core-b.xml
+
+  required:
+    name: ci-core / required
+    runs-on: ubuntu-latest
+    needs: [core-a, core-b]
+    if: always()
+    steps:
+      - name: Summarize core status
+        run: |
+          {
+            echo "### ci-core summary"
+            echo ""
+            echo "- core-a: ${{ needs.core-a.result }}"
+            echo "- core-b: ${{ needs.core-b.result }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce required status
+        run: |
+          if [ "${{ needs.core-a.result }}" != "success" ] || [ "${{ needs.core-b.result }}" != "success" ]; then
+            echo "ci-core failed"
+            exit 1
+          fi

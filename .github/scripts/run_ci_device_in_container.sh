@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Execute Iluvatar L2 device tests inside a CI container while reusing
+# host-provided SDK/driver paths (COREX + ixcc MLIR cmake package).
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "::error::docker is required on the self-hosted runner"
+  exit 1
+fi
+
+: "${CI_DEVICE_IMAGE:?CI_DEVICE_IMAGE is required}"
+: "${COREX_ROOT:?COREX_ROOT is required}"
+: "${IXCC_MLIR_CMAKE:?IXCC_MLIR_CMAKE is required}"
+
+WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
+DEVICE_PYTEST_ARGS_JSON="${DEVICE_PYTEST_ARGS_JSON:-[\"tests/unit\",\"-m\",\"l2_device\"]}"
+DEVICE_MUST_PASS_TESTS_JSON="${DEVICE_MUST_PASS_TESTS_JSON:-[]}"
+ARCH="${ARCH:-ivcore11}"
+CI_DEVICE_CONTAINER_EXTRA_ARGS="${CI_DEVICE_CONTAINER_EXTRA_ARGS:-}"
+CI_DEVICE_NETWORK_MODE="${CI_DEVICE_NETWORK_MODE:-bridge}"
+CI_DEVICE_IPC_MODE="${CI_DEVICE_IPC_MODE:-private}"
+CI_DEVICE_READONLY_ROOTFS="${CI_DEVICE_READONLY_ROOTFS:-1}"
+CI_DEVICE_DROP_ALL_CAPS="${CI_DEVICE_DROP_ALL_CAPS:-1}"
+CI_DEVICE_NO_NEW_PRIVS="${CI_DEVICE_NO_NEW_PRIVS:-1}"
+CI_DEVICE_PIDS_LIMIT="${CI_DEVICE_PIDS_LIMIT:-1024}"
+FLYDSL_ILUVATAR_SMOKE_BLOB_PATH="${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH:-}"
+FLYDSL_ILUVATAR_SMOKE_KERNEL="${FLYDSL_ILUVATAR_SMOKE_KERNEL:-}"
+FLYDSL_ILUVATAR_LAUNCH_KERNEL="${FLYDSL_ILUVATAR_LAUNCH_KERNEL:-}"
+COREX_VERSION_TAG="${COREX_VERSION_TAG:-}"
+
+if [[ ! -d "${WORKSPACE}" ]]; then
+  echo "::error::Workspace does not exist: ${WORKSPACE}"
+  exit 1
+fi
+if [[ ! -d "${COREX_ROOT}" ]]; then
+  echo "::error::COREX_ROOT does not exist: ${COREX_ROOT}"
+  exit 1
+fi
+if [[ ! -f "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake" ]]; then
+  echo "::error::IXCC_MLIR_CMAKE missing MLIRConfig.cmake: ${IXCC_MLIR_CMAKE}"
+  exit 1
+fi
+
+mkdir -p "${WORKSPACE}/logs" "${WORKSPACE}/reports"
+
+corex_git_commit=""
+corex_version_file=""
+corex_lld_version=""
+corex_libcuda_md5=""
+
+if [[ -d "${COREX_ROOT}/.git" ]] && command -v git >/dev/null 2>&1; then
+  corex_git_commit="$(git -C "${COREX_ROOT}" rev-parse --short HEAD 2>/dev/null || true)"
+fi
+
+for vf in VERSION version.txt .version; do
+  if [[ -f "${COREX_ROOT}/${vf}" ]]; then
+    corex_version_file="$(head -n 1 "${COREX_ROOT}/${vf}" | tr -d '\r' | xargs)"
+    break
+  fi
+done
+
+if [[ -x "${COREX_ROOT}/bin/ld.lld" ]]; then
+  corex_lld_version="$("${COREX_ROOT}/bin/ld.lld" --version 2>/dev/null | head -n 1 || true)"
+fi
+
+if [[ -f "${COREX_ROOT}/lib64/libcuda.so.1" ]] && command -v md5sum >/dev/null 2>&1; then
+  corex_libcuda_md5="$(md5sum "${COREX_ROOT}/lib64/libcuda.so.1" | awk '{print $1}')"
+fi
+
+corex_warning=""
+if [[ -z "${COREX_VERSION_TAG}" && -z "${corex_git_commit}" && -z "${corex_version_file}" && -z "${corex_lld_version}" ]]; then
+  corex_warning="WARN: unable to infer COREX version metadata; set COREX_VERSION_TAG for traceability"
+fi
+
+cat > "${WORKSPACE}/logs/device-container-env.txt" <<EOF
+CI_DEVICE_IMAGE=${CI_DEVICE_IMAGE}
+COREX_ROOT=${COREX_ROOT}
+IXCC_MLIR_CMAKE=${IXCC_MLIR_CMAKE}
+ARCH=${ARCH}
+DEVICE_PYTEST_ARGS_JSON=${DEVICE_PYTEST_ARGS_JSON}
+DEVICE_MUST_PASS_TESTS_JSON=${DEVICE_MUST_PASS_TESTS_JSON}
+FLYDSL_ILUVATAR_SMOKE_BLOB_PATH=${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}
+FLYDSL_ILUVATAR_SMOKE_KERNEL=${FLYDSL_ILUVATAR_SMOKE_KERNEL}
+FLYDSL_ILUVATAR_LAUNCH_KERNEL=${FLYDSL_ILUVATAR_LAUNCH_KERNEL}
+COREX_VERSION_TAG=${COREX_VERSION_TAG}
+WORKSPACE=${WORKSPACE}
+EOF
+
+{
+  echo "COREX_VERSION_TAG: ${COREX_VERSION_TAG:-<unset>}"
+  echo "COREX_GIT_COMMIT: ${corex_git_commit:-<unknown>}"
+  echo "COREX_VERSION_FILE: ${corex_version_file:-<unknown>}"
+  echo "COREX_LLD_VERSION: ${corex_lld_version:-<unknown>}"
+  echo "COREX_LIBCUDA_MD5: ${corex_libcuda_md5:-<unknown>}"
+  if [[ -n "${corex_warning}" ]]; then
+    echo "${corex_warning}"
+  fi
+} >> "${WORKSPACE}/logs/device-env.txt"
+
+{
+  echo "### COREX traceability"
+  echo ""
+  echo "| key | value |"
+  echo "|---|---|"
+  echo "| COREX_VERSION_TAG | \`${COREX_VERSION_TAG:-<unset>}\` |"
+  echo "| COREX_GIT_COMMIT | \`${corex_git_commit:-<unknown>}\` |"
+  echo "| COREX_VERSION_FILE | \`${corex_version_file:-<unknown>}\` |"
+  echo "| COREX_LLD_VERSION | \`${corex_lld_version:-<unknown>}\` |"
+  echo "| COREX_LIBCUDA_MD5 | \`${corex_libcuda_md5:-<unknown>}\` |"
+  if [[ -n "${corex_warning}" ]]; then
+    echo ""
+    echo "- :warning: ${corex_warning}"
+  fi
+} > "${WORKSPACE}/logs/corex-version-summary.md"
+
+docker_args=(
+  --rm
+  --network "${CI_DEVICE_NETWORK_MODE}"
+  --ipc "${CI_DEVICE_IPC_MODE}"
+  -v "${WORKSPACE}:/workspace"
+  -v "${COREX_ROOT}:${COREX_ROOT}:ro"
+  -v "${IXCC_MLIR_CMAKE}:${IXCC_MLIR_CMAKE}:ro"
+  -w /workspace
+  -e COREX_ROOT="${COREX_ROOT}"
+  -e IXCC_MLIR_CMAKE="${IXCC_MLIR_CMAKE}"
+  -e ARCH="${ARCH}"
+  -e DEVICE_PYTEST_ARGS_JSON="${DEVICE_PYTEST_ARGS_JSON}"
+  -e DEVICE_MUST_PASS_TESTS_JSON="${DEVICE_MUST_PASS_TESTS_JSON}"
+  -e FLYDSL_ILUVATAR_SMOKE_BLOB_PATH="${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}"
+  -e FLYDSL_ILUVATAR_SMOKE_KERNEL="${FLYDSL_ILUVATAR_SMOKE_KERNEL}"
+  -e FLYDSL_ILUVATAR_LAUNCH_KERNEL="${FLYDSL_ILUVATAR_LAUNCH_KERNEL}"
+  -e FLYDSL_COMPILE_BACKEND=iluvatar
+  -e FLYDSL_RUNTIME_KIND=iluvatar
+  -e FLYDSL_RUNTIME_ENABLE_CACHE=0
+  -e FLYDSL_ILUVATAR_RUN_JIT_SMOKE=1
+  -e CUDAToolkit_ROOT="${COREX_ROOT}"
+  -e MLIR_DIR="${IXCC_MLIR_CMAKE}"
+  -e PYTHONUNBUFFERED=1
+)
+
+if [[ "${CI_DEVICE_READONLY_ROOTFS}" == "1" ]]; then
+  docker_args+=(--read-only --tmpfs /tmp --tmpfs /var/tmp)
+fi
+if [[ "${CI_DEVICE_DROP_ALL_CAPS}" == "1" ]]; then
+  docker_args+=(--cap-drop=ALL)
+fi
+if [[ "${CI_DEVICE_NO_NEW_PRIVS}" == "1" ]]; then
+  docker_args+=(--security-opt=no-new-privileges)
+fi
+if [[ -n "${CI_DEVICE_PIDS_LIMIT}" ]]; then
+  docker_args+=(--pids-limit "${CI_DEVICE_PIDS_LIMIT}")
+fi
+
+if [[ -n "${CI_DEVICE_CONTAINER_EXTRA_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  extra_args=( ${CI_DEVICE_CONTAINER_EXTRA_ARGS} )
+  docker_args+=("${extra_args[@]}")
+fi
+
+docker run "${docker_args[@]}" \
+  "${CI_DEVICE_IMAGE}" \
+  bash -lc '
+    set -euo pipefail
+    export PATH="${COREX_ROOT}/bin:${PATH}"
+    export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+    export PIP_NO_CACHE_DIR=1
+    ASSET_DIR="/workspace/.ci-smoke-assets"
+    mkdir -p "${ASSET_DIR}"
+
+    python3 -m venv /workspace/.ci-venv
+    source /workspace/.ci-venv/bin/activate
+    python3 -m pip install --upgrade pip
+    python3 -m pip install --no-cache-dir -e .
+
+    cmake -S . -B build-fly -G Ninja \
+      -DFLYDSL_BACKENDS=iluvatar \
+      -DMLIR_DIR="${MLIR_DIR}" \
+      -DCUDAToolkit_ROOT="${CUDAToolkit_ROOT}" \
+      -DPython3_EXECUTABLE="$(command -v python3)"
+    cmake --build build-fly -j"$(nproc)"
+
+    runtime_lib="/workspace/build-fly/python_packages/flydsl/_mlir/_mlir_libs/libfly_iluvatar_jit_runtime.so"
+    if [[ ! -f "${runtime_lib}" ]]; then
+      echo "::error::missing runtime library: ${runtime_lib}"
+      exit 1
+    fi
+    export FLYDSL_ILUVATAR_JIT_RUNTIME_LIB="${runtime_lib}"
+
+    mapfile -t must_pass < <(python3 - <<'"'"'PY'"'"'
+import json
+import os
+for a in json.loads(os.environ["DEVICE_MUST_PASS_TESTS_JSON"]):
+    print(a)
+PY
+)
+    if [[ "${#must_pass[@]}" -eq 0 ]]; then
+      echo "::error::DEVICE_MUST_PASS_TESTS_JSON resolved to empty list"
+      exit 1
+    fi
+
+    need_runtime_smoke=0
+    for t in "${must_pass[@]}"; do
+      if [[ "$t" == "tests/unit/test_iluvatar_runtime_smoke.py" ]]; then
+        need_runtime_smoke=1
+      fi
+    done
+
+    if [[ "${need_runtime_smoke}" == "1" ]]; then
+      if [[ -z "${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH:-}" || -z "${FLYDSL_ILUVATAR_SMOKE_KERNEL:-}" || -z "${FLYDSL_ILUVATAR_LAUNCH_KERNEL:-}" ]]; then
+        echo "::error::runtime smoke is must-pass but blob path/kernel names are not fully configured"
+        exit 1
+      fi
+      if [[ "${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}" = /* ]]; then
+        blob_path="${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}"
+      else
+        blob_path="/workspace/${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}"
+      fi
+      if [[ ! -f "${blob_path}" ]]; then
+        echo "::error::runtime smoke blob not found in repository path: ${blob_path}"
+        exit 1
+      fi
+      export FLYDSL_ILUVATAR_SMOKE_BLOB="${blob_path}"
+      export FLYDSL_ILUVATAR_SMOKE_KERNEL
+      export FLYDSL_ILUVATAR_LAUNCH_KERNEL
+    fi
+
+    set +e
+    python3 -m pytest "${must_pass[@]}" -v -r a --junitxml=reports/device-must-pass.xml 2>&1 | tee logs/device-must-pass.log
+    must_pass_status=${PIPESTATUS[0]}
+    set -e
+
+    must_pass_skipped="$(python3 - <<'"'"'PY'"'"'
+import os
+import xml.etree.ElementTree as ET
+
+xml_path = "reports/device-must-pass.xml"
+summary_path = "logs/device-must-pass-summary.md"
+
+if not os.path.exists(xml_path):
+    with open(summary_path, "w", encoding="utf-8") as out:
+        out.write("### must-pass summary\n\n- junit xml missing: reports/device-must-pass.xml\n")
+    print(0)
+    raise SystemExit(0)
+
+root = ET.parse(xml_path).getroot()
+suite_nodes = [root] if root.tag == "testsuite" else list(root.findall(".//testsuite"))
+cases = []
+skipped = 0
+for suite in suite_nodes:
+    for case in suite.findall("testcase"):
+        file_name = case.attrib.get("file") or case.attrib.get("classname", "")
+        status = "passed"
+        if case.find("failure") is not None or case.find("error") is not None:
+            status = "failed"
+        elif case.find("skipped") is not None:
+            status = "skipped"
+            skipped += 1
+        cases.append((file_name, case.attrib.get("name", ""), status))
+
+with open(summary_path, "w", encoding="utf-8") as out:
+    out.write("### must-pass summary\n\n")
+    out.write("| file | test | status |\n")
+    out.write("|---|---|---|\n")
+    for file_name, test_name, status in cases:
+        out.write(f"| `{file_name}` | `{test_name}` | `{status}` |\n")
+    out.write("\n")
+    out.write(f"- skipped: {skipped}\n")
+
+print(skipped)
+PY
+)"
+
+    if [[ "${must_pass_status}" -ne 0 ]]; then
+      echo "::error::must-pass tests failed"
+      exit "${must_pass_status}"
+    fi
+    if [[ "${must_pass_skipped}" -gt 0 ]]; then
+      echo "::error::must-pass tests contain skipped cases (${must_pass_skipped})"
+      exit 1
+    fi
+
+    mapfile -t args < <(python3 - <<'"'"'PY'"'"'
+import json
+import os
+for a in json.loads(os.environ["DEVICE_PYTEST_ARGS_JSON"]):
+    print(a)
+PY
+)
+
+    set -o pipefail
+    python3 -m pytest "${args[@]}" -v --junitxml=reports/device-full.xml 2>&1 | tee logs/device-full.log
+  '
