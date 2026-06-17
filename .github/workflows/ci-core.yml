@@ -66,6 +66,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest
+          pip install -e .
 
       - name: Run A (L0/L1a common)
         env:
@@ -112,6 +113,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest
+          pip install -e .
 
       - name: Run B (Iluvatar compile-tier)
         env:
