@@ -25,7 +25,7 @@
       "self-hosted",
       "linux",
       "x64",
-      "iluvatar-gpu"
+      "gpu-iluvatar"
     ],
     "path_filters": [
       "kernels/**",

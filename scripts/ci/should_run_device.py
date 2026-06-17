@@ -183,7 +183,7 @@ def main() -> int:
         event_payload = _load_json_file(pathlib.Path(event_path))
         device_cfg = _get_nested(config, "device") or {}
         timeouts_cfg = _get_nested(config, "timeouts") or {}
-        runner_labels = list(device_cfg.get("runner_labels", ["self-hosted", "linux", "x64", "iluvatar-gpu"]))
+        runner_labels = list(device_cfg.get("runner_labels", ["self-hosted", "linux", "x64", "gpu-iluvatar"]))
         pytest_args = list(device_cfg.get("pytest_args", ["tests/unit", "-m", "l2_device"]))
         must_pass_tests = list(
             device_cfg.get(
