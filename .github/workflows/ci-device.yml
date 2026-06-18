@@ -78,7 +78,7 @@ jobs:
 
   device-full:
     name: device-full
-    runs-on: ${{ fromJSON(needs.should-run-device.outputs.runner_labels_json != '' && needs.should-run-device.outputs.runner_labels_json || '["self-hosted","linux","x64","iluvatar-gpu"]') }}
+    runs-on: ${{ fromJSON(needs.should-run-device.outputs.runner_labels_json != '' && needs.should-run-device.outputs.runner_labels_json || '["self-hosted","linux","x64","gpu-iluvatar"]') }}
     timeout-minutes: ${{ fromJSON(needs.should-run-device.outputs.device_timeout_minutes != '' && needs.should-run-device.outputs.device_timeout_minutes || '90') }}
     needs: [should-run-device]
     if: needs.should-run-device.outputs.should_run == 'true'
@@ -109,6 +109,23 @@ jobs:
             echo "IXCC_MLIR_CMAKE: ${IXCC_MLIR_CMAKE}"
             echo "COREX_VERSION_TAG: ${COREX_VERSION_TAG:-<unset>}"
           } | tee logs/device-env.txt
+
+      - name: Pre-pull CI device image (timeout + retry)
+        env:
+          CI_DEVICE_IMAGE: ${{ needs.should-run-device.outputs.container_image != '' && needs.should-run-device.outputs.container_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "pull attempt ${attempt}: ${CI_DEVICE_IMAGE}"
+            if timeout 900 docker pull "${CI_DEVICE_IMAGE}"; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::failed to pull CI_DEVICE_IMAGE after 3 attempts: ${CI_DEVICE_IMAGE}"
+              exit 1
+            fi
+            sleep $((attempt * 30))
+          done
 
       - name: Run C (Iluvatar L2 device full in container)
         env:
