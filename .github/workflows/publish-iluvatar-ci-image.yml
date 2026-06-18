@@ -150,6 +150,8 @@ jobs:
           wheel_md5="$(awk -v f="${wheel_name}" 'NF>=2 && $2==f {print $1}' /tmp/corex_torch.whl.md5sum)"
           echo "${wheel_md5}  /tmp/corex_torch.whl" | md5sum -c -
 
+          install -m 0644 /tmp/corex_torch.whl .github/docker/corex_torch.whl
+
           echo "wheel_url=${wheel_url}" >> "${GITHUB_OUTPUT}"
           echo "wheel_md5=${wheel_md5}" >> "${GITHUB_OUTPUT}"
 
@@ -208,3 +210,7 @@ jobs:
             echo "- digest: \`${digest}\`"
             echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup staged wheel artifact
+        if: ${{ always() }}
+        run: rm -f .github/docker/corex_torch.whl
