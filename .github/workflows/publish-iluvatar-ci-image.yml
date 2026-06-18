@@ -11,6 +11,10 @@ on:
         required: true
         default: "stable"
         type: string
+      reason:
+        description: "Reason for wheel URL/image publish change"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -20,6 +24,9 @@ jobs:
   build-and-push:
     name: build-and-push
     runs-on: ubuntu-latest
+    env:
+      TAG_INPUT: ${{ inputs.tag }}
+      REASON_INPUT: ${{ inputs.reason }}
     outputs:
       image: ${{ steps.meta.outputs.image }}
       digest: ${{ steps.build.outputs.digest }}
@@ -37,6 +44,81 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Pre-flight secrets
+        env:
+          COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
+        run: |
+          if [ -z "${COREX_TORCH_WHEEL_URL}" ]; then
+            echo "::error::COREX_TORCH_WHEEL_URL is required"
+            exit 1
+          fi
+
+      - name: Resolve and verify CoreX torch wheel md5
+        id: wheel
+        env:
+          COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
+        run: |
+          set -euo pipefail
+          retry_download() {
+            local url="$1"
+            local out="$2"
+            local n=0
+            until [ "$n" -ge 3 ]; do
+              if curl -fL --connect-timeout 15 --max-time 300 "$url" -o "$out"; then
+                return 0
+              fi
+              n=$((n+1))
+              sleep $((2**n))
+            done
+            return 1
+          }
+
+          wheel_url="${COREX_TORCH_WHEEL_URL}"
+          wheel_name="$(python3 - <<'PY'
+import os
+import urllib.parse
+u = os.environ["COREX_TORCH_WHEEL_URL"]
+print(os.path.basename(urllib.parse.urlparse(u).path))
+PY
+)"
+          if [ -z "${wheel_name}" ]; then
+            echo "::error::failed to derive wheel filename from URL"
+            exit 1
+          fi
+          wheel_dir="$(python3 - <<'PY'
+import os
+import urllib.parse
+u = urllib.parse.urlparse(os.environ["COREX_TORCH_WHEEL_URL"])
+path = u.path.rsplit("/", 1)[0] + "/"
+print(urllib.parse.urlunparse((u.scheme, u.netloc, path, "", "", "")))
+PY
+)"
+          md5sum_url="${wheel_dir}${wheel_name}.md5sum"
+
+          retry_download "${wheel_url}" /tmp/corex_torch.whl || {
+            echo "::error::failed to download wheel: ${wheel_url}"
+            exit 1
+          }
+          retry_download "${md5sum_url}" /tmp/corex_torch.whl.md5sum || {
+            echo "::error::.md5sum unavailable: ${md5sum_url}"
+            exit 1
+          }
+
+          match_count="$(awk -v f="${wheel_name}" 'NF>=2 && $2==f {c++} END {print c+0}' /tmp/corex_torch.whl.md5sum)"
+          if [ "${match_count}" -eq 0 ]; then
+            echo "::error::no md5 entry for ${wheel_name}"
+            exit 1
+          fi
+          if [ "${match_count}" -gt 1 ]; then
+            echo "::error::multiple md5 entries for ${wheel_name}"
+            exit 1
+          fi
+          wheel_md5="$(awk -v f="${wheel_name}" 'NF>=2 && $2==f {print $1}' /tmp/corex_torch.whl.md5sum)"
+          echo "${wheel_md5}  /tmp/corex_torch.whl" | md5sum -c -
+
+          echo "wheel_url=${wheel_url}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_md5=${wheel_md5}" >> "${GITHUB_OUTPUT}"
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -46,13 +128,14 @@ jobs:
 
       - name: Build and push image
         id: build
-        env:
-          TAG_INPUT: ${{ inputs.tag }}
         uses: docker/build-push-action@v6
         with:
           context: .
           file: .github/docker/Dockerfile.iluvatar-ci
           push: true
+          build-args: |
+            COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
+            COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
           tags: |
             ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
             ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
@@ -64,6 +147,9 @@ jobs:
             echo ""
             echo "- image: \`${{ steps.meta.outputs.image }}\`"
             echo "- tag: \`${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}\`"
+            echo "- reason: \`${{ env.REASON_INPUT != '' && env.REASON_INPUT || 'ci/publish-image-* temporary trigger' }}\`"
+            echo "- wheel: \`${{ steps.wheel.outputs.wheel_url }}\`"
+            echo "- wheel md5: \`${{ steps.wheel.outputs.wheel_md5 }}\`"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
             echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
