@@ -154,6 +154,7 @@ jobs:
 
           echo "wheel_url=${wheel_url}" >> "${GITHUB_OUTPUT}"
           echo "wheel_md5=${wheel_md5}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_name=${wheel_name}" >> "${GITHUB_OUTPUT}"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -173,6 +174,7 @@ jobs:
           build-args: |
             COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
             COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
+            COREX_TORCH_WHEEL_NAME=${{ steps.wheel.outputs.wheel_name }}
           tags: |
             ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
             ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
@@ -188,6 +190,7 @@ jobs:
           build-args: |
             COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
             COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
+            COREX_TORCH_WHEEL_NAME=${{ steps.wheel.outputs.wheel_name }}
           tags: |
             ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
             ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
