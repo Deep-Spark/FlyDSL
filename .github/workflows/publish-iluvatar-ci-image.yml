@@ -29,7 +29,7 @@ jobs:
       REASON_INPUT: ${{ inputs.reason }}
     outputs:
       image: ${{ steps.meta.outputs.image }}
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,6 +43,12 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["https://docker.m.daocloud.io"]
 
       - name: Pre-flight secrets
         env:
@@ -156,6 +162,22 @@ jobs:
 
       - name: Build and push image
         id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.iluvatar-ci
+          push: true
+          build-args: |
+            COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
+            COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
+            ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+
+      - name: Build and push image (retry once)
+        id: build_retry
+        if: ${{ steps.build.outcome == 'failure' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -171,6 +193,11 @@ jobs:
       - name: Print digest summary
         run: |
           {
+            digest="${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest }}"
+            if [ -z "${digest}" ]; then
+              echo "::error::missing image digest from build step(s)"
+              exit 1
+            fi
             echo "### Iluvatar CI image published"
             echo ""
             echo "- image: \`${{ steps.meta.outputs.image }}\`"
@@ -178,6 +205,6 @@ jobs:
             echo "- reason: \`${{ env.REASON_INPUT != '' && env.REASON_INPUT || 'ci/publish-image-* temporary trigger' }}\`"
             echo "- wheel: \`${{ steps.wheel.outputs.wheel_url }}\`"
             echo "- wheel md5: \`${{ steps.wheel.outputs.wheel_md5 }}\`"
-            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
-            echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}\`"
+            echo "- digest: \`${digest}\`"
+            echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
