@@ -3,6 +3,8 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV PIP_DEFAULT_TIMEOUT=180
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
@@ -18,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+RUN python3 -m venv "${VIRTUAL_ENV}"
+
 RUN set -eux; \
     retry() { \
       n=0; \
@@ -29,8 +33,8 @@ RUN set -eux; \
       done; \
       [ "$n" -lt 5 ]; \
     }; \
-    retry python3 -m pip install --upgrade pip --retries 10 --timeout 180; \
-    retry python3 -m pip install --no-cache-dir --retries 10 --timeout 180 \
+    retry pip install --upgrade pip --retries 10 --timeout 180; \
+    retry pip install --no-cache-dir --retries 10 --timeout 180 \
       nanobind \
       pybind11 \
       numpy \
@@ -46,7 +50,7 @@ RUN set -eux; \
     test -n "${COREX_TORCH_WHEEL_NAME}"; \
     echo "${COREX_TORCH_WHEEL_MD5}  /tmp/corex_torch.whl" | md5sum -c -; \
     install -m 0644 /tmp/corex_torch.whl "/tmp/${COREX_TORCH_WHEEL_NAME}"; \
-    python3 -m pip install --no-cache-dir --retries 10 --timeout 180 "/tmp/${COREX_TORCH_WHEEL_NAME}"; \
+    pip install --no-cache-dir --retries 10 --timeout 180 "/tmp/${COREX_TORCH_WHEEL_NAME}"; \
     rm -f /tmp/corex_torch.whl "/tmp/${COREX_TORCH_WHEEL_NAME}"
 
 WORKDIR /workspace
