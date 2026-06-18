@@ -74,25 +74,13 @@ jobs:
           }
 
           wheel_url="${COREX_TORCH_WHEEL_URL}"
-          wheel_name="$(python3 - <<'PY'
-import os
-import urllib.parse
-u = os.environ["COREX_TORCH_WHEEL_URL"]
-print(os.path.basename(urllib.parse.urlparse(u).path))
-PY
-)"
+          wheel_path="${wheel_url%%\?*}"
+          wheel_name="${wheel_path##*/}"
           if [ -z "${wheel_name}" ]; then
             echo "::error::failed to derive wheel filename from URL"
             exit 1
           fi
-          wheel_dir="$(python3 - <<'PY'
-import os
-import urllib.parse
-u = urllib.parse.urlparse(os.environ["COREX_TORCH_WHEEL_URL"])
-path = u.path.rsplit("/", 1)[0] + "/"
-print(urllib.parse.urlunparse((u.scheme, u.netloc, path, "", "", "")))
-PY
-)"
+          wheel_dir="${wheel_url%/*}/"
           md5sum_url="${wheel_dir}${wheel_name}.md5sum"
 
           retry_download "${wheel_url}" /tmp/corex_torch.whl || {
