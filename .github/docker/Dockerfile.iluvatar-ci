@@ -6,12 +6,14 @@ ENV PIP_DEFAULT_TIMEOUT=180
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
+    python3-dev \
     python3-pip \
     python3-venv \
     build-essential \
     cmake \
     ninja-build \
     git \
+    curl \
     pkg-config \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -33,5 +35,25 @@ RUN set -eux; \
       pybind11 \
       numpy \
       pytest
+
+ARG COREX_TORCH_WHEEL_URL
+ARG COREX_TORCH_WHEEL_MD5
+
+RUN set -eux; \
+    test -n "${COREX_TORCH_WHEEL_URL}"; \
+    test -n "${COREX_TORCH_WHEEL_MD5}"; \
+    retry() { \
+      n=0; \
+      until [ "$n" -ge 3 ]; do \
+        "$@" && break; \
+        n=$((n+1)); \
+        sleep $((2**n)); \
+      done; \
+      [ "$n" -lt 3 ]; \
+    }; \
+    retry curl -fL --connect-timeout 15 --max-time 300 "${COREX_TORCH_WHEEL_URL}" -o /tmp/corex_torch.whl; \
+    echo "${COREX_TORCH_WHEEL_MD5}  /tmp/corex_torch.whl" | md5sum -c -; \
+    python3 -m pip install --no-cache-dir --retries 10 --timeout 180 /tmp/corex_torch.whl; \
+    rm -f /tmp/corex_torch.whl
 
 WORKDIR /workspace
