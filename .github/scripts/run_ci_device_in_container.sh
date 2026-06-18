@@ -176,7 +176,10 @@ docker run "${docker_args[@]}" \
     python3 -m venv /workspace/.ci-venv
     source /workspace/.ci-venv/bin/activate
     python3 -m pip install --upgrade pip
-    python3 -m pip install --no-cache-dir -e .
+    # Do not use `pip install -e .` in CI device job: editable install triggers
+    # setup.py build-time checks (e.g. MLIR_PATH) before our explicit CMake build.
+    # Keep this job deterministic by building first, then importing via PYTHONPATH.
+    python3 -m pip install --no-cache-dir pytest
 
     cmake -S . -B build-fly -G Ninja \
       -DFLYDSL_BACKENDS=iluvatar \
@@ -191,6 +194,8 @@ docker run "${docker_args[@]}" \
       exit 1
     fi
     export FLYDSL_ILUVATAR_JIT_RUNTIME_LIB="${runtime_lib}"
+    # Use built package + source tree directly for tests.
+    export PYTHONPATH="/workspace/build-fly/python_packages:/workspace/python:/workspace:${PYTHONPATH:-}"
 
     mapfile -t must_pass < <(python3 - <<'"'"'PY'"'"'
 import json
