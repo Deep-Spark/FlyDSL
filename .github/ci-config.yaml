@@ -18,7 +18,7 @@
     ]
   },
   "device": {
-    "container_image": "ghcr.io/deep-spark/flydsl-iluvatar-ci@sha256:ed44a66536ec9f5dc7bfa040815df5803e2603cf58d2c2e2c13cddeb8b8df1e0",
+    "container_image": "ghcr.io/deep-spark/flydsl-iluvatar-ci@sha256:2e244d0ec15d0795195a67b1253631321ec2fcf9362401d661ffb8378b216f62",
     "force_label": "run-device-ci",
     "required_skip_message": "Skipped by policy: no matched paths and no run-device-ci label.",
     "runner_labels": [
