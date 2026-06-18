@@ -49,11 +49,11 @@ jobs:
           COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
         run: |
           if [ -z "${COREX_TORCH_WHEEL_URL}" ]; then
-            echo "::error::COREX_TORCH_WHEEL_URL is required"
+            echo "::error::COREX_TORCH_WHEEL_URL is required (full wheel URL or base directory URL)"
             exit 1
           fi
 
-      - name: Resolve and verify CoreX torch wheel md5
+      - name: Resolve and verify CoreX torch wheel/md5
         id: wheel
         env:
           COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
@@ -73,9 +73,49 @@ jobs:
             return 1
           }
 
-          wheel_url="${COREX_TORCH_WHEEL_URL}"
-          wheel_path="${wheel_url%%\?*}"
-          wheel_name="${wheel_path##*/}"
+          input_url="${COREX_TORCH_WHEEL_URL}"
+          wheel_url=""
+          wheel_name=""
+
+          if [[ "${input_url%%\?*}" == *.whl ]]; then
+            wheel_url="${input_url}"
+            wheel_path="${wheel_url%%\?*}"
+            wheel_name="${wheel_path##*/}"
+          else
+            base_url="${input_url}"
+            if [[ "${base_url}" != */ ]]; then
+              base_url="${base_url}/"
+            fi
+            retry_download "${base_url}" /tmp/corex_wheel_index.html || {
+              echo "::error::failed to download wheel index: ${base_url}"
+              exit 1
+            }
+
+            rg -o 'torch-[0-9][^"'"'"' <>]*\+corex\.[0-9.]+\.[0-9]{8}-cp312-cp312-linux_x86_64\.whl' /tmp/corex_wheel_index.html \
+              | sort -u \
+              | awk 'match($0, /\.[0-9]{8}-cp312-cp312-linux_x86_64\.whl$/) { d=substr($0, RSTART+1, 8); print d " " $0 }' \
+              | sort -r > /tmp/corex_wheel_candidates.txt
+
+            wheel_name=""
+            for offset in 0 1 2 3 4 5 6; do
+              target_date="$(date -u -d "${offset} day ago" +%Y%m%d)"
+              candidate="$(awk -v d="${target_date}" '$1==d {print $2; exit}' /tmp/corex_wheel_candidates.txt || true)"
+              if [[ -n "${candidate}" ]]; then
+                wheel_name="${candidate}"
+                echo "selected wheel date=${target_date} (offset=${offset}d): ${wheel_name}"
+                break
+              fi
+            done
+
+            if [[ -z "${wheel_name}" ]]; then
+              echo "::error::no stable wheel found for today or past 7 days under base URL: ${base_url}"
+              echo "recent candidates:"
+              head -n 20 /tmp/corex_wheel_candidates.txt || true
+              exit 1
+            fi
+            wheel_url="${base_url}${wheel_name}"
+          fi
+
           if [ -z "${wheel_name}" ]; then
             echo "::error::failed to derive wheel filename from URL"
             exit 1
