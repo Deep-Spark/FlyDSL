@@ -110,11 +110,23 @@ jobs:
             echo "COREX_VERSION_TAG: ${COREX_VERSION_TAG:-<unset>}"
           } | tee logs/device-env.txt
 
+      - name: Login to GHCR (best effort)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Pre-pull CI device image (timeout + retry)
         env:
           CI_DEVICE_IMAGE: ${{ needs.should-run-device.outputs.container_image != '' && needs.should-run-device.outputs.container_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
         run: |
           set -euo pipefail
+          if docker image inspect "${CI_DEVICE_IMAGE}" >/dev/null 2>&1; then
+            echo "local image cache hit: ${CI_DEVICE_IMAGE}"
+            exit 0
+          fi
           for attempt in 1 2 3; do
             echo "pull attempt ${attempt}: ${CI_DEVICE_IMAGE}"
             if timeout 900 docker pull "${CI_DEVICE_IMAGE}"; then
