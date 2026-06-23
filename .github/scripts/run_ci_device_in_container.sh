@@ -187,7 +187,11 @@ docker run "${docker_args[@]}" \
     # Do not use `pip install -e .` in CI device job: editable install triggers
     # setup.py build-time checks (e.g. MLIR_PATH) before our explicit CMake build.
     # Keep this job deterministic by building first, then importing via PYTHONPATH.
-    python3 -m pip install --no-cache-dir pytest nanobind pybind11 numpy
+    python3 -m pip install --no-cache-dir pytest nanobind pybind11 numpy patchelf
+    if ! command -v patchelf >/dev/null 2>&1; then
+      echo "::error::patchelf is required but not found in PATH after pip install"
+      exit 1
+    fi
 
     cmake -S . -B build-fly -G Ninja \
       -DFLYDSL_BACKENDS=iluvatar \
