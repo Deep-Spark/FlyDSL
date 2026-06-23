@@ -54,6 +54,8 @@ corex_git_commit=""
 corex_version_file=""
 corex_lld_version=""
 corex_libcuda_md5=""
+host_mpi_lib_path=""
+host_mpi_lib_dir=""
 
 if [[ -d "${COREX_ROOT}/.git" ]] && command -v git >/dev/null 2>&1; then
   corex_git_commit="$(git -C "${COREX_ROOT}" rev-parse --short HEAD 2>/dev/null || true)"
@@ -74,6 +76,13 @@ if [[ -f "${COREX_ROOT}/lib64/libcuda.so.1" ]] && command -v md5sum >/dev/null 2
   corex_libcuda_md5="$(md5sum "${COREX_ROOT}/lib64/libcuda.so.1" | awk '{print $1}')"
 fi
 
+if command -v ldconfig >/dev/null 2>&1; then
+  host_mpi_lib_path="$(ldconfig -p 2>/dev/null | awk '/libmpi\.so\.40/ { print $NF; exit }')"
+  if [[ -n "${host_mpi_lib_path}" && -f "${host_mpi_lib_path}" ]]; then
+    host_mpi_lib_dir="$(dirname "${host_mpi_lib_path}")"
+  fi
+fi
+
 corex_warning=""
 if [[ -z "${COREX_VERSION_TAG}" && -z "${corex_git_commit}" && -z "${corex_version_file}" && -z "${corex_lld_version}" ]]; then
   corex_warning="WARN: unable to infer COREX version metadata; set COREX_VERSION_TAG for traceability"
@@ -91,6 +100,7 @@ FLYDSL_ILUVATAR_SMOKE_BLOB_PATH=${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}
 FLYDSL_ILUVATAR_SMOKE_KERNEL=${FLYDSL_ILUVATAR_SMOKE_KERNEL}
 FLYDSL_ILUVATAR_LAUNCH_KERNEL=${FLYDSL_ILUVATAR_LAUNCH_KERNEL}
 COREX_VERSION_TAG=${COREX_VERSION_TAG}
+HOST_MPI_LIB_DIR=${host_mpi_lib_dir}
 WORKSPACE=${WORKSPACE}
 EOF
 
@@ -145,8 +155,13 @@ docker_args=(
   -e FLYDSL_ILUVATAR_RUN_JIT_SMOKE=1
   -e CUDAToolkit_ROOT="${COREX_ROOT}"
   -e MLIR_DIR="${IXCC_MLIR_CMAKE}"
+  -e HOST_MPI_LIB_DIR="${host_mpi_lib_dir}"
   -e PYTHONUNBUFFERED=1
 )
+
+if [[ -n "${host_mpi_lib_dir}" ]]; then
+  docker_args+=(-v "${host_mpi_lib_dir}:${host_mpi_lib_dir}:ro")
+fi
 
 if [[ "${CI_DEVICE_RUN_AS_HOST_USER}" == "1" ]]; then
   docker_args+=(-u "$(id -u):$(id -g)")
@@ -176,7 +191,11 @@ docker run "${docker_args[@]}" \
   bash -lc '
     set -euo pipefail
     export PATH="${COREX_ROOT}/bin:${PATH}"
-    export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+    if [[ -n "${HOST_MPI_LIB_DIR:-}" ]]; then
+      export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${HOST_MPI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+    else
+      export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+    fi
     export PIP_NO_CACHE_DIR=1
     ASSET_DIR="/workspace/.ci-smoke-assets"
     mkdir -p "${ASSET_DIR}"
@@ -189,7 +208,7 @@ docker run "${docker_args[@]}" \
     # Do not use `pip install -e .` in CI device job: editable install triggers
     # setup.py build-time checks (e.g. MLIR_PATH) before our explicit CMake build.
     # Keep this job deterministic by building first, then importing via PYTHONPATH.
-    python3 -m pip install --no-cache-dir pytest nanobind pybind11 numpy patchelf
+    python3 -m pip install --no-cache-dir pytest nanobind pybind11 "numpy<2" patchelf
     if ! command -v patchelf >/dev/null 2>&1; then
       echo "::error::patchelf is required but not found in PATH after pip install"
       exit 1
