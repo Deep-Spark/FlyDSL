@@ -14,6 +14,7 @@ fi
 : "${IXCC_MLIR_CMAKE:?IXCC_MLIR_CMAKE is required}"
 
 WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
+IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
 DEVICE_PYTEST_ARGS_JSON="${DEVICE_PYTEST_ARGS_JSON:-[\"tests/unit\",\"-m\",\"l2_device\"]}"
 DEVICE_MUST_PASS_TESTS_JSON="${DEVICE_MUST_PASS_TESTS_JSON:-[]}"
 ARCH="${ARCH:-ivcore11}"
@@ -40,6 +41,10 @@ if [[ ! -d "${COREX_ROOT}" ]]; then
 fi
 if [[ ! -f "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake" ]]; then
   echo "::error::IXCC_MLIR_CMAKE missing MLIRConfig.cmake: ${IXCC_MLIR_CMAKE}"
+  exit 1
+fi
+if [[ ! -d "${IXCC_ROOT}" ]]; then
+  echo "::error::Derived IXCC root does not exist: ${IXCC_ROOT}"
   exit 1
 fi
 
@@ -78,6 +83,7 @@ cat > "${WORKSPACE}/logs/device-container-env.txt" <<EOF
 CI_DEVICE_IMAGE=${CI_DEVICE_IMAGE}
 COREX_ROOT=${COREX_ROOT}
 IXCC_MLIR_CMAKE=${IXCC_MLIR_CMAKE}
+IXCC_ROOT=${IXCC_ROOT}
 ARCH=${ARCH}
 DEVICE_PYTEST_ARGS_JSON=${DEVICE_PYTEST_ARGS_JSON}
 DEVICE_MUST_PASS_TESTS_JSON=${DEVICE_MUST_PASS_TESTS_JSON}
@@ -121,9 +127,11 @@ docker_args=(
   --ipc "${CI_DEVICE_IPC_MODE}"
   -v "${WORKSPACE}:/workspace"
   -v "${COREX_ROOT}:${COREX_ROOT}:ro"
+  -v "${IXCC_ROOT}:${IXCC_ROOT}:ro"
   -v "${IXCC_MLIR_CMAKE}:${IXCC_MLIR_CMAKE}:ro"
   -w /workspace
   -e COREX_ROOT="${COREX_ROOT}"
+  -e IXCC_ROOT="${IXCC_ROOT}"
   -e IXCC_MLIR_CMAKE="${IXCC_MLIR_CMAKE}"
   -e ARCH="${ARCH}"
   -e DEVICE_PYTEST_ARGS_JSON="${DEVICE_PYTEST_ARGS_JSON}"
