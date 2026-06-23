@@ -317,11 +317,8 @@ PY
       fi
     done
 
-    if [[ "${need_runtime_smoke}" == "1" ]]; then
-      if [[ -z "${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH:-}" || -z "${FLYDSL_ILUVATAR_SMOKE_KERNEL:-}" || -z "${FLYDSL_ILUVATAR_LAUNCH_KERNEL:-}" ]]; then
-        echo "::error::runtime smoke is must-pass but blob path/kernel names are not fully configured"
-        exit 1
-      fi
+    runtime_smoke_ready=0
+    if [[ -n "${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH:-}" && -n "${FLYDSL_ILUVATAR_SMOKE_KERNEL:-}" && -n "${FLYDSL_ILUVATAR_LAUNCH_KERNEL:-}" ]]; then
       if [[ "${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}" = /* ]]; then
         blob_path="${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}"
       else
@@ -334,6 +331,12 @@ PY
       export FLYDSL_ILUVATAR_SMOKE_BLOB="${blob_path}"
       export FLYDSL_ILUVATAR_SMOKE_KERNEL
       export FLYDSL_ILUVATAR_LAUNCH_KERNEL
+      runtime_smoke_ready=1
+    fi
+
+    if [[ "${need_runtime_smoke}" == "1" && "${runtime_smoke_ready}" != "1" ]]; then
+      echo "::error::runtime smoke is must-pass but blob path/kernel names are not fully configured"
+      exit 1
     fi
 
     set +e
