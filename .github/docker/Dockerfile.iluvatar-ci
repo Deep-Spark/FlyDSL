@@ -37,7 +37,7 @@ RUN set -eux; \
     retry pip install --no-cache-dir --retries 10 --timeout 180 \
       nanobind \
       pybind11 \
-      numpy \
+      "numpy<2" \
       pytest
 
 ARG COREX_TORCH_WHEEL_MD5
