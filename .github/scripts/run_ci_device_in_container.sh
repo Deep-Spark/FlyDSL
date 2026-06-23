@@ -194,6 +194,20 @@ docker run "${docker_args[@]}" \
       echo "::error::patchelf is required but not found in PATH after pip install"
       exit 1
     fi
+
+    image_site_packages=""
+    for p in /opt/venv/lib/python*/site-packages; do
+      if [[ -d "${p}" ]]; then
+        image_site_packages="${p}"
+        break
+      fi
+    done
+    if [[ -z "${image_site_packages}" ]]; then
+      echo "::error::cannot locate image python site-packages under /opt/venv"
+      exit 1
+    fi
+    export PYTHONPATH="${image_site_packages}:${PYTHONPATH:-}"
+
     python3 - <<'PY'
 import torch
 print(f"torch visible in Run C venv: {torch.__version__}")
