@@ -26,6 +26,7 @@ CI_DEVICE_DROP_ALL_CAPS="${CI_DEVICE_DROP_ALL_CAPS:-1}"
 CI_DEVICE_NO_NEW_PRIVS="${CI_DEVICE_NO_NEW_PRIVS:-1}"
 CI_DEVICE_PIDS_LIMIT="${CI_DEVICE_PIDS_LIMIT:-1024}"
 CI_DEVICE_RUN_AS_HOST_USER="${CI_DEVICE_RUN_AS_HOST_USER:-1}"
+CI_DEVICE_PRIVILEGED="${CI_DEVICE_PRIVILEGED:-1}"
 FLYDSL_ILUVATAR_SMOKE_BLOB_PATH="${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH:-}"
 FLYDSL_ILUVATAR_SMOKE_KERNEL="${FLYDSL_ILUVATAR_SMOKE_KERNEL:-}"
 FLYDSL_ILUVATAR_LAUNCH_KERNEL="${FLYDSL_ILUVATAR_LAUNCH_KERNEL:-}"
@@ -99,6 +100,7 @@ DEVICE_MUST_PASS_TESTS_JSON=${DEVICE_MUST_PASS_TESTS_JSON}
 FLYDSL_ILUVATAR_SMOKE_BLOB_PATH=${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}
 FLYDSL_ILUVATAR_SMOKE_KERNEL=${FLYDSL_ILUVATAR_SMOKE_KERNEL}
 FLYDSL_ILUVATAR_LAUNCH_KERNEL=${FLYDSL_ILUVATAR_LAUNCH_KERNEL}
+CI_DEVICE_PRIVILEGED=${CI_DEVICE_PRIVILEGED}
 COREX_VERSION_TAG=${COREX_VERSION_TAG}
 HOST_MPI_LIB_DIR=${host_mpi_lib_dir}
 WORKSPACE=${WORKSPACE}
@@ -167,14 +169,18 @@ if [[ "${CI_DEVICE_RUN_AS_HOST_USER}" == "1" ]]; then
   docker_args+=(-u "$(id -u):$(id -g)")
 fi
 
-if [[ "${CI_DEVICE_READONLY_ROOTFS}" == "1" ]]; then
-  docker_args+=(--read-only --tmpfs /tmp --tmpfs /var/tmp)
-fi
-if [[ "${CI_DEVICE_DROP_ALL_CAPS}" == "1" ]]; then
-  docker_args+=(--cap-drop=ALL)
-fi
-if [[ "${CI_DEVICE_NO_NEW_PRIVS}" == "1" ]]; then
-  docker_args+=(--security-opt=no-new-privileges)
+if [[ "${CI_DEVICE_PRIVILEGED}" == "1" ]]; then
+  docker_args+=(--privileged)
+else
+  if [[ "${CI_DEVICE_READONLY_ROOTFS}" == "1" ]]; then
+    docker_args+=(--read-only --tmpfs /tmp --tmpfs /var/tmp)
+  fi
+  if [[ "${CI_DEVICE_DROP_ALL_CAPS}" == "1" ]]; then
+    docker_args+=(--cap-drop=ALL)
+  fi
+  if [[ "${CI_DEVICE_NO_NEW_PRIVS}" == "1" ]]; then
+    docker_args+=(--security-opt=no-new-privileges)
+  fi
 fi
 if [[ -n "${CI_DEVICE_PIDS_LIMIT}" ]]; then
   docker_args+=(--pids-limit "${CI_DEVICE_PIDS_LIMIT}")
