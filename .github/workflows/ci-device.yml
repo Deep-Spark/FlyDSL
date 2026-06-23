@@ -158,6 +158,12 @@ jobs:
           FLYDSL_ILUVATAR_SMOKE_BLOB_PATH: ${{ needs.should-run-device.outputs.runtime_smoke_blob_path }}
           FLYDSL_ILUVATAR_SMOKE_KERNEL: ${{ needs.should-run-device.outputs.runtime_smoke_kernel }}
           FLYDSL_ILUVATAR_LAUNCH_KERNEL: ${{ needs.should-run-device.outputs.runtime_smoke_launch_kernel }}
+          FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP: "1"
+          FLYDSL_ILUVATAR_RUN_MR_EPILOGUE: "1"
+          FLYDSL_ILUVATAR_RUN_MR_HGEMM_STAGES: "1"
+          FLYDSL_ILUVATAR_RUN_MR_MMA: "1"
+          FLYDSL_ILUVATAR_RUN_MR_S2R: "1"
+          FLYDSL_ILUVATAR_RUN_MR_S2R_MMA: "1"
         run: |
           bash .github/scripts/run_ci_device_in_container.sh
 
@@ -167,9 +173,23 @@ jobs:
           if [ -f logs/device-must-pass-summary.md ]; then
             cat logs/device-must-pass-summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
+          if [ -f logs/device-full.log ]; then
+            python3 -c "import re, pathlib; log = pathlib.Path('logs/device-full.log').read_text(encoding='utf-8', errors='replace'); collect = re.findall(r'collected\\s+\\d+\\s+items(?:\\s*/\\s*\\d+\\s+deselected\\s*/\\s*\\d+\\s+selected)?', log); summary = re.findall(r'=+\\s+.*\\s+in\\s+[0-9.]+s\\s+=+', log); print(); print('### device-full summary'); print(); print(f'- collection: `{collect[-1]}`') if collect else None; print(f'- result: `{summary[-1].strip(\"= \").strip()}`') if summary else None" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ -f logs/corex-version-summary.md ]; then
             cat logs/corex-version-summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Upload JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-device-junit
+          retention-days: 7
+          path: |
+            reports/device-must-pass.xml
+            reports/device-full.xml
+          if-no-files-found: warn
 
       - name: Upload failure artifacts
         if: failure()
@@ -184,8 +204,6 @@ jobs:
             logs/corex-version-summary.md
             logs/device-container-env.txt
             logs/device-env.txt
-            reports/device-must-pass.xml
-            reports/device-full.xml
 
   required:
     name: ci-device / required
