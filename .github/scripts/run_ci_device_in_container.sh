@@ -245,6 +245,14 @@ PY
       -DPython3_EXECUTABLE="$(command -v python3)"
     cmake --build build-fly -j"$(nproc)"
 
+    # Required by compile-only must-pass tests in test_iluvatar_binary_pipeline_smoke.py.
+    fly_opt_bin="/workspace/build-fly/tools/fly-opt/fly-opt"
+    if [[ ! -x "${fly_opt_bin}" ]]; then
+      echo "::error::missing fly-opt binary: ${fly_opt_bin}"
+      exit 1
+    fi
+    export FLYDSL_ILUVATAR_FLY_OPT="${fly_opt_bin}"
+
     runtime_lib="/workspace/build-fly/python_packages/flydsl/_mlir/_mlir_libs/libfly_iluvatar_jit_runtime.so"
     if [[ ! -f "${runtime_lib}" ]]; then
       echo "::error::missing runtime library: ${runtime_lib}"
