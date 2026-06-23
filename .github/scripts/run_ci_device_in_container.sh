@@ -221,9 +221,16 @@ docker run "${docker_args[@]}" \
     fi
 
     image_site_packages=""
+    venv_site_packages=""
     for p in /opt/venv/lib/python*/site-packages; do
       if [[ -d "${p}" ]]; then
         image_site_packages="${p}"
+        break
+      fi
+    done
+    for p in /workspace/.ci-venv/lib/python*/site-packages; do
+      if [[ -d "${p}" ]]; then
+        venv_site_packages="${p}"
         break
       fi
     done
@@ -231,7 +238,12 @@ docker run "${docker_args[@]}" \
       echo "::error::cannot locate image python site-packages under /opt/venv"
       exit 1
     fi
-    export PYTHONPATH="${image_site_packages}:${PYTHONPATH:-}"
+    if [[ -z "${venv_site_packages}" ]]; then
+      echo "::error::cannot locate venv python site-packages under /workspace/.ci-venv"
+      exit 1
+    fi
+    # Keep venv-installed numpy preferred, while making image-level torch importable.
+    printf "%s\n" "${image_site_packages}" > "${venv_site_packages}/_ci_image_site_packages.pth"
 
     python3 - <<'PY'
 import torch
@@ -246,9 +258,15 @@ PY
     cmake --build build-fly -j"$(nproc)"
 
     # Required by compile-only must-pass tests in test_iluvatar_binary_pipeline_smoke.py.
-    fly_opt_bin="/workspace/build-fly/tools/fly-opt/fly-opt"
-    if [[ ! -x "${fly_opt_bin}" ]]; then
-      echo "::error::missing fly-opt binary: ${fly_opt_bin}"
+    fly_opt_bin=""
+    for c in /workspace/build-fly/bin/fly-opt /workspace/build-fly/tools/fly-opt/fly-opt; do
+      if [[ -x "${c}" ]]; then
+        fly_opt_bin="${c}"
+        break
+      fi
+    done
+    if [[ -z "${fly_opt_bin}" ]]; then
+      echo "::error::missing fly-opt binary: /workspace/build-fly/bin/fly-opt (or legacy tools/fly-opt path)"
       exit 1
     fi
     export FLYDSL_ILUVATAR_FLY_OPT="${fly_opt_bin}"
