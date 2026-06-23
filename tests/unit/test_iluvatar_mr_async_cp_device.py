@@ -14,7 +14,7 @@ Set ``FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP=1`` to run (needs an Iluvatar device).
 Stage coverage notes
 --------------------
 
-* Original multibrick tests fixed ``K=64`` (BK=64) only; they cannot catch ``k_rep=2``
+* Original multibrick tests fixed ``K=64`` (BK=64) only; they cannot catch ``k_atoms=2``
   (BK=32) brick-count bugs.
 * Single-block launches cannot catch multi-CTA ``bid_x`` / ``bid_y`` G2S slice bugs.
 
@@ -33,10 +33,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kernels.iluvatar_mr_common import SMEM_ROWS, WARP_SIZE, major_pattern_id  # noqa: E402
+from kernels.iluvatar_common import parse_major_pattern, WARP_SIZE  # noqa: E402
+from kernels.iluvatar_mr_common import SMEM_ROWS  # noqa: E402
 from kernels.iluvatar_mr_operand_copy import (  # noqa: E402
     mr_hgemm_g2s_issue_operands,
-    mr_pattern_g2s_sme_config,
+    mr_g2s_sme_config,
     mr_sme_shared_view,
 )
 from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
@@ -45,11 +46,11 @@ from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
     STAGED_BRICK_N,
     STAGED_WARPS_M,
     STAGED_WARPS_N,
-    brick_k_from_k_rep,
+    brick_k_from_k_atoms,
     expected_multibrick_a_dump,
     expected_multibrick_b_dump,
     multibrick_position_tensor,
-    remap_hgemm_tensors_for_pattern,
+    remap_gemm_tensors,
     staged_cta_config,
 )
 
@@ -248,7 +249,9 @@ def _compile_multibrick_async_copy_dump_kernel(
     brick_k: int = STAGED_BRICK_K_DEFAULT,
     use_block_idx_m: bool = False,
 ):
-    pattern_id = major_pattern_id(major_pattern)
+    layout = parse_major_pattern(major_pattern)
+    a_mn_major = layout.a_mn_major
+    b_mn_major = layout.b_mn_major
     elem_bits = dtype_case["elem_bits"]
     elem_bytes = elem_bits // 8
     fx_dtype = getattr(fx, dtype_case["fx_dtype"])
@@ -264,19 +267,20 @@ def _compile_multibrick_async_copy_dump_kernel(
         warps_n=STAGED_WARPS_N,
         elem_bits=elem_bits,
     )
-    values_per_sme_row = cta["values_per_sme_row"]
+    vpr = cta["values_per_sme_row"]
+    geom = cta["geom"]
     threads = cta["threads"]
     a_atoms_total = cta["a_atoms_total"]
     b_atoms_total = cta["b_atoms_total"]
     a_per_warp = cta["a_per_warp"]
     b_per_warp = cta["b_per_warp"]
     smem_elems = cta["smem_elems"]
-    b_n_chunks = cta["b_n_chunks"]
+    cta_b_n_cnt = cta["cta_b_n_cnt"]
     b_logical_stride = cta["b_logical_stride"]
-    brick_elems = cta["brick_elems"]
+    cta_chunk_elems = cta["cta_chunk_elems"]
     grid_m = 2 if use_block_idx_m else 1
     a_logical_m = brick_m * grid_m if use_block_idx_m else brick_m
-    a_logical_stride = (1, a_logical_m) if pattern_id in (1, 3) else (brick_k, 1)
+    a_logical_stride = (1, a_logical_m) if a_mn_major else (brick_k, 1)
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def async_copy_dump_kernel(A: fx.Tensor, B: fx.Tensor, A_out: fx.Tensor, B_out: fx.Tensor):
@@ -286,7 +290,7 @@ def _compile_multibrick_async_copy_dump_kernel(
         bid_x, _, _ = fx.block_idx
         a_tile_id = bid_x if use_block_idx_m else fx.Int32(0)
         if fx.const_expr(use_block_idx_m):
-            a_out_cta_base = bid_x * fx.Int32(a_atoms_total * brick_elems)
+            a_out_cta_base = bid_x * fx.Int32(a_atoms_total * cta_chunk_elems)
         else:
             a_out_cta_base = fx.Int32(0)
 
@@ -310,45 +314,47 @@ def _compile_multibrick_async_copy_dump_kernel(
             fx.get_dyn_shared(),
         )
 
-        g2s_sme = mr_pattern_g2s_sme_config(
-            pattern_id,
-            fx_dtype,
+        g2s_sme = mr_g2s_sme_config(
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
+            elem_dtype=fx_dtype,
             row_atom=row_atom_factory,
             row_swizzle=row_swizzle,
         )
-        if fx.const_expr(pattern_id == 1 or pattern_id == 3):
+        if fx.const_expr(a_mn_major):
             # Col-A SME leading stride is the full logical M extent (not one CTA bm).
             a_leading = a_logical_m
         else:
             a_leading = brick_k
-        if fx.const_expr(pattern_id == 0 or pattern_id == 1):
+        if fx.const_expr(b_mn_major):
             b_leading = brick_n
         else:
             b_leading = brick_k
 
-        tile_smem = fx.make_tile(SMEM_ROWS, values_per_sme_row)
+        tile_smem = fx.make_tile(SMEM_ROWS, vpr)
         tile_smem_A = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 1 or pattern_id == 3)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(a_mn_major)
             else tile_smem
         )
         tile_smem_B = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 0 or pattern_id == 1)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(b_mn_major)
             else tile_smem
         )
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
-        g_A_div = fx.zipped_divide(sme_A, tile_smem_A)
-        g_B_div = fx.zipped_divide(sme_B, tile_smem_B)
+        a_cta_gmem_view = fx.zipped_divide(sme_A, tile_smem_A)
+        b_cta_gmem_view = fx.zipped_divide(sme_B, tile_smem_B)
 
         mr_hgemm_g2s_issue_operands(
-            pattern_id=pattern_id,
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
             warp_id=warp_id,
             a_per_warp=a_per_warp,
             b_per_warp=b_per_warp,
-            g_A_div=g_A_div,
-            g_B_div=g_B_div,
+            a_cta_gmem_view=a_cta_gmem_view,
+            b_cta_gmem_view=b_cta_gmem_view,
             g2s_sme=g2s_sme,
             smem_base=smem_elem_base,
             elem_dtype=fx_dtype,
@@ -356,7 +362,7 @@ def _compile_multibrick_async_copy_dump_kernel(
             bn=brick_n,
             bk=brick_k,
             stage_base=fx.Int32(0),
-            values_per_sme_row=values_per_sme_row,
+            geom=geom,
         )
         ixdl.cp_async_wait_group(0)
         fx.gpu.barrier()
@@ -369,18 +375,18 @@ def _compile_multibrick_async_copy_dump_kernel(
                 (1, SMEM_ROWS),
             ),
             fx.make_layout(
-                (1, values_per_sme_row // (WARP_SIZE // SMEM_ROWS)),
+                (1, vpr // (WARP_SIZE // SMEM_ROWS)),
                 (1, 1),
             ),
         )
         tiled_st_mn = fx.make_tiled_copy_tv(
             scalar_atom,
             fx.make_layout(
-                (values_per_sme_row, WARP_SIZE // values_per_sme_row),
-                (1, values_per_sme_row),
+                (vpr, WARP_SIZE // vpr),
+                (1, vpr),
             ),
             fx.make_layout(
-                (1, SMEM_ROWS // (WARP_SIZE // values_per_sme_row)),
+                (1, SMEM_ROWS // (WARP_SIZE // vpr)),
                 (1, 1),
             ),
         )
@@ -389,7 +395,7 @@ def _compile_multibrick_async_copy_dump_kernel(
 
         for t in fx.range_constexpr(a_per_warp):
             atom_idx = warp_id * fx.Int32(a_per_warp) + fx.Int32(t)
-            a_off = atom_idx * fx.Int32(SMEM_ROWS * values_per_sme_row)
+            a_off = atom_idx * fx.Int32(SMEM_ROWS * vpr)
             smem_tile = mr_sme_shared_view(
                 smem_elem_base,
                 a_off,
@@ -401,17 +407,17 @@ def _compile_multibrick_async_copy_dump_kernel(
                 fx.add_offset(fx.get_iter(A_out), a_off + a_out_cta_base),
                 (
                     fx.make_layout(
-                        (values_per_sme_row, SMEM_ROWS),
+                        (vpr, SMEM_ROWS),
                         (SMEM_ROWS, 1),
                     )
-                    if fx.const_expr(pattern_id == 1 or pattern_id == 3)
+                    if fx.const_expr(a_mn_major)
                     else fx.make_layout(
-                        (SMEM_ROWS, values_per_sme_row),
-                        (values_per_sme_row, 1),
+                        (SMEM_ROWS, vpr),
+                        (vpr, 1),
                     )
                 ),
             )
-            if fx.const_expr(pattern_id == 1 or pattern_id == 3):
+            if fx.const_expr(a_mn_major):
                 frag = fx.make_fragment_like(st_mn.partition_S(smem_tile))
                 fx.copy(scalar_atom, st_mn.partition_S(smem_tile), frag)
                 fx.copy(scalar_atom, frag, st_mn.partition_D(dst_tile))
@@ -422,14 +428,14 @@ def _compile_multibrick_async_copy_dump_kernel(
 
         for t in fx.range_constexpr(b_per_warp):
             atom_idx = warp_id * fx.Int32(b_per_warp) + fx.Int32(t)
-            if fx.const_expr(pattern_id == 0 or pattern_id == 1):
-                ni = atom_idx % fx.Int32(brick_n // values_per_sme_row)
-                ki = atom_idx // fx.Int32(brick_n // values_per_sme_row)
-                b_linear = ki * fx.Int32(b_n_chunks) + ni
-                b_off = fx.Int32(brick_m * brick_k) + b_linear * fx.Int32(SMEM_ROWS * values_per_sme_row)
+            if fx.const_expr(b_mn_major):
+                cta_n = atom_idx % fx.Int32(brick_n // vpr)
+                cta_k = atom_idx // fx.Int32(brick_n // vpr)
+                b_linear = cta_k * fx.Int32(cta_b_n_cnt) + cta_n
+                b_off = fx.Int32(brick_m * brick_k) + b_linear * fx.Int32(SMEM_ROWS * vpr)
             else:
-                b_off = fx.Int32(brick_m * brick_k) + atom_idx * fx.Int32(SMEM_ROWS * values_per_sme_row)
-            dst_off = atom_idx * fx.Int32(SMEM_ROWS * values_per_sme_row)
+                b_off = fx.Int32(brick_m * brick_k) + atom_idx * fx.Int32(SMEM_ROWS * vpr)
+            dst_off = atom_idx * fx.Int32(SMEM_ROWS * vpr)
             smem_tile = mr_sme_shared_view(
                 smem_elem_base,
                 b_off,
@@ -441,17 +447,17 @@ def _compile_multibrick_async_copy_dump_kernel(
                 fx.add_offset(fx.get_iter(B_out), dst_off),
                 (
                     fx.make_layout(
-                        (values_per_sme_row, SMEM_ROWS),
+                        (vpr, SMEM_ROWS),
                         (SMEM_ROWS, 1),
                     )
-                    if fx.const_expr(pattern_id == 0 or pattern_id == 1)
+                    if fx.const_expr(b_mn_major)
                     else fx.make_layout(
-                        (SMEM_ROWS, values_per_sme_row),
-                        (values_per_sme_row, 1),
+                        (SMEM_ROWS, vpr),
+                        (vpr, 1),
                     )
                 ),
             )
-            if fx.const_expr(pattern_id == 0 or pattern_id == 1):
+            if fx.const_expr(b_mn_major):
                 frag = fx.make_fragment_like(st_mn.partition_S(smem_tile))
                 fx.copy(scalar_atom, st_mn.partition_S(smem_tile), frag)
                 fx.copy(scalar_atom, frag, st_mn.partition_D(dst_tile))
@@ -475,7 +481,7 @@ def _compile_multibrick_async_copy_dump_kernel(
             stream=stream,
         )
 
-    return launch, a_atoms_total, b_atoms_total, values_per_sme_row, grid_m
+    return launch, a_atoms_total, b_atoms_total, vpr, grid_m
 
 
 def _run_multibrick_g2s_dump_check(
@@ -494,7 +500,7 @@ def _run_multibrick_g2s_dump_check(
 ):
     """Run G2S multibrick dump and compare against host reference."""
     total_m = brick_m if total_m is None else total_m
-    launch, a_atoms_total, b_atoms_total, values_per_sme_row, grid_m = _compile_multibrick_async_copy_dump_kernel(
+    launch, a_atoms_total, b_atoms_total, vpr, grid_m = _compile_multibrick_async_copy_dump_kernel(
         flyc,
         fx,
         ixdl,
@@ -506,32 +512,32 @@ def _run_multibrick_g2s_dump_check(
         use_block_idx_m=use_block_idx_m,
     )
     torch_dtype = getattr(torch, dtype_case["torch_dtype"])
-    brick_elems = SMEM_ROWS * values_per_sme_row
+    cta_chunk_elems = SMEM_ROWS * vpr
     A_logical = multibrick_position_tensor(torch, (total_m, brick_k), torch_dtype)
     B_logical = multibrick_position_tensor(torch, (brick_n, brick_k), torch_dtype)
     if torch_dtype != torch.int8:
         B_logical = B_logical + torch.tensor(17.0, device="cuda", dtype=torch_dtype)
-    A_dev, B_dev = remap_hgemm_tensors_for_pattern(A_logical, B_logical, major_pattern)
-    A_out = torch.empty(grid_m * a_atoms_total * brick_elems, device="cuda", dtype=torch_dtype)
-    B_out = torch.empty(b_atoms_total * brick_elems, device="cuda", dtype=torch_dtype)
+    A_dev, B_dev = remap_gemm_tensors(A_logical, B_logical, major_pattern)
+    A_out = torch.empty(grid_m * a_atoms_total * cta_chunk_elems, device="cuda", dtype=torch_dtype)
+    B_out = torch.empty(b_atoms_total * cta_chunk_elems, device="cuda", dtype=torch_dtype)
 
     launch(A_dev, B_dev, A_out, B_out)
     torch.cuda.synchronize()
 
     if use_block_idx_m:
-        pattern_id = major_pattern_id(major_pattern)
+        layout = parse_major_pattern(major_pattern)
         for bx in range(grid_m):
             a_slice = A_logical[bx * brick_m : (bx + 1) * brick_m, :]
-            if pattern_id in (0, 2):
+            if layout.a_k_major:
                 a_dev_slice = A_dev[bx * brick_m : (bx + 1) * brick_m, :]
-            elif pattern_id in (1, 3):
+            elif layout.a_mn_major:
                 a_dev_slice = A_dev[:, bx * brick_m : (bx + 1) * brick_m]
             else:
                 a_dev_slice = a_slice
             expected_a = expected_multibrick_a_dump(
-                torch, a_slice, a_dev_slice, major_pattern, brick_k, values_per_sme_row
+                torch, a_slice, a_dev_slice, major_pattern, brick_k, vpr
             )
-            got_a = A_out[bx * a_atoms_total * brick_elems : (bx + 1) * a_atoms_total * brick_elems]
+            got_a = A_out[bx * a_atoms_total * cta_chunk_elems : (bx + 1) * a_atoms_total * cta_chunk_elems]
             torch.testing.assert_close(
                 got_a,
                 expected_a,
@@ -542,14 +548,14 @@ def _run_multibrick_g2s_dump_check(
     else:
         torch.testing.assert_close(
             A_out,
-            expected_multibrick_a_dump(torch, A_logical, A_dev, major_pattern, brick_k, values_per_sme_row),
+            expected_multibrick_a_dump(torch, A_logical, A_dev, major_pattern, brick_k, vpr),
             rtol=0,
             atol=0,
             msg=f"{dtype_case['name']} {major_pattern} A multi-brick async-copy dump mismatch",
         )
     torch.testing.assert_close(
         B_out,
-        expected_multibrick_b_dump(torch, B_dev, major_pattern, brick_n, brick_k, values_per_sme_row),
+        expected_multibrick_b_dump(torch, B_dev, major_pattern, brick_n, brick_k, vpr),
         rtol=0,
         atol=0,
         msg=f"{dtype_case['name']} {major_pattern} B multi-brick async-copy dump mismatch",
@@ -714,8 +720,8 @@ def test_mr_async_cp_multibrick_layout_device(major_pattern, dtype_case, monkeyp
 
     The same physical footprint may be interpreted through different SME views:
 
-        K-major view:   16 rows x values_per_sme_row
-        MN-major view:  values_per_sme_row x 16 rows
+        K-major view:   16 rows x vpr
+        MN-major view:  vpr x 16 rows
 
     This test does not validate GEMM compute. It validates that after
     multi-brick async copies, shared memory can be read back through the
@@ -856,7 +862,7 @@ _B16_DTYPE = next(c for c in _MULTIBRICK_DTYPE_CASES if c["name"] == "b16")
     ids=["A-row_B-col", "A-row_B-row", "A-col_B-row", "A-col_B-col"],
 )
 def test_mr_async_cp_multibrick_bk32_device(major_pattern, monkeypatch):
-    """G2S multibrick dump at BK=32 (k_rep=2), the shape that exposed nn/tn bugs."""
+    """G2S multibrick dump at BK=32 (k_atoms=2), the shape that exposed nn/tn bugs."""
 
     _require_enabled()
     flyc, fx, ixdl = _require_imports()
@@ -870,7 +876,7 @@ def test_mr_async_cp_multibrick_bk32_device(major_pattern, monkeypatch):
         ixdl,
         major_pattern=major_pattern,
         dtype_case=_B16_DTYPE,
-        brick_k=brick_k_from_k_rep(2),
+        brick_k=brick_k_from_k_atoms(2),
     )
 
 

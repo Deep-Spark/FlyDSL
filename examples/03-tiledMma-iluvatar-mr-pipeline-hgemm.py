@@ -90,8 +90,9 @@ import torch  # noqa: E402
 
 import flydsl.compiler as flyc  # noqa: E402
 import flydsl.expr as fx  # noqa: E402
+from kernels.iluvatar_common import remap_gemm_tensors  # noqa: E402
 from kernels.iluvatar_mr_hgemm import (  # noqa: E402
-    ATOM_K,
+    ATOM_K_B16,
     DEFAULT_MAJOR_PATTERN,
     DEFAULT_SMEM_CAP_BYTES,
     DEFAULT_SWIZZLE_CTA,
@@ -111,7 +112,7 @@ from kernels.iluvatar_mr_hgemm import (  # noqa: E402
 # Harness-only default: run both epilogue modes unless --epilogue selects one.
 EPILOGUE_BOTH = "both"
 DEFAULT_EPILOGUE = EPILOGUE_BOTH
-DEFAULT_K_REP = 4  # BK = 64; matches SWIZZLE_CTA_PRESETS[*].default_k_rep
+DEFAULT_K_ATOMS = 4  # BK = 64; matches SWIZZLE_CTA_PRESETS[*].default_k_atoms
 DEFAULT_EPILOGUE_STORE = EPILOGUE_STORE_TILED
 
 
@@ -142,19 +143,6 @@ def _reference(A, B, C_in=None):
     return ab + C_in.to(torch.float32)
 
 
-def _remap_hgemm_tensors_for_pattern(A, B, major_pattern: str):
-    """Harness-side physical layout adapter for logical A(m,k), B(n,k) inputs."""
-    if major_pattern == "nn":
-        return A, B.t().contiguous()
-    if major_pattern == "tn":
-        return A.t().contiguous(), B.t().contiguous()
-    if major_pattern == "nt":
-        return A, B
-    if major_pattern == "tt":
-        return A.t().contiguous(), B
-    raise ValueError(f"unknown major pattern: {major_pattern}")
-
-
 def _epilogue_modes(epilogue: str) -> list[str]:
     if epilogue == EPILOGUE_BOTH:
         return [EPILOGUE_NO_C_READ, EPILOGUE_READ_C_ACCUM]
@@ -181,7 +169,7 @@ def _build_launcher(
     *,
     warps_m: int,
     warps_n: int,
-    k_rep: int,
+    k_atoms: int,
     warp_atoms_m: int,
     warp_atoms_n: int,
     epilogue: str,
@@ -194,7 +182,7 @@ def _build_launcher(
         K=k,
         warps_m=warps_m,
         warps_n=warps_n,
-        k_rep=k_rep,
+        k_atoms=k_atoms,
         warp_atoms_m=warp_atoms_m,
         warp_atoms_n=warp_atoms_n,
         epilogue=epilogue,
@@ -204,7 +192,7 @@ def _build_launcher(
     bm, bn, _bk, threads, smem = _swizzle_cta_shape(
         warps_m,
         warps_n,
-        k_rep,
+        k_atoms,
         warp_atoms_m=warp_atoms_m,
         warp_atoms_n=warp_atoms_n,
     )
@@ -223,8 +211,8 @@ def _expected_result(A, B, C_in, epilogue: str):
     return _reference(A, B, C_in)
 
 
-def _compare_atol(k: int, k_rep: int) -> float:
-    bk = ATOM_K * k_rep
+def _compare_atol(k: int, k_atoms: int) -> float:
+    bk = ATOM_K_B16 * k_atoms
     return 2e-2 * max(1.0, (k / bk) ** 0.5)
 
 
@@ -235,7 +223,7 @@ def _check(
     *,
     warps_m: int,
     warps_n: int,
-    k_rep: int,
+    k_atoms: int,
     warp_atoms_m: int,
     warp_atoms_n: int,
     epilogue: str,
@@ -254,14 +242,14 @@ def _check(
         k,
         warps_m=warps_m,
         warps_n=warps_n,
-        k_rep=k_rep,
+        k_atoms=k_atoms,
         warp_atoms_m=warp_atoms_m,
         warp_atoms_n=warp_atoms_n,
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
     )
-    a_dev, b_dev = _remap_hgemm_tensors_for_pattern(A, B, major_pattern)
+    a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
     launcher(a_dev, b_dev, C, stream=stream)
     torch.cuda.synchronize()
@@ -272,7 +260,7 @@ def _check(
     else:
         got = C
     diff = (got - expected).abs()
-    atol = _compare_atol(k, k_rep)
+    atol = _compare_atol(k, k_atoms)
     ok = torch.allclose(got, expected, atol=atol, rtol=2e-2)
     finite_ok = torch.isfinite(got).all().item()
     cta_note = (
@@ -300,7 +288,7 @@ def _bench(
     *,
     warps_m: int,
     warps_n: int,
-    k_rep: int,
+    k_atoms: int,
     warp_atoms_m: int,
     warp_atoms_n: int,
     epilogue: str,
@@ -321,14 +309,14 @@ def _bench(
         k,
         warps_m=warps_m,
         warps_n=warps_n,
-        k_rep=k_rep,
+        k_atoms=k_atoms,
         warp_atoms_m=warp_atoms_m,
         warp_atoms_n=warp_atoms_n,
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
     )
-    a_dev, b_dev = _remap_hgemm_tensors_for_pattern(A, B, major_pattern)
+    a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
 
     t0 = time.perf_counter()
@@ -392,7 +380,7 @@ def _bench(
         got = C.to(torch.float32)
     else:
         got = C
-    atol = _compare_atol(k, k_rep)
+    atol = _compare_atol(k, k_atoms)
     if not torch.allclose(got, expected, atol=atol, rtol=2e-2):
         diff = (got - expected).abs()
         print(f"  [WARN] post-bench correctness FAILED (max_abs={diff.max().item():.3e})")
@@ -419,7 +407,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--major-pattern",
         choices=MAJOR_PATTERN_CHOICES,
         default=DEFAULT_MAJOR_PATTERN,
-        help="G2S global layout tag for A/B (see kernels.iluvatar_mr_hgemm)",
+        help="CUTLASS 3.x BLAS global layout tag for A/B (see kernels.iluvatar_mr_hgemm)",
     )
     p.add_argument(
         "--cta",
@@ -432,7 +420,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--warps-n", type=int, default=None, help="override preset warps_n")
     p.add_argument("--warp-atoms-m", type=int, default=None, help="MMA atoms per warp in M")
     p.add_argument("--warp-atoms-n", type=int, default=None, help="MMA atoms per warp in N")
-    p.add_argument("--k-rep", type=int, default=DEFAULT_K_REP, help="BK = 16 * k_rep")
+    p.add_argument("--k-atoms", type=int, default=DEFAULT_K_ATOMS, help="BK = 16 * k_atoms")
     p.add_argument(
         "--check-shape",
         nargs=3,
@@ -461,23 +449,23 @@ def _validate_shape(m: int, n: int, k: int, args: argparse.Namespace) -> str | N
     bm, bn, bk, threads, smem_bytes = _swizzle_cta_shape(
         args.warps_m,
         args.warps_n,
-        args.k_rep,
+        args.k_atoms,
         warp_atoms_m=args.warp_atoms_m,
         warp_atoms_n=args.warp_atoms_n,
     )
     if k % bk:
-        return f"K must be a multiple of {bk} (16 * k_rep)"
+        return f"K must be a multiple of {bk} (16 * k_atoms)"
     if m % bm or n % bn:
         return f"M,N must be multiples of {bm}/{bn} for swizzle CTA"
     if not _swizzle_atom_work_ok(bm, bn, bk, args.warps_m, args.warps_n):
         return (
             f"SME brick count must divide evenly across {args.warps_m}x{args.warps_n} warps; "
-            f"try larger k_rep (current BK={bk})"
+            f"try larger k_atoms (current BK={bk})"
         )
     if smem_bytes > DEFAULT_SMEM_CAP_BYTES:
         return (
             f"CTA smem {smem_bytes} B exceeds device cap {DEFAULT_SMEM_CAP_BYTES} B "
-            f"({bm}x{bn}x{bk}, {threads} threads); use smaller tile or k_rep"
+            f"({bm}x{bn}x{bk}, {threads} threads); use smaller tile or k_atoms"
         )
     return None
 
@@ -486,9 +474,9 @@ def main(argv: list[str] | None = None) -> int:
     _warn_if_card_busy()
     args = _parse_args(argv or sys.argv[1:])
     preset = _finalize_swizzle_cta(args)
-    if args.cta == "2048" and args.k_rep < 4:
+    if args.cta == "2048" and args.k_atoms < 4:
         print(
-            "[WARN] 2048-thread CTA usually needs --k-rep >= 4 for even SME work " "and smem within 128 KiB",
+            "[WARN] 2048-thread CTA usually needs --k-atoms >= 4 for even SME work " "and smem within 128 KiB",
             file=sys.stderr,
         )
     elif preset.name == "2048":
@@ -520,14 +508,14 @@ def main(argv: list[str] | None = None) -> int:
                 k,
                 warps_m=args.warps_m,
                 warps_n=args.warps_n,
-                k_rep=args.k_rep,
+                k_atoms=args.k_atoms,
                 warp_atoms_m=args.warp_atoms_m,
                 warp_atoms_n=args.warp_atoms_n,
                 epilogue=epilogue,
                 epilogue_store=args.epilogue_store,
                 major_pattern=args.major_pattern,
             )
-            a_dev, b_dev = _remap_hgemm_tensors_for_pattern(a, b, args.major_pattern)
+            a_dev, b_dev = remap_gemm_tensors(a, b, args.major_pattern)
             launcher(a_dev, b_dev, c)
             store_note = f", store={args.epilogue_store}" if epilogue == EPILOGUE_NO_C_READ else ""
             print(
@@ -545,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
             ck,
             warps_m=args.warps_m,
             warps_n=args.warps_n,
-            k_rep=args.k_rep,
+            k_atoms=args.k_atoms,
             warp_atoms_m=args.warp_atoms_m,
             warp_atoms_n=args.warp_atoms_n,
             epilogue=epilogue,
@@ -571,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
                 k,
                 warps_m=args.warps_m,
                 warps_n=args.warps_n,
-                k_rep=args.k_rep,
+                k_atoms=args.k_atoms,
                 warp_atoms_m=args.warp_atoms_m,
                 warp_atoms_n=args.warp_atoms_n,
                 epilogue=epilogue,

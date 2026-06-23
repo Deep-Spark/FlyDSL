@@ -18,10 +18,10 @@ Stage coverage notes
   ``mr_hgemm_s2r_a_tile`` / ``mr_hgemm_s2r_b_tile`` against production G2S SME
   layout.
 * ``test_iluvatar_mr_g2s_s2r_ki_chain_device`` chains production G2S with
-  ``mr_hgemm_s2r_*_tile`` views and scalar smem readback (warp-00 Ki slices).
-  B is asserted for every pattern; A is asserted only for ``tn``/``tt`` where
-  the scalar readback matches logical layout (``nt``/``nn`` A uses Row-SME
-  swizzle that this harness does not decode).
+  ``mr_hgemm_s2r_copy_*`` and MMA-coupled fragment readback (warp-00 Ki slices).
+  Operand A uses a K-major ``partition_D`` layout on Iluvatar; the host reshapes
+  with ``.transpose(-1, -2)`` before compare. Operand B uses logical row-major.
+  Full A/B together is also covered by ``test_iluvatar_mr_g2s_s2r_mma_warp00_atom_device``.
 """
 
 import os
@@ -36,21 +36,22 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kernels.iluvatar_mr_common import ATOM_K, ATOM_M, ATOM_N, SMEM_ROWS, WARP_SIZE, major_pattern_id  # noqa: E402
+from kernels.iluvatar_common import WARP_SIZE  # noqa: E402
+from kernels.iluvatar_mr_common import ATOM_K_B32, ATOM_K_B16, ATOM_K_B8, ATOM_M, ATOM_N, SMEM_ROWS  # noqa: E402
 from kernels.iluvatar_mr_s2r import mr_hgemm_s2r_copy_a, mr_hgemm_s2r_copy_b  # noqa: E402
 from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
     STAGED_BRICK_M,
     STAGED_BRICK_N,
-    brick_k_from_k_rep,
-    expected_warp00_ab_ki_slice,
+    brick_k_from_k_atoms,
+    expected_warp00_ab_mma_k_slice,
     multibrick_position_tensor,
-    remap_hgemm_tensors_for_pattern,
+    remap_gemm_tensors,
 )
 from tests.unit.iluvatar_mr_staged_kernels import build_mr_g2s_s2r_ki_dump_launch  # noqa: E402
 
-# Chain test targets BK=32 (production default k_rep=2). k_rep=4 needs wider Ki
-# brick accounting in mr_hgemm_s2r_a_tile (tn A fails at brick_k=64).
-_G2S_K_REP_VALUES = (2,)
+# G2S->S2R chain uses production default k_atoms=2 (bk=32). k_atoms=4 (bk=64) is
+# supported after sme_row_k_slices parameterization in mr_hgemm_s2r_*_tile.
+_G2S_K_ATOMS_VALUES = (2,)
 
 S2R_MAJOR_PATTERNS = ("nt", "nn", "tn", "tt")
 S2R_K_CHUNK = 16
@@ -62,7 +63,7 @@ S2R_DTYPE_CASES = [
         "fx_dtype": "Int8",
         "fx_acc": "Int32",
         "elem_bits": 8,
-        "mma_k": 32,
+        "mma_k": ATOM_K_B8,
         "scalar_atom": "UniversalCopy8b",
     },
     {
@@ -71,7 +72,7 @@ S2R_DTYPE_CASES = [
         "fx_dtype": "Float16",
         "fx_acc": "Float32",
         "elem_bits": 16,
-        "mma_k": 16,
+        "mma_k": ATOM_K_B16,
         "scalar_atom": "UniversalCopy16b",
     },
     {
@@ -80,7 +81,7 @@ S2R_DTYPE_CASES = [
         "fx_dtype": "Float32",
         "fx_acc": "Float32",
         "elem_bits": 32,
-        "mma_k": 16,
+        "mma_k": ATOM_K_B32,
         "scalar_atom": "UniversalCopy32b",
     },
 ]
@@ -136,19 +137,6 @@ def _position_tensor(torch, shape, dtype):
     return encoded.to(dtype)
 
 
-def _remap_operands_for_pattern(A, B, major_pattern: str):
-    pattern_id = major_pattern_id(major_pattern)
-    if pattern_id == 0:
-        return A, B.t().contiguous()
-    if pattern_id == 1:
-        return A.t().contiguous(), B.t().contiguous()
-    if pattern_id == 2:
-        return A, B
-    if pattern_id == 3:
-        return A.t().contiguous(), B
-    raise ValueError(f"unknown major_pattern: {major_pattern}")
-
-
 def _pack_tensor_as_i32(torch, tensor):
     bytes_flat = tensor.contiguous().view(torch.uint8).to(torch.int32).reshape(-1, 4)
     return (
@@ -157,7 +145,6 @@ def _pack_tensor_as_i32(torch, tensor):
 
 
 def _compile_s2r_dump_kernel(flyc, fx, ixdl, major_pattern: str, dtype_case):
-    pattern_id = major_pattern_id(major_pattern)
     elem_bits = dtype_case["elem_bits"]
     elem_bytes = elem_bits // 8
     mma_k = dtype_case["mma_k"]
@@ -176,7 +163,6 @@ def _compile_s2r_dump_kernel(flyc, fx, ixdl, major_pattern: str, dtype_case):
     fx_dtype = getattr(fx, dtype_case["fx_dtype"])
     fx_acc = getattr(fx, dtype_case["fx_acc"])
     scalar_atom_factory = getattr(fx, dtype_case["scalar_atom"])
-    _ = pattern_id
 
     @flyc.kernel(known_block_size=[WARP_SIZE, 1, 1])
     def s2r_dump_kernel(A_init: fx.Tensor, B_init: fx.Tensor, A_out: fx.Tensor, B_out: fx.Tensor):
@@ -361,9 +347,9 @@ _G2S_S2R_CHAIN_CASES = [
 ]
 
 
-@pytest.mark.parametrize("major_pattern,k_rep,operand", _G2S_S2R_CHAIN_CASES)
-def test_iluvatar_mr_g2s_s2r_ki_chain_device(major_pattern, k_rep, operand, monkeypatch):
-    """Production G2S -> ``mr_hgemm_s2r_*_tile`` scalar readback for warp-00 Ki slices.
+@pytest.mark.parametrize("major_pattern,k_atoms,operand", _G2S_S2R_CHAIN_CASES)
+def test_iluvatar_mr_g2s_s2r_ki_chain_device(major_pattern, k_atoms, operand, monkeypatch):
+    """Production G2S -> ``mr_hgemm_s2r_copy_*`` fragment readback for warp-00 Ki slices.
 
     Each case builds one dump kernel only (A or B). Mixing both builders in one
     test tickles a FlyDSL JIT cache collision on Iluvatar.
@@ -374,32 +360,33 @@ def test_iluvatar_mr_g2s_s2r_ki_chain_device(major_pattern, k_rep, operand, monk
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
 
-    brick_k = brick_k_from_k_rep(k_rep)
-    ki_slices = brick_k // ATOM_K
+    brick_k = brick_k_from_k_atoms(k_atoms)
+    mma_k_slices = brick_k // ATOM_K_B16
     A_logical = multibrick_position_tensor(torch, (STAGED_BRICK_M, brick_k), torch.float16)
     B_logical = multibrick_position_tensor(torch, (STAGED_BRICK_N, brick_k), torch.float16)
     B_logical = B_logical + torch.tensor(17.0, device="cuda", dtype=torch.float16)
-    A_dev, B_dev = remap_hgemm_tensors_for_pattern(A_logical, B_logical, major_pattern)
+    A_dev, B_dev = remap_gemm_tensors(A_logical, B_logical, major_pattern)
 
     launch, _, _, dump_elems = build_mr_g2s_s2r_ki_dump_launch(
-        major_pattern=major_pattern, k_rep=k_rep, operand=operand
+        major_pattern=major_pattern, k_atoms=k_atoms, operand=operand
     )
     out = torch.zeros(dump_elems, device="cuda", dtype=torch.float16)
     launch(A_dev, B_dev, out)
     torch.cuda.synchronize()
 
     if operand == "A":
-        out_view = out.reshape(ki_slices, ATOM_M, ATOM_K)
+        # A fragment dump uses K-major partition_D; recover logical (M, K).
+        out_view = out.reshape(mma_k_slices, ATOM_K_B16, ATOM_M).transpose(-1, -2).contiguous()
     else:
-        out_view = out.reshape(ki_slices, ATOM_N, ATOM_K)
+        out_view = out.reshape(mma_k_slices, ATOM_N, ATOM_K_B16)
 
-    for ki in range(ki_slices):
-        exp_a, exp_b = expected_warp00_ab_ki_slice(A_logical, B_logical, ki=ki)
+    for mma_k in range(mma_k_slices):
+        exp_a, exp_b = expected_warp00_ab_mma_k_slice(A_logical, B_logical, mma_k=mma_k)
         expected = exp_a if operand == "A" else exp_b
         torch.testing.assert_close(
-            out_view[ki],
+            out_view[mma_k],
             expected,
             rtol=0,
             atol=0,
-            msg=f"{major_pattern} k_rep={k_rep} {operand} ki={ki} G2S->S2R mismatch",
+            msg=f"{major_pattern} k_atoms={k_atoms} {operand} mma_k={mma_k} G2S->S2R mismatch",
         )

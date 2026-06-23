@@ -3,46 +3,21 @@
 
 """Iluvatar MR (ivcore11) tiledMma pipeline HGEMM.
 
-Double-buffered shared-memory pipeline with async SME G2S
-(``MRAsyncCpRow16b`` / ``MRAsyncCpCol``), ``make_sme_shared_layout``, Ki-deferred
-S2R/MMA mainloop, and ``UniversalCopy32b`` for S2R.
+Double-buffered smem pipeline: async SME G2S (MRAsyncCpRow16b / MRAsyncCpCol),
+make_sme_shared_layout, Ki-deferred S2R/MMA mainloop, UniversalCopy32b S2R.
 
-Entry point: ``compile_iluvatar_mr_hgemm(M=..., N=..., K=..., ...)`` returns a
-``@flyc.jit`` launch wrapper ``launch_gemm(A, B, C, stream=...)``.
+Entry: compile_iluvatar_mr_hgemm(M=..., N=..., K=...) -> launch_gemm(A, B, C, stream=...).
 
-Tuning parameters
------------------
+Tuning:
+  epilogue no_c_read (default) — D = A @ B.T, fp16 out, acc zeroed. epilogue_store: shfl (default) or tiled.
+  epilogue read_c_accum — C = A @ B.T + C, fp32 out, load C before MMA.
 
-**epilogue**
+  major_pattern — BLAS layout tags nn/nt/tn (default)/tt on logical A(m,k)/B(n,k); see GemmLayout.
+    Default tn: both k-major, PyTorch (m,k)/(n,k) need no host transpose.
 
-* ``no_c_read`` (default) — ``D = A @ B.T``, fp16 output, accumulator zeroed (no
-  global C read). Store path selected by ``epilogue_store``. Not to be confused
-  with ``major_pattern`` ``nn`` (a G2S layout tag).
-* ``read_c_accum`` — ``C = A @ B.T + C``, fp32 output, load existing C into the
-  accumulator before MMA.
-
-**epilogue_store** (``no_c_read`` only)
-
-* ``shfl`` (default) — f32 acc → fp16 via warp ``shuffle_idx`` + packed i32 store.
-* ``tiled`` — vector ``trunc_f`` + ``make_tiled_copy_C`` / ``UniversalCopy16b``.
-
-**major_pattern** — G2S global layout for A/B: ``nn``, ``tn``, ``nt`` (default),
-``tt`` (two letters: A then B, ``n``=NoTrans/row SME, ``t``=Trans/col SME).
-Kernel tensors are always logical ``A(m,k)``, ``B(n,k)``; the pattern selects
-how SME views map to those layouts.
-
-**CTA shape** — ``warps_m``, ``warps_n``, ``warp_atoms_m``, ``warp_atoms_n``,
-``k_rep`` (``BK = 16 * k_rep``). ``SWIZZLE_CTA_PRESETS`` lists common presets:
-
-* ``1024`` — ``4 x 4`` warps, ``4 x 4`` atoms/warp → ``256 x 256`` CTA tile,
-  ``64 x 64``/warp; preset ``default_k_rep=4`` → ``BK=64``.
-* ``2048`` — ``4 x 8`` warps, ``4 x 2`` atoms/warp → same ``256 x 256`` tile,
-  ``64 x 32``/warp; typically needs ``k_rep >= 4`` so SME brick work divides
-  across warps and smem stays within 128 KiB/device.
-
-Default ``compile_iluvatar_mr_hgemm`` kwargs: ``4 x 4`` warps, ``4 x 4`` atoms/warp,
-``k_rep=2`` (``BK=32``, lower smem / peak-tuned). Override per preset or problem
-size; ``M``, ``N``, ``K`` must align with the resulting ``bm``/``bn``/``bk``.
+  CTA shape — warps_m/n, warp_atoms_m/n, k_atoms (BK = ATOM_K_B16 * k_atoms).
+  SWIZZLE_CTA_PRESETS: 1024 (4x4 warps, 4x4 atoms/warp, 256x256 tile), 2048 (4x8 warps, 4x2 atoms).
+  Default compile kwargs: 4x4 warps, 4x4 atoms, k_atoms=2 (BK=32).
 """
 
 # NOTE: do NOT add ``from __future__ import annotations`` (Constexpr introspection).
@@ -52,27 +27,29 @@ from typing import NamedTuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
+from kernels.iluvatar_common import (
+    DEFAULT_MAJOR_PATTERN,
+    MAJOR_PATTERN_CHOICES,
+    WARP_SIZE,
+    parse_major_pattern,
+)
 from kernels.iluvatar_mr_common import (
-    ATOM_K,
+    ATOM_K_B16,
     ATOM_M,
     ATOM_N,
-    DEFAULT_MAJOR_PATTERN,
     DEFAULT_SMEM_CAP_BYTES,
-    MAJOR_PATTERN_CHOICES,
-    PATTERN_ID,
-    SMEM_F16_PER_ROW,
+    MR_GEMM_GEOM,
     SMEM_ROWS,
-    WARP_SIZE,
 )
 from kernels.iluvatar_mr_epilogue import (
     mr_hgemm_epilogue_store_read_c_accum,
     mr_hgemm_epilogue_store_shfl,
     mr_hgemm_epilogue_store_tiled,
 )
-from kernels.iluvatar_mr_operand_copy import mr_hgemm_g2s_issue_operands, mr_pattern_g2s_sme_config
-from kernels.iluvatar_mr_s2r import mr_hgemm_s2r_load_ki
+from kernels.iluvatar_mr_operand_copy import mr_g2s_sme_config, mr_hgemm_g2s_issue_operands
+from kernels.iluvatar_mr_s2r import mr_hgemm_s2r_load_mma_k
 
-DEFAULT_K_REP = 2  # CTA K-tile: ATOM_K * k_rep = 32
+DEFAULT_K_ATOMS = 2  # CTA K-tile: ATOM_K_B16 * k_atoms = 32
 STAGES = 2
 K_LOOP_UNROLL = 2
 
@@ -84,8 +61,6 @@ EPILOGUE_STORE_TILED = "tiled"
 EPILOGUE_STORE_SHFL = "shfl"
 DEFAULT_EPILOGUE_STORE = EPILOGUE_STORE_SHFL
 
-_PATTERN_ID = PATTERN_ID
-
 
 class SwizzleCtaPreset(NamedTuple):
     """Swizzle-mode CTA: (warps_m x warps_n) warps, each (warp_atoms_m x warp_atoms_n) MMA atoms."""
@@ -95,13 +70,13 @@ class SwizzleCtaPreset(NamedTuple):
     warps_n: int
     warp_atoms_m: int
     warp_atoms_n: int
-    default_k_rep: int
+    default_k_atoms: int
 
 
 SWIZZLE_CTA_PRESETS: dict[str, SwizzleCtaPreset] = {
-    # 16 warps x 64 lanes; warp tile 64x64; CTA 256x256; smem ~64 KiB @ k_rep=4.
+    # 16 warps x 64 lanes; warp tile 64x64; CTA 256x256; smem ~64 KiB @ k_atoms=4.
     "1024": SwizzleCtaPreset("1024", 4, 4, 4, 4, 4),
-    # 32 warps x 64 lanes; warp tile 64x32; CTA still 256x256; smem ~128 KiB @ k_rep=4.
+    # 32 warps x 64 lanes; warp tile 64x32; CTA still 256x256; smem ~128 KiB @ k_atoms=4.
     "2048": SwizzleCtaPreset("2048", 4, 8, 4, 2, 4),
 }
 DEFAULT_SWIZZLE_CTA = "1024"
@@ -110,7 +85,7 @@ DEFAULT_SWIZZLE_CTA = "1024"
 def _swizzle_cta_shape(
     warps_m: int,
     warps_n: int,
-    k_rep: int,
+    k_atoms: int,
     *,
     warp_atoms_m: int,
     warp_atoms_n: int,
@@ -119,7 +94,7 @@ def _swizzle_cta_shape(
     warp_n = ATOM_N * warp_atoms_n
     bm = warp_m * warps_m
     bn = warp_n * warps_n
-    bk = ATOM_K * k_rep
+    bk = ATOM_K_B16 * k_atoms
     threads = warps_m * warps_n * WARP_SIZE
     smem_bytes = (bm + bn) * bk * 2 * STAGES
     return bm, bn, bk, threads, smem_bytes
@@ -127,9 +102,10 @@ def _swizzle_cta_shape(
 
 def _swizzle_atom_work_ok(bm: int, bn: int, bk: int, warps_m: int, warps_n: int) -> bool:
     num_warps = warps_m * warps_n
-    cta_atoms_k = bk // SMEM_F16_PER_ROW
-    a_atoms_total = (bm // SMEM_ROWS) * cta_atoms_k
-    b_atoms_total = (bn // SMEM_ROWS) * cta_atoms_k
+    vpr = MR_GEMM_GEOM.values_per_sme_row
+    k_bricks_row = bk // vpr
+    a_atoms_total = (bm // SMEM_ROWS) * k_bricks_row
+    b_atoms_total = (bn // SMEM_ROWS) * k_bricks_row
     return a_atoms_total % num_warps == 0 and b_atoms_total % num_warps == 0
 
 
@@ -139,14 +115,16 @@ def _build_swizzle_kernel(
     k: int,
     warps_m: int,
     warps_n: int,
-    k_rep: int,
+    k_atoms: int,
     warp_atoms_m: int,
     warp_atoms_n: int,
     epilogue: str,
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
 ):
-    pattern_id = _PATTERN_ID[major_pattern]
+    gemm_layout = parse_major_pattern(major_pattern)
+    a_mn_major = gemm_layout.a_mn_major
+    b_mn_major = gemm_layout.b_mn_major
     load_c = epilogue == EPILOGUE_READ_C_ACCUM
     out_fp16 = epilogue == EPILOGUE_NO_C_READ
     no_c_read_shfl_store = out_fp16 and epilogue_store == EPILOGUE_STORE_SHFL
@@ -155,19 +133,20 @@ def _build_swizzle_kernel(
     warp_n = ATOM_N * warp_atoms_n
     bm = warp_m * warps_m
     bn = warp_n * warps_n
-    bk = ATOM_K * k_rep
+    bk = ATOM_K_B16 * k_atoms
     num_warps = warps_m * warps_n
     threads = num_warps * WARP_SIZE
+    vpr = MR_GEMM_GEOM.values_per_sme_row
 
     assert k % bk == 0
     assert m % bm == 0 and n % bn == 0
-    assert bk % SMEM_F16_PER_ROW == 0
+    assert bk % vpr == 0
 
     cta_atoms_m = bm // SMEM_ROWS
     cta_atoms_n = bn // SMEM_ROWS
-    cta_atoms_k = bk // SMEM_F16_PER_ROW
-    a_atoms_total = cta_atoms_m * cta_atoms_k
-    b_atoms_total = cta_atoms_n * cta_atoms_k
+    k_bricks_row = bk // vpr
+    a_atoms_total = cta_atoms_m * k_bricks_row
+    b_atoms_total = cta_atoms_n * k_bricks_row
     a_per_warp = a_atoms_total // num_warps
     b_per_warp = b_atoms_total // num_warps
     assert a_atoms_total % num_warps == 0
@@ -188,25 +167,25 @@ def _build_swizzle_kernel(
         warp_m_id = warp_id // warps_n
         warp_n_id = warp_id % warps_n
 
-        if fx.const_expr(pattern_id == 1 or pattern_id == 3):
-            a_log_stride = (1, m)
+        if fx.const_expr(a_mn_major):
+            a_logical_stride = (1, m)
         else:
-            a_log_stride = (k, 1)
-        a_logical = fx.make_view(fx.get_iter(A), fx.make_layout((m, k), a_log_stride))
+            a_logical_stride = (k, 1)
+        a_logical = fx.make_view(fx.get_iter(A), fx.make_layout((m, k), a_logical_stride))
         gA = fx.slice(fx.flat_divide(a_logical, (bm, bk)), (None, None, bid_x, None))
 
-        if fx.const_expr(pattern_id == 0 or pattern_id == 1):
-            b_log_stride = (1, n)
+        if fx.const_expr(b_mn_major):
+            b_logical_stride = (1, n)
         else:
-            b_log_stride = (k, 1)
-        b_logical = fx.make_view(fx.get_iter(B), fx.make_layout((n, k), b_log_stride))
+            b_logical_stride = (k, 1)
+        b_logical = fx.make_view(fx.get_iter(B), fx.make_layout((n, k), b_logical_stride))
         gB = fx.slice(fx.flat_divide(b_logical, (bn, bk)), (None, None, bid_y, None))
 
         gC = fx.slice(fx.flat_divide(C, (bm, bn)), (None, None, bid_x, bid_y))
 
         smem_ptr = fx.get_dyn_shared()
 
-        mma_atom = fx.make_mma_atom(ixdl.MRMma(ATOM_M, ATOM_N, ATOM_K, fx.Float16, fx.Float16, fx.Float32))
+        mma_atom = fx.make_mma_atom(ixdl.MRMma(ATOM_M, ATOM_N, ATOM_K_B16, fx.Float16, fx.Float16, fx.Float32))
         tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
         thr_mma = tiled_mma.thr_slice(lane_id)
 
@@ -229,10 +208,10 @@ def _build_swizzle_kernel(
         )
 
         accs = []
-        for im in fx.range_constexpr(warp_atoms_m):
+        for mma_m in fx.range_constexpr(warp_atoms_m):
             row = []
-            for jn in fx.range_constexpr(warp_atoms_n):
-                c_tile = fx.slice(gC_atoms, (None, None, im, jn))
+            for mma_n in fx.range_constexpr(warp_atoms_n):
+                c_tile = fx.slice(gC_atoms, (None, None, mma_m, mma_n))
                 frag = thr_mma.make_fragment_C(c_tile)
                 if load_c:
                     fx.copy(
@@ -247,9 +226,10 @@ def _build_swizzle_kernel(
             accs.append(row)
 
         def _run_pipeline():
-            g2s_sme = mr_pattern_g2s_sme_config(
-                pattern_id,
-                fx.Float16,
+            g2s_sme = mr_g2s_sme_config(
+                a_mn_major=a_mn_major,
+                b_mn_major=b_mn_major,
+                elem_dtype=fx.Float16,
                 row_atom=ixdl.MRAsyncCpRow16b,
                 row_swizzle=ixdl.SMESwizzle.Row16b,
             )
@@ -261,38 +241,39 @@ def _build_swizzle_kernel(
             thr_copy_a = tiled_copy_a.get_slice(lane_id)
             thr_copy_b = tiled_copy_b.get_slice(lane_id)
 
-            tile_smem = fx.make_tile(SMEM_ROWS, SMEM_F16_PER_ROW)
+            tile_smem = fx.make_tile(SMEM_ROWS, vpr)
             tile_smem_A = (
-                fx.make_tile(SMEM_F16_PER_ROW, SMEM_ROWS)
-                if fx.const_expr(pattern_id == 1 or pattern_id == 3)
+                fx.make_tile(vpr, SMEM_ROWS)
+                if fx.const_expr(a_mn_major)
                 else tile_smem
             )
             tile_smem_B = (
-                fx.make_tile(SMEM_F16_PER_ROW, SMEM_ROWS)
-                if fx.const_expr(pattern_id == 0 or pattern_id == 1)
+                fx.make_tile(vpr, SMEM_ROWS)
+                if fx.const_expr(b_mn_major)
                 else tile_smem
             )
 
             def issue_stage(k_tile, stage_base):
                 k_A = gA[None, None, k_tile]
                 k_B = gB[None, None, k_tile]
-                if fx.const_expr(pattern_id == 1 or pattern_id == 3):
+                if fx.const_expr(a_mn_major):
                     a_leading = m
                 else:
                     a_leading = k
-                if fx.const_expr(pattern_id == 0 or pattern_id == 1):
+                if fx.const_expr(b_mn_major):
                     b_leading = n
                 else:
                     b_leading = k
                 sme_A = ixdl.make_sme_gmem_tensor(k_A, leading_stride=a_leading)
                 sme_B = ixdl.make_sme_gmem_tensor(k_B, leading_stride=b_leading)
                 mr_hgemm_g2s_issue_operands(
-                    pattern_id=pattern_id,
+                    a_mn_major=a_mn_major,
+                    b_mn_major=b_mn_major,
                     warp_id=warp_id,
                     a_per_warp=a_per_warp,
                     b_per_warp=b_per_warp,
-                    g_A_div=fx.zipped_divide(sme_A, tile_smem_A),
-                    g_B_div=fx.zipped_divide(sme_B, tile_smem_B),
+                    a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
+                    b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
                     g2s_sme=g2s_sme,
                     smem_base=smem_f16_base,
                     elem_dtype=fx.Float16,
@@ -300,12 +281,14 @@ def _build_swizzle_kernel(
                     bn=bn,
                     bk=bk,
                     stage_base=stage_base,
+                    geom=MR_GEMM_GEOM,
                 )
 
-            def _ki_load(stage_base, ki):
-                return mr_hgemm_s2r_load_ki(
-                    pattern_id=pattern_id,
-                    ki=ki,
+            def _mma_k_load(stage_base, mma_k):
+                return mr_hgemm_s2r_load_mma_k(
+                    a_mn_major=a_mn_major,
+                    b_mn_major=b_mn_major,
+                    mma_k=mma_k,
                     stage_base=stage_base,
                     g2s_sme=g2s_sme,
                     smem_base=smem_f16_base,
@@ -322,54 +305,43 @@ def _build_swizzle_kernel(
                     bm=bm,
                     bn=bn,
                     bk=bk,
+                    geom=MR_GEMM_GEOM,
                 )
 
             def _mma_frags(a_frags, b_frags):
-                for jn in fx.range_constexpr(warp_atoms_n):
-                    for im in fx.range_constexpr(warp_atoms_m):
-                        fx.gemm(mma_atom, accs[im][jn], a_frags[im], b_frags[jn], accs[im][jn])
-
-            def _copy_frag(dst, src):
-                dst.store(src.load())
-
-            def _copy_a_frags(dst, src):
-                for im in fx.range_constexpr(warp_atoms_m):
-                    _copy_frag(dst[im], src[im])
-
-            def _copy_b_frags(dst, src):
-                for jn in fx.range_constexpr(warp_atoms_n):
-                    _copy_frag(dst[jn], src[jn])
+                for mma_n in fx.range_constexpr(warp_atoms_n):
+                    for mma_m in fx.range_constexpr(warp_atoms_m):
+                        fx.gemm(mma_atom, accs[mma_m][mma_n], a_frags[mma_m], b_frags[mma_n], accs[mma_m][mma_n])
 
             def _s2r_mma_defer_last_into(stage_base, a_def, b_def):
-                for ki in fx.range_constexpr(k_rep - 1):
-                    a_frags, b_frags = _ki_load(stage_base, ki)
+                for mma_k in fx.range_constexpr(k_atoms - 1):
+                    a_frags, b_frags = _mma_k_load(stage_base, mma_k)
                     _mma_frags(a_frags, b_frags)
-                a_last, b_last = _ki_load(stage_base, k_rep - 1)
-                _copy_a_frags(a_def, a_last)
-                _copy_b_frags(b_def, b_last)
+                a_last, b_last = _mma_k_load(stage_base, k_atoms - 1)
+                for mma_m in fx.range_constexpr(warp_atoms_m):
+                    a_def[mma_m].store(a_last[mma_m].load())
+                for mma_n in fx.range_constexpr(warp_atoms_n):
+                    b_def[mma_n].store(b_last[mma_n].load())
 
             def _s2r_mma_defer_last(stage_base):
-                for ki in fx.range_constexpr(k_rep - 1):
-                    a_frags, b_frags = _ki_load(stage_base, ki)
+                for mma_k in fx.range_constexpr(k_atoms - 1):
+                    a_frags, b_frags = _mma_k_load(stage_base, mma_k)
                     _mma_frags(a_frags, b_frags)
-                return _ki_load(stage_base, k_rep - 1)
+                return _mma_k_load(stage_base, k_atoms - 1)
 
             def _s2r_mma_all(stage_base):
                 a_frags, b_frags = _s2r_mma_defer_last(stage_base)
                 _mma_frags(a_frags, b_frags)
 
-            def _wait_stage():
-                ixdl.cp_async_wait_group(0)
-
             # Prologue prefetch + Ki-deferred S2R/MMA + pipelined K-loop.
             issue_stage(fx.Int32(0), fx.Int32(0))
             fx.gpu.barrier()
-            _wait_stage()
+            ixdl.cp_async_wait_group(0)
 
             if k_tiles_const >= 2:
                 issue_stage(fx.Int32(1), fx.Int32(stage_stride))
                 fx.gpu.barrier()
-                _wait_stage()
+                ixdl.cp_async_wait_group(0)
 
             a_def, b_def = _s2r_mma_defer_last(fx.Int32(0))
 
@@ -448,7 +420,7 @@ def compile_iluvatar_mr_hgemm(
     K: int,
     warps_m: int = 4,
     warps_n: int = 4,
-    k_rep: int = DEFAULT_K_REP,
+    k_atoms: int = DEFAULT_K_ATOMS,
     warp_atoms_m: int = 4,
     warp_atoms_n: int = 4,
     epilogue: str = DEFAULT_EPILOGUE,
@@ -457,34 +429,35 @@ def compile_iluvatar_mr_hgemm(
 ):
     """Build and return a JIT launch wrapper for the Iluvatar MR HGEMM.
 
-    See the module docstring for ``epilogue``, ``epilogue_store``, ``major_pattern``,
-    and CTA preset semantics.
+    Computes D(M,N) = A(M,K) @ B(N,K).T. epilogue selects output dtype and accumulate mode.
+    M/N/K must be multiples of derived bm/bn/bk or ValueError is raised.
+    bm = ATOM_M * warp_atoms_m * warps_m, bn = ATOM_N * warp_atoms_n * warps_n,
+    bk = ATOM_K_B16 * k_atoms. See module doc for epilogue and major_pattern.
     """
-    if major_pattern not in _PATTERN_ID:
-        raise ValueError(f"unknown major pattern: {major_pattern}")
+    parse_major_pattern(major_pattern)
     if epilogue not in (EPILOGUE_NO_C_READ, EPILOGUE_READ_C_ACCUM):
         raise ValueError(f"unknown epilogue: {epilogue}")
 
     bm, bn, bk, threads, smem_bytes = _swizzle_cta_shape(
         warps_m,
         warps_n,
-        k_rep,
+        k_atoms,
         warp_atoms_m=warp_atoms_m,
         warp_atoms_n=warp_atoms_n,
     )
     if K % bk:
-        raise ValueError(f"K must be a multiple of {bk} (16 * k_rep)")
+        raise ValueError(f"K must be a multiple of {bk} (ATOM_K_B16 * k_atoms)")
     if M % bm or N % bn:
         raise ValueError(f"M,N must be multiples of {bm}/{bn} for swizzle CTA")
     if not _swizzle_atom_work_ok(bm, bn, bk, warps_m, warps_n):
         raise ValueError(
             f"SME brick count must divide evenly across {warps_m}x{warps_n} warps; "
-            f"try larger k_rep (current BK={bk})"
+            f"try larger k_atoms (current BK={bk})"
         )
     if smem_bytes > DEFAULT_SMEM_CAP_BYTES:
         raise ValueError(
             f"CTA smem {smem_bytes} B exceeds device cap {DEFAULT_SMEM_CAP_BYTES} B "
-            f"({bm}x{bn}x{bk}, {threads} threads); use smaller tile or k_rep"
+            f"({bm}x{bn}x{bk}, {threads} threads); use smaller tile or k_atoms"
         )
 
     gemm_kernel, threads, smem_bytes, bm, bn, _bk = _build_swizzle_kernel(
@@ -493,7 +466,7 @@ def compile_iluvatar_mr_hgemm(
         K,
         warps_m,
         warps_n,
-        k_rep,
+        k_atoms,
         warp_atoms_m,
         warp_atoms_n,
         epilogue,
@@ -513,7 +486,7 @@ def compile_iluvatar_mr_hgemm(
 __all__ = [
     "DEFAULT_EPILOGUE",
     "DEFAULT_EPILOGUE_STORE",
-    "DEFAULT_K_REP",
+    "DEFAULT_K_ATOMS",
     "DEFAULT_MAJOR_PATTERN",
     "DEFAULT_SWIZZLE_CTA",
     "EPILOGUE_READ_C_ACCUM",

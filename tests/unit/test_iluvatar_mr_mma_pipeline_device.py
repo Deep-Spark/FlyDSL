@@ -22,7 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kernels.iluvatar_mr_common import WARP_SIZE
+from kernels.iluvatar_common import WARP_SIZE
 
 # (name, M, N, K, fx multiplicand dtype, torch dtype, fx acc dtype, torch acc dtype).
 _CASES = [

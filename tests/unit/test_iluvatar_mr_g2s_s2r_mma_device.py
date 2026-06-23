@@ -4,7 +4,7 @@
 """Opt-in Iluvatar MR G2S -> S2R -> MMA staged device tests.
 
 Chains production ``mr_hgemm_g2s_issue_operands``, ``mr_hgemm_s2r_copy_*``, and a
-single ``fx.gemm`` on warp-00 atom (im=0,jn=0). No epilogue, no multi-K-tile loop.
+single ``fx.gemm`` on warp-00 atom (mma_m=0,mma_n=0). No epilogue, no multi-K-tile loop.
 
 This is the first stage test that exercises ``make_tiled_copy_A/B`` on real G2S
 smem tiles. Scalar S2R readback passing does not imply this path is correct.
@@ -28,15 +28,15 @@ from kernels.iluvatar_mr_common import ATOM_M, ATOM_N  # noqa: E402
 from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
     STAGED_BRICK_M,
     STAGED_BRICK_N,
-    brick_k_from_k_rep,
+    brick_k_from_k_atoms,
     expected_warp00_atom_gemm,
     multibrick_position_tensor,
-    remap_hgemm_tensors_for_pattern,
+    remap_gemm_tensors,
 )
 from tests.unit.iluvatar_mr_staged_kernels import build_mr_g2s_s2r_mma_warp00_launch  # noqa: E402
 
 _G2S_S2R_MMA_PATTERNS = ("nt", "nn", "tn", "tt")
-_G2S_S2R_MMA_K_REP = (2,)
+_G2S_S2R_MMA_K_ATOMS = (2,)
 
 
 def _require_enabled() -> None:
@@ -74,22 +74,22 @@ def _configure_iluvatar_env(monkeypatch) -> None:
     monkeypatch.delenv("COMPILE_ONLY", raising=False)
 
 
-@pytest.mark.parametrize("k_rep", _G2S_S2R_MMA_K_REP)
+@pytest.mark.parametrize("k_atoms", _G2S_S2R_MMA_K_ATOMS)
 @pytest.mark.parametrize("major_pattern", _G2S_S2R_MMA_PATTERNS)
-def test_iluvatar_mr_g2s_s2r_mma_warp00_atom_device(major_pattern, k_rep, monkeypatch):
+def test_iluvatar_mr_g2s_s2r_mma_warp00_atom_device(major_pattern, k_atoms, monkeypatch):
     """G2S -> production S2R copy -> MMA for warp-00 top-left 16x16 atom."""
 
     _require_enabled()
     _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
-    brick_k = brick_k_from_k_rep(k_rep)
-    launch, _ = build_mr_g2s_s2r_mma_warp00_launch(major_pattern=major_pattern, k_rep=k_rep)
+    brick_k = brick_k_from_k_atoms(k_atoms)
+    launch, _ = build_mr_g2s_s2r_mma_warp00_launch(major_pattern=major_pattern, k_atoms=k_atoms)
 
     A_logical = multibrick_position_tensor(torch, (STAGED_BRICK_M, brick_k), torch.float16)
     B_logical = multibrick_position_tensor(torch, (STAGED_BRICK_N, brick_k), torch.float16)
     B_logical = B_logical + torch.tensor(17.0, device="cuda", dtype=torch.float16)
-    A_dev, B_dev = remap_hgemm_tensors_for_pattern(A_logical, B_logical, major_pattern)
+    A_dev, B_dev = remap_gemm_tensors(A_logical, B_logical, major_pattern)
 
     C_out = torch.zeros((ATOM_M, ATOM_N), device="cuda", dtype=torch.float32)
     launch(A_dev, B_dev, C_out)
@@ -101,5 +101,5 @@ def test_iluvatar_mr_g2s_s2r_mma_warp00_atom_device(major_pattern, k_rep, monkey
         expected,
         rtol=2e-2,
         atol=2e-2,
-        msg=f"{major_pattern} k_rep={k_rep} G2S->S2R->MMA warp-00 atom mismatch",
+        msg=f"{major_pattern} k_atoms={k_atoms} G2S->S2R->MMA warp-00 atom mismatch",
     )

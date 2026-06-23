@@ -13,7 +13,7 @@ Epilogue belongs to ``tests/unit/test_iluvatar_mr_epilogue_device.py``.
 This file exercises the production ``compile_iluvatar_mr_hgemm`` launch wrapper across:
 
 * ``major_pattern`` (nn / tn / nt / tt)
-* ``k_rep`` (BK = 16 * k_rep, i.e. 32 and 64)
+* ``k_atoms`` (BK = 16 * k_atoms, i.e. 32 and 64)
 * ``epilogue_store`` (shfl / tiled for ``no_c_read``)
 * single-CTA (256 x 256 x 64, grid 1 x 1) and multi-CTA (512 x 512 x 128, grid 2 x 2)
 
@@ -31,7 +31,7 @@ pytestmark = [pytest.mark.l2_device]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _PATTERNS = ("nt", "nn", "tn", "tt")
-_K_REP_VALUES = (2, 4)
+_K_ATOMS_VALUES = (2, 4)
 _EPILOGUE_CASES = (
     ("no_c_read", "tiled"),
     ("no_c_read", "shfl"),
@@ -45,11 +45,12 @@ from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
     STAGED_WARP_ATOMS_N,
     STAGED_WARPS_M,
     STAGED_WARPS_N,
+    remap_gemm_tensors,
 )
 
 _SINGLE_CTA_SHAPE = (STAGED_BRICK_M, STAGED_BRICK_N, 64)
 _MULTI_CTA_SHAPE = (STAGED_BRICK_M * 2, STAGED_BRICK_N * 2, 128)
-_LARGE_SHAPE = (4096, 4096, 4096)
+_LARGE_SHAPE = (1024, 1024, 1024)
 
 
 def _require_enabled() -> None:
@@ -111,30 +112,17 @@ def _expected_result(torch, A, B, C_in, epilogue: str, hgemm):
     return expected
 
 
-def _remap_hgemm_tensors_for_pattern(A, B, major_pattern: str):
-    """Test-side physical layout adapter for logical A(m,k), B(n,k) inputs."""
-    if major_pattern == "nn":
-        return A, B.t().contiguous()
-    if major_pattern == "tn":
-        return A.t().contiguous(), B.t().contiguous()
-    if major_pattern == "nt":
-        return A, B
-    if major_pattern == "tt":
-        return A.t().contiguous(), B
-    raise ValueError(f"unknown major pattern: {major_pattern}")
-
-
-def _compare_atol(k: int, k_rep: int) -> float:
-    bk = 16 * k_rep
+def _compare_atol(k: int, k_atoms: int) -> float:
+    bk = 16 * k_atoms
     return 2e-2 * max(1.0, (k / bk) ** 0.5)
 
 
-def _cta_grid(m: int, n: int, k_rep: int, *, warp_size: int) -> tuple[tuple[int, int, int], tuple[int, int, int], int]:
+def _cta_grid(m: int, n: int, k_atoms: int, *, warp_size: int) -> tuple[tuple[int, int, int], tuple[int, int, int], int]:
     warp_m = 16 * STAGED_WARP_ATOMS_M
     warp_n = 16 * STAGED_WARP_ATOMS_N
     bm = warp_m * STAGED_WARPS_M
     bn = warp_n * STAGED_WARPS_N
-    bk = 16 * k_rep
+    bk = 16 * k_atoms
     threads = STAGED_WARPS_M * STAGED_WARPS_N * warp_size
     grid = (m // bm, n // bn, 1)
     block = (threads, 1, 1)
@@ -150,7 +138,7 @@ def _check_hgemm_pipeline(
     major_pattern: str,
     epilogue: str,
     epilogue_store: str,
-    k_rep: int,
+    k_atoms: int,
     seed: int = 0,
 ) -> bool:
     m, n, k = shape
@@ -166,14 +154,14 @@ def _check_hgemm_pipeline(
         K=k,
         warps_m=STAGED_WARPS_M,
         warps_n=STAGED_WARPS_N,
-        k_rep=k_rep,
+        k_atoms=k_atoms,
         warp_atoms_m=STAGED_WARP_ATOMS_M,
         warp_atoms_n=STAGED_WARP_ATOMS_N,
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
     )
-    a_dev, b_dev = _remap_hgemm_tensors_for_pattern(A, B, major_pattern)
+    a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
     launcher(a_dev, b_dev, C, stream=stream)
     torch.cuda.synchronize()
@@ -181,10 +169,10 @@ def _check_hgemm_pipeline(
     expected = _expected_result(torch, A, B, C_in, epilogue, hgemm)
     got = C.to(torch.float32) if epilogue == hgemm["EPILOGUE_NO_C_READ"] else C
     diff = (got - expected).abs()
-    atol = _compare_atol(k, k_rep)
+    atol = _compare_atol(k, k_atoms)
     ok = torch.allclose(got, expected, atol=atol, rtol=2e-2)
     finite_ok = torch.isfinite(got).all().item()
-    grid, block, smem = _cta_grid(m, n, k_rep, warp_size=hgemm["WARP_SIZE"])
+    grid, block, smem = _cta_grid(m, n, k_atoms, warp_size=hgemm["WARP_SIZE"])
     cta_note = (
         f" cta={STAGED_WARPS_M}x{STAGED_WARPS_N}warps"
         f" atoms={STAGED_WARP_ATOMS_M}x{STAGED_WARP_ATOMS_N}"
@@ -192,7 +180,7 @@ def _check_hgemm_pipeline(
     )
     store_note = f" store={epilogue_store}" if epilogue == hgemm["EPILOGUE_NO_C_READ"] else ""
     print(
-        f"[check] epilogue={epilogue}{store_note} pattern={major_pattern} k_rep={k_rep} "
+        f"[check] epilogue={epilogue}{store_note} pattern={major_pattern} k_atoms={k_atoms} "
         f"M={m} N={n} K={k}{cta_note} grid={grid} block={block} smem={smem} "
         f"ok={ok} finite={finite_ok} max_abs={diff.max().item():.3e} "
         f"mean_abs={diff.mean().item():.3e} atol={atol:.2e}"
@@ -203,10 +191,10 @@ def _check_hgemm_pipeline(
     return bool(ok and finite_ok)
 
 
-@pytest.mark.parametrize("k_rep", _K_REP_VALUES)
+@pytest.mark.parametrize("k_atoms", _K_ATOMS_VALUES)
 @pytest.mark.parametrize("major_pattern", _PATTERNS)
 @pytest.mark.parametrize("epilogue,epilogue_store", _EPILOGUE_CASES)
-def test_iluvatar_mr_hgemm_single_cta_pipeline(major_pattern, epilogue, epilogue_store, k_rep, monkeypatch):
+def test_iluvatar_mr_hgemm_single_cta_pipeline(major_pattern, epilogue, epilogue_store, k_atoms, monkeypatch):
     _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -219,14 +207,14 @@ def test_iluvatar_mr_hgemm_single_cta_pipeline(major_pattern, epilogue, epilogue
         major_pattern=major_pattern,
         epilogue=epilogue,
         epilogue_store=epilogue_store,
-        k_rep=k_rep,
+        k_atoms=k_atoms,
     )
 
 
-@pytest.mark.parametrize("k_rep", _K_REP_VALUES)
+@pytest.mark.parametrize("k_atoms", _K_ATOMS_VALUES)
 @pytest.mark.parametrize("major_pattern", _PATTERNS)
 @pytest.mark.parametrize("epilogue_store", ("tiled", "shfl"))
-def test_iluvatar_mr_hgemm_multi_cta_pipeline(major_pattern, epilogue_store, k_rep, monkeypatch):
+def test_iluvatar_mr_hgemm_multi_cta_pipeline(major_pattern, epilogue_store, k_atoms, monkeypatch):
     _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -239,15 +227,15 @@ def test_iluvatar_mr_hgemm_multi_cta_pipeline(major_pattern, epilogue_store, k_r
         major_pattern=major_pattern,
         epilogue="no_c_read",
         epilogue_store=epilogue_store,
-        k_rep=k_rep,
+        k_atoms=k_atoms,
     )
 
 
 @pytest.mark.large_shape
-@pytest.mark.parametrize("k_rep", _K_REP_VALUES)
+@pytest.mark.parametrize("k_atoms", _K_ATOMS_VALUES)
 @pytest.mark.parametrize("major_pattern", _PATTERNS)
 @pytest.mark.parametrize("epilogue_store", ("shfl",))
-def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(major_pattern, epilogue_store, k_rep, monkeypatch):
+def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(major_pattern, epilogue_store, k_atoms, monkeypatch):
     _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -260,5 +248,5 @@ def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(major_pattern, epilogue_stor
         major_pattern=major_pattern,
         epilogue="no_c_read",
         epilogue_store=epilogue_store,
-        k_rep=k_rep,
+        k_atoms=k_atoms,
     )

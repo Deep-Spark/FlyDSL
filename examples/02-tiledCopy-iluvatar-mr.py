@@ -29,7 +29,8 @@ import torch  # noqa: E402
 import flydsl.compiler as flyc  # noqa: E402
 import flydsl.expr as fx  # noqa: E402
 import flydsl.expr.ixdl as ixdl  # noqa: E402
-from kernels.iluvatar_mr_common import ATOM_M, ATOM_N, WARP_SIZE  # noqa: E402
+from kernels.iluvatar_common import WARP_SIZE  # noqa: E402
+from kernels.iluvatar_mr_common import ATOM_M, ATOM_N  # noqa: E402
 
 WARPS_PER_BLOCK = 4
 TILE_M = ATOM_M

@@ -10,10 +10,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
 
-from kernels.iluvatar_mr_common import ATOM_K, ATOM_M, ATOM_N, SMEM_ROWS, WARP_SIZE
+from kernels.iluvatar_common import WARP_SIZE
+from kernels.iluvatar_mr_common import ATOM_M, ATOM_N, SMEM_ROWS
 from kernels.iluvatar_mr_operand_copy import (
+    mr_g2s_sme_config,
     mr_hgemm_g2s_issue_operands,
-    mr_pattern_g2s_sme_config,
 )
 from kernels.iluvatar_mr_s2r import (
     mr_hgemm_s2r_a_tile,
@@ -25,41 +26,46 @@ from tests.unit.iluvatar_mr_hgemm_test_common import (
     STAGED_WARP_ATOMS_M,
     STAGED_WARP_ATOMS_N,
     STAGED_WARPS_N,
-    staged_k_rep_config,
+    staged_k_atoms_config,
 )
 
 
-def build_mr_g2s_s2r_ki_dump_launch(*, major_pattern: str, k_rep: int, operand: str):
-    """Return (launch, brick_k, ki_slices, dump_elems) for G2S -> S2R tile dump.
+def build_mr_g2s_s2r_ki_dump_launch(*, major_pattern: str, k_atoms: int, operand: str):
+    """Return (launch, brick_k, ki_slices, dump_elems) for G2S -> S2R fragment dump.
+
+    Uses production ``mr_hgemm_s2r_copy_*`` + ``make_tiled_copy_A/B`` readback (not
+    scalar smem unpack) so swizzled SME layouts match the MMA path.
 
     ``operand`` is ``"A"`` or ``"B"``. A/B use separate kernels so the JIT cache
-    cannot mix up scalar readback destinations.
+    cannot mix up readback destinations.
     """
     if operand == "A":
-        return _build_mr_g2s_s2r_a_dump_launch(major_pattern=major_pattern, k_rep=k_rep)
+        return _build_mr_g2s_s2r_a_dump_launch(major_pattern=major_pattern, k_atoms=k_atoms)
     if operand == "B":
-        return _build_mr_g2s_s2r_b_dump_launch(major_pattern=major_pattern, k_rep=k_rep)
+        return _build_mr_g2s_s2r_b_dump_launch(major_pattern=major_pattern, k_atoms=k_atoms)
     raise ValueError(f"operand must be 'A' or 'B', got {operand!r}")
 
 
-def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_rep: int):
-    cfg = staged_k_rep_config(major_pattern=major_pattern, k_rep=k_rep)
-    pattern_id = cfg["pattern_id"]
+def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
+    cfg = staged_k_atoms_config(major_pattern=major_pattern, k_atoms=k_atoms)
+    a_mn_major = cfg["a_mn_major"]
+    b_mn_major = cfg["b_mn_major"]
     brick_m = cfg["brick_m"]
     brick_n = cfg["brick_n"]
     brick_k = cfg["brick_k"]
-    values_per_sme_row = cfg["values_per_sme_row"]
+    geom = cfg["geom"]
+    vpr = geom.values_per_sme_row
     threads = cfg["threads"]
     smem_elems = cfg["smem_elems"]
-    ki_slices = cfg["ki_slices"]
+    ki_slices = cfg["mma_k_slices"]
     a_logical_stride = cfg["a_logical_stride"]
     b_logical_stride = cfg["b_logical_stride"]
     a_per_warp = cfg["a_per_warp"]
     b_per_warp = cfg["b_per_warp"]
     fx_dtype = fx.Float16
-    dump_elems = ki_slices * ATOM_M * ATOM_K
+    dump_elems = ki_slices * ATOM_M * geom.atom_k
 
-    kernel_name = f"g2s_s2r_ki_dump_a_{major_pattern}_k{k_rep}"
+    kernel_name = f"g2s_s2r_ki_dump_a_{major_pattern}_k{k_atoms}"
 
     @flyc.kernel(known_block_size=[threads, 1, 1], name=kernel_name)
     def g2s_s2r_ki_dump_a_kernel(A: fx.Tensor, B: fx.Tensor, Out: fx.Tensor):
@@ -83,42 +89,44 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_rep: int):
             fx.PointerType.get(fx_dtype.ir_type, fx.AddressSpace.Shared),
             fx.get_dyn_shared(),
         )
-        g2s_sme = mr_pattern_g2s_sme_config(
-            pattern_id,
-            fx_dtype,
+        g2s_sme = mr_g2s_sme_config(
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
+            elem_dtype=fx_dtype,
             row_atom=ixdl.MRAsyncCpRow16b,
             row_swizzle=ixdl.SMESwizzle.Row16b,
         )
-        if fx.const_expr(pattern_id == 1 or pattern_id == 3):
+        if fx.const_expr(a_mn_major):
             a_leading = brick_m
         else:
             a_leading = brick_k
-        if fx.const_expr(pattern_id == 0 or pattern_id == 1):
+        if fx.const_expr(b_mn_major):
             b_leading = brick_n
         else:
             b_leading = brick_k
 
-        tile_smem = fx.make_tile(SMEM_ROWS, values_per_sme_row)
+        tile_smem = fx.make_tile(SMEM_ROWS, vpr)
         tile_smem_A = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 1 or pattern_id == 3)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(a_mn_major)
             else tile_smem
         )
         tile_smem_B = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 0 or pattern_id == 1)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(b_mn_major)
             else tile_smem
         )
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
         mr_hgemm_g2s_issue_operands(
-            pattern_id=pattern_id,
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
             warp_id=warp_id,
             a_per_warp=a_per_warp,
             b_per_warp=b_per_warp,
-            g_A_div=fx.zipped_divide(sme_A, tile_smem_A),
-            g_B_div=fx.zipped_divide(sme_B, tile_smem_B),
+            a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
+            b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
             g2s_sme=g2s_sme,
             smem_base=smem_elem_base,
             elem_dtype=fx_dtype,
@@ -126,57 +134,55 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_rep: int):
             bn=brick_n,
             bk=brick_k,
             stage_base=fx.Int32(0),
-            values_per_sme_row=values_per_sme_row,
+            geom=geom,
         )
         ixdl.cp_async_wait_group(0)
         fx.gpu.barrier()
 
-        scalar_atom = fx.make_copy_atom(fx.UniversalCopy16b(), fx_dtype)
-        tiled_st_k = fx.make_tiled_copy_tv(
-            scalar_atom,
-            fx.make_layout((SMEM_ROWS, WARP_SIZE // SMEM_ROWS), (1, SMEM_ROWS)),
-            fx.make_layout((1, values_per_sme_row // (WARP_SIZE // SMEM_ROWS)), (1, 1)),
-        )
-        tiled_st_mn = fx.make_tiled_copy_tv(
-            scalar_atom,
-            fx.make_layout(
-                (values_per_sme_row, WARP_SIZE // values_per_sme_row),
-                (1, values_per_sme_row),
-            ),
-            fx.make_layout((1, SMEM_ROWS // (WARP_SIZE // values_per_sme_row)), (1, 1)),
-        )
-
-        for ki in fx.range_constexpr(ki_slices):
-            smem_a_tile = mr_hgemm_s2r_a_tile(
-                pattern_id=pattern_id,
-                im=0,
-                ki=ki,
-                stage_base=fx.Int32(0),
-                g2s_sme=g2s_sme,
-                smem_base=smem_elem_base,
-                elem_dtype=fx_dtype,
-                warp_m_id=warp_m_id,
-                warp_atoms_m=STAGED_WARP_ATOMS_M,
-                bm=brick_m,
-                bn=brick_n,
-                bk=brick_k,
-                values_per_sme_row=values_per_sme_row,
+        if warp_id == fx.Int32(0):
+            mma_atom = fx.make_mma_atom(
+                ixdl.MRMma(geom.atom_m, geom.atom_n, geom.atom_k, fx_dtype, fx_dtype, fx.Float32)
             )
-            if warp_id == fx.Int32(0):
-                st_k = tiled_st_k.get_slice(lane_id)
-                st_mn = tiled_st_mn.get_slice(lane_id)
-                dst = fx.make_view(
-                    fx.add_offset(fx.get_iter(Out), fx.Int32(ki * ATOM_M * ATOM_K)),
-                    fx.make_layout((ATOM_M, ATOM_K), (ATOM_K, 1)),
+            tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
+            thr_mma = tiled_mma.thr_slice(lane_id)
+            copy_atom_s2r_a = fx.make_copy_atom(fx.UniversalCopy32b(), fx_dtype)
+            tiled_copy_a = fx.make_tiled_copy_A(copy_atom_s2r_a, tiled_mma)
+            thr_copy_a = tiled_copy_a.get_slice(lane_id)
+
+            for mma_k in fx.range_constexpr(ki_slices):
+                smem_a_tile = mr_hgemm_s2r_a_tile(
+                    a_mn_major=a_mn_major,
+                    b_mn_major=b_mn_major,
+                    mma_m=0,
+                    mma_k=mma_k,
+                    stage_base=fx.Int32(0),
+                    g2s_sme=g2s_sme,
+                    smem_base=smem_elem_base,
+                    elem_dtype=fx_dtype,
+                    warp_m_id=warp_m_id,
+                    warp_atoms_m=STAGED_WARP_ATOMS_M,
+                    bm=brick_m,
+                    bn=brick_n,
+                    bk=brick_k,
+                    geom=geom,
                 )
-                if fx.const_expr(pattern_id == 1 or pattern_id == 3):
-                    frag = fx.make_fragment_like(st_mn.partition_S(smem_a_tile))
-                    fx.copy(scalar_atom, st_mn.partition_S(smem_a_tile), frag)
-                    fx.copy(scalar_atom, frag, st_mn.partition_D(dst))
-                else:
-                    frag = fx.make_fragment_like(st_k.partition_S(smem_a_tile))
-                    fx.copy(scalar_atom, st_k.partition_S(smem_a_tile), frag)
-                    fx.copy(scalar_atom, frag, st_k.partition_D(dst))
+                frag_a = mr_hgemm_s2r_copy_a(
+                    copy_atom=copy_atom_s2r_a,
+                    thr_copy_a=thr_copy_a,
+                    thr_mma=thr_mma,
+                    smem_a_tile=smem_a_tile,
+                )
+                # make_tiled_copy_A partition_D lands K-major; host compares after .T
+                dst = fx.make_view(
+                    fx.add_offset(fx.get_iter(Out), fx.Int32(mma_k * ATOM_M * geom.atom_k)),
+                    fx.make_layout((geom.atom_k, ATOM_M), (1, geom.atom_k)),
+                )
+                fx.copy(
+                    copy_atom_s2r_a,
+                    thr_copy_a.retile(frag_a),
+                    thr_copy_a.partition_D(dst),
+                    pred=None,
+                )
 
     @flyc.jit
     def launch_g2s_s2r_ki_dump_a(
@@ -195,24 +201,26 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_rep: int):
     return launch_g2s_s2r_ki_dump_a, brick_k, ki_slices, dump_elems
 
 
-def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_rep: int):
-    cfg = staged_k_rep_config(major_pattern=major_pattern, k_rep=k_rep)
-    pattern_id = cfg["pattern_id"]
+def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
+    cfg = staged_k_atoms_config(major_pattern=major_pattern, k_atoms=k_atoms)
+    a_mn_major = cfg["a_mn_major"]
+    b_mn_major = cfg["b_mn_major"]
     brick_m = cfg["brick_m"]
     brick_n = cfg["brick_n"]
     brick_k = cfg["brick_k"]
-    values_per_sme_row = cfg["values_per_sme_row"]
+    geom = cfg["geom"]
+    vpr = geom.values_per_sme_row
     threads = cfg["threads"]
     smem_elems = cfg["smem_elems"]
-    ki_slices = cfg["ki_slices"]
+    ki_slices = cfg["mma_k_slices"]
     a_logical_stride = cfg["a_logical_stride"]
     b_logical_stride = cfg["b_logical_stride"]
     a_per_warp = cfg["a_per_warp"]
     b_per_warp = cfg["b_per_warp"]
     fx_dtype = fx.Float16
-    dump_elems = ki_slices * ATOM_N * ATOM_K
+    dump_elems = ki_slices * ATOM_N * geom.atom_k
 
-    kernel_name = f"g2s_s2r_ki_dump_b_{major_pattern}_k{k_rep}"
+    kernel_name = f"g2s_s2r_ki_dump_b_{major_pattern}_k{k_atoms}"
 
     @flyc.kernel(known_block_size=[threads, 1, 1], name=kernel_name)
     def g2s_s2r_ki_dump_b_kernel(A: fx.Tensor, B: fx.Tensor, Out: fx.Tensor):
@@ -236,42 +244,44 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_rep: int):
             fx.PointerType.get(fx_dtype.ir_type, fx.AddressSpace.Shared),
             fx.get_dyn_shared(),
         )
-        g2s_sme = mr_pattern_g2s_sme_config(
-            pattern_id,
-            fx_dtype,
+        g2s_sme = mr_g2s_sme_config(
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
+            elem_dtype=fx_dtype,
             row_atom=ixdl.MRAsyncCpRow16b,
             row_swizzle=ixdl.SMESwizzle.Row16b,
         )
-        if fx.const_expr(pattern_id == 1 or pattern_id == 3):
+        if fx.const_expr(a_mn_major):
             a_leading = brick_m
         else:
             a_leading = brick_k
-        if fx.const_expr(pattern_id == 0 or pattern_id == 1):
+        if fx.const_expr(b_mn_major):
             b_leading = brick_n
         else:
             b_leading = brick_k
 
-        tile_smem = fx.make_tile(SMEM_ROWS, values_per_sme_row)
+        tile_smem = fx.make_tile(SMEM_ROWS, vpr)
         tile_smem_A = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 1 or pattern_id == 3)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(a_mn_major)
             else tile_smem
         )
         tile_smem_B = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 0 or pattern_id == 1)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(b_mn_major)
             else tile_smem
         )
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
         mr_hgemm_g2s_issue_operands(
-            pattern_id=pattern_id,
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
             warp_id=warp_id,
             a_per_warp=a_per_warp,
             b_per_warp=b_per_warp,
-            g_A_div=fx.zipped_divide(sme_A, tile_smem_A),
-            g_B_div=fx.zipped_divide(sme_B, tile_smem_B),
+            a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
+            b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
             g2s_sme=g2s_sme,
             smem_base=smem_elem_base,
             elem_dtype=fx_dtype,
@@ -279,57 +289,54 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_rep: int):
             bn=brick_n,
             bk=brick_k,
             stage_base=fx.Int32(0),
-            values_per_sme_row=values_per_sme_row,
+            geom=geom,
         )
         ixdl.cp_async_wait_group(0)
         fx.gpu.barrier()
 
-        scalar_atom = fx.make_copy_atom(fx.UniversalCopy16b(), fx_dtype)
-        tiled_st_k = fx.make_tiled_copy_tv(
-            scalar_atom,
-            fx.make_layout((SMEM_ROWS, WARP_SIZE // SMEM_ROWS), (1, SMEM_ROWS)),
-            fx.make_layout((1, values_per_sme_row // (WARP_SIZE // SMEM_ROWS)), (1, 1)),
-        )
-        tiled_st_mn = fx.make_tiled_copy_tv(
-            scalar_atom,
-            fx.make_layout(
-                (values_per_sme_row, WARP_SIZE // values_per_sme_row),
-                (1, values_per_sme_row),
-            ),
-            fx.make_layout((1, SMEM_ROWS // (WARP_SIZE // values_per_sme_row)), (1, 1)),
-        )
-
-        for ki in fx.range_constexpr(ki_slices):
-            smem_b_tile = mr_hgemm_s2r_b_tile(
-                pattern_id=pattern_id,
-                jn=0,
-                ki=ki,
-                stage_base=fx.Int32(0),
-                g2s_sme=g2s_sme,
-                smem_base=smem_elem_base,
-                elem_dtype=fx_dtype,
-                warp_n_id=warp_n_id,
-                warp_atoms_n=STAGED_WARP_ATOMS_N,
-                bm=brick_m,
-                bn=brick_n,
-                bk=brick_k,
-                values_per_sme_row=values_per_sme_row,
+        if warp_id == fx.Int32(0):
+            mma_atom = fx.make_mma_atom(
+                ixdl.MRMma(geom.atom_m, geom.atom_n, geom.atom_k, fx_dtype, fx_dtype, fx.Float32)
             )
-            if warp_id == fx.Int32(0):
-                st_k = tiled_st_k.get_slice(lane_id)
-                st_mn = tiled_st_mn.get_slice(lane_id)
-                dst = fx.make_view(
-                    fx.add_offset(fx.get_iter(Out), fx.Int32(ki * ATOM_N * ATOM_K)),
-                    fx.make_layout((ATOM_N, ATOM_K), (ATOM_K, 1)),
+            tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
+            thr_mma = tiled_mma.thr_slice(lane_id)
+            copy_atom_s2r_b = fx.make_copy_atom(fx.UniversalCopy32b(), fx_dtype)
+            tiled_copy_b = fx.make_tiled_copy_B(copy_atom_s2r_b, tiled_mma)
+            thr_copy_b = tiled_copy_b.get_slice(lane_id)
+
+            for mma_k in fx.range_constexpr(ki_slices):
+                smem_b_tile = mr_hgemm_s2r_b_tile(
+                    a_mn_major=a_mn_major,
+                    b_mn_major=b_mn_major,
+                    mma_n=0,
+                    mma_k=mma_k,
+                    stage_base=fx.Int32(0),
+                    g2s_sme=g2s_sme,
+                    smem_base=smem_elem_base,
+                    elem_dtype=fx_dtype,
+                    warp_n_id=warp_n_id,
+                    warp_atoms_n=STAGED_WARP_ATOMS_N,
+                    bm=brick_m,
+                    bn=brick_n,
+                    bk=brick_k,
+                    geom=geom,
                 )
-                if fx.const_expr(pattern_id == 0 or pattern_id == 1):
-                    frag = fx.make_fragment_like(st_mn.partition_S(smem_b_tile))
-                    fx.copy(scalar_atom, st_mn.partition_S(smem_b_tile), frag)
-                    fx.copy(scalar_atom, frag, st_mn.partition_D(dst))
-                else:
-                    frag = fx.make_fragment_like(st_k.partition_S(smem_b_tile))
-                    fx.copy(scalar_atom, st_k.partition_S(smem_b_tile), frag)
-                    fx.copy(scalar_atom, frag, st_k.partition_D(dst))
+                frag_b = mr_hgemm_s2r_copy_b(
+                    copy_atom=copy_atom_s2r_b,
+                    thr_copy_b=thr_copy_b,
+                    thr_mma=thr_mma,
+                    smem_b_tile=smem_b_tile,
+                )
+                dst = fx.make_view(
+                    fx.add_offset(fx.get_iter(Out), fx.Int32(mma_k * ATOM_N * geom.atom_k)),
+                    fx.make_layout((ATOM_N, geom.atom_k), (geom.atom_k, 1)),
+                )
+                fx.copy(
+                    copy_atom_s2r_b,
+                    thr_copy_b.retile(frag_b),
+                    thr_copy_b.partition_D(dst),
+                    pred=None,
+                )
 
     @flyc.jit
     def launch_g2s_s2r_ki_dump_b(
@@ -348,23 +355,25 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_rep: int):
     return launch_g2s_s2r_ki_dump_b, brick_k, ki_slices, dump_elems
 
 
-def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_rep: int):
+def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
     """Return (launch, brick_k) for warp-00 atom G2S -> S2R -> MMA (no epilogue)."""
-    cfg = staged_k_rep_config(major_pattern=major_pattern, k_rep=k_rep)
-    pattern_id = cfg["pattern_id"]
+    cfg = staged_k_atoms_config(major_pattern=major_pattern, k_atoms=k_atoms)
+    a_mn_major = cfg["a_mn_major"]
+    b_mn_major = cfg["b_mn_major"]
     brick_m = cfg["brick_m"]
     brick_n = cfg["brick_n"]
     brick_k = cfg["brick_k"]
-    values_per_sme_row = cfg["values_per_sme_row"]
+    geom = cfg["geom"]
+    vpr = geom.values_per_sme_row
     threads = cfg["threads"]
     smem_elems = cfg["smem_elems"]
-    ki_slices = cfg["ki_slices"]
+    ki_slices = cfg["mma_k_slices"]
     a_logical_stride = cfg["a_logical_stride"]
     b_logical_stride = cfg["b_logical_stride"]
     a_per_warp = cfg["a_per_warp"]
     b_per_warp = cfg["b_per_warp"]
     fx_dtype = fx.Float16
-    kernel_name = f"g2s_s2r_mma_warp00_{major_pattern}_k{k_rep}"
+    kernel_name = f"g2s_s2r_mma_warp00_{major_pattern}_k{k_atoms}"
 
     @flyc.kernel(known_block_size=[threads, 1, 1], name=kernel_name)
     def g2s_s2r_mma_warp00_kernel(A: fx.Tensor, B: fx.Tensor, C_out: fx.Tensor):
@@ -389,42 +398,44 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_rep: int):
             fx.PointerType.get(fx_dtype.ir_type, fx.AddressSpace.Shared),
             fx.get_dyn_shared(),
         )
-        g2s_sme = mr_pattern_g2s_sme_config(
-            pattern_id,
-            fx_dtype,
+        g2s_sme = mr_g2s_sme_config(
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
+            elem_dtype=fx_dtype,
             row_atom=ixdl.MRAsyncCpRow16b,
             row_swizzle=ixdl.SMESwizzle.Row16b,
         )
-        if fx.const_expr(pattern_id == 1 or pattern_id == 3):
+        if fx.const_expr(a_mn_major):
             a_leading = brick_m
         else:
             a_leading = brick_k
-        if fx.const_expr(pattern_id == 0 or pattern_id == 1):
+        if fx.const_expr(b_mn_major):
             b_leading = brick_n
         else:
             b_leading = brick_k
 
-        tile_smem = fx.make_tile(SMEM_ROWS, values_per_sme_row)
+        tile_smem = fx.make_tile(SMEM_ROWS, vpr)
         tile_smem_A = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 1 or pattern_id == 3)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(a_mn_major)
             else tile_smem
         )
         tile_smem_B = (
-            fx.make_tile(values_per_sme_row, SMEM_ROWS)
-            if fx.const_expr(pattern_id == 0 or pattern_id == 1)
+            fx.make_tile(vpr, SMEM_ROWS)
+            if fx.const_expr(b_mn_major)
             else tile_smem
         )
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
         mr_hgemm_g2s_issue_operands(
-            pattern_id=pattern_id,
+            a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
             warp_id=warp_id,
             a_per_warp=a_per_warp,
             b_per_warp=b_per_warp,
-            g_A_div=fx.zipped_divide(sme_A, tile_smem_A),
-            g_B_div=fx.zipped_divide(sme_B, tile_smem_B),
+            a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
+            b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
             g2s_sme=g2s_sme,
             smem_base=smem_elem_base,
             elem_dtype=fx_dtype,
@@ -432,13 +443,15 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_rep: int):
             bn=brick_n,
             bk=brick_k,
             stage_base=fx.Int32(0),
-            values_per_sme_row=values_per_sme_row,
+            geom=geom,
         )
         ixdl.cp_async_wait_group(0)
         fx.gpu.barrier()
 
         if warp_id == fx.Int32(0):
-            mma_atom = fx.make_mma_atom(ixdl.MRMma(ATOM_M, ATOM_N, ATOM_K, fx_dtype, fx_dtype, fx.Float32))
+            mma_atom = fx.make_mma_atom(
+                ixdl.MRMma(geom.atom_m, geom.atom_n, geom.atom_k, fx_dtype, fx_dtype, fx.Float32)
+            )
             tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
             thr_mma = tiled_mma.thr_slice(lane_id)
 
@@ -460,11 +473,12 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_rep: int):
             acc = thr_mma.make_fragment_C(c_dst)
             acc.fill(0)
 
-            for ki in fx.range_constexpr(ki_slices):
+            for mma_k in fx.range_constexpr(ki_slices):
                 smem_a_tile = mr_hgemm_s2r_a_tile(
-                    pattern_id=pattern_id,
-                    im=0,
-                    ki=ki,
+                    a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
+                    mma_m=0,
+                    mma_k=mma_k,
                     stage_base=fx.Int32(0),
                     g2s_sme=g2s_sme,
                     smem_base=smem_elem_base,
@@ -474,12 +488,13 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_rep: int):
                     bm=brick_m,
                     bn=brick_n,
                     bk=brick_k,
-                    values_per_sme_row=values_per_sme_row,
+                    geom=geom,
                 )
                 smem_b_tile = mr_hgemm_s2r_b_tile(
-                    pattern_id=pattern_id,
-                    jn=0,
-                    ki=ki,
+                    a_mn_major=a_mn_major,
+            b_mn_major=b_mn_major,
+                    mma_n=0,
+                    mma_k=mma_k,
                     stage_base=fx.Int32(0),
                     g2s_sme=g2s_sme,
                     smem_base=smem_elem_base,
@@ -489,7 +504,7 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_rep: int):
                     bm=brick_m,
                     bn=brick_n,
                     bk=brick_k,
-                    values_per_sme_row=values_per_sme_row,
+                    geom=geom,
                 )
                 frag_a = mr_hgemm_s2r_copy_a(
                     copy_atom=copy_atom_s2r_a,

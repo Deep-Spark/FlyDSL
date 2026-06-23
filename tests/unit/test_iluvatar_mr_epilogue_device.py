@@ -67,7 +67,8 @@ def _require_imports():
         import flydsl.compiler as flyc
         import flydsl.expr as fx
         import flydsl.expr.ixdl as ixdl
-        from kernels.iluvatar_mr_common import ATOM_K, ATOM_M, ATOM_N, WARP_SIZE
+        from kernels.iluvatar_common import WARP_SIZE
+        from kernels.iluvatar_mr_common import ATOM_K_B16, ATOM_M, ATOM_N
         from kernels.iluvatar_mr_epilogue import (
             mr_hgemm_epilogue_store_read_c_accum,
             mr_hgemm_epilogue_store_shfl,
@@ -79,7 +80,7 @@ def _require_imports():
         flyc,
         fx,
         ixdl,
-        ATOM_K,
+        ATOM_K_B16,
         ATOM_M,
         ATOM_N,
         WARP_SIZE,
@@ -158,10 +159,10 @@ def _compile_epilogue_kernel(
         gC_atoms = fx.flat_divide(gC_warp, (atom_m, atom_n))
 
         accs = []
-        for im in fx.range_constexpr(warp_atoms_m):
+        for mma_m in fx.range_constexpr(warp_atoms_m):
             row = []
-            for jn in fx.range_constexpr(warp_atoms_n):
-                c_tile = fx.slice(gC_atoms, (None, None, im, jn))
+            for mma_n in fx.range_constexpr(warp_atoms_n):
+                c_tile = fx.slice(gC_atoms, (None, None, mma_m, mma_n))
                 acc = thr_mma.make_fragment_C(c_tile)
                 if fx.const_expr(read_c_accum):
                     copy_atom_c_f32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)

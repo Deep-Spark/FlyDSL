@@ -3,19 +3,18 @@
 
 """Reusable Iluvatar MR HGEMM epilogue helpers.
 
-Three store paths (each exposed as its own function):
+  mr_hgemm_epilogue_store_shfl — fp16 via warp shuffle + packed i32 store
+  mr_hgemm_epilogue_store_tiled — fp16 via trunc_f + make_tiled_copy_C
+  mr_hgemm_epilogue_store_read_c_accum — fp32 make_tiled_copy_C
 
-* ``mr_hgemm_epilogue_store_shfl`` — warp shuffle + packed i32 store (fp16)
-* ``mr_hgemm_epilogue_store_tiled`` — ``trunc_f`` + ``make_tiled_copy_C`` (fp16)
-* ``mr_hgemm_epilogue_store_read_c_accum`` — ``make_tiled_copy_C`` (fp32)
-
-``mr_hgemm_epilogue_store`` dispatches on ``store_mode`` for production kernels.
+mr_hgemm_epilogue_store dispatches on store_mode.
 """
 
 import flydsl.expr as fx
 from flydsl.expr.typing import Vector as Vec
 
-from kernels.iluvatar_mr_common import ATOM_M, ATOM_N, TCU_LANE_COLS, WARP_SIZE
+from kernels.iluvatar_common import WARP_SIZE
+from kernels.iluvatar_mr_common import ATOM_M, ATOM_N, TCU_LANE_COLS
 
 EPILOGUE_STORE_SHFL = "shfl"
 EPILOGUE_STORE_TILED = "tiled"
@@ -31,7 +30,7 @@ def mr_hgemm_epilogue_store_shfl(
     warp_atoms_m: int,
     warp_atoms_n: int,
 ):
-    """fp16 shuffle/packed-i32 store (``no_c_read`` + ``shfl``)."""
+    """fp16 shuffle/packed-i32 store (``EPILOGUE_STORE_SHFL``). Parameters: see ``mr_hgemm_epilogue_store``."""
     c_warp_n = ATOM_N * warp_atoms_n
 
     lane_col = lane_id % fx.Int32(TCU_LANE_COLS)
@@ -41,7 +40,7 @@ def mr_hgemm_epilogue_store_shfl(
     lane_select1 = lane_select0 + fx.Int32(1)
     lane_em = lane_col // fx.Int32(8)
     width_i32 = fx.Int32(WARP_SIZE)
-    mask16 = fx.Int32(0xFFFF)
+    mask_lo = fx.Int32(0xFFFF)
     mask_hi = fx.Int32(0xFFFF0000)
 
     c_warp_ptr = fx.get_iter(gC_warp)
@@ -50,23 +49,23 @@ def mr_hgemm_epilogue_store_shfl(
         c_warp_ptr,
     )
 
-    for im in fx.range_constexpr(warp_atoms_m):
-        mi = im * TCU_LANE_COLS
+    for mma_m in fx.range_constexpr(warp_atoms_m):
+        phys_m = mma_m * TCU_LANE_COLS
         for ei in fx.range_constexpr(4):
-            for ni in fx.range_constexpr(0, c_warp_n, TCU_LANE_COLS * 2):
-                jn0 = ni // TCU_LANE_COLS
-                jn1 = jn0 + 1
-                tile_half_soffset = fx.Int32((mi + ei * 4) * c_global_n + ni)
+            for phys_n in fx.range_constexpr(0, c_warp_n, TCU_LANE_COLS * 2):
+                mma_n0 = phys_n // TCU_LANE_COLS
+                mma_n1 = mma_n0 + 1
+                tile_half_soffset = fx.Int32((phys_m + ei * 4) * c_global_n + phys_n)
 
-                f32_0 = Vec(accs[im][jn0].load())[ei]
-                f32_1 = Vec(accs[im][jn1].load())[ei]
+                f32_0 = Vec(accs[mma_m][mma_n0].load())[ei]
+                f32_1 = Vec(accs[mma_m][mma_n1].load())[ei]
                 h0 = fx.arith.trunc_f(fx.Float16.ir_type, f32_0)
                 h1 = fx.arith.trunc_f(fx.Float16.ir_type, f32_1)
                 hval_i32 = Vec(Vec.from_elements([h0, h1], fx.Float16)).bitcast(fx.Int32)[0]
 
                 hvall = hval_i32.shuffle_idx(lane_select0, width_i32)
                 hvalh = hval_i32.shuffle_idx(lane_select1, width_i32)
-                val0 = (hvall & mask16) | (hvalh << fx.Int32(16))
+                val0 = (hvall & mask_lo) | (hvalh << fx.Int32(16))
                 val1 = hvall.shrui(fx.Int32(16)) | (hvalh & mask_hi)
                 val = fx.arith.select(
                     fx.arith.cmpi(fx.arith.CmpIPredicate.ne, lane_em, fx.Int32(0)),
@@ -91,16 +90,16 @@ def mr_hgemm_epilogue_store_tiled(
     warp_atoms_m: int,
     warp_atoms_n: int,
 ):
-    """fp16 tiled ``make_tiled_copy_C`` store (``no_c_read`` + ``tiled``)."""
+    """fp16 ``make_tiled_copy_C`` store (``EPILOGUE_STORE_TILED``). Parameters: see ``mr_hgemm_epilogue_store``."""
     gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
 
     copy_atom_c_f16 = fx.make_copy_atom(fx.UniversalCopy16b(), fx.Float16)
     tiled_copy_c_f16 = fx.make_tiled_copy_C(copy_atom_c_f16, tiled_mma)
     thr_copy_c_f16 = tiled_copy_c_f16.get_slice(lane_id)
-    for im in fx.range_constexpr(warp_atoms_m):
-        for jn in fx.range_constexpr(warp_atoms_n):
-            c_tile = fx.slice(gC_atoms, (None, None, im, jn))
-            acc = accs[im][jn]
+    for mma_m in fx.range_constexpr(warp_atoms_m):
+        for mma_n in fx.range_constexpr(warp_atoms_n):
+            c_tile = fx.slice(gC_atoms, (None, None, mma_m, mma_n))
+            acc = accs[mma_m][mma_n]
             frag_f16 = fx.make_fragment_like(acc, fx.Float16.ir_type)
             acc_vec = acc.load()
             f16_vec = fx.arith.trunc_f(
@@ -125,16 +124,16 @@ def mr_hgemm_epilogue_store_read_c_accum(
     warp_atoms_m: int,
     warp_atoms_n: int,
 ):
-    """fp32 tiled ``make_tiled_copy_C`` store (``read_c_accum`` epilogue)."""
+    """fp32 ``make_tiled_copy_C`` store (``EPILOGUE_STORE_READ_C_ACCUM``). Parameters: see ``mr_hgemm_epilogue_store``."""
     gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
 
     copy_atom_c_f32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
     tiled_copy_c_f32 = fx.make_tiled_copy_C(copy_atom_c_f32, tiled_mma)
     thr_copy_c_f32 = tiled_copy_c_f32.get_slice(lane_id)
-    for im in fx.range_constexpr(warp_atoms_m):
-        for jn in fx.range_constexpr(warp_atoms_n):
-            c_tile = fx.slice(gC_atoms, (None, None, im, jn))
-            acc = accs[im][jn]
+    for mma_m in fx.range_constexpr(warp_atoms_m):
+        for mma_n in fx.range_constexpr(warp_atoms_n):
+            c_tile = fx.slice(gC_atoms, (None, None, mma_m, mma_n))
+            acc = accs[mma_m][mma_n]
             fx.copy(
                 copy_atom_c_f32,
                 thr_copy_c_f32.retile(acc),
@@ -154,7 +153,24 @@ def mr_hgemm_epilogue_store(
     warp_atoms_m: int,
     warp_atoms_n: int,
 ):
-    """Dispatch to the selected MR HGEMM C-store epilogue."""
+    """Dispatch to the selected MR HGEMM C-store epilogue.
+
+    Args:
+        store_mode: One of ``EPILOGUE_STORE_SHFL`` (``"shfl"``), ``EPILOGUE_STORE_TILED``
+            (``"tiled"``), or ``EPILOGUE_STORE_READ_C_ACCUM`` (``"read_c_accum"``).
+            ``shfl`` and ``tiled`` write fp16 without reading C; ``read_c_accum`` writes
+            fp32 accumulators (C was loaded before MMA).
+        lane_id: Lane index within the warp (0 .. WARP_SIZE-1).
+        accs: ``[mma_m][mma_n]`` f32 MMA accumulator fragments for this warp.
+        gC_warp: This warp's global C tile view: ``gC`` flat-divided by
+            ``(warp_m, warp_n)``, then sliced to ``(warp_m_id, warp_n_id)``.
+        c_global_n: Full problem N extent; only used by the ``shfl`` path for GMEM
+            stride / packed-store addressing.
+        tiled_mma: Tiled MMA from ``fx.make_tiled_mma``; required by ``tiled`` and
+            ``read_c_accum`` (ignored by ``shfl``).
+        warp_atoms_m: Count of ``atom_m`` (16) MMA tiles along M owned by this warp.
+        warp_atoms_n: Count of ``atom_n`` (16) MMA tiles along N owned by this warp.
+    """
     if fx.const_expr(store_mode == EPILOGUE_STORE_SHFL):
         mr_hgemm_epilogue_store_shfl(
             lane_id=lane_id,

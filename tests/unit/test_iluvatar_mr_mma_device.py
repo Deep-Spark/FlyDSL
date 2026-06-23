@@ -31,7 +31,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kernels.iluvatar_mr_common import ATOM_M, ATOM_N, WARP_SIZE  # noqa: E402
+from kernels.iluvatar_common import WARP_SIZE  # noqa: E402
+from kernels.iluvatar_mr_common import ATOM_K_B32, ATOM_K_B16, ATOM_K_B8, ATOM_M, ATOM_N  # noqa: E402
 
 MMA_MAJOR_PATTERNS = ("nt", "nn", "tn", "tt")
 
@@ -41,7 +42,7 @@ MMA_DTYPE_CASES = [
         "fx_dtype": "Int8",
         "fx_acc": "Int32",
         "torch_acc": "int32",
-        "mma_k": 32,
+        "mma_k": ATOM_K_B8,
         "a_value": 1,
         "b_value": 2,
     },
@@ -50,7 +51,7 @@ MMA_DTYPE_CASES = [
         "fx_dtype": "Float16",
         "fx_acc": "Float32",
         "torch_acc": "float32",
-        "mma_k": 16,
+        "mma_k": ATOM_K_B16,
         "a_value": 1.0,
         "b_value": 2.0,
     },
@@ -59,7 +60,7 @@ MMA_DTYPE_CASES = [
         "fx_dtype": "Float32",
         "fx_acc": "Float32",
         "torch_acc": "float32",
-        "mma_k": 16,
+        "mma_k": ATOM_K_B32,
         "a_value": 1.0,
         "b_value": 2.0,
     },

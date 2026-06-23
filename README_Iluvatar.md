@@ -99,7 +99,7 @@ python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench
 
 # Peak-shape reference run (see performance table below)
 python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \
-  --m 4096 --n 4096 --k 4096 --cta 1024 --k-rep 2 \
+  --m 4096 --n 4096 --k 4096 --cta 1024 --k-atoms 2 \
   --epilogue no_c_read --epilogue-store shfl
 ```
 
@@ -110,10 +110,10 @@ from kernels.iluvatar_mr_hgemm import compile_iluvatar_mr_hgemm
 
 launch = compile_iluvatar_mr_hgemm(
     M=4096, N=4096, K=4096,
-    major_pattern="nt",       # G2S layout tag for A/B (A then B: n=row SME, t=col SME)
-    epilogue="no_c_read",      # D = A @ B.T, fp16, no C read
-    epilogue_store="shfl",     # warp-shuffle epilogue (fastest for no_c_read)
-    k_rep=2,                   # BK = 16 * k_rep = 32
+    major_pattern="tn",         # CUTLASS 3.x BLAS tag (default: A/B both K-major)
+    epilogue="no_c_read",       # D = A @ B.T, fp16, no C read
+    epilogue_store="shfl",      # warp-shuffle epilogue (fastest for no_c_read)
+    k_atoms=2,                  # BK = 16 * k_atoms = 32
 )
 launch(A, B, C, stream=torch.cuda.Stream())
 ```
@@ -127,7 +127,7 @@ Measured on **Iluvatar BI-V150S** (`ARCH=ivcore11`), using `kernels.iluvatar_mr_
 (modular G2S / S2R / epilogue helpers) with:
 
 - CTA preset **1024** (16 warps × 64 lanes → **256×256** output tile per block)
-- **`k_rep=2`** → **BK = 32**
+- **`k_atoms=2`** → **BK = 32**
 - **`epilogue=no_c_read`**, **`epilogue_store=shfl`**
 - ROCm-style K-loop: outer `fx.range` + inner `range_constexpr(K_LOOP_UNROLL=2)`
 - JIT launch via `flyc.compile()` (same path as the example bench harness)
@@ -136,36 +136,38 @@ TFLOPS below are **medians of 3 runs** (warmup=15, iters=30 per run, CUDA events
 TFLOPS = `2·M·N·K / time`. Reproduce with::
 
     python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \
-      --epilogue no_c_read --epilogue-store shfl --k-rep 2 \
-      --m <M> --n <N> --k <K> [--major-pattern nt]
+      --epilogue no_c_read --epilogue-store shfl --k-atoms 2 \
+      --m <M> --n <N> --k <K> [--major-pattern tn]
 
 ### Square GEMM by `major_pattern` (fp16, `no_c_read` + `shfl`)
 
 | Pattern | 1024³ TFLOPS | 2048³ TFLOPS | 4096³ TFLOPS |
 |---------|-------------|-------------|-------------|
-| `nn` | 68.9 | 94.8 | 99.5 |
-| `tn` | 65.3 | 93.7 | **101.3** |
-| `nt` | 74.5 | 94.0 | 101.0 |
-| `tt` | 69.3 | 94.5 | **101.3** |
+| `nn` | 69.3 | 94.5 | **101.3** |
+| `nt` | 65.3 | 93.7 | **101.3** |
+| `tn` | 74.5 | 94.0 | 101.0 |
+| `tt` | 68.9 | 94.8 | 99.5 |
 
-At **4096³**, `tn` / `tt` peak at **~101 TFLOPS**; `nt` is within **0.3 T**;
-`nn` is **~99.5 T** (~1.5 T below peak). **2048³** is **~94–95 TFLOPS** across
-patterns (`tn` ~93.7 T). **1024³** spans **~65–75 TFLOPS** (`nt` fastest;
+At **4096³**, `nn` / `nt` peak at **~101 TFLOPS**; `tn` is within **0.3 T**;
+`tt` is **~99.5 T** (~1.5 T below peak). **2048³** is **~94–95 TFLOPS** across
+patterns (`nt` ~93.7 T). **1024³** spans **~65–75 TFLOPS** (`tn` fastest;
 short-kernel timing is sensitive to launch/JIT overhead — bench through
 `flyc.compile()` as in example 03).
 
-### `major_pattern` (G2S global layout tags)
+### `major_pattern` (CUTLASS 3.x BLAS layout tags)
 
-Logical tensors are always `A(m,k)`, `B(n,k)`. Two-letter tags encode A then B
-(`n` = NoTrans / row SME, `t` = Trans / col SME). The pattern selects how SME
-global views map to those layouts (not the epilogue store mode):
+Logical tensors are always `A(m,k)`, `B(n,k)` (CuTe `M×K · N×K`). Tags are opaque
+BLAS names — **do not** decode each letter as that operand's M/N/K major mode.
+Major modes describe logical layouts; host shapes are `tensor.shape` after remap.
+Internally kernels use ``GemmLayout`` (`a_mn_major` / `b_mn_major` in ``kernels/iluvatar_common``), not integer pattern ids.
+Table order matches the [CuTe gemm tutorial](https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/cute/0x_gemm_tutorial.md):
 
-| Pattern | A G2S / atom | B G2S / atom | Host layout (A, B) | Native kernel path? |
-|---------|--------------|--------------|--------------------|---------------------|
-| `nn` | row / `Row16b` | row / `Row16b` | `(m,k)`, `(k,n)` | host physical layout |
-| `tn` | col / `Col` | row / `Row16b` | `(k,m)`, `(k,n)` | host physical layout |
-| `nt` | row / `Row16b` | col / `Col` | `(m,k)`, `(n,k)` | **yes** (default) |
-| `tt` | col / `Col` | col / `Col` | `(k,m)`, `(n,k)` | host physical layout |
+| Pattern | A major | B major | Host `A.shape`, `B.shape` | Native path? |
+|---------|---------|---------|-----------------------------|--------------|
+| `nt` | M | N | `(k,m)`, `(k,n)` | host transpose |
+| `tn` | K | K | `(m,k)`, `(n,k)` | **yes** (default) |
+| `nn` | M | K | `(k,m)`, `(n,k)` | host transpose |
+| `tt` | K | N | `(m,k)`, `(k,n)` | host transpose |
 
 Choose the pattern that matches your framework tensor layouts; peak TFLOPS at 4k are
 similar across all four when host tensors use the expected physical layout.
@@ -189,13 +191,13 @@ sequentially for the chosen `--major-pattern`:
 ```bash
 FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
   python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --check \
-  --major-pattern nt
+  --major-pattern tn
 ```
 
 All four `major_pattern` values (`no_c_read` and `read_c_accum` each):
 
 ```bash
-for p in nn tn nt tt; do
+for p in nt tn nn tt; do
   FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
     python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --check \
     --major-pattern "$p" || exit 1
@@ -207,22 +209,22 @@ Optional shape override:
 ```bash
 FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
   python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --check \
-  --check-shape 256 256 64 --major-pattern nt
+  --check-shape 256 256 64 --major-pattern tn
 ```
 
 All four `major_pattern` values pass at the default check shape. Staged device unit
 tests (`test_iluvatar_mr_*`) additionally cover G2S, S2R, MMA, epilogue, and
-full-pipeline shapes including `k_rep=2` and multi-CTA cases.
+full-pipeline shapes including `k_atoms=2` and multi-CTA cases.
 
 Example 03 exits non-zero if any check fails, so it can be used as a manual
 pre-bench / pre-commit gate on machines without CI.
 
 ### CTA presets
 
-| Preset | Warps (M×N) | Warp tile | Block output tile | `k_rep` guidance |
+| Preset | Warps (M×N) | Warp tile | Block output tile | `k_atoms` guidance |
 |--------|-------------|-----------|-------------------|------------------|
-| `1024` | 4×4 | 64×64 | 256×256 | `k_rep=2` for peak; `k_rep=4` (BK=64) for preset default smem |
-| `2048` | 4×8 | 64×32 | 256×256 | Usually `k_rep ≥ 4` for even SME work within 128 KiB smem |
+| `1024` | 4×4 | 64×64 | 256×256 | `k_atoms=2` for peak; `k_atoms=4` (BK=64) for preset default smem |
+| `2048` | 4×8 | 64×32 | 256×256 | Usually `k_atoms ≥ 4` for even SME work within 128 KiB smem |
 
 ## Tests
 
