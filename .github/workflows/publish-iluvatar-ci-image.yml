@@ -46,9 +46,6 @@ jobs:
         with:
           driver-opts: |
             network=host
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["https://docker.m.daocloud.io"]
 
       - name: Pre-flight secrets
         env:
