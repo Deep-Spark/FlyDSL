@@ -381,6 +381,22 @@ for a in json.loads(os.environ["DEVICE_PYTEST_ARGS_JSON"]):
 PY
 )
 
+    # Full device stage runs on Iluvatar runtime. Exclude ROCm-lower tests to
+    # avoid mixing incompatible backend/device paths in one pytest invocation.
+    marker_idx=-1
+    for i in "${!args[@]}"; do
+      if [[ "${args[$i]}" == "-m" || "${args[$i]}" == "--markexpr" ]]; then
+        marker_idx=$i
+        break
+      fi
+    done
+    if [[ "${marker_idx}" -ge 0 && $((marker_idx + 1)) -lt "${#args[@]}" ]]; then
+      marker_expr="${args[$((marker_idx + 1))]}"
+      if [[ "${marker_expr}" == *"l2_device"* && "${marker_expr}" != *"rocm_lower"* ]]; then
+        args[$((marker_idx + 1))]="(${marker_expr}) and not rocm_lower"
+      fi
+    fi
+
     set -o pipefail
     python3 -m pytest "${args[@]}" -v --junitxml=reports/device-full.xml 2>&1 | tee logs/device-full.log
   '
