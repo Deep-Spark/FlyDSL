@@ -181,7 +181,9 @@ docker run "${docker_args[@]}" \
     ASSET_DIR="/workspace/.ci-smoke-assets"
     mkdir -p "${ASSET_DIR}"
 
-    python3 -m venv /workspace/.ci-venv
+    # Inherit image-level Python packages (notably iluvatar-custom torch)
+    # to avoid masking them in an isolated CI venv.
+    python3 -m venv --system-site-packages /workspace/.ci-venv
     source /workspace/.ci-venv/bin/activate
     python3 -m pip install --upgrade pip
     # Do not use `pip install -e .` in CI device job: editable install triggers
@@ -192,6 +194,10 @@ docker run "${docker_args[@]}" \
       echo "::error::patchelf is required but not found in PATH after pip install"
       exit 1
     fi
+    python3 - <<'PY'
+import torch
+print(f"torch visible in Run C venv: {torch.__version__}")
+PY
 
     cmake -S . -B build-fly -G Ninja \
       -DFLYDSL_BACKENDS=iluvatar \
