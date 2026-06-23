@@ -174,7 +174,7 @@ jobs:
             cat logs/device-must-pass-summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ -f logs/device-full.log ]; then
-            python3 -c "import re, pathlib; log = pathlib.Path('logs/device-full.log').read_text(encoding='utf-8', errors='replace'); collect = re.findall(r'collected\\s+\\d+\\s+items(?:\\s*/\\s*\\d+\\s+deselected\\s*/\\s*\\d+\\s+selected)?', log); summary = re.findall(r'=+\\s+.*\\s+in\\s+[0-9.]+s\\s+=+', log); print(); print('### device-full summary'); print(); print(f'- collection: {collect[-1]}') if collect else print('- collection: unavailable'); print(f'- result: {summary[-1].strip(\"= \").strip()}') if summary else print('- result: unavailable')" >> "$GITHUB_STEP_SUMMARY"
+            python3 -c "import re, pathlib; log = pathlib.Path('logs/device-full.log').read_text(encoding='utf-8', errors='replace'); collect = re.findall(r'collected\\s+\\d+\\s+items(?:\\s*/\\s*\\d+\\s+deselected\\s*/\\s*\\d+\\s+selected)?', log); summary = re.findall(r'=+\\s+.*\\s+in\\s+[0-9.]+s(?:\\s*\\([^\\)]*\\))?\\s+=+', log); print(); print('### device-full summary'); print(); print(f'- collection: {collect[-1]}') if collect else print('- collection: unavailable'); print(f'- result: {summary[-1].strip(\"= \").strip()}') if summary else print('- result: unavailable')" >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ -f logs/corex-version-summary.md ]; then
             cat logs/corex-version-summary.md >> "$GITHUB_STEP_SUMMARY"
