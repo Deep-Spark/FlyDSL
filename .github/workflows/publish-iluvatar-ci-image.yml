@@ -46,6 +46,9 @@ jobs:
         with:
           driver-opts: |
             network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       - name: Pre-flight secrets
         env:
