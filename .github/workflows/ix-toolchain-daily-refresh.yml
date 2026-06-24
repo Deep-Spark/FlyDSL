@@ -30,8 +30,8 @@ jobs:
     runs-on: [self-hosted, linux, x64, gpu-iluvatar]
     timeout-minutes: 240
     env:
-      IXCC_WORKING_ROOT: ${{ vars.IXCC_WORKING_ROOT || '/home/wcyx/sw_home/sdk/ixcc' }}
-      IXSDK_WORKING_ROOT: ${{ vars.IXSDK_WORKING_ROOT || '/home/wcyx/sw_home/sdk/ixsdk' }}
+      IXCC_WORKING_ROOT: ${{ vars.IXCC_WORKING_ROOT || '/home/flydsl/sw_home/sdk/ixcc' }}
+      IXSDK_WORKING_ROOT: ${{ vars.IXSDK_WORKING_ROOT || '/home/flydsl/sw_home/sdk/ixsdk' }}
       IX_TOOLCHAIN_DAILY_STATE_FILE: ${{ vars.IX_TOOLCHAIN_DAILY_STATE_FILE || '/var/tmp/flydsl-ix-toolchain-daily.state' }}
     steps:
       - name: Checkout
