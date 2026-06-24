@@ -1,0 +1,70 @@
+name: ix-toolchain-daily-refresh
+
+on:
+  schedule:
+    # 03:00 Asia/Shanghai == 19:00 UTC (previous day)
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild even if already updated today"
+        required: false
+        type: boolean
+        default: false
+      reason:
+        description: "Why manual run is requested"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ix-toolchain-daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: refresh-ixcc-ixsdk-working
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 240
+    env:
+      IXCC_WORKING_ROOT: ${{ vars.IXCC_WORKING_ROOT || '/home/wcyx/sw_home/sdk/ixcc' }}
+      IXSDK_WORKING_ROOT: ${{ vars.IXSDK_WORKING_ROOT || '/home/wcyx/sw_home/sdk/ixsdk' }}
+      IX_TOOLCHAIN_DAILY_STATE_FILE: ${{ vars.IX_TOOLCHAIN_DAILY_STATE_FILE || '/var/tmp/flydsl-ix-toolchain-daily.state' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Daily update IXCC/IXSDK from working
+        id: refresh
+        run: |
+          extra_args=()
+          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || 'false' }}" == "true" ]]; then
+            extra_args+=(--force-rebuild)
+          fi
+          bash .github/scripts/prepare_ix_toolchains_daily.sh \
+            --ixcc-root "${IXCC_WORKING_ROOT}" \
+            --ixsdk-root "${IXSDK_WORKING_ROOT}" \
+            --state-file "${IX_TOOLCHAIN_DAILY_STATE_FILE}" \
+            "${extra_args[@]}"
+
+      - name: Write summary
+        env:
+          INPUT_REASON: ${{ github.event_name == 'workflow_dispatch' && inputs.reason || '' }}
+        run: |
+          {
+            echo "### IX toolchain daily refresh"
+            echo ""
+            echo "- ixcc_root: \`${IXCC_WORKING_ROOT}\`"
+            echo "- ixsdk_root: \`${IXSDK_WORKING_ROOT}\`"
+            echo "- state_file: \`${IX_TOOLCHAIN_DAILY_STATE_FILE}\`"
+            echo "- ixcc_commit: \`${{ steps.refresh.outputs.ixcc_commit || 'unknown' }}\`"
+            echo "- ixsdk_commit: \`${{ steps.refresh.outputs.ixsdk_commit || 'unknown' }}\`"
+            echo "- updated_today: \`${{ steps.refresh.outputs.updated_today || 'false' }}\`"
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "- manual reason: \`${INPUT_REASON}\`"
+              echo "- force_rebuild: \`${{ inputs.force_rebuild }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
