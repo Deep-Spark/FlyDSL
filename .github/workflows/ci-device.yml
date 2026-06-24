@@ -1,6 +1,9 @@
 name: ci-device
 
 on:
+  workflow_run:
+    workflows: ["ci-core"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       ref:
@@ -8,7 +11,7 @@ on:
         required: true
         type: string
       force_run:
-        description: "Reserved for later full ci-device rollout"
+        description: "Force run full device tests"
         required: false
         type: boolean
         default: false
@@ -20,19 +23,212 @@ on:
 
 permissions: read-all
 
+concurrency:
+  group: ci-device-${{ github.event.workflow_run.id || github.run_id || inputs.ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  should-run-device:
+    name: should-run-device
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request')
+    outputs:
+      should_run: ${{ steps.decision.outputs.should_run }}
+      reason: ${{ steps.decision.outputs.reason }}
+      changed_files: ${{ steps.decision.outputs.changed_files }}
+      matched_files: ${{ steps.decision.outputs.matched_files }}
+      runner_labels_json: ${{ steps.decision.outputs.runner_labels_json }}
+      skip_message: ${{ steps.decision.outputs.skip_message }}
+      device_pytest_args_json: ${{ steps.decision.outputs.device_pytest_args_json }}
+      device_must_pass_tests_json: ${{ steps.decision.outputs.device_must_pass_tests_json }}
+      runtime_smoke_blob_path: ${{ steps.decision.outputs.runtime_smoke_blob_path }}
+      runtime_smoke_kernel: ${{ steps.decision.outputs.runtime_smoke_kernel }}
+      runtime_smoke_launch_kernel: ${{ steps.decision.outputs.runtime_smoke_launch_kernel }}
+      container_image: ${{ steps.decision.outputs.container_image }}
+      python_version: ${{ steps.decision.outputs.python_version }}
+      device_timeout_minutes: ${{ steps.decision.outputs.device_timeout_minutes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+
+      - name: Decide whether to run full device tests
+        id: decision
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/ci/should_run_device.py --config .github/ci-config.yaml
+
+      - name: Write decision summary
+        run: |
+          {
+            echo "### ci-device decision"
+            echo ""
+            echo "- should_run: \`${{ steps.decision.outputs.should_run }}\`"
+            echo "- reason: ${{ steps.decision.outputs.reason }}"
+            echo "- changed_files: ${{ steps.decision.outputs.changed_files }}"
+            echo "- matched_files: ${{ steps.decision.outputs.matched_files }}"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "- manual reason: ${{ inputs.reason }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  device-full:
+    name: device-full
+    runs-on: ${{ fromJSON(needs.should-run-device.outputs.runner_labels_json != '' && needs.should-run-device.outputs.runner_labels_json || '["self-hosted","linux","x64","gpu-iluvatar"]') }}
+    timeout-minutes: ${{ fromJSON(needs.should-run-device.outputs.device_timeout_minutes != '' && needs.should-run-device.outputs.device_timeout_minutes || '90') }}
+    needs: [should-run-device]
+    if: needs.should-run-device.outputs.should_run == 'true'
+    env:
+      COREX_ROOT: ${{ vars.COREX_ROOT || '/home/wcyx/sw_home/local/corex' }}
+      IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/wcyx/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
+      COREX_VERSION_TAG: ${{ vars.COREX_VERSION_TAG || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+
+      - name: Install dependencies
+        run: |
+          docker info >/dev/null
+
+      - name: Capture environment snapshot
+        run: |
+          mkdir -p logs reports
+          {
+            echo "docker: $(docker --version || true)"
+            echo "runner: ${{ runner.name }} labels=${{ toJson(runner.labels) }}"
+            echo "repo: ${{ github.repository }}"
+            echo "sha: ${{ github.sha }}"
+            echo "event: ${{ github.event_name }}"
+            echo "COREX_ROOT: ${COREX_ROOT}"
+            echo "IXCC_MLIR_CMAKE: ${IXCC_MLIR_CMAKE}"
+            echo "COREX_VERSION_TAG: ${COREX_VERSION_TAG:-<unset>}"
+          } | tee logs/device-env.txt
+
+      - name: Login to GHCR (best effort)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-pull CI device image (timeout + retry)
+        env:
+          CI_DEVICE_IMAGE: ${{ needs.should-run-device.outputs.container_image != '' && needs.should-run-device.outputs.container_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+        run: |
+          set -euo pipefail
+          if docker image inspect "${CI_DEVICE_IMAGE}" >/dev/null 2>&1; then
+            echo "local image cache hit: ${CI_DEVICE_IMAGE}"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            echo "pull attempt ${attempt}: ${CI_DEVICE_IMAGE}"
+            if timeout 900 docker pull "${CI_DEVICE_IMAGE}"; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::failed to pull CI_DEVICE_IMAGE after 3 attempts: ${CI_DEVICE_IMAGE}"
+              exit 1
+            fi
+            sleep $((attempt * 30))
+          done
+
+      - name: Run C (Iluvatar L2 device full in container)
+        env:
+          CI_DEVICE_IMAGE: ${{ needs.should-run-device.outputs.container_image != '' && needs.should-run-device.outputs.container_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+          CI_DEVICE_CONTAINER_EXTRA_ARGS: ${{ vars.CI_DEVICE_CONTAINER_EXTRA_ARGS || '' }}
+          CI_DEVICE_NETWORK_MODE: ${{ vars.CI_DEVICE_NETWORK_MODE || 'bridge' }}
+          CI_DEVICE_IPC_MODE: ${{ vars.CI_DEVICE_IPC_MODE || 'private' }}
+          CI_DEVICE_READONLY_ROOTFS: ${{ vars.CI_DEVICE_READONLY_ROOTFS || '1' }}
+          CI_DEVICE_DROP_ALL_CAPS: ${{ vars.CI_DEVICE_DROP_ALL_CAPS || '1' }}
+          CI_DEVICE_NO_NEW_PRIVS: ${{ vars.CI_DEVICE_NO_NEW_PRIVS || '1' }}
+          CI_DEVICE_PIDS_LIMIT: ${{ vars.CI_DEVICE_PIDS_LIMIT || '1024' }}
+          COREX_ROOT: ${{ env.COREX_ROOT }}
+          IXCC_MLIR_CMAKE: ${{ env.IXCC_MLIR_CMAKE }}
+          COREX_VERSION_TAG: ${{ env.COREX_VERSION_TAG }}
+          ARCH: ivcore11
+          DEVICE_PYTEST_ARGS_JSON: ${{ needs.should-run-device.outputs.device_pytest_args_json != '' && needs.should-run-device.outputs.device_pytest_args_json || '["tests/unit","-m","l2_device"]' }}
+          DEVICE_MUST_PASS_TESTS_JSON: ${{ needs.should-run-device.outputs.device_must_pass_tests_json != '' && needs.should-run-device.outputs.device_must_pass_tests_json || '["tests/unit/test_iluvatar_binary_pipeline_smoke.py","tests/unit/test_iluvatar_compile_backend.py","tests/unit/test_iluvatar_jit_launch_smoke.py","tests/unit/test_iluvatar_jit_runtime_resolution.py"]' }}
+          FLYDSL_ILUVATAR_SMOKE_BLOB_PATH: ${{ needs.should-run-device.outputs.runtime_smoke_blob_path }}
+          FLYDSL_ILUVATAR_SMOKE_KERNEL: ${{ needs.should-run-device.outputs.runtime_smoke_kernel }}
+          FLYDSL_ILUVATAR_LAUNCH_KERNEL: ${{ needs.should-run-device.outputs.runtime_smoke_launch_kernel }}
+          FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP: "1"
+          FLYDSL_ILUVATAR_RUN_MR_EPILOGUE: "1"
+          FLYDSL_ILUVATAR_RUN_MR_HGEMM_STAGES: "1"
+          FLYDSL_ILUVATAR_RUN_MR_MMA: "1"
+          FLYDSL_ILUVATAR_RUN_MR_S2R: "1"
+          FLYDSL_ILUVATAR_RUN_MR_S2R_MMA: "1"
+        run: |
+          bash .github/scripts/run_ci_device_in_container.sh
+
+      - name: Append must-pass summary
+        if: always()
+        run: |
+          if [ -f logs/device-must-pass-summary.md ]; then
+            cat logs/device-must-pass-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f logs/device-full.log ]; then
+            python3 -c "import re, pathlib; log = pathlib.Path('logs/device-full.log').read_text(encoding='utf-8', errors='replace'); collect = re.findall(r'collected\\s+\\d+\\s+items(?:\\s*/\\s*\\d+\\s+deselected\\s*/\\s*\\d+\\s+selected)?', log); summary = re.findall(r'=+\\s+.*\\s+in\\s+[0-9.]+s(?:\\s*\\([^\\)]*\\))?\\s+=+', log); print(); print('### device-full summary'); print(); print(f'- collection: {collect[-1]}') if collect else print('- collection: unavailable'); print(f'- result: {summary[-1].strip(\"= \").strip()}') if summary else print('- result: unavailable')" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f logs/corex-version-summary.md ]; then
+            cat logs/corex-version-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-device-junit
+          retention-days: 7
+          path: |
+            reports/device-must-pass.xml
+            reports/device-full.xml
+          if-no-files-found: warn
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-device-failure
+          retention-days: 7
+          path: |
+            logs/device-full.log
+            logs/device-must-pass.log
+            logs/device-must-pass-summary.md
+            logs/corex-version-summary.md
+            logs/device-container-env.txt
+            logs/device-env.txt
+
   required:
     name: ci-device / required
     runs-on: ubuntu-latest
+    needs: [should-run-device, device-full]
+    if: always()
     steps:
-      - name: Registration placeholder
+      - name: Summarize device status
         run: |
           {
-            echo "### ci-device (bootstrap mode)"
+            echo "### ci-device summary"
             echo ""
-            echo "- status: registered"
-            echo "- note: this is a temporary workflow for Actions registration only."
-            echo "- ref: ${{ inputs.ref }}"
-            echo "- force_run: ${{ inputs.force_run }}"
-            echo "- reason: ${{ inputs.reason }}"
+            echo "- should_run: \`${{ needs.should-run-device.outputs.should_run }}\`"
+            echo "- reason: ${{ needs.should-run-device.outputs.reason }}"
+            echo "- device-full: ${{ needs.device-full.result }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce required status
+        run: |
+          if [ "${{ needs.should-run-device.outputs.should_run }}" != "true" ]; then
+            echo "${{ needs.should-run-device.outputs.skip_message || 'Skipped by policy: no matched paths and no run-device-ci label.' }}"
+            exit 0
+          fi
+
+          if [ "${{ needs.device-full.result }}" != "success" ]; then
+            echo "ci-device failed"
+            exit 1
+          fi

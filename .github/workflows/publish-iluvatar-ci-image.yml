@@ -1,0 +1,219 @@
+name: publish-iluvatar-ci-image
+
+on:
+  push:
+    branches:
+      - ci/publish-image-*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Primary image tag"
+        required: true
+        default: "stable"
+        type: string
+      reason:
+        description: "Reason for wheel URL/image publish change"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: build-and-push
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    env:
+      TAG_INPUT: ${{ inputs.tag }}
+      REASON_INPUT: ${{ inputs.reason }}
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive image name
+        id: meta
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/flydsl-iluvatar-ci"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Pre-flight secrets
+        env:
+          COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
+        run: |
+          if [ -z "${COREX_TORCH_WHEEL_URL}" ]; then
+            echo "::error::COREX_TORCH_WHEEL_URL is required (full wheel URL or base directory URL)"
+            exit 1
+          fi
+
+      - name: Resolve and verify CoreX torch wheel/md5
+        id: wheel
+        env:
+          COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
+        run: |
+          set -euo pipefail
+          retry_download() {
+            local url="$1"
+            local out="$2"
+            local n=0
+            until [ "$n" -ge 3 ]; do
+              if curl -fL --connect-timeout 15 --max-time 300 "$url" -o "$out"; then
+                return 0
+              fi
+              n=$((n+1))
+              sleep $((2**n))
+            done
+            return 1
+          }
+
+          input_url="${COREX_TORCH_WHEEL_URL}"
+          wheel_url=""
+          wheel_name=""
+
+          if [[ "${input_url%%\?*}" == *.whl ]]; then
+            wheel_url="${input_url}"
+            wheel_path="${wheel_url%%\?*}"
+            wheel_name="${wheel_path##*/}"
+          else
+            base_url="${input_url}"
+            if [[ "${base_url}" != */ ]]; then
+              base_url="${base_url}/"
+            fi
+            retry_download "${base_url}" /tmp/corex_wheel_index.html || {
+              echo "::error::failed to download wheel index: ${base_url}"
+              exit 1
+            }
+
+            rg -o 'torch-[0-9][^"'"'"' <>]*\+corex\.[0-9.]+\.[0-9]{8}-cp312-cp312-linux_x86_64\.whl' /tmp/corex_wheel_index.html \
+              | sort -u \
+              | awk 'match($0, /\.[0-9]{8}-cp312-cp312-linux_x86_64\.whl$/) { d=substr($0, RSTART+1, 8); print d " " $0 }' \
+              | sort -r > /tmp/corex_wheel_candidates.txt
+
+            wheel_name=""
+            for offset in 0 1 2 3 4 5 6; do
+              target_date="$(date -u -d "${offset} day ago" +%Y%m%d)"
+              candidate="$(awk -v d="${target_date}" '$1==d {print $2; exit}' /tmp/corex_wheel_candidates.txt || true)"
+              if [[ -n "${candidate}" ]]; then
+                wheel_name="${candidate}"
+                echo "selected wheel date=${target_date} (offset=${offset}d): ${wheel_name}"
+                break
+              fi
+            done
+
+            if [[ -z "${wheel_name}" ]]; then
+              echo "::error::no stable wheel found for today or past 7 days under base URL: ${base_url}"
+              echo "recent candidates:"
+              head -n 20 /tmp/corex_wheel_candidates.txt || true
+              exit 1
+            fi
+            wheel_url="${base_url}${wheel_name}"
+          fi
+
+          if [ -z "${wheel_name}" ]; then
+            echo "::error::failed to derive wheel filename from URL"
+            exit 1
+          fi
+          wheel_dir="${wheel_url%/*}/"
+          md5sum_url="${wheel_dir}${wheel_name}.md5sum"
+
+          retry_download "${wheel_url}" /tmp/corex_torch.whl || {
+            echo "::error::failed to download wheel: ${wheel_url}"
+            exit 1
+          }
+          retry_download "${md5sum_url}" /tmp/corex_torch.whl.md5sum || {
+            echo "::error::.md5sum unavailable: ${md5sum_url}"
+            exit 1
+          }
+
+          match_count="$(awk -v f="${wheel_name}" 'NF>=2 && $2==f {c++} END {print c+0}' /tmp/corex_torch.whl.md5sum)"
+          if [ "${match_count}" -eq 0 ]; then
+            echo "::error::no md5 entry for ${wheel_name}"
+            exit 1
+          fi
+          if [ "${match_count}" -gt 1 ]; then
+            echo "::error::multiple md5 entries for ${wheel_name}"
+            exit 1
+          fi
+          wheel_md5="$(awk -v f="${wheel_name}" 'NF>=2 && $2==f {print $1}' /tmp/corex_torch.whl.md5sum)"
+          echo "${wheel_md5}  /tmp/corex_torch.whl" | md5sum -c -
+
+          install -m 0644 /tmp/corex_torch.whl .github/docker/corex_torch.whl
+
+          echo "wheel_url=${wheel_url}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_md5=${wheel_md5}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_name=${wheel_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.iluvatar-ci
+          push: true
+          build-args: |
+            COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
+            COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
+            COREX_TORCH_WHEEL_NAME=${{ steps.wheel.outputs.wheel_name }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
+            ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+
+      - name: Build and push image (retry once)
+        id: build_retry
+        if: ${{ steps.build.outcome == 'failure' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.iluvatar-ci
+          push: true
+          build-args: |
+            COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
+            COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
+            COREX_TORCH_WHEEL_NAME=${{ steps.wheel.outputs.wheel_name }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
+            ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+
+      - name: Print digest summary
+        run: |
+          {
+            digest="${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest }}"
+            if [ -z "${digest}" ]; then
+              echo "::error::missing image digest from build step(s)"
+              exit 1
+            fi
+            echo "### Iluvatar CI image published"
+            echo ""
+            echo "- image: \`${{ steps.meta.outputs.image }}\`"
+            echo "- tag: \`${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}\`"
+            echo "- reason: \`${{ env.REASON_INPUT != '' && env.REASON_INPUT || 'ci/publish-image-* temporary trigger' }}\`"
+            echo "- wheel: \`${{ steps.wheel.outputs.wheel_url }}\`"
+            echo "- wheel md5: \`${{ steps.wheel.outputs.wheel_md5 }}\`"
+            echo "- digest: \`${digest}\`"
+            echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup staged wheel artifact
+        if: ${{ always() }}
+        run: rm -f .github/docker/corex_torch.whl
