@@ -16,8 +16,8 @@ Options:
 EOF
 }
 
-IXCC_ROOT="${IXCC_WORKING_ROOT:-/home/wcyx/sw_home/sdk/ixcc}"
-IXSDK_ROOT="${IXSDK_WORKING_ROOT:-/home/wcyx/sw_home/sdk/ixsdk}"
+IXCC_ROOT="${IXCC_WORKING_ROOT:-/home/flydsl/sw_home/sdk/ixcc}"
+IXSDK_ROOT="${IXSDK_WORKING_ROOT:-/home/flydsl/sw_home/sdk/ixsdk}"
 STATE_FILE="${IX_TOOLCHAIN_DAILY_STATE_FILE:-/var/tmp/flydsl-ix-toolchain-daily.state}"
 FORCE_REBUILD=0
 
@@ -69,6 +69,30 @@ if [[ ! -d "${IXSDK_ROOT}" ]]; then
   echo "::error::IXSDK root not found: ${IXSDK_ROOT}"
   exit 1
 fi
+if [[ ! -d "${IXCC_ROOT}/.git" ]]; then
+  echo "::error::IXCC root is not a git repository: ${IXCC_ROOT}"
+  exit 1
+fi
+if [[ ! -d "${IXSDK_ROOT}/.git" ]]; then
+  echo "::error::IXSDK root is not a git repository: ${IXSDK_ROOT}"
+  exit 1
+fi
+
+# IXCC build must run from sw_home root after sourcing enable.
+SW_HOME="$(cd "${IXCC_ROOT}/../.." && pwd)"
+if [[ ! -f "${SW_HOME}/enable" ]]; then
+  echo "::error::sw_home enable script not found: ${SW_HOME}/enable"
+  exit 1
+fi
+if [[ ! -x "${SW_HOME}/build.sh" ]]; then
+  echo "::error::sw_home build.sh not found or not executable: ${SW_HOME}/build.sh"
+  exit 1
+fi
+
+# Self-hosted runners can mount toolchain repos with ownership different from
+# the runner user. Mark them as safe to prevent "dubious ownership" failures.
+git config --global --add safe.directory "${IXCC_ROOT}" || true
+git config --global --add safe.directory "${IXSDK_ROOT}" || true
 
 write_state() {
   local date_utc="$1"
@@ -96,8 +120,17 @@ ixcc_remote_head="$(git -C "${IXCC_ROOT}" rev-parse origin/working)"
 if [[ "${FORCE_REBUILD}" == "1" || "${ixcc_local_head}" != "${ixcc_remote_head}" ]]; then
   echo "[ix-toolchain] IXCC has updates (or force rebuild), syncing working branch"
   git -C "${IXCC_ROOT}" pull --ff-only origin working
-  echo "[ix-toolchain] building IXCC (./build.sh -r ixcc --host)"
-  (cd "${IXCC_ROOT}" && ./build.sh -r ixcc --host)
+  echo "[ix-toolchain] building IXCC from sw_home (source enable && ./build.sh -r ixcc --host)"
+  (
+    cd "${SW_HOME}"
+    # sw_home/enable expects interactive shell vars (e.g. PS1). In CI with
+    # `set -u`, temporarily relax nounset while sourcing.
+    set +u
+    # shellcheck disable=SC1091
+    source "${SW_HOME}/enable"
+    set -u
+    ./build.sh -r ixcc --host
+  )
   updated_today="true"
 else
   echo "[ix-toolchain] IXCC already latest on working; skip build"
