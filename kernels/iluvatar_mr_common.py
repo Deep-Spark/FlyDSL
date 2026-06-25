@@ -91,9 +91,9 @@ class MrOperandGeom(NamedTuple):
     sme_row_* counts how many atom_*-wide slices fit on one SME row during S2R
     (vpr // atom_*). Axis depends on major mode:
 
-      k-major operand  -> sme_row_k_slices  (= // atom_k)
-      A mn-major       -> sme_row_a_m_atoms (= // atom_m)
-      B mn-major       -> sme_row_b_n_atoms (= // atom_n)
+      k-major operand  -> sme_row_k_slices  (= vpr // atom_k)
+      A mn-major       -> sme_row_a_m_atoms (= vpr // atom_m)
+      B mn-major       -> sme_row_b_n_atoms (= vpr // atom_n)
 
     major_pattern -> which property S2R uses on A / B:
       tn: k/k   -> sme_row_k_slices on both
