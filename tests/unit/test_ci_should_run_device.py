@@ -66,7 +66,10 @@ def test_workflow_run_label_forces_run(monkeypatch):
     monkeypatch.setattr(
         module,
         "_fetch_pull_request",
-        lambda *_args, **_kwargs: {"head": {"repo": {"fork": False}}},
+        lambda *_args, **_kwargs: {
+            "head": {"repo": {"full_name": "deepspark/FlyDSL"}},
+            "base": {"repo": {"full_name": "deepspark/FlyDSL"}},
+        },
     )
     monkeypatch.setattr(module, "_fetch_pull_request_labels", lambda *_args, **_kwargs: ["run-device-ci"])
     monkeypatch.setattr(module, "_fetch_pull_request_files", lambda *_args, **_kwargs: ["docs/readme.md"])
@@ -87,7 +90,10 @@ def test_workflow_run_fork_pr_skips(monkeypatch):
     monkeypatch.setattr(
         module,
         "_fetch_pull_request",
-        lambda *_args, **_kwargs: {"head": {"repo": {"fork": True}}},
+        lambda *_args, **_kwargs: {
+            "head": {"repo": {"full_name": "external/FlyDSL"}},
+            "base": {"repo": {"full_name": "deepspark/FlyDSL"}},
+        },
     )
     monkeypatch.setattr(module, "_fetch_pull_request_labels", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(module, "_fetch_pull_request_files", lambda *_args, **_kwargs: ["kernels/x.py"])
@@ -108,7 +114,10 @@ def test_workflow_run_path_match_triggers(monkeypatch):
     monkeypatch.setattr(
         module,
         "_fetch_pull_request",
-        lambda *_args, **_kwargs: {"head": {"repo": {"fork": False}}},
+        lambda *_args, **_kwargs: {
+            "head": {"repo": {"full_name": "deepspark/FlyDSL"}},
+            "base": {"repo": {"full_name": "deepspark/FlyDSL"}},
+        },
     )
     monkeypatch.setattr(module, "_fetch_pull_request_labels", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
@@ -128,3 +137,29 @@ def test_workflow_run_path_match_triggers(monkeypatch):
     assert "path filter" in reason
     assert "python/flydsl/compiler/foo.py" in changed
     assert "python/flydsl/compiler/foo.py" in matched
+
+
+def test_workflow_run_same_repo_with_head_fork_flag_still_runs_by_path(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_fetch_pull_request",
+        lambda *_args, **_kwargs: {
+            "head": {"repo": {"full_name": "deepspark/FlyDSL", "fork": True}},
+            "base": {"repo": {"full_name": "deepspark/FlyDSL"}},
+        },
+    )
+    monkeypatch.setattr(module, "_fetch_pull_request_labels", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(module, "_fetch_pull_request_files", lambda *_args, **_kwargs: ["kernels/foo.py"])
+
+    should_run, reason, changed, matched = module._decide(  # pylint: disable=protected-access
+        event_name="workflow_run",
+        event_payload={"workflow_run": {"pull_requests": [{"number": 11}]}},
+        config=_base_config(),
+        repository="deepspark/FlyDSL",
+        token="dummy",
+    )
+    assert should_run is True
+    assert "path filter" in reason
+    assert "kernels/foo.py" in changed
+    assert "kernels/foo.py" in matched
