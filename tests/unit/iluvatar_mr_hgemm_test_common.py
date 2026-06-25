@@ -4,7 +4,6 @@
 """Shared helpers for Iluvatar MR HGEMM staged device tests."""
 
 from kernels.iluvatar_common import (
-    logical_strides,
     parse_major_pattern,
     remap_gemm_tensors,
     WARP_SIZE,
@@ -123,12 +122,8 @@ def staged_cta_config(
         brick_k,
         values_per_sme_row=vpr,
     )
-    a_logical_stride, b_logical_stride = logical_strides(
-        layout,
-        m=brick_m,
-        k=brick_k,
-        n=brick_n,
-    )
+    a_logical_stride = (1, brick_m) if layout.a_mn_major else (brick_k, 1)
+    b_logical_stride = (1, brick_n) if layout.b_mn_major else (brick_k, 1)
     cta_chunk_elems = geom.cta_chunk_elems
     return {
         "layout": layout,

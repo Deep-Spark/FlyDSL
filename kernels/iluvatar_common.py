@@ -71,8 +71,8 @@ def remap_gemm_tensors(A, B, layout: GemmLayout | str):
     k-major on both operands, so PyTorch (m,k) and (n,k) need no change. mn-major
     operands need .t().contiguous() so the non-K dim is contiguous in device memory.
 
-    The kernel still uses logical_strides / GemmLayout as logical A(m,k)/B(n,k); this
-    only changes physical tensor.shape before launch.
+    The kernel still uses GemmLayout as logical A(m,k)/B(n,k); this only changes
+    physical tensor.shape before launch.
 
     layout: GemmLayout or a tag string ("nt", "tn", ...) parsed by parse_major_pattern.
     Returns (a_dev, b_dev).
@@ -84,19 +84,6 @@ def remap_gemm_tensors(A, B, layout: GemmLayout | str):
     return a_dev, b_dev
 
 
-def logical_strides(
-    layout: GemmLayout,
-    *,
-    m: int,
-    k: int,
-    n: int,
-) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Return (a_logical_stride, b_logical_stride) for logical A(m,k) / B(n,k)."""
-    a_stride = (1, m) if layout.a_mn_major else (k, 1)
-    b_stride = (1, n) if layout.b_mn_major else (k, 1)
-    return a_stride, b_stride
-
-
 __all__ = [
     "DEFAULT_MAJOR_PATTERN",
     "GemmLayout",
@@ -105,7 +92,6 @@ __all__ = [
     "MAJOR_PATTERN_TN",
     "MAJOR_PATTERN_NN",
     "MAJOR_PATTERN_TT",
-    "logical_strides",
     "parse_major_pattern",
     "remap_gemm_tensors",
     "WARP_SIZE",
