@@ -51,34 +51,22 @@ jobs:
           core_status=missing
           core_url=
           while true; do
-            payload="$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" -f per_page=100)"
-            core_status="$(python3 - <<'PY' "$payload"
-import json, sys
-data = json.loads(sys.argv[1])
-for c in data.get("check_runs", []):
-    if c.get("name") == "ci-core / required":
-        status = c.get("status", "")
-        concl = c.get("conclusion")
-        if status != "completed":
-            print("in_progress")
-        else:
-            print(concl or "unknown")
-        break
-else:
-    print("missing")
-PY
-)"
-            core_url="$(python3 - <<'PY' "$payload"
-import json, sys
-data = json.loads(sys.argv[1])
-for c in data.get("check_runs", []):
-    if c.get("name") == "ci-core / required":
-        print(c.get("html_url", ""))
-        break
-else:
-    print("")
-PY
-)"
+            if payload="$(gh run list --repo "${{ github.repository }}" --workflow ci-core.yml --event pull_request --limit 100 --json headSha,status,conclusion,url,createdAt 2>/tmp/ci_device_core_api.err)"; then
+              :
+            else
+              api_err="$(cat /tmp/ci_device_core_api.err || true)"
+              echo "::warning::failed to query ci-core runs (will retry): ${api_err}"
+              if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+                core_ok=false
+                core_status=timeout
+                break
+              fi
+              sleep 20
+              continue
+            fi
+            core_status="$(python3 -c 'import json,sys; head=sys.argv[1]; runs=json.loads(sys.argv[2]); target=next((r for r in runs if r.get("headSha")==head), None); print("missing" if target is None else ("in_progress" if target.get("status")!="completed" else (target.get("conclusion") or "unknown")))' "${HEAD_SHA}" "$payload")"
+            core_url="$(python3 -c 'import json,sys; head=sys.argv[1]; runs=json.loads(sys.argv[2]); target=next((r for r in runs if r.get("headSha")==head), None); print("" if target is None else target.get("url",""))' "${HEAD_SHA}" "$payload")"
+            echo "ci-core run status: ${core_status}"
             if [[ "${core_status}" == "success" ]]; then
               core_ok=true
               break
