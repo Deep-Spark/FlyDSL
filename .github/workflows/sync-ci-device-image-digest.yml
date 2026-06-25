@@ -1,0 +1,124 @@
+name: sync-ci-device-image-digest
+
+on:
+  workflow_run:
+    workflows: ["publish-iluvatar-ci-image"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch to update"
+        required: false
+        default: "iluvatar"
+        type: string
+      reason:
+        description: "Why manual sync is requested"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-ci-device-image-digest-${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'iluvatar' }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: sync-device-image-digest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REF: ghcr.io/deep-spark/flydsl-iluvatar-ci:stable
+      BASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.base_branch || 'iluvatar' }}
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+
+      - name: Resolve stable digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${IMAGE_REF}" | awk '/^Digest:/ {print $2}')"
+          if [ -z "${digest}" ]; then
+            echo "::error::failed to resolve digest for ${IMAGE_REF}"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "immutable_ref=ghcr.io/deep-spark/flydsl-iluvatar-ci@${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Update ci-config digest
+        id: update
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path(".github/ci-config.yaml")
+          cfg = json.loads(p.read_text(encoding="utf-8"))
+          target = f"ghcr.io/deep-spark/flydsl-iluvatar-ci@{os.environ['DIGEST']}"
+          current = cfg.get("device", {}).get("container_image", "")
+          changed = current != target
+          if changed:
+              cfg["device"]["container_image"] = target
+              p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          with out.open("a", encoding="utf-8") as f:
+              f.write(f"changed={'true' if changed else 'false'}\n")
+              f.write(f"previous={current}\n")
+              f.write(f"target={target}\n")
+          print(f"previous={current}")
+          print(f"target={target}")
+          print(f"changed={changed}")
+          PY
+
+      - name: Write summary
+        env:
+          INPUT_REASON: ${{ github.event_name == 'workflow_dispatch' && inputs.reason || '' }}
+        run: |
+          {
+            echo "### Sync ci-device image digest"
+            echo ""
+            echo "- base_branch: \`${BASE_BRANCH}\`"
+            echo "- source image: \`${IMAGE_REF}\`"
+            echo "- previous: \`${{ steps.update.outputs.previous }}\`"
+            echo "- target: \`${{ steps.update.outputs.target }}\`"
+            echo "- changed: \`${{ steps.update.outputs.changed }}\`"
+            if [ "${{ github.event_name }}" = "workflow_run" ]; then
+              echo "- trigger run: [${{ github.event.workflow_run.id }}](${{ github.event.workflow_run.html_url }})"
+            fi
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "- manual reason: \`${INPUT_REASON}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update digest PR
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: |
+            [Iluvatar] ci: sync device container image digest
+          title: |
+            [Iluvatar] ci: sync device container image digest
+          body: |
+            Sync `.github/ci-config.yaml` `device.container_image` to latest published `stable` digest.
+
+            - previous: `${{ steps.update.outputs.previous }}`
+            - target: `${{ steps.update.outputs.target }}`
+            - source image: `${{ env.IMAGE_REF }}`
+          branch: ci/sync-device-image-digest
+          base: ${{ env.BASE_BRANCH }}
+          delete-branch: true
+          add-paths: |
+            .github/ci-config.yaml
