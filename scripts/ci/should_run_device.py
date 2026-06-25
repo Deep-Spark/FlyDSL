@@ -98,6 +98,19 @@ def _write_output(key: str, value: str) -> None:
         out.write(f"{key}={value}\n")
 
 
+def _is_cross_repo_pr(pull_request: dict[str, Any], default_repo: str) -> bool:
+    head_repo = pull_request.get("head", {}).get("repo", {})
+    base_repo = pull_request.get("base", {}).get("repo", {})
+    head_full_name = str(head_repo.get("full_name", "")).strip().lower()
+    base_full_name = str(base_repo.get("full_name", "")).strip().lower()
+    repo_full_name = default_repo.strip().lower()
+    if not base_full_name:
+        base_full_name = repo_full_name
+    if not head_full_name:
+        return False
+    return head_full_name != base_full_name
+
+
 def _decide(
     event_name: str,
     event_payload: dict[str, Any],
@@ -130,8 +143,7 @@ def _decide(
         pull_request = event_payload.get("pull_request", {})
         pr_number = pull_request.get("number")
         labels = [item.get("name", "") for item in pull_request.get("labels", []) if isinstance(item, dict)]
-        head_repo = pull_request.get("head", {}).get("repo", {})
-        if head_repo.get("fork", False):
+        if _is_cross_repo_pr(pull_request, repository):
             return False, "Skipped by policy: fork pull_request cannot auto-run ci-device.", [], []
         changed_files = _fetch_pull_request_files(repository, int(pr_number), token)
     elif event_name == "workflow_run":
@@ -142,8 +154,7 @@ def _decide(
         if pr_number is None:
             return False, "Skipped by policy: workflow_run has no pull_request context.", [], []
         pull_request = _fetch_pull_request(repository, int(pr_number), token)
-        head_repo = pull_request.get("head", {}).get("repo", {})
-        if head_repo.get("fork", False):
+        if _is_cross_repo_pr(pull_request, repository):
             return False, "Skipped by policy: fork pull_request cannot auto-run ci-device.", [], []
         labels = _fetch_pull_request_labels(repository, int(pr_number), token)
         changed_files = _fetch_pull_request_files(repository, int(pr_number), token)
