@@ -1,9 +1,9 @@
 name: publish-iluvatar-ci-image
 
 on:
-  push:
-    branches:
-      - ci/publish-image-*
+  schedule:
+    # 02:00 Asia/Shanghai == 18:00 UTC (previous day)
+    - cron: "0 18 * * *"
   workflow_dispatch:
     inputs:
       tag:
@@ -13,7 +13,8 @@ on:
         type: string
       reason:
         description: "Reason for wheel URL/image publish change"
-        required: true
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -207,7 +208,7 @@ jobs:
             echo ""
             echo "- image: \`${{ steps.meta.outputs.image }}\`"
             echo "- tag: \`${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}\`"
-            echo "- reason: \`${{ env.REASON_INPUT != '' && env.REASON_INPUT || 'ci/publish-image-* temporary trigger' }}\`"
+            echo "- reason: \`${{ env.REASON_INPUT != '' && env.REASON_INPUT || 'scheduled publish (02:00 CST) or manual dispatch' }}\`"
             echo "- wheel: \`${{ steps.wheel.outputs.wheel_url }}\`"
             echo "- wheel md5: \`${{ steps.wheel.outputs.wheel_md5 }}\`"
             echo "- digest: \`${digest}\`"
