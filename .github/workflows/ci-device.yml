@@ -120,6 +120,7 @@ jobs:
         id: decision
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_DEVICE_IMAGE_REF: ${{ vars.CI_DEVICE_IMAGE_REF || '' }}
         run: |
           python scripts/ci/should_run_device.py --config .github/ci-config.yaml
 
