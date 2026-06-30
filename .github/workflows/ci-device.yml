@@ -16,7 +16,7 @@ on:
         description: "Force run full device tests"
         required: false
         type: boolean
-        default: false
+        default: true
       reason:
         description: "Why manual run is requested"
         required: false
@@ -93,8 +93,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [wait-core-required]
     if: >
+      always() && (
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && needs.wait-core-required.outputs.core_ok == 'true')
+      )
     outputs:
       should_run: ${{ steps.decision.outputs.should_run }}
       reason: ${{ steps.decision.outputs.reason }}
@@ -143,7 +145,13 @@ jobs:
     runs-on: ${{ fromJSON(needs.should-run-device.outputs.runner_labels_json != '' && needs.should-run-device.outputs.runner_labels_json || '["self-hosted","linux","x64","gpu-iluvatar"]') }}
     timeout-minutes: ${{ fromJSON(needs.should-run-device.outputs.device_timeout_minutes != '' && needs.should-run-device.outputs.device_timeout_minutes || '90') }}
     needs: [should-run-device]
-    if: needs.should-run-device.outputs.should_run == 'true'
+    if: >
+      always() && (
+      (
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.force_run == 'true') ||
+        (github.event_name != 'workflow_dispatch' && needs.should-run-device.outputs.should_run == 'true')
+      )
+      )
     env:
       COREX_ROOT: ${{ vars.COREX_ROOT || '/home/wcyx/sw_home/local/corex' }}
       IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/wcyx/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
@@ -296,9 +304,16 @@ jobs:
             exit 1
           fi
 
-          if [ "${{ needs.should-run-device.outputs.should_run }}" != "true" ]; then
-            echo "${{ needs.should-run-device.outputs.skip_message || 'Skipped by policy: no matched paths and no run-device-ci label.' }}"
-            exit 0
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.force_run }}" != "true" ]; then
+              echo "Skipped by policy: workflow_dispatch force_run=false."
+              exit 0
+            fi
+          else
+            if [ "${{ needs.should-run-device.outputs.should_run }}" != "true" ]; then
+              echo "${{ needs.should-run-device.outputs.skip_message || 'Skipped by policy: no matched paths and no run-device-ci label.' }}"
+              exit 0
+            fi
           fi
 
           if [ "${{ needs.device-full.result }}" != "success" ]; then
