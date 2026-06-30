@@ -210,7 +210,10 @@ def main() -> int:
         runtime_smoke_blob_path = str(device_cfg.get("runtime_smoke_blob_path", ""))
         runtime_smoke_kernel = str(device_cfg.get("runtime_smoke_kernel", ""))
         runtime_smoke_launch_kernel = str(device_cfg.get("runtime_smoke_launch_kernel", ""))
-        container_image = str(device_cfg.get("container_image", "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"))
+        container_image_override = os.environ.get("CI_DEVICE_IMAGE_REF", "").strip()
+        container_image = container_image_override or str(
+            device_cfg.get("container_image", "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable")
+        )
         skip_msg = str(
             device_cfg.get(
                 "required_skip_message",
