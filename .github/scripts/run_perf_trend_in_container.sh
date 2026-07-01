@@ -20,6 +20,7 @@ fi
 
 WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
 CI_DEVICE_PRIVILEGED="${CI_DEVICE_PRIVILEGED:-1}"
+CI_DEVICE_RUN_AS_HOST_USER="${CI_DEVICE_RUN_AS_HOST_USER:-1}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 PERF_LOCK_WAIT_SECONDS="${PERF_LOCK_WAIT_SECONDS:-900}"
 PERF_GPU_IDLE_RETRIES="${PERF_GPU_IDLE_RETRIES:-9}"
@@ -119,6 +120,10 @@ docker_args=(
 
 if [[ "${CI_DEVICE_PRIVILEGED}" == "1" ]]; then
   docker_args+=(--privileged)
+fi
+
+if [[ "${CI_DEVICE_RUN_AS_HOST_USER}" == "1" ]]; then
+  docker_args+=(-u "$(id -u):$(id -g)")
 fi
 
 if [[ -n "${host_mpi_lib_dir}" ]]; then
