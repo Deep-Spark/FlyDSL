@@ -1,0 +1,13 @@
+[
+  {
+    "name": "iluvatar_mr_hgemm",
+    "entry": "examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py",
+    "major_pattern": "nt",
+    "epilogue": "no_c_read",
+    "epilogue_store": "shfl",
+    "k_atoms": 2,
+    "warmup": 5,
+    "iters": 15,
+    "shapes": "1024x1024x1024,2048x2048x2048,4096x4096x4096"
+  }
+]
