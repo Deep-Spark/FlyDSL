@@ -312,7 +312,39 @@ public:
     if (!ptrTy)
       return failure();
 
-    Type elemTy = projectToLLVMCompatibleElemTy(flyPtrTy.getElemTy());
+    Type flyElemTy = flyPtrTy.getElemTy();
+    Type elemTy = projectToLLVMCompatibleElemTy(flyElemTy);
+
+    // On Iluvatar an element-typed GEP into global memory lowers to a scaled,
+    // sign-extended index. Compiler-backend has no zoom encoding for a scaled
+    // signed moffset, so it cannot fold such an index into the descriptor-based
+    // store and falls back to 64-bit absolute addressing (ml_lsa_store_a64_*),
+    // which costs an addo/addc address computation per store. Emitting a byte
+    // (i8) GEP with an explicit byte offset keeps the index a plain
+    // sign-extended i32 with no scale, which the backend matches to the
+    // descriptor store (ml_lsa_store_*_U). Only worthwhile for >8-bit elements;
+    // an i8 element GEP already uses byte addressing.
+    if (isGenericAddressSpace<AddressSpace::Global>(flyPtrTy.getAddressSpace()) &&
+        flyElemTy.isIntOrFloat()) {
+      int64_t elemBits = flyElemTy.getIntOrFloatBitWidth();
+      // TODO(sub-byte): packed sub-byte / non-byte-multiple elements (e.g. i4,
+      // fp4) are not handled here. A whole-element GEP on such a type strides by
+      // the rounded-up byte alloc size (1 byte for i4), mis-addressing the
+      // packed array, and the byte rewrite below only covers whole-byte
+      // elements. Supporting them needs bit-granular offset math
+      // (offset * elemBits / 8, as the sme_gmem path above does) plus an
+      // even-element-count guarantee. Assert for now so the gap surfaces
+      // instead of silently emitting a wrong-stride store.
+      assert(elemBits % 8 == 0 &&
+             "add_offset: byte-GEP store optimization does not yet handle "
+             "sub-byte / non-byte-multiple global element types (e.g. i4/fp4)");
+      if (elemBits > 8 && elemBits % 8 == 0) {
+        Value elemBytes = arith::ConstantIntOp::create(rewriter, loc, elemBits / 8, 32);
+        offsetVal = arith::MulIOp::create(rewriter, loc, offsetVal, elemBytes);
+        elemTy = rewriter.getI8Type();
+      }
+    }
+
     Value gep = LLVM::GEPOp::create(rewriter, loc, ptrTy, elemTy, base, ValueRange{offsetVal});
     rewriter.replaceOp(op, gep);
     return success();
