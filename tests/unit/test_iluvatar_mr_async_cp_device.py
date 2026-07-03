@@ -36,7 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
 from kernels.iluvatar_common import parse_major_pattern, WARP_SIZE  # noqa: E402
 from kernels.iluvatar_mr_common import SMEM_ROWS  # noqa: E402
 from kernels.iluvatar_mr_operand_copy import (  # noqa: E402
-    mr_hgemm_g2s_issue_operands,
+    mr_gemm_g2s_issue_operands,
     mr_g2s_sme_config,
     mr_sme_shared_view,
 )
@@ -351,7 +351,7 @@ def _compile_multibrick_async_copy_dump_kernel(
         a_cta_gmem_view = fx.zipped_divide(sme_A, tile_smem_A)
         b_cta_gmem_view = fx.zipped_divide(sme_B, tile_smem_B)
 
-        mr_hgemm_g2s_issue_operands(
+        mr_gemm_g2s_issue_operands(
             a_mn_major=a_mn_major,
             b_mn_major=b_mn_major,
             warp_id=warp_id,

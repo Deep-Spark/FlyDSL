@@ -14,7 +14,7 @@ import flydsl.expr as fx
 from flydsl.expr.typing import Vector as Vec
 
 from kernels.iluvatar_common import WARP_SIZE
-from kernels.iluvatar_mr_common import ATOM_M, ATOM_N, TCU_LANE_COLS
+from kernels.iluvatar_mr_common import ATOM_M, ATOM_N, TCU_LANE_COLS, byte_perm
 
 EPILOGUE_STORE_SHFL = "shfl"
 EPILOGUE_STORE_TILED = "tiled"
@@ -59,8 +59,8 @@ def mr_hgemm_epilogue_store_shfl(
 
                 f32_0 = Vec(accs[mma_m][mma_n0].load())[ei]
                 f32_1 = Vec(accs[mma_m][mma_n1].load())[ei]
-                h0 = fx.arith.trunc_f(fx.Float16.ir_type, f32_0)
-                h1 = fx.arith.trunc_f(fx.Float16.ir_type, f32_1)
+                h0 = f32_0.to(fx.Float16)
+                h1 = f32_1.to(fx.Float16)
                 hval_i32 = Vec(Vec.from_elements([h0, h1], fx.Float16)).bitcast(fx.Int32)[0]
 
                 hvall = hval_i32.shuffle_idx(lane_select0, width_i32)
@@ -101,12 +101,7 @@ def mr_hgemm_epilogue_store_tiled(
             c_tile = fx.slice(gC_atoms, (None, None, mma_m, mma_n))
             acc = accs[mma_m][mma_n]
             frag_f16 = fx.make_fragment_like(acc, fx.Float16.ir_type)
-            acc_vec = acc.load()
-            f16_vec = fx.arith.trunc_f(
-                fx.T.VectorType.get(list(acc_vec.type.shape), fx.T.f16()),
-                acc_vec,
-            )
-            frag_f16.store(f16_vec)
+            frag_f16.store(Vec(acc.load()).to(fx.Float16))
             fx.copy(
                 copy_atom_c_f16,
                 thr_copy_c_f16.retile(frag_f16),
@@ -141,6 +136,115 @@ def mr_hgemm_epilogue_store_read_c_accum(
                 pred=None,
             )
 
+
+def mr_igemm_epilogue_store_i32(
+    *,
+    lane_id,
+    accs,
+    gC_warp,
+    tiled_mma,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+):
+    """i32 direct ``make_tiled_copy_C`` store (int8 GEMM, ``D = A @ B.T``)."""
+    gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
+
+    copy_atom_c_i32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
+    tiled_copy_c_i32 = fx.make_tiled_copy_C(copy_atom_c_i32, tiled_mma)
+    thr_copy_c_i32 = tiled_copy_c_i32.get_slice(lane_id)
+    for im in fx.range_constexpr(warp_atoms_m):
+        for jn in fx.range_constexpr(warp_atoms_n):
+            c_tile = fx.slice(gC_atoms, (None, None, im, jn))
+            acc = accs[im][jn]
+            fx.copy(
+                copy_atom_c_i32,
+                thr_copy_c_i32.retile(acc),
+                thr_copy_c_i32.partition_S(c_tile),
+                pred=None,
+            )
+
+
+def mr_igemm_epilogue_store_i8_packed(
+    *,
+    lane_id,
+    warp_id,
+    accs,
+    gC_warp,
+    smem_base,
+    tiled_mma,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    c_global_n: int,
+):
+    """int8 packed store (int8 GEMM, ``D = A @ B.T``, truncating cast).
+    Per lane each MMA atom owns 4 rows {r, r+4, r+8, r+12} x 1
+    For every group of 4 N-atoms (64 cols):
+      1. pack each atom's 4 i8 rows into one i32 (truncating cast, wrap on overflow);
+      2. scatter the 4 i32 into SMEM (32-bit writes,
+         bank-conflict free) -> read back 4 i32 with the transpose swizzle;
+      3. 6x ``__byte_perm`` recombine -> 4 i32, each = 4 contiguous-N i8 of one row;
+      4. one coalesced 32-bit global store per output row.
+      
+    No quant scale/bias/relu fusion.
+    """
+    if fx.const_expr(warp_atoms_n % 4 != 0):
+        raise ValueError("i8 packed epilogue requires warp_atoms_n %% 4 == 0")
+    warp_m = ATOM_M * warp_atoms_m
+    warp_n = ATOM_N * warp_atoms_n
+    groups_n = warp_atoms_n // 4
+
+    lane_row = lane_id // fx.Int32(TCU_LANE_COLS)  # 0..3
+    lane_col = lane_id % fx.Int32(TCU_LANE_COLS)  # 0..15
+    lane01 = lane_col % fx.Int32(4)
+    lane23 = lane_col // fx.Int32(4)
+
+    smem_warp_i32 = fx.recast_iter(
+        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared),
+        smem_base,
+    )
+    warp_base = warp_id * fx.Int32(warp_m * warp_n // 4)
+
+    def _pack_i32(acc):
+        return Vec(acc.load()).to(fx.Int8).bitcast(fx.Int32)[0]
+
+    # Mainloop has finished reading the pipeline smem; safe to reuse for staging.
+    fx.gpu.barrier()
+    # Phase 1: scatter-write all (im, group) blocks.
+    for im in fx.range_constexpr(warp_atoms_m):
+        for g in fx.range_constexpr(groups_n):
+            block = warp_base + fx.Int32((im * groups_n + g) * 256)
+            for e in fx.range_constexpr(4):
+                src_e = _pack_i32(accs[im][g * 4 + e])
+                idx = block + lane01 * fx.Int32(64) + lane_row * fx.Int32(16) + (lane01 ^ fx.Int32(e)) * fx.Int32(4) + lane23
+                fx.ptr_store(src_e, fx.add_offset(smem_warp_i32, fx.make_int_tuple(idx)))
+
+    fx.gpu.barrier()
+
+    # Phase 2: transpose-read + byte_perm recombine + coalesced global store.
+    c_warp_ptr = fx.get_iter(gC_warp)
+    i32_global_ty = fx.PointerType.get(fx.Int32.ir_type, c_warp_ptr.memspace)
+    for im in fx.range_constexpr(warp_atoms_m):
+        for g in fx.range_constexpr(groups_n):
+            block = warp_base + fx.Int32((im * groups_n + g) * 256)
+            val = []
+            for e in fx.range_constexpr(4):
+                idx = block + fx.Int32(e * 64) + (lane_id ^ fx.Int32(e * 4))
+                val.append(fx.ptr_load(fx.add_offset(smem_warp_i32, fx.make_int_tuple(idx))))
+            t0 = byte_perm(val[0], val[1], 0x5140)
+            t1 = byte_perm(val[2], val[3], 0x5140)
+            ret0 = byte_perm(t0, t1, 0x5410)
+            ret1 = byte_perm(t0, t1, 0x7632)
+            t0 = byte_perm(val[0], val[1], 0x7362)
+            t1 = byte_perm(val[2], val[3], 0x7362)
+            ret2 = byte_perm(t0, t1, 0x5410)
+            ret3 = byte_perm(t0, t1, 0x7632)
+            rets = (ret0, ret1, ret2, ret3)
+            col = fx.Int32(g * 64) + lane_col * fx.Int32(4)
+            for k in fx.range_constexpr(4):
+                row = fx.Int32(im * 16 + k * 4) + lane_row
+                byte_off = row * fx.Int32(c_global_n) + col
+                store_ptr = fx.recast_iter(i32_global_ty, fx.add_offset(c_warp_ptr, fx.make_int_tuple(byte_off)))
+                fx.ptr_store(rets[k], store_ptr)
 
 def mr_hgemm_epilogue_store(
     *,

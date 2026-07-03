@@ -14,7 +14,7 @@ atom_m/n/k — size (elements) of one MRMma / fx.gemm tile (f16: 16). Not a loop
 mma_m/n/k  — 0-based index of which atom_* tile the warp uses within the CTA bk step.
 values_per_sme_row (vpr) — elements per 512-bit SME row; f16 32, i8 64, f32 16.
 
-G2S chunk grid (cta_*, mr_hgemm_g2s_issue_*_warp):
+G2S chunk grid (cta_*, mr_gemm_g2s_issue_*_warp):
   One G2S issue moves cta_chunk_elems = 16 smem rows x vpr into smem.
   Count chunks on the CTA A(m,k) or B(n,k) tile (sme_atom_counts / MrCtaSmemGrid):
     a_atoms_total = (bm/16)*(bk/vpr) for k-major A; B symmetric on bn.
@@ -59,6 +59,8 @@ Three unrelated "atom" sizes:
 """
 
 from typing import NamedTuple
+
+import flydsl.expr as fx
 
 from kernels.iluvatar_common import GemmLayout
 
@@ -107,7 +109,7 @@ class MrOperandGeom(NamedTuple):
     mr_cta_smem_grid; smem offset is cta_lin * cta_chunk_elems within smem_a/smem_b.
     atom_m/n/k are not used in G2S address math (MMA / S2R tile shape only).
 
-    Used in mr_hgemm_s2r_*_tile for sme_row_* and atom_*; G2S issue passes geom but
+    Used in mr_gemm_s2r_*_tile for sme_row_* and atom_*; G2S issue passes geom but
     does not read sme_row_* or atom_* for addressing.
     """
 
@@ -176,7 +178,7 @@ class MrCtaSmemGrid(NamedTuple):
       cta_b_k_cnt — B k-major K count
       cta_b_n_cnt — B mn-major N count (G2S %)
 
-    See mr_hgemm_g2s_issue_a_warp / mr_hgemm_g2s_issue_b_warp for formulas.
+    See mr_gemm_g2s_issue_a_warp / mr_gemm_g2s_issue_b_warp for formulas.
     """
 
     cta_a_k_cnt: int
@@ -219,6 +221,35 @@ def sme_atom_counts(
     return a_atoms_total, b_atoms_total, cta_a_k_cnt, cta_b_k_cnt
 
 
+def byte_perm(a, b, sel: int):
+    """CUDA ``__byte_perm(a, b, sel)`` equivalent on two ``fx.Int32`` values.
+
+    Source bytes are indexed 0-3 = bytes of ``a`` (low->high), 4-7 = bytes of ``b``.
+    Each of ``sel``'s 4 nibbles selects one source byte for the matching output byte.
+    ``sel`` is a Python compile-time constant, so this unrolls to fixed shift/mask ops.
+    """
+    out = fx.Int32(0)
+    for j in fx.range_constexpr(4):
+        idx = (sel >> (4 * j)) & 0xF
+        src = a if idx < 4 else b
+        byte = src.shrui(fx.Int32(8 * (idx % 4))) & fx.Int32(0xFF)
+        out = out | (byte << fx.Int32(8 * j))
+    return out
+
+
+def mr_stage_smem_ab(smem_base, stage_base, a_stage_elems):
+    """Per-stage shared A/B base pointers for the GEMM pipeline.
+
+    A starts at ``stage_base``; B follows immediately after A's tile at
+    ``stage_base + a_stage_elems``. ``smem_base`` is the element-typed shared base
+    pointer, so all offsets are counted in elements (``a_stage_elems`` = bm * bk
+    for a bm x bk A tile). Shared by the f16 (hgemm) and i8 (igemm) pipelines.
+    """
+    smem_a = fx.add_offset(smem_base, fx.make_int_tuple(stage_base))
+    smem_b = fx.add_offset(smem_a, fx.make_int_tuple(fx.Int32(a_stage_elems)))
+    return smem_a, smem_b
+
+
 # Default operand geometry for production MR f16 HGEMM kernels/tests.
 MR_GEMM_GEOM = MrOperandGeom.b16()
 
@@ -239,6 +270,8 @@ __all__ = [
     "SMEM_B8_PER_ROW",
     "SMEM_ROWS",
     "TCU_LANE_COLS",
+    "byte_perm",
+    "mr_stage_smem_ab",
     "sme_atom_counts",
     "sme_values_per_row",
 ]
