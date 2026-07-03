@@ -168,7 +168,6 @@ jobs:
         run: |
           bash .ci-utils/.github/scripts/run_perf_trend_in_container.sh -- bash -lc '
             set -euo pipefail
-            python3 -m pip install --no-cache-dir patchelf
             if ! command -v patchelf >/dev/null 2>&1; then
               echo "::error::patchelf is required but not found in PATH"
               exit 1
