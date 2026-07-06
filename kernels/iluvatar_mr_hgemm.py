@@ -163,7 +163,7 @@ def _build_swizzle_kernel(
         tid = fx.thread_idx.x
         bid_x, bid_y, _ = fx.block_idx
         warp_id = tid // WARP_SIZE
-        lane_id = tid % WARP_SIZE
+        lane_id = fx.Int32(fx.lane_id)  # tid % WARP_SIZE
         warp_m_id = warp_id // warps_n
         warp_n_id = warp_id % warps_n
 
