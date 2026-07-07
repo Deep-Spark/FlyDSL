@@ -25,6 +25,8 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 PERF_LOCK_WAIT_SECONDS="${PERF_LOCK_WAIT_SECONDS:-900}"
 PERF_GPU_IDLE_RETRIES="${PERF_GPU_IDLE_RETRIES:-9}"
 PERF_GPU_IDLE_SLEEP_SECONDS="${PERF_GPU_IDLE_SLEEP_SECONDS:-10}"
+PERF_CACHE_ROOT="${PERF_CACHE_ROOT:-/workspace/.flydsl}"
+PERF_CACHE_DIR="${PERF_CACHE_DIR:-${PERF_CACHE_ROOT}/cache}"
 
 if [[ ! -d "${WORKSPACE}" ]]; then
   echo "::error::workspace does not exist: ${WORKSPACE}"
@@ -116,6 +118,9 @@ docker_args=(
   -e COREX_ROOT="${COREX_ROOT}"
   -e CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
   -e PYTHONUNBUFFERED=1
+  -e HOME=/workspace
+  -e XDG_CACHE_HOME="${PERF_CACHE_ROOT}"
+  -e FLYDSL_RUNTIME_CACHE_DIR="${PERF_CACHE_DIR}"
 )
 
 if [[ "${CI_DEVICE_PRIVILEGED}" == "1" ]]; then
@@ -151,6 +156,11 @@ docker run "${docker_args[@]}" "${CI_DEVICE_IMAGE}" bash -lc '
   # Perf trend must execute kernels; force-disable compile-only mode in case
   # runner/image environment accidentally exports COMPILE_ONLY=1.
   export COMPILE_ONLY=0
+  mkdir -p "${XDG_CACHE_HOME}" "${FLYDSL_RUNTIME_CACHE_DIR}"
+  if [[ ! -w "${XDG_CACHE_HOME}" || ! -w "${FLYDSL_RUNTIME_CACHE_DIR}" ]]; then
+    echo "::error::cache directories are not writable: XDG_CACHE_HOME=${XDG_CACHE_HOME}, FLYDSL_RUNTIME_CACHE_DIR=${FLYDSL_RUNTIME_CACHE_DIR}" >&2
+    exit 1
+  fi
   export PATH="${COREX_ROOT}/bin:${PATH}"
   if [[ -n "${HOST_MPI_LIB_DIR:-}" ]]; then
     export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${COREX_ROOT}/lib:${HOST_MPI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
