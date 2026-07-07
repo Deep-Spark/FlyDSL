@@ -2,7 +2,10 @@
 build/
 build_*/
 build-fly/
+build-fly-*/
 cmake-build-*/
+**/.ninja_deps
+**/.ninja_log
 
 # GPU core dumps
 gpucore.*
