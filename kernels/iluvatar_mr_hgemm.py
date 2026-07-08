@@ -51,7 +51,7 @@ from kernels.iluvatar_mr_s2r import mr_hgemm_s2r_load_mma_k
 
 DEFAULT_K_ATOMS = 2  # CTA K-tile: ATOM_K_B16 * k_atoms = 32
 STAGES = 2
-K_LOOP_UNROLL = 2
+K_LOOP_UNROLL = 1
 
 EPILOGUE_NO_C_READ = "no_c_read"
 EPILOGUE_READ_C_ACCUM = "read_c_accum"
