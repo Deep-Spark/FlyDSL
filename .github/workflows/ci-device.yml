@@ -195,13 +195,22 @@ jobs:
           CI_DEVICE_IMAGE: ${{ needs.should-run-device.outputs.container_image != '' && needs.should-run-device.outputs.container_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
         run: |
           set -euo pipefail
-          if docker image inspect "${CI_DEVICE_IMAGE}" >/dev/null 2>&1; then
-            echo "local image cache hit: ${CI_DEVICE_IMAGE}"
+          resolve_script=".github/scripts/resolve_local_ci_device_image.sh"
+          record_script=".github/scripts/record_local_ci_device_image.sh"
+
+          # Prefer local content match (exact ref, recorded map, or config digest).
+          if resolved="$(bash "${resolve_script}" "${CI_DEVICE_IMAGE}")"; then
+            echo "local image content hit: ${CI_DEVICE_IMAGE} -> ${resolved}"
+            echo "CI_DEVICE_IMAGE_LOCAL=${resolved}" >> "${GITHUB_ENV}"
+            bash "${record_script}" "${CI_DEVICE_IMAGE}" "${resolved}" || true
             exit 0
           fi
+
           for attempt in 1 2 3; do
             echo "pull attempt ${attempt}: ${CI_DEVICE_IMAGE}"
             if timeout 900 docker pull "${CI_DEVICE_IMAGE}"; then
+              echo "CI_DEVICE_IMAGE_LOCAL=${CI_DEVICE_IMAGE}" >> "${GITHUB_ENV}"
+              bash "${record_script}" "${CI_DEVICE_IMAGE}" "${CI_DEVICE_IMAGE}" || true
               exit 0
             fi
             if [ "${attempt}" -eq 3 ]; then

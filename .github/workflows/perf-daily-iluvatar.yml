@@ -160,6 +160,44 @@ jobs:
           print(f"Loaded previous metrics from run {candidate}.")
           PY
 
+      - name: Login to GHCR (best effort)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-pull CI device image (timeout + retry)
+        env:
+          CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}
+        run: |
+          set -euo pipefail
+          resolve_script=".ci-utils/.github/scripts/resolve_local_ci_device_image.sh"
+          record_script=".ci-utils/.github/scripts/record_local_ci_device_image.sh"
+
+          # Prefer local content match (exact ref, recorded map, or config digest).
+          if resolved="$(bash "${resolve_script}" "${CI_DEVICE_IMAGE}")"; then
+            echo "local image content hit: ${CI_DEVICE_IMAGE} -> ${resolved}"
+            echo "CI_DEVICE_IMAGE_LOCAL=${resolved}" >> "${GITHUB_ENV}"
+            bash "${record_script}" "${CI_DEVICE_IMAGE}" "${resolved}" || true
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            echo "pull attempt ${attempt}: ${CI_DEVICE_IMAGE}"
+            if timeout 900 docker pull "${CI_DEVICE_IMAGE}"; then
+              echo "CI_DEVICE_IMAGE_LOCAL=${CI_DEVICE_IMAGE}" >> "${GITHUB_ENV}"
+              bash "${record_script}" "${CI_DEVICE_IMAGE}" "${CI_DEVICE_IMAGE}" || true
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::failed to pull CI_DEVICE_IMAGE after 3 attempts: ${CI_DEVICE_IMAGE}"
+              exit 1
+            fi
+            sleep $((attempt * 30))
+          done
+
       - name: Rebuild FlyDSL in perf container
         env:
           CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}

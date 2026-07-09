@@ -9,6 +9,9 @@ fi
 : "${CI_DEVICE_IMAGE:?CI_DEVICE_IMAGE is required}"
 : "${COREX_ROOT:?COREX_ROOT is required}"
 
+# Prefer a locally resolved runnable ref when available.
+CI_DEVICE_IMAGE="${CI_DEVICE_IMAGE_LOCAL:-${CI_DEVICE_IMAGE}}"
+
 if [[ "${1:-}" == "--" ]]; then
   shift
 fi

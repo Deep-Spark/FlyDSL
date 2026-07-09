@@ -13,6 +13,10 @@ fi
 : "${COREX_ROOT:?COREX_ROOT is required}"
 : "${IXCC_MLIR_CMAKE:?IXCC_MLIR_CMAKE is required}"
 
+# Prefer a locally resolved runnable ref (image ID / local tag) when available.
+# This avoids requiring RepoDigests for @sha256 refs that were loaded via type=docker.
+CI_DEVICE_IMAGE="${CI_DEVICE_IMAGE_LOCAL:-${CI_DEVICE_IMAGE}}"
+
 WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
 IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
 DEVICE_PYTEST_ARGS_JSON="${DEVICE_PYTEST_ARGS_JSON:-[\"tests/unit\",\"-m\",\"l2_device\"]}"
