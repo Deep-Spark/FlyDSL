@@ -23,7 +23,7 @@ G2S chunk grid (cta_*, mr_hgemm_g2s_issue_*_warp):
     cta_lin = warp_id * per_warp + t   (t = 0 .. per_warp-1; A and B each have own range)
   Decode coords from cta_lin (fast axis = %, slow axis = //), e.g. A k-major tn:
     cta_k = cta_lin % cta_a_k_cnt_k_major;  cta_m = cta_lin // cta_a_k_cnt_k_major
-  Smem offset: stage_base + cta_lin * cta_chunk_elems (B after + bm*bk).
+  Smem offset: cta_lin * cta_chunk_elems within the stage's smem_a / smem_b buffer.
 
   f16 tn, bm=64, bk=32: vpr=32 -> 4 chunks (4x1 along M); warp0..3 get cta_lin 0..3
   when num_warps=4 and a_per_warp=1; all have cta_k=0, cta_m=cta_lin.
@@ -104,8 +104,8 @@ class MrOperandGeom(NamedTuple):
     sme_row_* — S2R only (in-row sub-slices from mma_k / mma_m / mma_n).
 
     G2S reads only vpr (values_per_sme_row) and cta_chunk_elems (= 16 * vpr) via
-    mr_cta_smem_grid; smem offset is stage_base + cta_lin * cta_chunk_elems. atom_m/n/k
-    are not used in G2S address math (MMA / S2R tile shape only).
+    mr_cta_smem_grid; smem offset is cta_lin * cta_chunk_elems within smem_a/smem_b.
+    atom_m/n/k are not used in G2S address math (MMA / S2R tile shape only).
 
     Used in mr_hgemm_s2r_*_tile for sme_row_* and atom_*; G2S issue passes geom but
     does not read sme_row_* or atom_* for addressing.

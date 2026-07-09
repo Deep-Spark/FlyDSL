@@ -44,9 +44,8 @@ def mr_hgemm_s2r_a_tile(
     b_mn_major: bool,
     mma_m: int,
     mma_k: int,
-    stage_base,
     g2s_sme: SmeConfig,
-    smem_base,
+    smem_a,
     elem_dtype,
     warp_m_id,
     warp_atoms_m: int,
@@ -81,14 +80,14 @@ def mr_hgemm_s2r_a_tile(
         cta_m_blk = cta_m_atom // fx.Int32(sme_row_m)
         sme_row_sub = cta_m_atom % fx.Int32(sme_row_m)
         linear = cta_m_blk * fx.Int32(cta_grid.cta_a_k_cnt) + fx.Int32(cta_k_blk)
-        off = stage_base + linear * fx.Int32(cta_grid.cta_chunk_elems)
+        off = linear * fx.Int32(cta_grid.cta_chunk_elems)
     else:
         cta_k_blk = mma_k // sme_row_k
         sme_row_sub = mma_k % sme_row_k
-        off = stage_base + warp_a_base + fx.Int32((mma_m * cta_grid.cta_a_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
+        off = warp_a_base + fx.Int32((mma_m * cta_grid.cta_a_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
 
     smem_view = mr_sme_shared_view(
-        smem_base,
+        smem_a,
         off,
         g2s_sme.a_sme_sw,
         elem_dtype,
@@ -103,9 +102,8 @@ def mr_hgemm_s2r_b_tile(
     b_mn_major: bool,
     mma_n: int,
     mma_k: int,
-    stage_base,
     g2s_sme: SmeConfig,
-    smem_base,
+    smem_b,
     elem_dtype,
     warp_n_id,
     warp_atoms_n: int,
@@ -116,7 +114,7 @@ def mr_hgemm_s2r_b_tile(
 ):
     """Build the shared B operand tile view for one warp atom (mma_n) at mma_k.
 
-    B smem region starts at stage_base + bm * bk. Same sme_row_* sub-slice rules as A.
+    B smem uses ``smem_b`` directly. Same sme_row_* sub-slice rules as A.
     Shared parameters: see mr_hgemm_s2r_load_mma_k. Operand-specific: mma_n, warp_n_id,
     warp_atoms_n.
     """
@@ -139,14 +137,14 @@ def mr_hgemm_s2r_b_tile(
         cta_n_blk = cta_n_atom // fx.Int32(sme_row_n)
         sme_row_sub = cta_n_atom % fx.Int32(sme_row_n)
         linear = fx.Int32(cta_k_blk) * fx.Int32(cta_grid.cta_b_n_cnt) + cta_n_blk
-        off = stage_base + fx.Int32(bm * bk) + linear * fx.Int32(cta_grid.cta_chunk_elems)
+        off = linear * fx.Int32(cta_grid.cta_chunk_elems)
     else:
         cta_k_blk = mma_k // sme_row_k
         sme_row_sub = mma_k % sme_row_k
-        off = stage_base + warp_b_base + fx.Int32(bm * bk + (mma_n * cta_grid.cta_b_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
+        off = warp_b_base + fx.Int32((mma_n * cta_grid.cta_b_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
 
     smem_view = mr_sme_shared_view(
-        smem_base,
+        smem_b,
         off,
         g2s_sme.b_sme_sw,
         elem_dtype,
@@ -160,9 +158,9 @@ def mr_hgemm_s2r_load_mma_k(
     a_mn_major: bool,
     b_mn_major: bool,
     mma_k: int,
-    stage_base,
     g2s_sme: SmeConfig,
-    smem_base,
+    smem_a,
+    smem_b,
     elem_dtype,
     warp_m_id,
     warp_n_id,
@@ -189,9 +187,8 @@ def mr_hgemm_s2r_load_mma_k(
         b_mn_major: True when logical B(n,k) is N-major; selects B smem offset / sme_row path.
         mma_k: K atom index within this CTA bk tile (0 .. bk/atom_k - 1); not cta_k or
             the outer problem-K loop index.
-        stage_base: Smem element offset for this pipeline stage's A tile (Int32); B at + bm*bk.
-        g2s_sme: Swizzle and smem major from mr_g2s_sme_config (must match prior G2S).
-        smem_base: Dynamic shared base pointer (recast to elem_dtype).
+        smem_a: Shared A buffer for this pipeline stage (f16 shared pointer).
+        smem_b: Shared B buffer for this pipeline stage (f16 shared pointer).
         elem_dtype: Operand element type for mr_sme_shared_view and S2R copy atoms.
         warp_m_id: This warp's row index in the CTA warp grid (typically warp_id // warps_n).
         warp_n_id: This warp's col index in the CTA warp grid (typically warp_id % warps_n).
@@ -219,9 +216,8 @@ def mr_hgemm_s2r_load_mma_k(
                     b_mn_major=b_mn_major,
                     mma_m=mma_m,
                     mma_k=mma_k,
-                    stage_base=stage_base,
                     g2s_sme=g2s_sme,
-                    smem_base=smem_base,
+                    smem_a=smem_a,
                     elem_dtype=elem_dtype,
                     warp_m_id=warp_m_id,
                     warp_atoms_m=warp_atoms_m,
@@ -244,9 +240,8 @@ def mr_hgemm_s2r_load_mma_k(
                     b_mn_major=b_mn_major,
                     mma_n=mma_n,
                     mma_k=mma_k,
-                    stage_base=stage_base,
                     g2s_sme=g2s_sme,
-                    smem_base=smem_base,
+                    smem_b=smem_b,
                     elem_dtype=elem_dtype,
                     warp_n_id=warp_n_id,
                     warp_atoms_n=warp_atoms_n,

@@ -159,19 +159,18 @@ def mr_hgemm_g2s_issue_a_warp(
     a_per_warp: int,
     a_cta_gmem_view,
     g2s_sme: SmeConfig,
-    smem_base,
+    smem_a,
     elem_dtype,
     bm: int,
     bn: int,
     bk: int,
-    stage_base,
     geom: MrOperandGeom,
 ):
     """Issue this warp's A-tile SME async G2S copies for one pipeline stage.
 
     A k-major: cta_m = cta_lin // cta_a_k_cnt_k_major, cta_k = cta_lin % cta_a_k_cnt_k_major.
     A mn-major: cta_m = cta_lin // cta_a_k_cnt, cta_k = cta_lin % cta_a_k_cnt.
-    Smem: stage_base + cta_lin * cta_chunk_elems. Does not commit async.
+    Smem: cta_lin * cta_chunk_elems within ``smem_a``. Does not commit async.
     Parameters: see mr_hgemm_g2s_issue_operands.
     """
     cta_grid = mr_cta_smem_grid(
@@ -192,12 +191,12 @@ def mr_hgemm_g2s_issue_a_warp(
             cta_m = cta_lin // fx.Int32(cta_grid.cta_a_k_cnt_k_major)
             cta_k = cta_lin % fx.Int32(cta_grid.cta_a_k_cnt_k_major)
         a_src = fx.slice(a_cta_gmem_view, (None, (cta_m, cta_k)))
-        a_off = stage_base + cta_lin * fx.Int32(cta_grid.cta_chunk_elems)
+        a_off = cta_lin * fx.Int32(cta_grid.cta_chunk_elems)
         fx.copy_atom_call(
             g2s_sme.sme_atom_a,
             a_src,
             mr_sme_shared_view(
-                smem_base,
+                smem_a,
                 a_off,
                 g2s_sme.a_sme_sw,
                 elem_dtype,
@@ -214,17 +213,16 @@ def mr_hgemm_g2s_issue_b_warp(
     b_per_warp: int,
     b_cta_gmem_view,
     g2s_sme: SmeConfig,
-    smem_base,
+    smem_b,
     elem_dtype,
     bm: int,
     bn: int,
     bk: int,
-    stage_base,
     geom: MrOperandGeom,
 ):
     """Issue this warp's B-tile SME async G2S copies for one pipeline stage.
 
-    B smem starts at stage_base + bm * bk. B mn-major: cta_n = cta_lin % cta_b_n_cnt,
+    B smem uses ``smem_b`` directly. B mn-major: cta_n = cta_lin % cta_b_n_cnt,
     cta_k = cta_lin // cta_b_n_cnt. B k-major: cta_n = cta_lin // cta_b_k_cnt,
     cta_k = cta_lin % cta_b_k_cnt. Does not commit async.
     Parameters: see mr_hgemm_g2s_issue_operands.
@@ -237,7 +235,6 @@ def mr_hgemm_g2s_issue_b_warp(
         bk=bk,
         geom=geom,
     )
-    b_storage_base = bm * bk
     warp_b_start = warp_id * fx.Int32(b_per_warp)
     for t in fx.range_constexpr(b_per_warp):
         cta_lin = warp_b_start + fx.Int32(t)
@@ -246,17 +243,17 @@ def mr_hgemm_g2s_issue_b_warp(
             cta_k = cta_lin // fx.Int32(cta_grid.cta_b_n_cnt)
             b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
             b_linear = cta_k * fx.Int32(cta_grid.cta_b_n_cnt) + cta_n
-            b_off = stage_base + fx.Int32(b_storage_base) + b_linear * fx.Int32(cta_grid.cta_chunk_elems)
+            b_off = b_linear * fx.Int32(cta_grid.cta_chunk_elems)
         else:
             cta_n = cta_lin // fx.Int32(cta_grid.cta_b_k_cnt)
             cta_k = cta_lin % fx.Int32(cta_grid.cta_b_k_cnt)
             b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
-            b_off = stage_base + fx.Int32(b_storage_base) + cta_lin * fx.Int32(cta_grid.cta_chunk_elems)
+            b_off = cta_lin * fx.Int32(cta_grid.cta_chunk_elems)
         fx.copy_atom_call(
             g2s_sme.sme_atom_b,
             b_src,
             mr_sme_shared_view(
-                smem_base,
+                smem_b,
                 b_off,
                 g2s_sme.b_sme_sw,
                 elem_dtype,
@@ -275,12 +272,12 @@ def mr_hgemm_g2s_issue_operands(
     a_cta_gmem_view,
     b_cta_gmem_view,
     g2s_sme: SmeConfig,
-    smem_base,
+    smem_a,
+    smem_b,
     elem_dtype,
     bm: int,
     bn: int,
     bk: int,
-    stage_base,
     geom: MrOperandGeom,
     commit: bool = True,
 ):
@@ -302,13 +299,12 @@ def mr_hgemm_g2s_issue_operands(
         b_cta_gmem_view: GMEM B after ixdl.make_sme_gmem_tensor + fx.zipped_divide(..., tile_smem_B);
             issue_b_warp slices (cta_n, cta_k) per chunk.
         g2s_sme: Copy atoms, swizzle, and smem major from mr_g2s_sme_config.
-        smem_base: Dynamic shared base pointer (recast to elem_dtype).
+        smem_a: Shared A buffer for this pipeline stage (f16 shared pointer).
+        smem_b: Shared B buffer for this pipeline stage (f16 shared pointer).
         elem_dtype: Operand element type for copy_atom_call and smem views.
         bm: CTA A-tile M extent (one block M slice, not full problem M).
         bn: CTA B-tile N extent (one block N slice).
         bk: CTA K-tile extent for this K-step (not full problem K).
-        stage_base: Smem element offset where this pipeline stage's A tile starts (Int32);
-            B tile follows at stage_base + bm * bk.
         geom: MrOperandGeom; supplies vpr and cta_chunk_elems for chunk grid.
         commit: If True, commit the async copy group after A and B issues.
     """
@@ -319,12 +315,11 @@ def mr_hgemm_g2s_issue_operands(
         a_per_warp=a_per_warp,
         a_cta_gmem_view=a_cta_gmem_view,
         g2s_sme=g2s_sme,
-        smem_base=smem_base,
+        smem_a=smem_a,
         elem_dtype=elem_dtype,
         bm=bm,
         bn=bn,
         bk=bk,
-        stage_base=stage_base,
         geom=geom,
     )
     mr_hgemm_g2s_issue_b_warp(
@@ -334,12 +329,11 @@ def mr_hgemm_g2s_issue_operands(
         b_per_warp=b_per_warp,
         b_cta_gmem_view=b_cta_gmem_view,
         g2s_sme=g2s_sme,
-        smem_base=smem_base,
+        smem_b=smem_b,
         elem_dtype=elem_dtype,
         bm=bm,
         bn=bn,
         bk=bk,
-        stage_base=stage_base,
         geom=geom,
     )
     if fx.const_expr(commit):
