@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG BASE_IMAGE=ubuntu:24.04
 FROM ${BASE_IMAGE}
 
@@ -46,19 +47,17 @@ ARG COREX_TORCH_WHEEL_MD5
 ARG COREX_TORCH_WHEEL_NAME
 ARG SKIP_COREX_TORCH_INSTALL=0
 
-COPY .github/docker/corex_torch.whl /tmp/corex_torch.whl
-
-RUN set -eux; \
+RUN --mount=type=bind,source=.github/docker/corex_torch.whl,target=/tmp/corex_torch.whl,readonly \
+    set -eux; \
     if [ "${SKIP_COREX_TORCH_INSTALL}" = "1" ]; then \
       echo "skip CoreX torch install and reuse torch from base image"; \
-      rm -f /tmp/corex_torch.whl; \
     else \
       test -n "${COREX_TORCH_WHEEL_MD5}"; \
       test -n "${COREX_TORCH_WHEEL_NAME}"; \
       echo "${COREX_TORCH_WHEEL_MD5}  /tmp/corex_torch.whl" | md5sum -c -; \
       install -m 0644 /tmp/corex_torch.whl "/tmp/${COREX_TORCH_WHEEL_NAME}"; \
       pip install --no-cache-dir --retries 10 --timeout 180 "/tmp/${COREX_TORCH_WHEEL_NAME}"; \
-      rm -f /tmp/corex_torch.whl "/tmp/${COREX_TORCH_WHEEL_NAME}"; \
+      rm -f "/tmp/${COREX_TORCH_WHEEL_NAME}"; \
     fi
 
 WORKDIR /workspace
