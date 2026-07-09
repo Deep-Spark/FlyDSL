@@ -89,6 +89,10 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
             fx.PointerType.get(fx_dtype.ir_type, fx.AddressSpace.Shared),
             fx.get_dyn_shared(),
         )
+        smem_b_base = fx.add_offset(
+            smem_elem_base,
+            fx.make_int_tuple(fx.Int32(brick_m * brick_k)),
+        )
         g2s_sme = mr_g2s_sme_config(
             a_mn_major=a_mn_major,
             b_mn_major=b_mn_major,
@@ -128,12 +132,12 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
             a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
             b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
             g2s_sme=g2s_sme,
-            smem_base=smem_elem_base,
+            smem_a=smem_elem_base,
+            smem_b=smem_b_base,
             elem_dtype=fx_dtype,
             bm=brick_m,
             bn=brick_n,
             bk=brick_k,
-            stage_base=fx.Int32(0),
             geom=geom,
         )
         ixdl.cp_async_wait_group(0)
@@ -155,9 +159,8 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
                     b_mn_major=b_mn_major,
                     mma_m=0,
                     mma_k=mma_k,
-                    stage_base=fx.Int32(0),
                     g2s_sme=g2s_sme,
-                    smem_base=smem_elem_base,
+                    smem_a=smem_elem_base,
                     elem_dtype=fx_dtype,
                     warp_m_id=warp_m_id,
                     warp_atoms_m=STAGED_WARP_ATOMS_M,
@@ -244,6 +247,10 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
             fx.PointerType.get(fx_dtype.ir_type, fx.AddressSpace.Shared),
             fx.get_dyn_shared(),
         )
+        smem_b_base = fx.add_offset(
+            smem_elem_base,
+            fx.make_int_tuple(fx.Int32(brick_m * brick_k)),
+        )
         g2s_sme = mr_g2s_sme_config(
             a_mn_major=a_mn_major,
             b_mn_major=b_mn_major,
@@ -283,12 +290,12 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
             a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
             b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
             g2s_sme=g2s_sme,
-            smem_base=smem_elem_base,
+            smem_a=smem_elem_base,
+            smem_b=smem_b_base,
             elem_dtype=fx_dtype,
             bm=brick_m,
             bn=brick_n,
             bk=brick_k,
-            stage_base=fx.Int32(0),
             geom=geom,
         )
         ixdl.cp_async_wait_group(0)
@@ -310,9 +317,8 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
                     b_mn_major=b_mn_major,
                     mma_n=0,
                     mma_k=mma_k,
-                    stage_base=fx.Int32(0),
                     g2s_sme=g2s_sme,
-                    smem_base=smem_elem_base,
+                    smem_b=smem_b_base,
                     elem_dtype=fx_dtype,
                     warp_n_id=warp_n_id,
                     warp_atoms_n=STAGED_WARP_ATOMS_N,
@@ -398,6 +404,10 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
             fx.PointerType.get(fx_dtype.ir_type, fx.AddressSpace.Shared),
             fx.get_dyn_shared(),
         )
+        smem_b_base = fx.add_offset(
+            smem_elem_base,
+            fx.make_int_tuple(fx.Int32(brick_m * brick_k)),
+        )
         g2s_sme = mr_g2s_sme_config(
             a_mn_major=a_mn_major,
             b_mn_major=b_mn_major,
@@ -437,12 +447,12 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
             a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
             b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
             g2s_sme=g2s_sme,
-            smem_base=smem_elem_base,
+            smem_a=smem_elem_base,
+            smem_b=smem_b_base,
             elem_dtype=fx_dtype,
             bm=brick_m,
             bn=brick_n,
             bk=brick_k,
-            stage_base=fx.Int32(0),
             geom=geom,
         )
         ixdl.cp_async_wait_group(0)
@@ -476,12 +486,11 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
             for mma_k in fx.range_constexpr(ki_slices):
                 smem_a_tile = mr_hgemm_s2r_a_tile(
                     a_mn_major=a_mn_major,
-            b_mn_major=b_mn_major,
+                    b_mn_major=b_mn_major,
                     mma_m=0,
                     mma_k=mma_k,
-                    stage_base=fx.Int32(0),
                     g2s_sme=g2s_sme,
-                    smem_base=smem_elem_base,
+                    smem_a=smem_elem_base,
                     elem_dtype=fx_dtype,
                     warp_m_id=warp_m_id,
                     warp_atoms_m=STAGED_WARP_ATOMS_M,
@@ -492,12 +501,11 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
                 )
                 smem_b_tile = mr_hgemm_s2r_b_tile(
                     a_mn_major=a_mn_major,
-            b_mn_major=b_mn_major,
+                    b_mn_major=b_mn_major,
                     mma_n=0,
                     mma_k=mma_k,
-                    stage_base=fx.Int32(0),
                     g2s_sme=g2s_sme,
-                    smem_base=smem_elem_base,
+                    smem_b=smem_b_base,
                     elem_dtype=fx_dtype,
                     warp_n_id=warp_n_id,
                     warp_atoms_n=STAGED_WARP_ATOMS_N,
