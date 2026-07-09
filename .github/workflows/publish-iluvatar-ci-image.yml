@@ -263,8 +263,8 @@ jobs:
             echo "::error::invalid CI_DEVICE_IMAGE_REF format: ${FALLBACK_IMAGE_REF}"
             exit 1
           fi
-          if ! docker pull "${FALLBACK_IMAGE_REF}" >/dev/null; then
-            echo "::error::unable to pull fallback base image: ${FALLBACK_IMAGE_REF}"
+          if ! docker buildx imagetools inspect "${FALLBACK_IMAGE_REF}" >/dev/null 2>&1; then
+            echo "::error::unable to inspect fallback base image: ${FALLBACK_IMAGE_REF}"
             exit 1
           fi
 
@@ -304,6 +304,116 @@ jobs:
           echo "digest=${fallback_digest}" >> "${GITHUB_OUTPUT}"
           echo "image_ref=${FALLBACK_IMAGE_REF}" >> "${GITHUB_OUTPUT}"
 
+      - name: Resolve image size
+        id: image_size
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest != '' && steps.build_retry.outputs.digest || steps.build_prev_torch.outputs.digest != '' && steps.build_prev_torch.outputs.digest || steps.fallback.outputs.digest }}
+          FALLBACK_IMAGE_REF: ${{ steps.fallback.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          image_ref=""
+          if [ -n "${DIGEST}" ]; then
+            image_ref="${IMAGE}@${DIGEST}"
+          elif [ -n "${FALLBACK_IMAGE_REF}" ]; then
+            image_ref="${FALLBACK_IMAGE_REF}"
+          fi
+
+          size_bytes=""
+          size_human="n/a"
+          if [ -n "${image_ref}" ]; then
+            # Query remote manifest directly from registry.
+            size_bytes="$(IMAGE_REF="${image_ref}" python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          image_ref = os.environ["IMAGE_REF"]
+          def inspect_raw(ref: str):
+              try:
+                  result = subprocess.run(
+                      ["docker", "buildx", "imagetools", "inspect", ref, "--raw"],
+                      check=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                  )
+              except Exception:
+                  return None
+              try:
+                  return json.loads(result.stdout)
+              except json.JSONDecodeError:
+                  return None
+
+          def sum_manifest_layers(obj: dict) -> int:
+              layers = obj.get("layers")
+              if not isinstance(layers, list):
+                  return 0
+              return sum(
+                  layer.get("size", 0)
+                  for layer in layers
+                  if isinstance(layer, dict) and isinstance(layer.get("size"), int)
+              )
+
+          root = inspect_raw(image_ref)
+          if not isinstance(root, dict):
+              print("")
+              sys.exit(0)
+
+          total = sum_manifest_layers(root)
+          if total > 0:
+              print(total)
+              sys.exit(0)
+
+          manifests = root.get("manifests")
+          if not isinstance(manifests, list):
+              print("")
+              sys.exit(0)
+
+          # OCI index: walk real platform manifests and ignore attestation-only entries.
+          repo_ref = image_ref.split("@", 1)[0]
+          total = 0
+          for m in manifests:
+              if not isinstance(m, dict):
+                  continue
+              digest = m.get("digest")
+              if not isinstance(digest, str) or not digest.startswith("sha256:"):
+                  continue
+              platform = m.get("platform")
+              if isinstance(platform, dict):
+                  if platform.get("os") == "unknown" and platform.get("architecture") == "unknown":
+                      continue
+              child = inspect_raw(f"{repo_ref}@{digest}")
+              if isinstance(child, dict):
+                  total += sum_manifest_layers(child)
+
+          print(total if total > 0 else "")
+          PY
+            )"
+          fi
+
+          if [[ "${size_bytes}" =~ ^[0-9]+$ ]]; then
+            size_human="$(SIZE_BYTES="${size_bytes}" python3 - <<'PY'
+          import os
+          size = int(os.environ["SIZE_BYTES"])
+          units = ["B", "KB", "MB", "GB", "TB"]
+          value = float(size)
+          idx = 0
+          while value >= 1024.0 and idx < len(units) - 1:
+              value /= 1024.0
+              idx += 1
+          print(f"{value:.2f}{units[idx]}")
+          PY
+            )"
+          else
+            size_bytes="n/a"
+          fi
+
+          echo "image_ref=${image_ref}" >> "${GITHUB_OUTPUT}"
+          echo "size_bytes=${size_bytes}" >> "${GITHUB_OUTPUT}"
+          echo "size_human=${size_human}" >> "${GITHUB_OUTPUT}"
+
       - name: Print digest summary
         run: |
           {
@@ -317,6 +427,7 @@ jobs:
             echo "- image: \`${{ steps.meta.outputs.image }}\`"
             echo "- tag: \`${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}\`"
             echo "- reason: \`${{ env.REASON_INPUT != '' && env.REASON_INPUT || 'scheduled publish (02:00 CST) or manual dispatch' }}\`"
+            echo "- image size: \`${{ steps.image_size.outputs.size_human }}\` (\`${{ steps.image_size.outputs.size_bytes }} bytes\`)"
             if [ "${{ steps.wheel.outputs.wheel_found }}" = "true" ]; then
               echo "- wheel: \`${{ steps.wheel.outputs.wheel_url }}\`"
               echo "- wheel md5: \`${{ steps.wheel.outputs.wheel_md5 }}\`"
