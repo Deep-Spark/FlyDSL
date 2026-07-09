@@ -118,6 +118,7 @@ _CACHE_INVALIDATING_ENV_VARS = (
     "FLYDSL_COMPILE_OPT_LEVEL",
     "FLYDSL_COMPILE_BACKEND",
     "FLYDSL_COMPILE_LLVM_DIR",
+    "FLYDSL_ILUVATAR_PREBUILT_BINARY",
     "FLYDSL_DEBUG_ENABLE_DEBUG_INFO",
     "FLYDSL_EXTRA_SOURCE_DIRS",
 )
@@ -137,14 +138,45 @@ except Exception:
 _CACHE_INVALIDATING_ENV_VARS_ENCODED = tuple((n, os.fsencode(n)) for n in _CACHE_INVALIDATING_ENV_VARS)
 
 
-def _cache_invalidating_env_values() -> tuple:
-    # Re-read on every call: users may mutate os.environ mid-process (e.g.
-    # toggling FLYDSL_COMPILE_OPT_LEVEL between runs) and any caching here
-    # would freeze the first observed values into every subsequent cache key.
+@lru_cache(maxsize=8)
+def _prebuilt_binary_file_hash(path: str, size: int, mtime_ns: int) -> str:
+    del size, mtime_ns  # included in the cache key
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _prebuilt_binary_cache_values() -> tuple:
+    raw = os.environ.get("FLYDSL_ILUVATAR_PREBUILT_BINARY", "").strip()
+    if not raw:
+        return ()
+    path = Path(raw).expanduser()
+    try:
+        resolved = path.resolve()
+        st = resolved.stat()
+        digest = _prebuilt_binary_file_hash(str(resolved), st.st_size, st.st_mtime_ns)
+    except OSError as exc:
+        return (("FLYDSL_ILUVATAR_PREBUILT_BINARY_ERROR", str(exc)),)
+    return (("FLYDSL_ILUVATAR_PREBUILT_BINARY_SHA256", digest),)
+
+
+def _raw_cache_invalidating_env_values() -> tuple:
     if _ENABLE_ENV_FAST_READ:
         data = os.environ._data
         return tuple((n, os.fsdecode(data[b]) if b in data else "") for n, b in _CACHE_INVALIDATING_ENV_VARS_ENCODED)
     return tuple((n, os.environ.get(n, "")) for n in _CACHE_INVALIDATING_ENV_VARS)
+
+
+def _cache_invalidating_env_values() -> tuple:
+    # Re-read on every call: users may mutate os.environ mid-process (e.g.
+    # toggling FLYDSL_COMPILE_OPT_LEVEL between runs) and any caching here
+    # would freeze the first observed values into every subsequent cache key.
+    return _raw_cache_invalidating_env_values() + _prebuilt_binary_cache_values()
 
 
 def _snapshot_global_value(val, *, stable, _path=()):
@@ -407,6 +439,10 @@ def _flydsl_key_cached(use_external_binary: bool, llvm_dir: str, extra_source_di
 
 def _use_external_binary_codegen() -> bool:
     return bool(env.compile.llvm_dir.strip())
+
+
+def _use_prebuilt_binary_codegen() -> bool:
+    return bool(env.compile.iluvatar_prebuilt_binary.strip())
 
 
 def _get_underlying_func(obj):
@@ -747,6 +783,7 @@ class PipelineConfig:
     binary_fragment: Optional[str]
     llvm_opts: Optional[dict]
     external: bool
+    prebuilt: bool
 
 
 def _pipeline_fragments_for_mode(backend) -> PipelineConfig:
@@ -755,6 +792,23 @@ def _pipeline_fragments_for_mode(backend) -> PipelineConfig:
 
     hints = CompilationContext.get_compile_hints()
     llvm_opts = hints.get("llvm_options")
+    if _use_external_binary_codegen() and _use_prebuilt_binary_codegen():
+        raise RuntimeError(
+            "FLYDSL_COMPILE_LLVM_DIR external codegen and FLYDSL_ILUVATAR_PREBUILT_BINARY "
+            "cannot be used at the same time."
+        )
+    if _use_prebuilt_binary_codegen():
+        if backend.target.backend != "iluvatar":
+            raise RuntimeError("FLYDSL_ILUVATAR_PREBUILT_BINARY is only supported with the iluvatar backend.")
+        pre_binary_fragments, binary_fragment = backend.external_binary_pipeline_fragments(compile_hints=hints)
+        return PipelineConfig(
+            fragments=[*pre_binary_fragments, binary_fragment],
+            pre_binary=pre_binary_fragments,
+            binary_fragment=binary_fragment,
+            llvm_opts=llvm_opts,
+            external=False,
+            prebuilt=True,
+        )
     if _use_external_binary_codegen():
         pre_binary_fragments, binary_fragment = backend.external_binary_pipeline_fragments(compile_hints=hints)
         return PipelineConfig(
@@ -763,6 +817,7 @@ def _pipeline_fragments_for_mode(backend) -> PipelineConfig:
             binary_fragment=binary_fragment,
             llvm_opts=llvm_opts,
             external=True,
+            prebuilt=False,
         )
 
     fragments = backend.pipeline_fragments(compile_hints=hints)
@@ -772,6 +827,7 @@ def _pipeline_fragments_for_mode(backend) -> PipelineConfig:
         binary_fragment=None,
         llvm_opts=llvm_opts,
         external=False,
+        prebuilt=False,
     )
 
 
@@ -804,10 +860,11 @@ class MlirCompiler:
         binary_fragment = cfg.binary_fragment
         llvm_opts = cfg.llvm_opts
         external_binary = cfg.external
+        prebuilt_binary = cfg.prebuilt
 
-        if external_binary and link_libs:
+        if (external_binary or prebuilt_binary) and link_libs:
             raise RuntimeError(
-                "FLYDSL_COMPILE_LLVM_DIR external codegen does not support extern link_libs yet; "
+                "External/prebuilt device binary codegen does not support extern link_libs yet; "
                 "use embedded codegen for kernels that require #fly.explicit_module."
             )
 
@@ -841,7 +898,7 @@ class MlirCompiler:
                 asm_for_isa = None
                 llir = None
                 stage_num_base = 1
-                dump_fragments = pre_binary_fragments if external_binary else fragments
+                dump_fragments = pre_binary_fragments if (external_binary or prebuilt_binary) else fragments
                 for idx, frag in enumerate(dump_fragments):
                     if frag.strip().startswith("gpu-module-to-binary"):
                         llir = _extract_llvm_ir(module)
@@ -884,6 +941,21 @@ class MlirCompiler:
                     )
                     print(f"[flydsl.compile] dump {stage_name}_output -> {dump_dir / f'{stage_name}_output.mlir'}")
                     next_stage += 1
+                elif prebuilt_binary:
+                    from .external_llvm import run_prebuilt_binary_codegen
+
+                    llir = _extract_llvm_ir(module)
+                    stage_name = f"{next_stage:02d}_prebuilt_binary"
+                    run_prebuilt_binary_codegen(
+                        module,
+                        env.compile.iluvatar_prebuilt_binary,
+                        target_attr=backend.gpu_module_targets()[0],
+                        work_dir=dump_dir,
+                        stage_prefix=stage_name,
+                    )
+                    module.operation.verify()
+                    print(f"[flydsl.compile] dump {stage_name}_output -> {dump_dir / f'{stage_name}_output.mlir'}")
+                    next_stage += 1
 
                 if llir is not None:
                     ll_name = f"{next_stage:02d}_llvm_ir"
@@ -892,7 +964,7 @@ class MlirCompiler:
                     next_stage += 1
 
                 if asm_for_isa is not None:
-                    if not external_binary:
+                    if not (external_binary or prebuilt_binary):
                         isa_stage = f"{next_stage:02d}_final_isa"
                         isa_out = _dump_isa(
                             dump_dir=dump_dir,
@@ -903,6 +975,8 @@ class MlirCompiler:
                         )
                         if isa_out is not None:
                             print(f"[flydsl.compile] dump {isa_stage} -> {isa_out}")
+                    elif prebuilt_binary:
+                        print("[flydsl.compile] ISA dump skipped (prebuilt binary mode)")
                     else:
                         print("[flydsl.compile] ISA dump skipped (external LLVM mode)")
             else:
@@ -927,6 +1001,21 @@ class MlirCompiler:
                         module,
                         binary_fragment,
                         llvm_options=llvm_opts,
+                    )
+                    module.operation.verify()
+                elif prebuilt_binary:
+                    from .external_llvm import run_prebuilt_binary_codegen
+
+                    _run_pipeline(
+                        module,
+                        pre_binary_fragments,
+                        verifier=env.debug.enable_verifier,
+                        print_after_all=env.debug.print_after_all,
+                    )
+                    run_prebuilt_binary_codegen(
+                        module,
+                        env.compile.iluvatar_prebuilt_binary,
+                        target_attr=backend.gpu_module_targets()[0],
                     )
                     module.operation.verify()
                 else:

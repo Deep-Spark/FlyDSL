@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-from typing import List
+from typing import List, Tuple
 
 from ...utils import env
 from .base import BaseBackend, GPUTarget
@@ -61,6 +61,10 @@ class IluvatarBackend(BaseBackend):
             "reconcile-unrealized-casts",
             "gpu-module-to-binary{format=fatbin}",
         ]
+
+    def external_binary_pipeline_fragments(self, *, compile_hints: dict) -> Tuple[List[str], str]:
+        fragments = self.pipeline_fragments(compile_hints=compile_hints)
+        return fragments[:-1], fragments[-1]
 
     def gpu_module_targets(self) -> List[str]:
         return [f'#ixdl.target<chip = "{self.target.arch}">']

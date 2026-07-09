@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
 from functools import lru_cache
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from .._mlir import ir
+from .._mlir.dialects import gpu
 from ..utils import env
 
 
@@ -114,6 +116,95 @@ def _replace_gpu_module_with_binary_op(module: ir.Module, external_binary_module
 
     ir.InsertionPoint(gpu_module).insert(gpu_binary.clone())
     gpu_module.erase()
+
+
+def _is_elf_relocatable(blob: bytes) -> bool:
+    """Return True when *blob* looks like a 32/64-bit little-endian ELF ET_REL object."""
+    if len(blob) < 18 or blob[:4] != b"\x7fELF":
+        return False
+    if blob[5] != 1:  # EI_DATA = little endian
+        return False
+    return int.from_bytes(blob[16:18], "little") == 1  # e_type = ET_REL
+
+
+def _link_iluvatar_relocatable_object(object_path: Path) -> bytes:
+    """Link an Iluvatar relocatable object the same way IXDL moduleToObject does."""
+    lld = shutil.which("ld.lld")
+    if lld is None:
+        raise ExternalLLVMError(
+            "FLYDSL_ILUVATAR_PREBUILT_BINARY points to a relocatable ELF object, "
+            "but ld.lld was not found in PATH. Link it first or add the Iluvatar "
+            "toolchain bin directory to PATH."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="flydsl_iluvatar_prebuilt_") as tmp:
+        output_path = Path(tmp) / "prebuilt-linked.ixbin"
+        cmd = [
+            lld,
+            "-flavor",
+            "gnu",
+            "--no-check-dynamic-relocations",
+            str(object_path),
+            "-o",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired as exc:
+            raise ExternalLLVMError(
+                "Linking FLYDSL_ILUVATAR_PREBUILT_BINARY timed out after 600s.\n"
+                f"command: {' '.join(cmd)}"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise ExternalLLVMError(
+                "Linking FLYDSL_ILUVATAR_PREBUILT_BINARY failed.\n"
+                f"command: {' '.join(cmd)}\n"
+                f"stdout:\n{exc.stdout}\n"
+                f"stderr:\n{exc.stderr}"
+            ) from exc
+        return output_path.read_bytes()
+
+
+def _read_iluvatar_prebuilt_binary(path: Path) -> bytes:
+    blob = path.read_bytes()
+    if not blob:
+        raise ExternalLLVMError(f"FLYDSL_ILUVATAR_PREBUILT_BINARY is empty: {path}")
+    if _is_elf_relocatable(blob):
+        return _link_iluvatar_relocatable_object(path)
+    return blob
+
+
+def run_prebuilt_binary_codegen(
+    module: ir.Module,
+    binary_path: str,
+    *,
+    target_attr: str,
+    work_dir: Optional[Path] = None,
+    stage_prefix: str = "prebuilt_binary",
+) -> None:
+    """Replace the bundled gpu.module with a gpu.binary backed by a user-supplied blob."""
+    path = Path(binary_path).expanduser().resolve()
+    if not path.is_file():
+        raise ExternalLLVMError(f"FLYDSL_ILUVATAR_PREBUILT_BINARY does not point to a file: {path}")
+
+    gpu_module = _single_top_level_op(module, "gpu.module")
+    module_name = _symbol_name(gpu_module)
+    blob = _read_iluvatar_prebuilt_binary(path)
+
+    loc = ir.Location.unknown(module.context)
+    binary_module = ir.Module.create(loc=loc)
+    target = ir.Attribute.parse(target_attr, context=module.context)
+    obj = gpu.ObjectAttr.get(target, gpu.CompilationTarget.Fatbin, blob)
+    objects = ir.ArrayAttr.get([obj], context=module.context)
+    offloading = ir.Attribute.parse("#gpu.select_object", context=module.context)
+    with ir.InsertionPoint.at_block_begin(binary_module.body):
+        gpu.BinaryOp(module_name, objects, offloadingHandler=offloading, loc=loc)
+
+    _replace_gpu_module_with_binary_op(module, binary_module)
+    if work_dir is not None:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        output_path = work_dir / f"{stage_prefix}_output.mlir"
+        output_path.write_text(module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info), encoding="utf-8")
 
 
 def run_external_binary_codegen(

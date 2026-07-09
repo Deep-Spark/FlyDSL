@@ -230,6 +230,11 @@ class CompileEnvManager(EnvManager):
     arch = OptStr("", env_var="ARCH", description="Override target GPU architecture (e.g. gfx942, gfx950)")
     backend = OptStr("rocm", description="GPU compile backend id (e.g. rocm)")
     llvm_dir = OptStr("", description="External LLVM/MLIR install prefix for final code generation")
+    iluvatar_prebuilt_binary = OptStr(
+        "",
+        env_var="FLYDSL_ILUVATAR_PREBUILT_BINARY",
+        description="Iluvatar-only: replace generated device binary with this prebuilt binary/object path",
+    )
 
 
 class DebugEnvManager(EnvManager):
