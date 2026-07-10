@@ -135,6 +135,9 @@ jobs:
 
           logs_url = f"https://api.github.com/repos/{repo}/actions/runs/{candidate}/logs"
           raw_zip = api_get(logs_url)
+          # Job log downloads prefix each line with a timestamp like:
+          #   2026-07-07T19:57:44.3756419Z PERF_METRIC_JSON={...}
+          ts_prefix_re = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z\s+")
           marker_re = re.compile(r"^PERF_METRIC_JSON=(\{.*\})$")
           found = None
 
@@ -145,7 +148,8 @@ jobs:
                   except Exception:
                       continue
                   for line in content.splitlines():
-                      m = marker_re.match(line.strip())
+                      text = ts_prefix_re.sub("", line.strip(), count=1)
+                      m = marker_re.match(text)
                       if not m:
                           continue
                       try:
