@@ -313,6 +313,10 @@ def _compile_multibrick_async_copy_dump_kernel(
             fx.PointerType.get(fx_dtype.ir_type, fx.AddressSpace.Shared),
             fx.get_dyn_shared(),
         )
+        smem_b_base = fx.add_offset(
+            smem_elem_base,
+            fx.make_int_tuple(fx.Int32(brick_m * brick_k)),
+        )
 
         g2s_sme = mr_g2s_sme_config(
             a_mn_major=a_mn_major,
@@ -356,12 +360,12 @@ def _compile_multibrick_async_copy_dump_kernel(
             a_cta_gmem_view=a_cta_gmem_view,
             b_cta_gmem_view=b_cta_gmem_view,
             g2s_sme=g2s_sme,
-            smem_base=smem_elem_base,
+            smem_a=smem_elem_base,
+            smem_b=smem_b_base,
             elem_dtype=fx_dtype,
             bm=brick_m,
             bn=brick_n,
             bk=brick_k,
-            stage_base=fx.Int32(0),
             geom=geom,
         )
         ixdl.cp_async_wait_group(0)
