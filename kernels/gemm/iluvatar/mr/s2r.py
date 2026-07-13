@@ -4,17 +4,22 @@
 """Reusable Iluvatar MR GEMM S2R (shared -> MMA register) helpers.
 
 S2R loads smem into MMA register fragments via make_tiled_copy_A/B.
-mr_hgemm_s2r_*_tile builds the smem source view; mr_hgemm_s2r_copy_* runs the copy.
-mr_hgemm_s2r_load_mma_k loads all warp A/B fragments for one mma_k step.
+mr_gemm_s2r_*_tile builds the smem source view; mr_gemm_s2r_copy_* runs the copy.
+mr_gemm_s2r_load_mma_k loads all warp A/B fragments for one mma_k step.
 """
 
 import flydsl.expr as fx
 
-from kernels.gemm.iluvatar.mr.common import MrOperandGeom
-from kernels.gemm.iluvatar.mr.operand_copy import SmeConfig, mr_cta_smem_grid, mr_sme_shared_view
+from kernels.gemm.iluvatar.mr.common import SMEM_ROWS, MrOperandGeom
+from kernels.gemm.iluvatar.mr.operand_copy import (
+    SmeConfig,
+    mr_cta_smem_grid,
+    mr_sme_shared_view,
+    mr_sme_shared_view_k_spanning,
+)
 
 
-def mr_hgemm_s2r_copy_a(*, copy_atom, thr_copy_a, thr_mma, smem_a_tile):
+def mr_gemm_s2r_copy_a(*, copy_atom, thr_copy_a, thr_mma, smem_a_tile):
     """S2R: shared A tile -> MMA A register fragment via ``make_tiled_copy_A``."""
     frag_a = thr_mma.make_fragment_A(smem_a_tile)
     fx.copy(
@@ -26,7 +31,7 @@ def mr_hgemm_s2r_copy_a(*, copy_atom, thr_copy_a, thr_mma, smem_a_tile):
     return frag_a
 
 
-def mr_hgemm_s2r_copy_b(*, copy_atom, thr_copy_b, thr_mma, smem_b_tile):
+def mr_gemm_s2r_copy_b(*, copy_atom, thr_copy_b, thr_mma, smem_b_tile):
     """S2R: shared B tile -> MMA B register fragment via ``make_tiled_copy_B``."""
     frag_b = thr_mma.make_fragment_B(smem_b_tile)
     fx.copy(
@@ -38,7 +43,7 @@ def mr_hgemm_s2r_copy_b(*, copy_atom, thr_copy_b, thr_mma, smem_b_tile):
     return frag_b
 
 
-def mr_hgemm_s2r_a_tile(
+def mr_gemm_s2r_a_tile(
     *,
     a_mn_major: bool,
     b_mn_major: bool,
@@ -58,7 +63,7 @@ def mr_hgemm_s2r_a_tile(
 
     Returns an atom_m x atom_k smem view for make_tiled_copy_A. Uses sme_row_* to
     pick the in-row sub-slice when k-major (sme_row_k_sub) or mn-major (sme_row_m_sub).
-    Shared parameters: see mr_hgemm_s2r_load_mma_k. Operand-specific: mma_m, warp_m_id,
+    Shared parameters: see mr_gemm_s2r_load_mma_k. Operand-specific: mma_m, warp_m_id,
     warp_atoms_m.
     """
     cta_grid = mr_cta_smem_grid(
@@ -75,28 +80,40 @@ def mr_hgemm_s2r_a_tile(
     warp_a_base = fx.Int32(warp_m_id) * fx.Int32(warp_atoms_m * cta_grid.cta_a_k_cnt * cta_grid.cta_chunk_elems)
 
     if fx.const_expr(a_mn_major):
-        cta_k_blk = mma_k
+        # mn-major: an SME brick holds K=SMEM_ROWS, so one MMA K-atom spans
+        # atom_k // SMEM_ROWS contiguous K-bricks (i8: 32//16=2; f16: 16//16=1).
+        cta_k_blk = mma_k * (geom.atom_k // SMEM_ROWS)
         cta_m_atom = fx.Int32(warp_m_id) * fx.Int32(warp_atoms_m) + fx.Int32(mma_m)
         cta_m_blk = cta_m_atom // fx.Int32(sme_row_m)
         sme_row_sub = cta_m_atom % fx.Int32(sme_row_m)
         linear = cta_m_blk * fx.Int32(cta_grid.cta_a_k_cnt) + fx.Int32(cta_k_blk)
         off = linear * fx.Int32(cta_grid.cta_chunk_elems)
+        if fx.const_expr(geom.atom_k > SMEM_ROWS):
+            smem_view = mr_sme_shared_view_k_spanning(
+                smem_a,
+                off,
+                g2s_sme.a_sme_sw,
+                elem_dtype,
+                major=g2s_sme.a_smem_major,
+                mn_extent=geom.values_per_sme_row,
+                k_total=geom.atom_k,
+            )
+        else:
+            smem_view = mr_sme_shared_view(
+                smem_a, off, g2s_sme.a_sme_sw, elem_dtype, major=g2s_sme.a_smem_major
+            )
     else:
         cta_k_blk = mma_k // sme_row_k
         sme_row_sub = mma_k % sme_row_k
         off = warp_a_base + fx.Int32((mma_m * cta_grid.cta_a_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
+        smem_view = mr_sme_shared_view(
+            smem_a, off, g2s_sme.a_sme_sw, elem_dtype, major=g2s_sme.a_smem_major
+        )
 
-    smem_view = mr_sme_shared_view(
-        smem_a,
-        off,
-        g2s_sme.a_sme_sw,
-        elem_dtype,
-        major=g2s_sme.a_smem_major,
-    )
     return fx.slice(fx.zipped_divide(smem_view, tile_atom_a), (None, sme_row_sub))
 
 
-def mr_hgemm_s2r_b_tile(
+def mr_gemm_s2r_b_tile(
     *,
     a_mn_major: bool,
     b_mn_major: bool,
@@ -115,7 +132,7 @@ def mr_hgemm_s2r_b_tile(
     """Build the shared B operand tile view for one warp atom (mma_n) at mma_k.
 
     B smem uses ``smem_b`` directly. Same sme_row_* sub-slice rules as A.
-    Shared parameters: see mr_hgemm_s2r_load_mma_k. Operand-specific: mma_n, warp_n_id,
+    Shared parameters: see mr_gemm_s2r_load_mma_k. Operand-specific: mma_n, warp_n_id,
     warp_atoms_n.
     """
     cta_grid = mr_cta_smem_grid(
@@ -132,28 +149,42 @@ def mr_hgemm_s2r_b_tile(
     warp_b_base = fx.Int32(warp_n_id) * fx.Int32(warp_atoms_n * cta_grid.cta_b_k_cnt * cta_grid.cta_chunk_elems)
 
     if fx.const_expr(b_mn_major):
-        cta_k_blk = mma_k
+        # mn-major: an SME brick holds K=SMEM_ROWS, so one MMA K-atom spans
+        # atom_k // SMEM_ROWS contiguous K-bricks (i8: 32//16=2; f16: 16//16=1).
+        cta_k_blk = mma_k * (geom.atom_k // SMEM_ROWS)
         cta_n_atom = fx.Int32(warp_n_id) * fx.Int32(warp_atoms_n) + fx.Int32(mma_n)
         cta_n_blk = cta_n_atom // fx.Int32(sme_row_n)
         sme_row_sub = cta_n_atom % fx.Int32(sme_row_n)
-        linear = fx.Int32(cta_k_blk) * fx.Int32(cta_grid.cta_b_n_cnt) + cta_n_blk
+        # n-outer / k-inner so an atom's K-bricks are contiguous (i8 k_spanning;
+        # f16 uses the same order to match the g2s write).
+        linear = cta_n_blk * fx.Int32(cta_grid.cta_b_k_cnt) + fx.Int32(cta_k_blk)
         off = linear * fx.Int32(cta_grid.cta_chunk_elems)
+        if fx.const_expr(geom.atom_k > SMEM_ROWS):
+            smem_view = mr_sme_shared_view_k_spanning(
+                smem_b,
+                off,
+                g2s_sme.b_sme_sw,
+                elem_dtype,
+                major=g2s_sme.b_smem_major,
+                mn_extent=geom.values_per_sme_row,
+                k_total=geom.atom_k,
+            )
+        else:
+            smem_view = mr_sme_shared_view(
+                smem_b, off, g2s_sme.b_sme_sw, elem_dtype, major=g2s_sme.b_smem_major
+            )
     else:
         cta_k_blk = mma_k // sme_row_k
         sme_row_sub = mma_k % sme_row_k
         off = warp_b_base + fx.Int32((mma_n * cta_grid.cta_b_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
+        smem_view = mr_sme_shared_view(
+            smem_b, off, g2s_sme.b_sme_sw, elem_dtype, major=g2s_sme.b_smem_major
+        )
 
-    smem_view = mr_sme_shared_view(
-        smem_b,
-        off,
-        g2s_sme.b_sme_sw,
-        elem_dtype,
-        major=g2s_sme.b_smem_major,
-    )
     return fx.slice(fx.zipped_divide(smem_view, tile_atom_b), (None, sme_row_sub))
 
 
-def mr_hgemm_s2r_load_mma_k(
+def mr_gemm_s2r_load_mma_k(
     *,
     a_mn_major: bool,
     b_mn_major: bool,
@@ -179,7 +210,7 @@ def mr_hgemm_s2r_load_mma_k(
     """Load all warp A/B MMA operand fragments for one mma_k slice from shared memory.
 
     Loops mma_m in [0, warp_atoms_m) and mma_n in [0, warp_atoms_n); for each pair calls
-    mr_hgemm_s2r_a_tile / _b_tile then mr_hgemm_s2r_copy_a / _copy_b. Returns two lists
+    mr_gemm_s2r_a_tile / _b_tile then mr_gemm_s2r_copy_a / _copy_b. Returns two lists
     indexed by mma_m and mma_n for fx.gemm.
 
     Args:
@@ -207,11 +238,11 @@ def mr_hgemm_s2r_load_mma_k(
     a_frags = []
     for mma_m in fx.range_constexpr(warp_atoms_m):
         a_frags.append(
-            mr_hgemm_s2r_copy_a(
+            mr_gemm_s2r_copy_a(
                 copy_atom=copy_atom_a,
                 thr_copy_a=thr_copy_a,
                 thr_mma=thr_mma,
-                smem_a_tile=mr_hgemm_s2r_a_tile(
+                smem_a_tile=mr_gemm_s2r_a_tile(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_m=mma_m,
@@ -231,11 +262,11 @@ def mr_hgemm_s2r_load_mma_k(
     b_frags = []
     for mma_n in fx.range_constexpr(warp_atoms_n):
         b_frags.append(
-            mr_hgemm_s2r_copy_b(
+            mr_gemm_s2r_copy_b(
                 copy_atom=copy_atom_b,
                 thr_copy_b=thr_copy_b,
                 thr_mma=thr_mma,
-                smem_b_tile=mr_hgemm_s2r_b_tile(
+                smem_b_tile=mr_gemm_s2r_b_tile(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_n=mma_n,

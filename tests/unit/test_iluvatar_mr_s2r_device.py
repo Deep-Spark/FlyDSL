@@ -15,10 +15,10 @@ Stage coverage notes
 --------------------
 
 * The original S2R test hand-packs linear shared memory and never exercises
-  ``mr_hgemm_s2r_a_tile`` / ``mr_hgemm_s2r_b_tile`` against production G2S SME
+  ``mr_gemm_s2r_a_tile`` / ``mr_gemm_s2r_b_tile`` against production G2S SME
   layout.
 * ``test_iluvatar_mr_g2s_s2r_ki_chain_device`` chains production G2S with
-  ``mr_hgemm_s2r_copy_*`` and MMA-coupled fragment readback (warp-00 Ki slices).
+  ``mr_gemm_s2r_copy_*`` and MMA-coupled fragment readback (warp-00 Ki slices).
   Operand A uses a K-major ``partition_D`` layout on Iluvatar; the host reshapes
   with ``.transpose(-1, -2)`` before compare. Operand B uses logical row-major.
   Full A/B together is also covered by ``test_iluvatar_mr_g2s_s2r_mma_warp00_atom_device``.
@@ -38,7 +38,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from kernels.gemm.iluvatar.common import WARP_SIZE  # noqa: E402
 from kernels.gemm.iluvatar.mr.common import ATOM_K_B32, ATOM_K_B16, ATOM_K_B8, ATOM_M, ATOM_N, SMEM_ROWS  # noqa: E402
-from kernels.gemm.iluvatar.mr.s2r import mr_hgemm_s2r_copy_a, mr_hgemm_s2r_copy_b  # noqa: E402
+from kernels.gemm.iluvatar.mr.s2r import mr_gemm_s2r_copy_a, mr_gemm_s2r_copy_b  # noqa: E402
 from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
     STAGED_BRICK_M,
     STAGED_BRICK_N,
@@ -50,7 +50,7 @@ from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
 from tests.unit.iluvatar_mr_staged_kernels import build_mr_g2s_s2r_ki_dump_launch  # noqa: E402
 
 # G2S->S2R chain uses production default k_atoms=2 (bk=32). k_atoms=4 (bk=64) is
-# supported after sme_row_k_slices parameterization in mr_hgemm_s2r_*_tile.
+# supported after sme_row_k_slices parameterization in mr_gemm_s2r_*_tile.
 _G2S_K_ATOMS_VALUES = (2,)
 
 S2R_MAJOR_PATTERNS = ("nt", "nn", "tn", "tt")
@@ -246,13 +246,13 @@ def _compile_s2r_dump_kernel(flyc, fx, ixdl, major_pattern: str, dtype_case):
 
         packed_A = _smem(0, (ATOM_M, mma_k), (mma_k, 1))
         packed_B = _smem(packed_a_elems, (ATOM_N, mma_k), (mma_k, 1))
-        frag_A = mr_hgemm_s2r_copy_a(
+        frag_A = mr_gemm_s2r_copy_a(
             copy_atom=scalar_atom,
             thr_copy_a=thr_copy_A,
             thr_mma=thr_mma,
             smem_a_tile=packed_A,
         )
-        frag_B = mr_hgemm_s2r_copy_b(
+        frag_B = mr_gemm_s2r_copy_b(
             copy_atom=scalar_atom,
             thr_copy_b=thr_copy_B,
             thr_mma=thr_mma,
@@ -349,7 +349,7 @@ _G2S_S2R_CHAIN_CASES = [
 
 @pytest.mark.parametrize("major_pattern,k_atoms,operand", _G2S_S2R_CHAIN_CASES)
 def test_iluvatar_mr_g2s_s2r_ki_chain_device(major_pattern, k_atoms, operand, monkeypatch):
-    """Production G2S -> ``mr_hgemm_s2r_copy_*`` fragment readback for warp-00 Ki slices.
+    """Production G2S -> ``mr_gemm_s2r_copy_*`` fragment readback for warp-00 Ki slices.
 
     Each case builds one dump kernel only (A or B). Mixing both builders in one
     test tickles a FlyDSL JIT cache collision on Iluvatar.

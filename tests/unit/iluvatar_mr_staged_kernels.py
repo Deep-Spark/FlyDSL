@@ -14,13 +14,13 @@ from kernels.gemm.iluvatar.common import WARP_SIZE
 from kernels.gemm.iluvatar.mr.common import ATOM_M, ATOM_N, SMEM_ROWS
 from kernels.gemm.iluvatar.mr.operand_copy import (
     mr_g2s_sme_config,
-    mr_hgemm_g2s_issue_operands,
+    mr_gemm_g2s_issue_operands,
 )
 from kernels.gemm.iluvatar.mr.s2r import (
-    mr_hgemm_s2r_a_tile,
-    mr_hgemm_s2r_b_tile,
-    mr_hgemm_s2r_copy_a,
-    mr_hgemm_s2r_copy_b,
+    mr_gemm_s2r_a_tile,
+    mr_gemm_s2r_b_tile,
+    mr_gemm_s2r_copy_a,
+    mr_gemm_s2r_copy_b,
 )
 from tests.unit.iluvatar_mr_hgemm_test_common import (
     STAGED_WARP_ATOMS_M,
@@ -33,7 +33,7 @@ from tests.unit.iluvatar_mr_hgemm_test_common import (
 def build_mr_g2s_s2r_ki_dump_launch(*, major_pattern: str, k_atoms: int, operand: str):
     """Return (launch, brick_k, ki_slices, dump_elems) for G2S -> S2R fragment dump.
 
-    Uses production ``mr_hgemm_s2r_copy_*`` + ``make_tiled_copy_A/B`` readback (not
+    Uses production ``mr_gemm_s2r_copy_*`` + ``make_tiled_copy_A/B`` readback (not
     scalar smem unpack) so swizzled SME layouts match the MMA path.
 
     ``operand`` is ``"A"`` or ``"B"``. A/B use separate kernels so the JIT cache
@@ -123,7 +123,7 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
-        mr_hgemm_g2s_issue_operands(
+        mr_gemm_g2s_issue_operands(
             a_mn_major=a_mn_major,
             b_mn_major=b_mn_major,
             warp_id=warp_id,
@@ -154,7 +154,7 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
             thr_copy_a = tiled_copy_a.get_slice(lane_id)
 
             for mma_k in fx.range_constexpr(ki_slices):
-                smem_a_tile = mr_hgemm_s2r_a_tile(
+                smem_a_tile = mr_gemm_s2r_a_tile(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_m=0,
@@ -169,7 +169,7 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
                     bk=brick_k,
                     geom=geom,
                 )
-                frag_a = mr_hgemm_s2r_copy_a(
+                frag_a = mr_gemm_s2r_copy_a(
                     copy_atom=copy_atom_s2r_a,
                     thr_copy_a=thr_copy_a,
                     thr_mma=thr_mma,
@@ -281,7 +281,7 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
-        mr_hgemm_g2s_issue_operands(
+        mr_gemm_g2s_issue_operands(
             a_mn_major=a_mn_major,
             b_mn_major=b_mn_major,
             warp_id=warp_id,
@@ -312,7 +312,7 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
             thr_copy_b = tiled_copy_b.get_slice(lane_id)
 
             for mma_k in fx.range_constexpr(ki_slices):
-                smem_b_tile = mr_hgemm_s2r_b_tile(
+                smem_b_tile = mr_gemm_s2r_b_tile(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_n=0,
@@ -327,7 +327,7 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
                     bk=brick_k,
                     geom=geom,
                 )
-                frag_b = mr_hgemm_s2r_copy_b(
+                frag_b = mr_gemm_s2r_copy_b(
                     copy_atom=copy_atom_s2r_b,
                     thr_copy_b=thr_copy_b,
                     thr_mma=thr_mma,
@@ -438,7 +438,7 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
-        mr_hgemm_g2s_issue_operands(
+        mr_gemm_g2s_issue_operands(
             a_mn_major=a_mn_major,
             b_mn_major=b_mn_major,
             warp_id=warp_id,
@@ -484,7 +484,7 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
             acc.fill(0)
 
             for mma_k in fx.range_constexpr(ki_slices):
-                smem_a_tile = mr_hgemm_s2r_a_tile(
+                smem_a_tile = mr_gemm_s2r_a_tile(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_m=0,
@@ -499,7 +499,7 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
                     bk=brick_k,
                     geom=geom,
                 )
-                smem_b_tile = mr_hgemm_s2r_b_tile(
+                smem_b_tile = mr_gemm_s2r_b_tile(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_n=0,
@@ -514,13 +514,13 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
                     bk=brick_k,
                     geom=geom,
                 )
-                frag_a = mr_hgemm_s2r_copy_a(
+                frag_a = mr_gemm_s2r_copy_a(
                     copy_atom=copy_atom_s2r_a,
                     thr_copy_a=thr_copy_a,
                     thr_mma=thr_mma,
                     smem_a_tile=smem_a_tile,
                 )
-                frag_b = mr_hgemm_s2r_copy_b(
+                frag_b = mr_gemm_s2r_copy_b(
                     copy_atom=copy_atom_s2r_b,
                     thr_copy_b=thr_copy_b,
                     thr_mma=thr_mma,

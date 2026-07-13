@@ -7,8 +7,9 @@ G2S maps global memory to swem using SME copy atoms (not TiledCopy). cta_lin is 
 linear chunk index; mr_cta_smem_grid supplies the cta_lin // and % divisors.
 
 Exports:
-  mr_g2s_sme_config, mr_hgemm_g2s_issue_a_warp, mr_hgemm_g2s_issue_b_warp,
-  mr_hgemm_g2s_issue_operands, mr_cta_smem_grid, mr_sme_shared_view
+  mr_g2s_sme_config, mr_gemm_g2s_issue_a_warp, mr_gemm_g2s_issue_b_warp,
+  mr_gemm_g2s_issue_operands, mr_cta_smem_grid, mr_sme_shared_view,
+  mr_sme_shared_view_k_spanning
 
 S2R helpers are in kernels.gemm.iluvatar.mr.s2r.
 """
@@ -19,7 +20,7 @@ import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
 
 from kernels.gemm.iluvatar.common import GemmLayout
-from kernels.gemm.iluvatar.mr.common import MrCtaSmemGrid, MrOperandGeom, sme_atom_counts
+from kernels.gemm.iluvatar.mr.common import SMEM_ROWS, MrCtaSmemGrid, MrOperandGeom, sme_atom_counts
 
 
 class SmeConfig(NamedTuple):
@@ -115,6 +116,23 @@ def mr_sme_shared_view(smem_base, elem_offset, swizzle, elem_dtype, *, major):
     return fx.make_view(smem_ptr, layout)
 
 
+def mr_sme_shared_view_k_spanning(smem_base, elem_offset, swizzle, elem_dtype, *, major, mn_extent, k_total):
+    """SME shared view whose K mode spans several contiguous SME bricks.
+
+    For 8-bit MN-major operands one brick only holds K = ``SMEM_ROWS`` (16), but an
+    i8 MMA atom needs K = 32 = 2 bricks. ``ixdl.make_sme_shared_layout_k_spanning``
+    appends the brick selector as a clean outer K sub-mode so the MMA TV K-decode
+    stays ``(within_brick_K, brick)``. The spanned K-bricks must be contiguous in
+    shared starting at ``elem_offset``. When ``k_total`` equals one brick's K this
+    reduces to :func:`mr_sme_shared_view`.
+    """
+    smem_ptr = fx.add_offset(smem_base, fx.make_int_tuple(fx.Int32(elem_offset)))
+    layout = ixdl.make_sme_shared_layout_k_spanning(
+        swizzle, elem_dtype, major=major, mn_extent=mn_extent, k_total=k_total
+    )
+    return fx.make_view(smem_ptr, layout)
+
+
 def mr_cta_smem_grid(
     *,
     a_mn_major: bool,
@@ -151,7 +169,7 @@ def mr_cta_smem_grid(
     )
 
 
-def mr_hgemm_g2s_issue_a_warp(
+def mr_gemm_g2s_issue_a_warp(
     *,
     a_mn_major: bool,
     b_mn_major: bool,
@@ -171,7 +189,7 @@ def mr_hgemm_g2s_issue_a_warp(
     A k-major: cta_m = cta_lin // cta_a_k_cnt_k_major, cta_k = cta_lin % cta_a_k_cnt_k_major.
     A mn-major: cta_m = cta_lin // cta_a_k_cnt, cta_k = cta_lin % cta_a_k_cnt.
     Smem: cta_lin * cta_chunk_elems within ``smem_a``. Does not commit async.
-    Parameters: see mr_hgemm_g2s_issue_operands.
+    Parameters: see mr_gemm_g2s_issue_operands.
     """
     cta_grid = mr_cta_smem_grid(
         a_mn_major=a_mn_major,
@@ -191,6 +209,9 @@ def mr_hgemm_g2s_issue_a_warp(
             cta_m = cta_lin // fx.Int32(cta_grid.cta_a_k_cnt_k_major)
             cta_k = cta_lin % fx.Int32(cta_grid.cta_a_k_cnt_k_major)
         a_src = fx.slice(a_cta_gmem_view, (None, (cta_m, cta_k)))
+        # m-outer / k-inner: A's decode order already equals the smem placement, so
+        # an MMA atom's K-bricks are contiguous without a remap (cta_lin == cta_m *
+        # cta_a_k_cnt + cta_k). The mirror decode lives in mr_gemm_s2r_a_tile.
         a_off = cta_lin * fx.Int32(cta_grid.cta_chunk_elems)
         fx.copy_atom_call(
             g2s_sme.sme_atom_a,
@@ -205,7 +226,7 @@ def mr_hgemm_g2s_issue_a_warp(
         )
 
 
-def mr_hgemm_g2s_issue_b_warp(
+def mr_gemm_g2s_issue_b_warp(
     *,
     a_mn_major: bool,
     b_mn_major: bool,
@@ -225,7 +246,7 @@ def mr_hgemm_g2s_issue_b_warp(
     B smem uses ``smem_b`` directly. B mn-major: cta_n = cta_lin % cta_b_n_cnt,
     cta_k = cta_lin // cta_b_n_cnt. B k-major: cta_n = cta_lin // cta_b_k_cnt,
     cta_k = cta_lin % cta_b_k_cnt. Does not commit async.
-    Parameters: see mr_hgemm_g2s_issue_operands.
+    Parameters: see mr_gemm_g2s_issue_operands.
     """
     cta_grid = mr_cta_smem_grid(
         a_mn_major=a_mn_major,
@@ -241,14 +262,15 @@ def mr_hgemm_g2s_issue_b_warp(
         if fx.const_expr(b_mn_major):
             cta_n = cta_lin % fx.Int32(cta_grid.cta_b_n_cnt)
             cta_k = cta_lin // fx.Int32(cta_grid.cta_b_n_cnt)
-            b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
-            b_linear = cta_k * fx.Int32(cta_grid.cta_b_n_cnt) + cta_n
-            b_off = b_linear * fx.Int32(cta_grid.cta_chunk_elems)
         else:
             cta_n = cta_lin // fx.Int32(cta_grid.cta_b_k_cnt)
             cta_k = cta_lin % fx.Int32(cta_grid.cta_b_k_cnt)
-            b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
-            b_off = cta_lin * fx.Int32(cta_grid.cta_chunk_elems)
+        b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
+        # n-outer / k-inner so an MMA atom's K-bricks land contiguous in shared
+        # (required by the i8 k-spanning S2R view; f16 uses the same order). For
+        # k-major this equals cta_lin; the mirror decode lives in mr_gemm_s2r_b_tile.
+        b_linear = cta_n * fx.Int32(cta_grid.cta_b_k_cnt) + cta_k
+        b_off = b_linear * fx.Int32(cta_grid.cta_chunk_elems)
         fx.copy_atom_call(
             g2s_sme.sme_atom_b,
             b_src,
@@ -262,7 +284,7 @@ def mr_hgemm_g2s_issue_b_warp(
         )
 
 
-def mr_hgemm_g2s_issue_operands(
+def mr_gemm_g2s_issue_operands(
     *,
     a_mn_major: bool,
     b_mn_major: bool,
@@ -283,7 +305,7 @@ def mr_hgemm_g2s_issue_operands(
 ):
     """Issue this warp's A and B SME async G2S copies for one pipeline stage.
 
-    Calls mr_hgemm_g2s_issue_a_warp then mr_hgemm_g2s_issue_b_warp. Each warp issues
+    Calls mr_gemm_g2s_issue_a_warp then mr_gemm_g2s_issue_b_warp. Each warp issues
     a_per_warp / b_per_warp chunks with cta_lin = warp_id * per_warp + t. When commit
     is True (default), calls ixdl.cp_async_commit_group after both operands.
 
@@ -308,7 +330,7 @@ def mr_hgemm_g2s_issue_operands(
         geom: MrOperandGeom; supplies vpr and cta_chunk_elems for chunk grid.
         commit: If True, commit the async copy group after A and B issues.
     """
-    mr_hgemm_g2s_issue_a_warp(
+    mr_gemm_g2s_issue_a_warp(
         a_mn_major=a_mn_major,
         b_mn_major=b_mn_major,
         warp_id=warp_id,
@@ -322,7 +344,7 @@ def mr_hgemm_g2s_issue_operands(
         bk=bk,
         geom=geom,
     )
-    mr_hgemm_g2s_issue_b_warp(
+    mr_gemm_g2s_issue_b_warp(
         a_mn_major=a_mn_major,
         b_mn_major=b_mn_major,
         warp_id=warp_id,
