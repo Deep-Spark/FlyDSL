@@ -183,7 +183,13 @@ def _build_swizzle_kernel(
 
         gC = fx.slice(fx.flat_divide(C, (bm, bn)), (None, None, bid_x, bid_y))
 
-        smem_ptr = fx.get_dyn_shared()
+        # Contiguous static shared memory so stage pick can stay branchless XOR.
+        # Split s0/s1 Array symbols cannot XOR element offsets across banks.
+        @fx.struct
+        class MrPipelineSmem:
+            buf: fx.Array[fx.Float16, stage_elems * STAGES]
+
+        smem_f16_base = fx.SharedAllocator(static=True).allocate(MrPipelineSmem).peek().buf.ptr
 
         mma_atom = fx.make_mma_atom(ixdl.MRMma(ATOM_M, ATOM_N, ATOM_K_B16, fx.Float16, fx.Float16, fx.Float32))
         tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
@@ -193,11 +199,6 @@ def _build_swizzle_kernel(
             copy_atom_c_f32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
             tiled_copy_c_f32 = fx.make_tiled_copy_C(copy_atom_c_f32, tiled_mma)
             thr_copy_c_f32 = tiled_copy_c_f32.get_slice(lane_id)
-
-        smem_f16_base = fx.recast_iter(
-            fx.PointerType.get(fx.Float16.ir_type, fx.AddressSpace.Shared),
-            smem_ptr,
-        )
 
         gC_atoms = fx.flat_divide(
             fx.slice(
@@ -253,6 +254,11 @@ def _build_swizzle_kernel(
                 else tile_smem
             )
 
+            def _stage_smem_ab(stage_base):
+                smem_a = fx.add_offset(smem_f16_base, fx.make_int_tuple(stage_base))
+                smem_b = fx.add_offset(smem_a, fx.make_int_tuple(fx.Int32(bm * bk)))
+                return smem_a, smem_b
+
             def issue_stage(k_tile, stage_base):
                 k_A = gA[None, None, k_tile]
                 k_B = gB[None, None, k_tile]
@@ -266,6 +272,7 @@ def _build_swizzle_kernel(
                     b_leading = k
                 sme_A = ixdl.make_sme_gmem_tensor(k_A, leading_stride=a_leading)
                 sme_B = ixdl.make_sme_gmem_tensor(k_B, leading_stride=b_leading)
+                smem_a, smem_b = _stage_smem_ab(stage_base)
                 mr_hgemm_g2s_issue_operands(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
@@ -275,23 +282,24 @@ def _build_swizzle_kernel(
                     a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
                     b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
                     g2s_sme=g2s_sme,
-                    smem_base=smem_f16_base,
+                    smem_a=smem_a,
+                    smem_b=smem_b,
                     elem_dtype=fx.Float16,
                     bm=bm,
                     bn=bn,
                     bk=bk,
-                    stage_base=stage_base,
                     geom=MR_GEMM_GEOM,
                 )
 
             def _mma_k_load(stage_base, mma_k):
+                smem_a, smem_b = _stage_smem_ab(stage_base)
                 return mr_hgemm_s2r_load_mma_k(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_k=mma_k,
-                    stage_base=stage_base,
                     g2s_sme=g2s_sme,
-                    smem_base=smem_f16_base,
+                    smem_a=smem_a,
+                    smem_b=smem_b,
                     elem_dtype=fx.Float16,
                     warp_m_id=warp_m_id,
                     warp_n_id=warp_n_id,
@@ -333,15 +341,13 @@ def _build_swizzle_kernel(
                 a_frags, b_frags = _s2r_mma_defer_last(stage_base)
                 _mma_frags(a_frags, b_frags)
 
-            # Prologue prefetch + Ki-deferred S2R/MMA + pipelined K-loop.
+            # Prologue: tile0 G2S → barrier (IXDL drains g2scnt before barrier);
+            # tile1 issue only so Peel S2R on stage0 overlaps tile1 G2S.
             issue_stage(fx.Int32(0), fx.Int32(0))
             fx.gpu.barrier()
-            ixdl.cp_async_wait_group(0)
 
             if k_tiles_const >= 2:
                 issue_stage(fx.Int32(1), fx.Int32(stage_stride))
-                fx.gpu.barrier()
-                ixdl.cp_async_wait_group(0)
 
             a_def, b_def = _s2r_mma_defer_last(fx.Int32(0))
 
@@ -476,7 +482,8 @@ def compile_iluvatar_mr_hgemm(
 
     @flyc.jit
     def launch_gemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
-        gemm_kernel(A, B, C).launch(grid=grid, block=block, smem=smem_bytes, stream=stream)
+        # Static SharedAllocator banks are sized by the compiler; leave launch smem unset.
+        gemm_kernel(A, B, C).launch(grid=grid, block=block, stream=stream)
 
     return launch_gemm
 
