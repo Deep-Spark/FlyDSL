@@ -36,6 +36,7 @@ from .struct import (
 from .typing import Array, PointerType, Tuple3D, as_ir_value
 
 __all__ = [
+    "lane_id",
     "thread_idx",
     "block_idx",
     "block_dim",
@@ -47,6 +48,31 @@ __all__ = [
     "shuffle_idx",
     "SharedAllocator",
 ]
+
+
+class _ScalarGPUIndex(Int32):
+    """Lazy token for zero-argument GPU index ops, materialized via ``Int32(...)``."""
+
+    __slots__ = ("_dtype", "_factory")
+    _is_lazy_gpu_index = True
+
+    def __init__(self, factory, dtype=Int32):
+        self._factory = factory
+        self._dtype = dtype
+
+    def _materialize(self):
+        return self._dtype(self._factory())
+
+    @property
+    def value(self):
+        return self._materialize().value
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def ir_value(self):
+        return self._materialize().ir_value()
 
 
 @dsl_loc_tracing
@@ -102,6 +128,7 @@ def shuffle_idx(value, lane, width):
     """``shuffle`` in ``"idx"`` mode: every lane reads lane ``lane``."""
     return shuffle(value, lane, width, mode="idx")
 
+lane_id = _ScalarGPUIndex(gpu.lane_id)
 
 thread_idx = Tuple3D(gpu.thread_id)
 block_idx = Tuple3D(gpu.block_id)

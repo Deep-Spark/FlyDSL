@@ -679,6 +679,12 @@ class Integer(Numeric, metaclass=NumericMeta, width=32, signed=True, ir_type=T.i
                 x_val = int(x)
         elif type(x) is ty:
             x_val = x.value
+        elif getattr(x, "_is_lazy_gpu_index", False):
+            x_val = x.ir_value()
+            if isinstance(x_val.type, ir.IndexType):
+                x_val = index_cast(ty.ir_type, x_val)
+            elif isinstance(x_val.type, ir.IntegerType) and x_val.type.width != ty.width:
+                x_val = int_to_int(x_val, ty, signed=ty.signed)
         elif isinstance(x, ir.Value):
             x_val = x
             if isinstance(x.type, ir.IndexType):
