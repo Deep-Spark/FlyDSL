@@ -20,16 +20,19 @@ from typing import Dict, Optional, Type
 
 from ...utils import env
 from .base import DeviceRuntime
+from .iluvatar import IluvatarDeviceRuntime
 from .rocm import RocmDeviceRuntime
 
 # Compile-backend id -> device-runtime kind (single string namespace).
 COMPILE_BACKEND_TO_RUNTIME_KIND: Dict[str, str] = {
+    "iluvatar": "iluvatar",
     "rocm": "rocm",
 }
 
 _EXTRA_MAPPINGS: Dict[str, str] = {}
 
 _builtin_runtimes: Dict[str, Type[DeviceRuntime]] = {
+    "iluvatar": IluvatarDeviceRuntime,
     "rocm": RocmDeviceRuntime,
 }
 
@@ -164,6 +167,7 @@ def get_device_runtime() -> DeviceRuntime:
 __all__ = [
     "COMPILE_BACKEND_TO_RUNTIME_KIND",
     "DeviceRuntime",
+    "IluvatarDeviceRuntime",
     "RocmDeviceRuntime",
     "ensure_compile_runtime_compatible",
     "ensure_compile_runtime_pairing_from_env",
