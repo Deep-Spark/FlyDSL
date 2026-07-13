@@ -51,7 +51,7 @@ from kernels.gemm.iluvatar.mr.s2r import mr_hgemm_s2r_load_mma_k
 
 DEFAULT_K_ATOMS = 2  # CTA K-tile: ATOM_K_B16 * k_atoms = 32
 STAGES = 2
-K_LOOP_UNROLL = 2
+K_LOOP_UNROLL = 1
 
 EPILOGUE_NO_C_READ = "no_c_read"
 EPILOGUE_READ_C_ACCUM = "read_c_accum"
@@ -349,12 +349,10 @@ def _build_swizzle_kernel(
                 fx.gpu.barrier()
                 _mma_frags(a_def, b_def)
                 k_tile = k_idx + 2
-                if k_idx % 2 == 0:
-                    issue_stage(fx.Int32(k_tile), fx.Int32(0))
-                    _s2r_mma_defer_last_into(fx.Int32(stage_stride), a_def, b_def)
-                else:
-                    issue_stage(fx.Int32(k_tile), fx.Int32(stage_stride))
-                    _s2r_mma_defer_last_into(fx.Int32(0), a_def, b_def)
+                load_stage_base = fx.Int32(k_idx % 2) * fx.Int32(stage_stride)
+                comp_stage_base = load_stage_base ^ fx.Int32(stage_stride)
+                issue_stage(fx.Int32(k_tile), load_stage_base)
+                _s2r_mma_defer_last_into(comp_stage_base, a_def, b_def)
 
             # ROCm-style K-loop: outer scf.for + inner range_constexpr partial unroll.
             if fx.const_expr(main_k_full > 0):
