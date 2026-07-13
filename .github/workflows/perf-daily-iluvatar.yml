@@ -1,0 +1,697 @@
+name: perf-daily-iluvatar
+
+on:
+  schedule:
+    # 02:00 Asia/Shanghai == 18:00 UTC (previous day)
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this manual run is requested"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: perf-daily-iluvatar-iluvatar
+  cancel-in-progress: false
+
+jobs:
+  trend:
+    name: perf-trend (working only)
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 240
+    env:
+      PERF_BRANCH: iluvatar
+      PERF_WARMUP: "5"
+      PERF_ITERS: "15"
+      PERF_MAJOR_PATTERN: nt
+      PERF_EPILOGUE: no_c_read
+      PERF_EPILOGUE_STORE: shfl
+      PERF_K_ATOMS: "2"
+      PERF_SHAPES: "1024x1024x1024,2048x2048x2048,4096x4096x4096"
+      PERF_KERNEL_NAME: iluvatar_mr_hgemm
+      PERF_KERNEL_ENTRY: examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py
+      PERF_KERNELS_FILE: .ci-utils/.github/perf-kernels-iluvatar.json
+      PERF_DELTA_FLAT_PCT: "3"
+      CUDA_VISIBLE_DEVICES: "0"
+      COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
+      IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
+      CI_DEVICE_IMAGE: ${{ vars.CI_DEVICE_IMAGE_REF || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      IXCC_WORKING_ROOT: ${{ vars.IXCC_WORKING_ROOT || '' }}
+      IXSDK_WORKING_ROOT: ${{ vars.IXSDK_WORKING_ROOT || '' }}
+      IX_TOOLCHAIN_DAILY_STATE_FILE: ${{ vars.IX_TOOLCHAIN_DAILY_STATE_FILE || '' }}
+    steps:
+      - name: Checkout CI utils (workflow ref)
+        uses: actions/checkout@v4
+        with:
+          path: .ci-utils
+
+      - name: Checkout benchmark source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PERF_BRANCH }}
+          clean: false
+
+      - name: Daily update IXCC/IXSDK from working
+        id: ix-toolchain
+        continue-on-error: true
+        run: |
+          args=()
+          if [[ -n "${IXCC_WORKING_ROOT}" ]]; then
+            args+=(--ixcc-root "${IXCC_WORKING_ROOT}")
+          fi
+          if [[ -n "${IXSDK_WORKING_ROOT}" ]]; then
+            args+=(--ixsdk-root "${IXSDK_WORKING_ROOT}")
+          fi
+          if [[ -n "${IX_TOOLCHAIN_DAILY_STATE_FILE}" ]]; then
+            args+=(--state-file "${IX_TOOLCHAIN_DAILY_STATE_FILE}")
+          fi
+          bash .github/scripts/prepare_ix_toolchains_daily.sh "${args[@]}"
+
+      - name: Fetch previous metrics marker from last successful run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import io
+          import json
+          import os
+          import re
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ.get("GITHUB_TOKEN", "")
+          branch = os.environ.get("PERF_BRANCH", "iluvatar")
+          run_id = int(os.environ["GITHUB_RUN_ID"])
+          workflow_file = "perf-daily-iluvatar.yml"
+
+          out_dir = Path(".perf")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          prev_file = out_dir / "previous_metrics.json"
+
+          if not token:
+              print("No GITHUB_TOKEN; skip previous metrics lookup.")
+              raise SystemExit(0)
+
+          def api_get(url: str):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return resp.read()
+
+          runs_url = (
+              f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/runs"
+              f"?branch={branch}&status=completed&per_page=20"
+          )
+          runs_payload = json.loads(api_get(runs_url).decode("utf-8"))
+          runs = runs_payload.get("workflow_runs", [])
+
+          candidate = None
+          for r in runs:
+              rid = int(r.get("id", 0))
+              if rid == run_id:
+                  continue
+              if r.get("conclusion") != "success":
+                  continue
+              candidate = rid
+              break
+
+          if candidate is None:
+              print("No previous successful run found.")
+              raise SystemExit(0)
+
+          logs_url = f"https://api.github.com/repos/{repo}/actions/runs/{candidate}/logs"
+          raw_zip = api_get(logs_url)
+          # Job log downloads prefix each line with a timestamp like:
+          #   2026-07-07T19:57:44.3756419Z PERF_METRIC_JSON={...}
+          ts_prefix_re = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z\s+")
+          marker_re = re.compile(r"^PERF_METRIC_JSON=(\{.*\})$")
+          found = None
+
+          with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
+              for name in zf.namelist():
+                  try:
+                      content = zf.read(name).decode("utf-8", errors="replace")
+                  except Exception:
+                      continue
+                  for line in content.splitlines():
+                      text = ts_prefix_re.sub("", line.strip(), count=1)
+                      m = marker_re.match(text)
+                      if not m:
+                          continue
+                      try:
+                          found = json.loads(m.group(1))
+                      except json.JSONDecodeError:
+                          continue
+              if found is None:
+                  print(f"No PERF_METRIC_JSON marker found in run {candidate} logs.")
+                  raise SystemExit(0)
+
+          prev_file.write_text(json.dumps(found, ensure_ascii=True, indent=2), encoding="utf-8")
+          print(f"Loaded previous metrics from run {candidate}.")
+          PY
+
+      - name: Login to GHCR (best effort)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-pull CI device image (timeout + retry)
+        env:
+          CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}
+        run: |
+          set -euo pipefail
+          resolve_script=".ci-utils/.github/scripts/resolve_local_ci_device_image.sh"
+          record_script=".ci-utils/.github/scripts/record_local_ci_device_image.sh"
+
+          # Prefer local content match (exact ref, recorded map, or config digest).
+          if resolved="$(bash "${resolve_script}" "${CI_DEVICE_IMAGE}")"; then
+            echo "local image content hit: ${CI_DEVICE_IMAGE} -> ${resolved}"
+            echo "CI_DEVICE_IMAGE_LOCAL=${resolved}" >> "${GITHUB_ENV}"
+            bash "${record_script}" "${CI_DEVICE_IMAGE}" "${resolved}" || true
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            echo "pull attempt ${attempt}: ${CI_DEVICE_IMAGE}"
+            if timeout 900 docker pull "${CI_DEVICE_IMAGE}"; then
+              echo "CI_DEVICE_IMAGE_LOCAL=${CI_DEVICE_IMAGE}" >> "${GITHUB_ENV}"
+              bash "${record_script}" "${CI_DEVICE_IMAGE}" "${CI_DEVICE_IMAGE}" || true
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::failed to pull CI_DEVICE_IMAGE after 3 attempts: ${CI_DEVICE_IMAGE}"
+              exit 1
+            fi
+            sleep $((attempt * 30))
+          done
+
+      - name: Rebuild FlyDSL in perf container
+        env:
+          CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}
+          COREX_ROOT: ${{ env.COREX_ROOT }}
+          IXCC_MLIR_CMAKE: ${{ env.IXCC_MLIR_CMAKE }}
+        run: |
+          bash .ci-utils/.github/scripts/run_perf_trend_in_container.sh -- bash -lc '
+            set -euo pipefail
+            if ! command -v patchelf >/dev/null 2>&1; then
+              echo "::error::patchelf is required but not found in PATH"
+              exit 1
+            fi
+            rm -rf /workspace/build-fly
+            cmake -S /workspace -B /workspace/build-fly -G Ninja \
+              -DFLYDSL_BACKENDS=iluvatar \
+              -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
+              -DCUDAToolkit_ROOT="${COREX_ROOT}" \
+              -DPython3_EXECUTABLE="$(command -v python3)"
+            cmake --build /workspace/build-fly -j"$(nproc)"
+          '
+
+      - name: Build working toolchains and run perf trend probes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IX_TOOLCHAIN_OUTCOME: ${{ steps.ix-toolchain.outcome }}
+          IXCC_COMMIT: ${{ steps.ix-toolchain.outputs.ixcc_commit }}
+          IXSDK_COMMIT: ${{ steps.ix-toolchain.outputs.ixsdk_commit }}
+          CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}
+          IXCC_MLIR_CMAKE: ${{ env.IXCC_MLIR_CMAKE }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          def git_short(path):
+              p = subprocess.run(
+                  ["git", "rev-parse", "--short", "HEAD"],
+                  cwd=path,
+                  text=True,
+                  capture_output=True,
+              )
+              if p.returncode == 0:
+                  return p.stdout.strip()
+              return "unknown"
+
+          def parse_bench_metrics(output):
+              # Example:
+              # [bench] ... 123.4 us/iter  101.23 TFLOPS  (torch 50.7 us, 42.35 TFLOPS, 0.61x)
+              pat = re.compile(
+                  r"\[bench\].*?"
+                  r"([0-9]+(?:\.[0-9]+)?)\s+TFLOPS\s+"
+                  r"\(torch\s+[0-9]+(?:\.[0-9]+)?\s+us,\s+"
+                  r"([0-9]+(?:\.[0-9]+)?)\s+TFLOPS,\s+"
+                  r"([0-9]+(?:\.[0-9]+)?)x\)"
+              )
+              m = pat.findall(output)
+              if not m:
+                  return None
+              cur, torch_ref, speedup = m[-1]
+              return float(cur), float(torch_ref), float(speedup)
+
+          start_ts = int(time.time())
+          repo_root = Path(".").resolve()
+          perf_dir = repo_root / ".perf"
+          perf_dir.mkdir(parents=True, exist_ok=True)
+          result_file = perf_dir / "result.json"
+          prev_file = perf_dir / "previous_metrics.json"
+
+          result = {
+              "status": "ok",
+              "invalid_reason": "",
+              "failure_detail": {},
+              "flydsl_commit": git_short(repo_root),
+              "ixcc_commit": os.environ.get("IXCC_COMMIT", "unknown"),
+              "ixsdk_commit": os.environ.get("IXSDK_COMMIT", "unknown"),
+              "config": {
+                  "branch": os.environ.get("PERF_BRANCH", "iluvatar"),
+                  "kernels_file": os.environ.get("PERF_KERNELS_FILE", ".ci-utils/.github/perf-kernels-iluvatar.json"),
+                  "major_pattern": os.environ.get("PERF_MAJOR_PATTERN", "nt"),
+                  "epilogue": os.environ.get("PERF_EPILOGUE", "no_c_read"),
+                  "epilogue_store": os.environ.get("PERF_EPILOGUE_STORE", "shfl"),
+                  "k_atoms": int(os.environ.get("PERF_K_ATOMS", "2")),
+                  "warmup": int(os.environ.get("PERF_WARMUP", "5")),
+                  "iters": int(os.environ.get("PERF_ITERS", "15")),
+                  "shapes": os.environ.get("PERF_SHAPES", ""),
+                  "kernel_name": os.environ.get("PERF_KERNEL_NAME", "iluvatar_mr_hgemm"),
+                  "kernel_entry": os.environ.get(
+                      "PERF_KERNEL_ENTRY",
+                      "examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py",
+                  ),
+              },
+              "kernels": {},
+              "timestamp": start_ts,
+          }
+
+          previous = None
+          if prev_file.exists():
+              try:
+                  previous = json.loads(prev_file.read_text(encoding="utf-8"))
+              except json.JSONDecodeError:
+                  previous = None
+
+          corex_root = Path(os.environ["COREX_ROOT"])
+
+          def invalidate(reason):
+              result["status"] = "invalid_sample"
+              result["invalid_reason"] = reason
+
+          def tail_text(text: str, max_lines: int = 60, max_chars: int = 4000) -> str:
+              if not text:
+                  return ""
+              lines = text.splitlines()
+              tail = "\n".join(lines[-max_lines:])
+              if len(tail) > max_chars:
+                  tail = tail[-max_chars:]
+              return tail
+
+          def default_kernel_list():
+              return [
+                  {
+                      "name": result["config"]["kernel_name"],
+                      "entry": result["config"]["kernel_entry"],
+                      "major_pattern": result["config"]["major_pattern"],
+                      "epilogue": result["config"]["epilogue"],
+                      "epilogue_store": result["config"]["epilogue_store"],
+                      "k_atoms": result["config"]["k_atoms"],
+                      "warmup": result["config"]["warmup"],
+                      "iters": result["config"]["iters"],
+                      "shapes": result["config"]["shapes"],
+                  }
+              ]
+
+          def parse_kernel_item(item):
+              if not isinstance(item, dict):
+                  raise ValueError("Each kernel item must be an object")
+              name = str(item.get("name", "")).strip()
+              entry = str(item.get("entry", "")).strip()
+              if not name or not entry:
+                  raise ValueError("Each kernel item must include non-empty name and entry")
+              return {
+                  "name": name,
+                  "entry": entry,
+                  "major_pattern": str(item.get("major_pattern", os.environ.get("PERF_MAJOR_PATTERN", "nt"))),
+                  "epilogue": str(item.get("epilogue", os.environ.get("PERF_EPILOGUE", "no_c_read"))),
+                  "epilogue_store": str(item.get("epilogue_store", os.environ.get("PERF_EPILOGUE_STORE", "shfl"))),
+                  "k_atoms": int(item.get("k_atoms", os.environ.get("PERF_K_ATOMS", "2"))),
+                  "warmup": int(item.get("warmup", os.environ.get("PERF_WARMUP", "5"))),
+                  "iters": int(item.get("iters", os.environ.get("PERF_ITERS", "15"))),
+                  "shapes": str(item.get("shapes", os.environ.get("PERF_SHAPES", ""))),
+              }
+
+          def build_kernel_list():
+              kernels_file = Path(result["config"]["kernels_file"])
+              if kernels_file.exists():
+                  loaded = json.loads(kernels_file.read_text(encoding="utf-8"))
+                  if not isinstance(loaded, list) or not loaded:
+                      raise ValueError(f"{kernels_file} must contain a non-empty JSON array")
+                  return [parse_kernel_item(item) for item in loaded]
+
+              print(f"::warning::kernel config file not found: {kernels_file}, fallback to single-kernel defaults")
+              return default_kernel_list()
+
+          if not corex_root.is_dir():
+              invalidate(f"COREX_ROOT not found: {corex_root}")
+          if result["status"] == "ok" and os.environ.get("IX_TOOLCHAIN_OUTCOME") != "success":
+              invalidate("ix toolchain refresh failed")
+
+          kernels = []
+          if result["status"] == "ok":
+              try:
+                  kernels = build_kernel_list()
+              except Exception as exc:
+                  invalidate(f"invalid kernel config: {exc}")
+
+          if result["status"] == "ok":
+              env = os.environ.copy()
+              env["PATH"] = f"{corex_root}/bin:" + env.get("PATH", "")
+              env["LD_LIBRARY_PATH"] = f"{corex_root}/lib64:{corex_root}/lib:" + env.get("LD_LIBRARY_PATH", "")
+              env["FLYDSL_COMPILE_BACKEND"] = "iluvatar"
+              env["FLYDSL_RUNTIME_KIND"] = "iluvatar"
+              env["ARCH"] = "ivcore11"
+              env["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
+              env["PYTHONUNBUFFERED"] = "1"
+
+              for kernel in kernels:
+                  kernel_id = f"{kernel['name']} ({kernel['entry']})"
+                  kernel_result = {
+                      "name": kernel["name"],
+                      "entry": kernel["entry"],
+                      "status": "ok",
+                      "invalid_reason": "",
+                      "failure_detail": {},
+                      "config": {
+                          "major_pattern": kernel["major_pattern"],
+                          "epilogue": kernel["epilogue"],
+                          "epilogue_store": kernel["epilogue_store"],
+                          "k_atoms": kernel["k_atoms"],
+                          "warmup": kernel["warmup"],
+                          "iters": kernel["iters"],
+                          "shapes": kernel["shapes"],
+                      },
+                      "metrics": {},
+                      "torch_metrics": {},
+                      "speedup_vs_torch": {},
+                      "delta_vs_prev_pct": {},
+                  }
+
+                  shape_specs = [s.strip() for s in kernel["shapes"].split(",") if s.strip()]
+                  for spec in shape_specs:
+                      m, n, k = spec.split("x")
+                      cmd = [
+                          "python3",
+                          kernel["entry"],
+                          "--bench",
+                          "--epilogue",
+                          kernel["epilogue"],
+                          "--epilogue-store",
+                          kernel["epilogue_store"],
+                          "--major-pattern",
+                          kernel["major_pattern"],
+                          "--k-atoms",
+                          str(kernel["k_atoms"]),
+                          "--warmup",
+                          str(kernel["warmup"]),
+                          "--iters",
+                          str(kernel["iters"]),
+                          "--m",
+                          m,
+                          "--n",
+                          n,
+                          "--k",
+                          k,
+                      ]
+                      in_container_cmd = ["bash", ".ci-utils/.github/scripts/run_perf_trend_in_container.sh", "--", *cmd]
+                      print(f"$ {' '.join(in_container_cmd)}")
+                      p = subprocess.run(in_container_cmd, text=True, capture_output=True, env=env)
+                      if p.stdout:
+                          print(p.stdout, end="")
+                      if p.stderr:
+                          print(p.stderr, end="")
+                      if p.returncode != 0:
+                          kernel_result["status"] = "invalid_sample"
+                          kernel_result["invalid_reason"] = f"bench failed for shape {spec}"
+                          kernel_result["failure_detail"] = {
+                              "shape": spec,
+                              "returncode": p.returncode,
+                              "stdout_tail": tail_text(p.stdout or ""),
+                              "stderr_tail": tail_text(p.stderr or ""),
+                          }
+                          break
+
+                      merged = (p.stdout or "") + "\n" + (p.stderr or "")
+                      parsed = parse_bench_metrics(merged)
+                      if parsed is None:
+                          kernel_result["status"] = "invalid_sample"
+                          kernel_result["invalid_reason"] = f"unable to parse TFLOPS for shape {spec}"
+                          kernel_result["failure_detail"] = {
+                              "shape": spec,
+                              "returncode": p.returncode,
+                              "stdout_tail": tail_text(p.stdout or ""),
+                              "stderr_tail": tail_text(p.stderr or ""),
+                              "merged_tail": tail_text(merged),
+                          }
+                          break
+
+                      tflops, torch_tflops, speedup = parsed
+                      kernel_result["metrics"][spec] = tflops
+                      kernel_result["torch_metrics"][spec] = torch_tflops
+                      kernel_result["speedup_vs_torch"][spec] = speedup
+
+                  result["kernels"][kernel_id] = kernel_result
+
+              prev_kernels = {}
+              if previous and isinstance(previous, dict):
+                  prev_kernels = previous.get("kernels", {})
+                  if not isinstance(prev_kernels, dict):
+                      prev_kernels = {}
+
+              for kernel_id, kernel_result in result["kernels"].items():
+                  prev_metrics = {}
+                  if kernel_id in prev_kernels and isinstance(prev_kernels[kernel_id], dict):
+                      maybe = prev_kernels[kernel_id].get("metrics", {})
+                      if isinstance(maybe, dict):
+                          prev_metrics = maybe
+                  elif len(result["kernels"]) == 1 and previous and isinstance(previous, dict):
+                      maybe = previous.get("metrics", {})
+                      if isinstance(maybe, dict):
+                          prev_metrics = maybe
+
+                  for spec, cur in kernel_result["metrics"].items():
+                      prev = prev_metrics.get(spec)
+                      if isinstance(prev, (int, float)) and prev != 0:
+                          kernel_result["delta_vs_prev_pct"][spec] = (cur - float(prev)) / float(prev) * 100.0
+
+              invalid_items = [(k, v) for k, v in result["kernels"].items() if v.get("status") != "ok"]
+              if invalid_items:
+                  first_kernel_id, first_kernel = invalid_items[0]
+                  result["status"] = "invalid_sample"
+                  result["invalid_reason"] = f"{first_kernel_id}: {first_kernel.get('invalid_reason', 'unknown')}"
+                  detail = dict(first_kernel.get("failure_detail", {}))
+                  if detail:
+                      detail["kernel_id"] = first_kernel_id
+                  result["failure_detail"] = detail
+
+          result_file.write_text(json.dumps(result, ensure_ascii=True, indent=2), encoding="utf-8")
+          print("PERF_METRIC_JSON=" + json.dumps(result, ensure_ascii=True))
+          PY
+
+      - name: Write performance summary
+        env:
+          INPUT_REASON: ${{ github.event_name == 'workflow_dispatch' && inputs.reason || '' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(Path(".perf/result.json").read_text(encoding="utf-8"))
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          flat_threshold_pct = float(os.environ.get("PERF_DELTA_FLAT_PCT", "3"))
+
+          kernels = result.get("kernels", {})
+          if not isinstance(kernels, dict):
+              kernels = {}
+          if not kernels:
+              # Legacy fallback.
+              legacy_kernel_id = f"{result.get('config', {}).get('kernel_name', 'legacy')} ({result.get('config', {}).get('kernel_entry', '<unknown>')})"
+              kernels = {
+                  legacy_kernel_id: {
+                      "name": result.get("config", {}).get("kernel_name", "legacy"),
+                      "entry": result.get("config", {}).get("kernel_entry", "<unknown>"),
+                      "status": result.get("status", "unknown"),
+                      "invalid_reason": result.get("invalid_reason", ""),
+                      "failure_detail": result.get("failure_detail", {}),
+                      "config": result.get("config", {}),
+                      "metrics": result.get("metrics", {}),
+                      "torch_metrics": {},
+                      "speedup_vs_torch": {},
+                      "delta_vs_prev_pct": result.get("delta_vs_prev_pct", {}),
+                  }
+              }
+
+          def bucket_for_delta(delta: float) -> str:
+              if delta <= -flat_threshold_pct:
+                  return "regressed"
+              if delta >= flat_threshold_pct:
+                  return "improved"
+              return "flat"
+
+          def kernel_bucket(kernel_result: dict) -> str:
+              if kernel_result.get("status") != "ok":
+                  return "invalid"
+              deltas = [
+                  float(v)
+                  for v in kernel_result.get("delta_vs_prev_pct", {}).values()
+                  if isinstance(v, (int, float))
+              ]
+              if not deltas:
+                  return "flat"
+              if any(d <= -flat_threshold_pct for d in deltas):
+                  return "regressed"
+              if any(d >= flat_threshold_pct for d in deltas):
+                  return "improved"
+              return "flat"
+
+          lines = []
+          lines.append("### Daily performance trend (Iluvatar)")
+          lines.append("")
+          lines.append(f"- mode: `trend-only` (non-blocking)")
+          lines.append(f"- branch: `{result['config']['branch']}`")
+          lines.append(f"- kernels file: `{result['config'].get('kernels_file', '.ci-utils/.github/perf-kernels-iluvatar.json')}`")
+          lines.append(f"- flydsl_commit: `{result.get('flydsl_commit','unknown')}`")
+          lines.append(f"- ixcc_commit: `{result.get('ixcc_commit','unknown') or '<unknown>'}`")
+          lines.append(f"- ixsdk_commit: `{result.get('ixsdk_commit','unknown') or '<unknown>'}`")
+          if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+              lines.append(f"- manual reason: `{os.environ.get('INPUT_REASON','')}`")
+          lines.append(f"- delta threshold: `flat if |Δ| < {flat_threshold_pct:.1f}%`")
+
+          regressed = 0
+          flat = 0
+          improved = 0
+          invalid = 0
+          for kernel_result in kernels.values():
+              bucket = kernel_bucket(kernel_result)
+              if bucket == "regressed":
+                  regressed += 1
+              elif bucket == "improved":
+                  improved += 1
+              elif bucket == "invalid":
+                  invalid += 1
+              else:
+                  flat += 1
+          lines.append(
+              f"- rollup: RED regressed `{regressed}` | YELLOW flat `{flat}` | GREEN improved `{improved}` | INVALID `{invalid}`"
+          )
+          lines.append("")
+
+          ordered_kernels = sorted(
+              kernels.items(),
+              key=lambda kv: (0 if kv[1].get("status") != "ok" else 1, kv[0].lower()),
+          )
+
+          for kernel_id, kernel_result in ordered_kernels:
+              lines.append(f"#### {kernel_id}")
+              lines.append("")
+              lines.append(f"- status: `{kernel_result.get('status', 'unknown')}`")
+              kcfg = kernel_result.get("config", {})
+              lines.append(
+                  f"- bench config: pattern=`{kcfg.get('major_pattern', 'n/a')}`, "
+                  f"epilogue=`{kcfg.get('epilogue', 'n/a')}`, "
+                  f"store=`{kcfg.get('epilogue_store', 'n/a')}`, "
+                  f"k_atoms=`{kcfg.get('k_atoms', 'n/a')}`, "
+                  f"warmup=`{kcfg.get('warmup', 'n/a')}`, "
+                  f"iters=`{kcfg.get('iters', 'n/a')}`"
+              )
+
+              if kernel_result.get("status") != "ok":
+                  lines.append(f"- reason: `{kernel_result.get('invalid_reason','unknown')}`")
+                  detail = kernel_result.get("failure_detail", {})
+                  if isinstance(detail, dict) and detail:
+                      shape = detail.get("shape", "")
+                      returncode = detail.get("returncode", "")
+                      if shape:
+                          lines.append(f"- failed shape: `{shape}`")
+                      if returncode != "":
+                          lines.append(f"- returncode: `{returncode}`")
+                      stderr_tail = detail.get("stderr_tail", "")
+                      stdout_tail = detail.get("stdout_tail", "")
+                      merged_tail = detail.get("merged_tail", "")
+                      if stderr_tail:
+                          lines.append("")
+                          lines.append("stderr tail:")
+                          lines.append("```")
+                          lines.append(stderr_tail)
+                          lines.append("```")
+                      if stdout_tail:
+                          lines.append("")
+                          lines.append("stdout tail:")
+                          lines.append("```")
+                          lines.append(stdout_tail)
+                          lines.append("```")
+                      if merged_tail and not (stderr_tail or stdout_tail):
+                          lines.append("")
+                          lines.append("output tail:")
+                          lines.append("```")
+                          lines.append(merged_tail)
+                          lines.append("```")
+                  lines.append("")
+                  continue
+
+              metrics = kernel_result.get("metrics", {})
+              torch_metrics = kernel_result.get("torch_metrics", {})
+              speedups = kernel_result.get("speedup_vs_torch", {})
+              deltas = kernel_result.get("delta_vs_prev_pct", {})
+
+              lines.append("")
+              lines.append("| shape | TFLOPS | torch TFLOPS | speedup |")
+              lines.append("|---|---:|---:|---:|")
+              for spec in sorted(metrics):
+                  cur = metrics[spec]
+                  torch_ref = torch_metrics.get(spec)
+                  speedup = speedups.get(spec)
+                  torch_text = "n/a" if not isinstance(torch_ref, (int, float)) else f"{torch_ref:.2f}"
+                  speedup_text = "n/a" if not isinstance(speedup, (int, float)) else f"{speedup:.2f}x"
+                  lines.append(f"| `{spec}` | `{cur:.2f}` | `{torch_text}` | `{speedup_text}` |")
+
+              lines.append("")
+              lines.append("| shape | Δ vs prev | bucket |")
+              lines.append("|---|---:|---|")
+              for spec in sorted(metrics):
+                  delta = deltas.get(spec)
+                  if not isinstance(delta, (int, float)):
+                      delta_text = "n/a"
+                      bucket_text = "n/a"
+                  else:
+                      delta_text = f"{float(delta):+.2f}%"
+                      bucket = bucket_for_delta(float(delta))
+                      if bucket == "regressed":
+                          bucket_text = "regressed"
+                      elif bucket == "improved":
+                          bucket_text = "improved"
+                      else:
+                          bucket_text = "flat"
+                  lines.append(f"| `{spec}` | `{delta_text}` | `{bucket_text}` |")
+              lines.append("")
+
+          summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+

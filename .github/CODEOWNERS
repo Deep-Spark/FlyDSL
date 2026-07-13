@@ -1,0 +1,10 @@
+# Default reviewer baseline.
+* @Peter9606 @DiamondI
+
+# High-risk paths require explicit owners.
+kernels/** @Peter9606 @DiamondI
+lib/** @Peter9606 @DiamondI
+include/** @Peter9606 @DiamondI
+python/flydsl/compiler/** @Peter9606 @DiamondI
+.github/workflows/** @Peter9606 @DiamondI
+.github/ci-config.yaml @Peter9606 @DiamondI

@@ -1,0 +1,62 @@
+{
+  "python_version": "3.10",
+  "timeouts": {
+    "core_a_minutes": 30,
+    "core_b_minutes": 45,
+    "device_minutes": 90
+  },
+  "core": {
+    "a_tests": [
+      "tests/unit/test_iluvatar_compile_backend.py",
+      "tests/unit/test_iluvatar_backend_cmake.py",
+      "tests/unit/test_iluvatar_device_runtime.py",
+      "tests/unit/test_iluvatar_jit_runtime_resolution.py"
+    ],
+    "b_tests": [
+      "tests/unit/test_iluvatar_binary_pipeline_smoke.py",
+      "tests/unit/test_iluvatar_compile_backend.py"
+    ]
+  },
+  "device": {
+    "container_image": "ghcr.io/deep-spark/flydsl-iluvatar-ci@sha256:c07c06ae405e67fbf9bde13a8802fad4c921545fd11b658142d139374d265c17",
+    "force_label": "run-device-ci",
+    "required_skip_message": "Skipped by policy: no matched paths and no run-device-ci label.",
+    "runner_labels": [
+      "self-hosted",
+      "linux",
+      "x64",
+      "gpu-iluvatar"
+    ],
+    "path_filters": [
+      "kernels/**",
+      "tests/kernels/**",
+      "tests/unit/test_iluvatar_*",
+      "python/flydsl/compiler/**",
+      "lib/**",
+      "include/**",
+      "cmake/**",
+      "CMakeLists.txt"
+    ],
+    "pytest_args": [
+      "tests/unit",
+      "-m",
+      "l2_device"
+    ],
+    "must_pass_tests": [
+      "tests/unit/test_iluvatar_binary_pipeline_smoke.py",
+      "tests/unit/test_iluvatar_compile_backend.py",
+      "tests/unit/test_iluvatar_jit_launch_smoke.py",
+      "tests/unit/test_iluvatar_jit_runtime_resolution.py"
+    ],
+    "runtime_smoke_blob_path": "tests/assets/iluvatar/iluvatar_smoke.fatbin",
+    "runtime_smoke_kernel": "k",
+    "runtime_smoke_launch_kernel": "k"
+  },
+  "branches": {
+    "protected": [
+      "iluvatar",
+      "main",
+      "release/**"
+    ]
+  }
+}
