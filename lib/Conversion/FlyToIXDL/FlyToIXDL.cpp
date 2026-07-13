@@ -57,6 +57,33 @@ unsigned mapAttrToLLVMAddressSpace(Attribute attr) {
   return 0;   // default to generic address space
 }
 
+// Create a freshly named shared-memory global of `[nbytes x i8]` in
+// `addrSpace`, inserted at the start of `moduleOp`. Backs the static shared
+// `make_ptr` lowering (mirrors the static-shared global in FlyToROCDL).
+static LLVM::GlobalOp createSharedMemoryGlobal(ConversionPatternRewriter &rewriter,
+                                               gpu::GPUModuleOp moduleOp, Location loc,
+                                               StringRef prefix, int64_t nbytes, int64_t align,
+                                               unsigned addrSpace) {
+  llvm::StringSet<> existingNames;
+  for (auto globalOp : moduleOp.getBody()->getOps<LLVM::GlobalOp>())
+    existingNames.insert(globalOp.getSymName());
+
+  unsigned counter = 0;
+  SmallString<128> symName = SymbolTable::generateSymbolName<128>(
+      prefix, [&](StringRef candidate) { return existingNames.contains(candidate); }, counter);
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(moduleOp.getBody());
+
+  auto arrayTy = LLVM::LLVMArrayType::get(IntegerType::get(rewriter.getContext(), 8), nbytes);
+  auto globalOp = LLVM::GlobalOp::create(rewriter, loc, arrayTy,
+                                         /*isConstant=*/false, LLVM::Linkage::External, symName,
+                                         /*value=*/Attribute(),
+                                         /*alignment=*/align, addrSpace);
+  globalOp.setDsoLocal(true);
+  return globalOp;
+}
+
 class MakePtrOpLowering : public OpConversionPattern<MakePtrOp> {
 public:
   MakePtrOpLowering(const TypeConverter &typeConverter, MLIRContext *context)
@@ -122,6 +149,26 @@ public:
       }
 
       rewriter.replaceOp(op, fly_ixdl::SmeGmemFatPtr::pack(rewriter, loc, base, strideByte));
+      return success();
+    } else if (isGenericAddressSpace<AddressSpace::Shared>(addrSpaceAttr)) {
+      auto dictAttrs = op.getDictAttrs();
+      if (!dictAttrs)
+        return rewriter.notifyMatchFailure(
+            op, "shared make_ptr requires dictAttrs={allocBytes, allocAlign}");
+      auto allocBytesAttr = dictAttrs->getAs<IntegerAttr>("allocBytes");
+      auto allocAlignAttr = dictAttrs->getAs<IntegerAttr>("allocAlign");
+      if (!allocBytesAttr || !allocAlignAttr)
+        return rewriter.notifyMatchFailure(
+            op, "shared make_ptr requires allocBytes, allocAlign in dictAttrs");
+
+      auto moduleOp = op->getParentOfType<gpu::GPUModuleOp>();
+      if (!moduleOp)
+        return op->emitError("shared make_ptr must be inside a gpu.module");
+
+      LLVM::GlobalOp global = createSharedMemoryGlobal(rewriter, moduleOp, loc, "__shared_alloc",
+                                                       allocBytesAttr.getInt(),
+                                                       allocAlignAttr.getInt(), /*addrSpace=*/3);
+      rewriter.replaceOpWithNewOp<LLVM::AddressOfOp>(op, global);
       return success();
     }
 
