@@ -63,7 +63,14 @@ def expected_multibrick_a_dump(torch, A_logical, A_dev, major_pattern: str, bric
     return torch.cat([chunk.reshape(-1) for chunk in chunks])
 
 
-def expected_multibrick_b_dump(torch, B_dev, major_pattern: str, brick_n: int, brick_k: int, values_per_sme_row: int):
+def expected_multibrick_b_dump(
+    torch,
+    B_dev,
+    major_pattern: str,
+    brick_n: int,
+    brick_k: int,
+    values_per_sme_row: int,
+):
     vpr = values_per_sme_row
     layout = parse_major_pattern(major_pattern)
     chunks = []
@@ -78,9 +85,11 @@ def expected_multibrick_b_dump(torch, B_dev, major_pattern: str, brick_n: int, b
                 ].contiguous()
             )
     else:
+        # B mn-major: n-outer / k-inner for all dtypes so an MMA atom's K-bricks
+        # land contiguous in shared (matches mr_gemm_g2s_issue_b_warp).
         for cta_lin in range((brick_n // vpr) * (brick_k // SMEM_ROWS)):
-            cta_n = cta_lin % (brick_n // vpr)
-            cta_k = cta_lin // (brick_n // vpr)
+            cta_n = cta_lin // (brick_k // SMEM_ROWS)
+            cta_k = cta_lin % (brick_k // SMEM_ROWS)
             chunks.append(
                 B_dev[
                     cta_k * SMEM_ROWS : (cta_k + 1) * SMEM_ROWS,
