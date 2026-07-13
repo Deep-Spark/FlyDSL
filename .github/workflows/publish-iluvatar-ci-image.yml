@@ -1,0 +1,678 @@
+name: publish-iluvatar-ci-image
+
+on:
+  schedule:
+    # 02:00 Asia/Shanghai == 18:00 UTC (previous day)
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Primary image tag"
+        required: true
+        default: "stable"
+        type: string
+      force_rebuild:
+        description: "Force rebuild even if latest wheel is unavailable"
+        required: false
+        default: false
+        type: boolean
+      reason:
+        description: "Reason for wheel URL/image publish change"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: build-and-push
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    env:
+      TAG_INPUT: ${{ inputs.tag }}
+      FORCE_REBUILD_INPUT: ${{ inputs.force_rebuild }}
+      REASON_INPUT: ${{ inputs.reason }}
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest != '' && steps.build_retry.outputs.digest || steps.build_prev_torch.outputs.digest != '' && steps.build_prev_torch.outputs.digest || steps.reuse_existing.outputs.digest != '' && steps.reuse_existing.outputs.digest || steps.fallback.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Derive image name
+        id: meta
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/flydsl-iluvatar-ci"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Pre-flight secrets
+        env:
+          COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
+        run: |
+          if [ -z "${COREX_TORCH_WHEEL_URL}" ]; then
+            echo "::error::COREX_TORCH_WHEEL_URL is required (full wheel URL or base directory URL)"
+            exit 1
+          fi
+
+      - name: Decide fallback rebuild mode
+        id: rebuild_mode
+        run: |
+          set -euo pipefail
+          force_rebuild="false"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${FORCE_REBUILD_INPUT}" = "true" ]; then
+            force_rebuild="true"
+          fi
+
+          rebuild_with_prev_torch="false"
+          if [ "${force_rebuild}" = "true" ]; then
+            rebuild_with_prev_torch="true"
+          fi
+
+          echo "force_rebuild=${force_rebuild}" >> "${GITHUB_OUTPUT}"
+          echo "rebuild_with_prev_torch=${rebuild_with_prev_torch}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve and verify CoreX torch wheel/md5
+        id: wheel
+        env:
+          COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
+        run: |
+          set -euo pipefail
+          retry_download() {
+            local url="$1"
+            local out="$2"
+            local n=0
+            until [ "$n" -ge 3 ]; do
+              if curl -fL --connect-timeout 15 --max-time 300 "$url" -o "$out"; then
+                return 0
+              fi
+              n=$((n+1))
+              sleep $((2**n))
+            done
+            return 1
+          }
+
+          input_url="${COREX_TORCH_WHEEL_URL}"
+          wheel_url=""
+          wheel_name=""
+
+          if [[ "${input_url%%\?*}" == *.whl ]]; then
+            wheel_url="${input_url}"
+            wheel_path="${wheel_url%%\?*}"
+            wheel_name="${wheel_path##*/}"
+          else
+            base_url="${input_url}"
+            if [[ "${base_url}" != */ ]]; then
+              base_url="${base_url}/"
+            fi
+            retry_download "${base_url}" /tmp/corex_wheel_index.html || {
+              echo "::warning::failed to download wheel index: ${base_url}; fallback to previous successful image"
+              echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+              echo "fallback_reason=wheel_index_unavailable" >> "${GITHUB_OUTPUT}"
+              exit 0
+            }
+
+            rg -o 'torch-[0-9][^"'"'"' <>]*\+corex\.[0-9.]+\.[0-9]{8}-cp312-cp312-linux_x86_64\.whl' /tmp/corex_wheel_index.html \
+              | sort -u \
+              | awk 'match($0, /\.[0-9]{8}-cp312-cp312-linux_x86_64\.whl$/) { d=substr($0, RSTART+1, 8); print d " " $0 }' \
+              | sort -r > /tmp/corex_wheel_candidates.txt || true
+
+            wheel_name=""
+            for offset in 0 1 2 3 4 5 6; do
+              target_date="$(date -u -d "${offset} day ago" +%Y%m%d)"
+              candidate="$(awk -v d="${target_date}" '$1==d {print $2; exit}' /tmp/corex_wheel_candidates.txt || true)"
+              if [[ -n "${candidate}" ]]; then
+                wheel_name="${candidate}"
+                echo "selected wheel date=${target_date} (offset=${offset}d): ${wheel_name}"
+                break
+              fi
+            done
+
+            if [[ -z "${wheel_name}" ]]; then
+              echo "::warning::no stable wheel found for today or past 7 days under base URL: ${base_url}; fallback to previous successful image"
+              echo "recent candidates:"
+              head -n 20 /tmp/corex_wheel_candidates.txt || true
+              echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+              echo "fallback_reason=no_recent_wheel" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            wheel_url="${base_url}${wheel_name}"
+          fi
+
+          if [ -z "${wheel_name}" ]; then
+            echo "::warning::failed to derive wheel filename from URL; fallback to previous successful image"
+            echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+            echo "fallback_reason=wheel_name_parse_failed" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          wheel_dir="${wheel_url%/*}/"
+          md5sum_url="${wheel_dir}${wheel_name}.md5sum"
+
+          retry_download "${wheel_url}" /tmp/corex_torch.whl || {
+            echo "::warning::failed to download wheel: ${wheel_url}; fallback to previous successful image"
+            echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+            echo "fallback_reason=wheel_download_failed" >> "${GITHUB_OUTPUT}"
+            exit 0
+          }
+          retry_download "${md5sum_url}" /tmp/corex_torch.whl.md5sum || {
+            echo "::warning::.md5sum unavailable: ${md5sum_url}; fallback to previous successful image"
+            echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+            echo "fallback_reason=md5sum_unavailable" >> "${GITHUB_OUTPUT}"
+            exit 0
+          }
+
+          match_count="$(awk -v f="${wheel_name}" 'NF>=2 && $2==f {c++} END {print c+0}' /tmp/corex_torch.whl.md5sum)"
+          if [ "${match_count}" -eq 0 ]; then
+            echo "::warning::no md5 entry for ${wheel_name}; fallback to previous successful image"
+            echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+            echo "fallback_reason=md5_entry_missing" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [ "${match_count}" -gt 1 ]; then
+            echo "::warning::multiple md5 entries for ${wheel_name}; fallback to previous successful image"
+            echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+            echo "fallback_reason=md5_entry_multiple" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          wheel_md5="$(awk -v f="${wheel_name}" 'NF>=2 && $2==f {print $1}' /tmp/corex_torch.whl.md5sum)"
+          if ! echo "${wheel_md5}  /tmp/corex_torch.whl" | md5sum -c -; then
+            echo "::warning::md5 verification failed for ${wheel_name}; fallback to previous successful image"
+            echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+            echo "fallback_reason=md5_verify_failed" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          install -m 0644 /tmp/corex_torch.whl .github/docker/corex_torch.whl
+
+          echo "wheel_found=true" >> "${GITHUB_OUTPUT}"
+          echo "wheel_url=${wheel_url}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_md5=${wheel_md5}" >> "${GITHUB_OUTPUT}"
+          echo "wheel_name=${wheel_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Login to GHCR
+        if: ${{ steps.wheel.outputs.wheel_found == 'true' || steps.rebuild_mode.outputs.rebuild_with_prev_torch == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether build is required
+        id: build_decision
+        if: ${{ steps.wheel.outputs.wheel_found == 'true' }}
+        env:
+          FORCE_REBUILD: ${{ steps.rebuild_mode.outputs.force_rebuild }}
+          PREV_IMAGE_REF: ${{ vars.CI_DEVICE_IMAGE_REF || '' }}
+          PREV_FINGERPRINT: ${{ vars.CI_DEVICE_IMAGE_FINGERPRINT || '' }}
+          WHEEL_MD5: ${{ steps.wheel.outputs.wheel_md5 }}
+          WHEEL_NAME: ${{ steps.wheel.outputs.wheel_name }}
+        run: |
+          set -euo pipefail
+          dockerfile_sha="$(sha256sum .github/docker/Dockerfile.iluvatar-ci | awk '{print $1}')"
+          fingerprint="$(
+            printf '%s\n' \
+              "dockerfile_sha256=${dockerfile_sha}" \
+              "wheel_md5=${WHEEL_MD5}" \
+              "wheel_name=${WHEEL_NAME}" \
+            | sha256sum | awk '{print $1}'
+          )"
+
+          build_required="true"
+          skip_reason=""
+          reuse_digest=""
+
+          if [ "${FORCE_REBUILD}" = "true" ]; then
+            skip_reason="force_rebuild"
+          elif [ -n "${PREV_IMAGE_REF}" ] && [ -n "${PREV_FINGERPRINT}" ] && [ "${fingerprint}" = "${PREV_FINGERPRINT}" ]; then
+            build_required="false"
+            skip_reason="unchanged_inputs"
+            reuse_digest="${PREV_IMAGE_REF##*@}"
+          else
+            skip_reason="inputs_changed_or_missing_history"
+          fi
+
+          echo "fingerprint=${fingerprint}" >> "${GITHUB_OUTPUT}"
+          echo "build_required=${build_required}" >> "${GITHUB_OUTPUT}"
+          echo "skip_reason=${skip_reason}" >> "${GITHUB_OUTPUT}"
+          echo "reuse_digest=${reuse_digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Reuse previous image for unchanged build inputs
+        id: reuse_existing
+        if: ${{ steps.wheel.outputs.wheel_found == 'true' && steps.build_decision.outputs.build_required != 'true' }}
+        env:
+          PREV_IMAGE_REF: ${{ vars.CI_DEVICE_IMAGE_REF || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PREV_IMAGE_REF}" ]; then
+            echo "::error::build skipped but CI_DEVICE_IMAGE_REF is empty"
+            exit 1
+          fi
+          if [[ "${PREV_IMAGE_REF}" != *@sha256:* ]]; then
+            echo "::error::invalid CI_DEVICE_IMAGE_REF format: ${PREV_IMAGE_REF}"
+            exit 1
+          fi
+          echo "digest=${PREV_IMAGE_REF##*@}" >> "${GITHUB_OUTPUT}"
+          echo "image_ref=${PREV_IMAGE_REF}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push image
+        id: build
+        if: ${{ steps.wheel.outputs.wheel_found == 'true' && steps.build_decision.outputs.build_required == 'true' }}
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.iluvatar-ci
+          # Load into local docker daemon and push to GHCR in one build.
+          # Do not use push+load shorthands together; use dual exporters instead.
+          outputs: |
+            type=docker
+            type=registry,push=true
+          build-args: |
+            COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
+            COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
+            COREX_TORCH_WHEEL_NAME=${{ steps.wheel.outputs.wheel_name }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
+            ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+            ${{ steps.meta.outputs.image }}:runner-local
+
+      - name: Build and push image (retry once)
+        id: build_retry
+        if: ${{ steps.wheel.outputs.wheel_found == 'true' && steps.build_decision.outputs.build_required == 'true' && steps.build.outcome == 'failure' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.iluvatar-ci
+          outputs: |
+            type=docker
+            type=registry,push=true
+          build-args: |
+            COREX_TORCH_WHEEL_URL=${{ steps.wheel.outputs.wheel_url }}
+            COREX_TORCH_WHEEL_MD5=${{ steps.wheel.outputs.wheel_md5 }}
+            COREX_TORCH_WHEEL_NAME=${{ steps.wheel.outputs.wheel_name }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
+            ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+            ${{ steps.meta.outputs.image }}:runner-local
+
+      - name: Prepare placeholder wheel for fallback rebuild
+        if: ${{ steps.wheel.outputs.wheel_found != 'true' && steps.rebuild_mode.outputs.rebuild_with_prev_torch == 'true' }}
+        run: |
+          : > .github/docker/corex_torch.whl
+
+      - name: Validate previous image for fallback rebuild
+        if: ${{ steps.wheel.outputs.wheel_found != 'true' && steps.rebuild_mode.outputs.rebuild_with_prev_torch == 'true' }}
+        env:
+          FALLBACK_IMAGE_REF: ${{ vars.CI_DEVICE_IMAGE_REF || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FALLBACK_IMAGE_REF}" ]; then
+            echo "::error::force rebuild requires CI_DEVICE_IMAGE_REF; cannot rebuild with previous torch"
+            exit 1
+          fi
+          if [[ "${FALLBACK_IMAGE_REF}" != *@sha256:* ]]; then
+            echo "::error::invalid CI_DEVICE_IMAGE_REF format: ${FALLBACK_IMAGE_REF}"
+            exit 1
+          fi
+          if ! docker buildx imagetools inspect "${FALLBACK_IMAGE_REF}" >/dev/null 2>&1; then
+            echo "::error::unable to inspect fallback base image: ${FALLBACK_IMAGE_REF}"
+            exit 1
+          fi
+
+      - name: Build and push image (reuse previous torch)
+        id: build_prev_torch
+        if: ${{ steps.wheel.outputs.wheel_found != 'true' && steps.rebuild_mode.outputs.rebuild_with_prev_torch == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.iluvatar-ci
+          outputs: |
+            type=docker
+            type=registry,push=true
+          build-args: |
+            BASE_IMAGE=${{ vars.CI_DEVICE_IMAGE_REF }}
+            SKIP_COREX_TORCH_INSTALL=1
+            COREX_TORCH_WHEEL_MD5=skip
+            COREX_TORCH_WHEEL_NAME=skip.whl
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
+            ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+            ${{ steps.meta.outputs.image }}:runner-local
+
+      - name: Fallback to previous successful image
+        id: fallback
+        if: ${{ steps.wheel.outputs.wheel_found != 'true' && steps.rebuild_mode.outputs.rebuild_with_prev_torch != 'true' }}
+        env:
+          FALLBACK_IMAGE_REF: ${{ vars.CI_DEVICE_IMAGE_REF || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FALLBACK_IMAGE_REF}" ]; then
+            echo "::error::wheel unavailable and CI_DEVICE_IMAGE_REF is empty; cannot fallback"
+            exit 1
+          fi
+          if [[ "${FALLBACK_IMAGE_REF}" != *@sha256:* ]]; then
+            echo "::error::invalid CI_DEVICE_IMAGE_REF format: ${FALLBACK_IMAGE_REF}"
+            exit 1
+          fi
+          fallback_digest="${FALLBACK_IMAGE_REF##*@}"
+          echo "digest=${fallback_digest}" >> "${GITHUB_OUTPUT}"
+          echo "image_ref=${FALLBACK_IMAGE_REF}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve image size
+        id: image_size
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest != '' && steps.build_retry.outputs.digest || steps.build_prev_torch.outputs.digest != '' && steps.build_prev_torch.outputs.digest || steps.reuse_existing.outputs.digest != '' && steps.reuse_existing.outputs.digest || steps.fallback.outputs.digest }}
+          FALLBACK_IMAGE_REF: ${{ steps.reuse_existing.outputs.image_ref != '' && steps.reuse_existing.outputs.image_ref || steps.fallback.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          image_ref=""
+          if [ -n "${DIGEST}" ]; then
+            image_ref="${IMAGE}@${DIGEST}"
+          elif [ -n "${FALLBACK_IMAGE_REF}" ]; then
+            image_ref="${FALLBACK_IMAGE_REF}"
+          fi
+
+          size_bytes=""
+          size_human="n/a"
+          if [ -n "${image_ref}" ]; then
+            # Query remote manifest directly from registry.
+            size_bytes="$(IMAGE_REF="${image_ref}" python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          image_ref = os.environ["IMAGE_REF"]
+          def inspect_raw(ref: str):
+              try:
+                  result = subprocess.run(
+                      ["docker", "buildx", "imagetools", "inspect", ref, "--raw"],
+                      check=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                  )
+              except Exception:
+                  return None
+              try:
+                  return json.loads(result.stdout)
+              except json.JSONDecodeError:
+                  return None
+
+          def sum_manifest_layers(obj: dict) -> int:
+              layers = obj.get("layers")
+              if not isinstance(layers, list):
+                  return 0
+              return sum(
+                  layer.get("size", 0)
+                  for layer in layers
+                  if isinstance(layer, dict) and isinstance(layer.get("size"), int)
+              )
+
+          root = inspect_raw(image_ref)
+          if not isinstance(root, dict):
+              print("")
+              sys.exit(0)
+
+          total = sum_manifest_layers(root)
+          if total > 0:
+              print(total)
+              sys.exit(0)
+
+          manifests = root.get("manifests")
+          if not isinstance(manifests, list):
+              print("")
+              sys.exit(0)
+
+          # OCI index: walk real platform manifests and ignore attestation-only entries.
+          repo_ref = image_ref.split("@", 1)[0]
+          total = 0
+          for m in manifests:
+              if not isinstance(m, dict):
+                  continue
+              digest = m.get("digest")
+              if not isinstance(digest, str) or not digest.startswith("sha256:"):
+                  continue
+              platform = m.get("platform")
+              if isinstance(platform, dict):
+                  if platform.get("os") == "unknown" and platform.get("architecture") == "unknown":
+                      continue
+              child = inspect_raw(f"{repo_ref}@{digest}")
+              if isinstance(child, dict):
+                  total += sum_manifest_layers(child)
+
+          print(total if total > 0 else "")
+          PY
+            )"
+          fi
+
+          if [[ "${size_bytes}" =~ ^[0-9]+$ ]]; then
+            size_human="$(SIZE_BYTES="${size_bytes}" python3 - <<'PY'
+          import os
+          size = int(os.environ["SIZE_BYTES"])
+          units = ["B", "KB", "MB", "GB", "TB"]
+          value = float(size)
+          idx = 0
+          while value >= 1024.0 and idx < len(units) - 1:
+              value /= 1024.0
+              idx += 1
+          print(f"{value:.2f}{units[idx]}")
+          PY
+            )"
+          else
+            size_bytes="n/a"
+          fi
+
+          echo "image_ref=${image_ref}" >> "${GITHUB_OUTPUT}"
+          echo "size_bytes=${size_bytes}" >> "${GITHUB_OUTPUT}"
+          echo "size_human=${size_human}" >> "${GITHUB_OUTPUT}"
+
+      - name: Ensure local runnable image on runner
+        id: local_image
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG_VALUE: ${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}
+          DIGEST: ${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest != '' && steps.build_retry.outputs.digest || steps.build_prev_torch.outputs.digest != '' && steps.build_prev_torch.outputs.digest || steps.reuse_existing.outputs.digest != '' && steps.reuse_existing.outputs.digest || steps.fallback.outputs.digest }}
+          BUILT_LOCALLY: ${{ (steps.build.outputs.digest != '' || steps.build_retry.outputs.digest != '' || steps.build_prev_torch.outputs.digest != '') && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::missing digest; cannot prepare local runnable image"
+            exit 1
+          fi
+          image_ref="${IMAGE}@${DIGEST}"
+          local_tag="${IMAGE}:${TAG_VALUE}"
+          local_sha_tag="${IMAGE}:sha-${GITHUB_SHA}"
+          local_runner_tag="${IMAGE}:runner-local"
+          source_ref=""
+
+          # Prefer images already loaded by the build exporters. Never pull after a
+          # successful local build; only pull for reuse/fallback when missing locally.
+          for candidate in "${local_tag}" "${local_sha_tag}" "${local_runner_tag}" "${image_ref}"; do
+            if docker image inspect "${candidate}" >/dev/null 2>&1; then
+              source_ref="${candidate}"
+              break
+            fi
+          done
+
+          if [ -z "${source_ref}" ]; then
+            if [ "${BUILT_LOCALLY}" = "true" ]; then
+              echo "::error::build completed but local docker image is missing; dual exporter load failed"
+              exit 1
+            fi
+            echo "local image missing for reuse/fallback; pulling ${image_ref}"
+            docker pull "${image_ref}"
+            source_ref="${image_ref}"
+          else
+            echo "using local image source: ${source_ref}"
+          fi
+
+          docker tag "${source_ref}" "${local_tag}"
+          docker tag "${source_ref}" "${local_runner_tag}"
+
+          # Docker cannot synthesize RepoDigests via `docker tag`, but we can create a
+          # stable local alias for the registry digest so later jobs can hit without pull.
+          digest_hex="${DIGEST#sha256:}"
+          local_digest_tag="${IMAGE}:sha256-${digest_hex}"
+          docker tag "${source_ref}" "${local_digest_tag}"
+
+          # Record digest -> local config id so ci-device/prewarm can skip pull.
+          bash .github/scripts/record_local_ci_device_image.sh "${image_ref}" "${local_digest_tag}" || true
+
+          echo "image_ref=${image_ref}" >> "${GITHUB_OUTPUT}"
+          echo "local_tag=${local_tag}" >> "${GITHUB_OUTPUT}"
+          echo "local_runner_tag=${local_runner_tag}" >> "${GITHUB_OUTPUT}"
+          echo "local_digest_tag=${local_digest_tag}" >> "${GITHUB_OUTPUT}"
+          echo "source_ref=${source_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Print digest summary
+        run: |
+          {
+            digest="${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest != '' && steps.build_retry.outputs.digest || steps.build_prev_torch.outputs.digest != '' && steps.build_prev_torch.outputs.digest || steps.reuse_existing.outputs.digest != '' && steps.reuse_existing.outputs.digest || steps.fallback.outputs.digest }}"
+            if [ -z "${digest}" ]; then
+              echo "::error::missing image digest from build step(s)"
+              exit 1
+            fi
+            echo "### Iluvatar CI image published"
+            echo ""
+            echo "- image: \`${{ steps.meta.outputs.image }}\`"
+            echo "- tag: \`${{ env.TAG_INPUT != '' && env.TAG_INPUT || 'stable' }}\`"
+            echo "- reason: \`${{ env.REASON_INPUT != '' && env.REASON_INPUT || 'scheduled publish (02:00 CST) or manual dispatch' }}\`"
+            echo "- image size: \`${{ steps.image_size.outputs.size_human }}\` (\`${{ steps.image_size.outputs.size_bytes }} bytes\`)"
+            echo "- local image ref: \`${{ steps.local_image.outputs.image_ref }}\`"
+            echo "- local runnable tags: \`${{ steps.local_image.outputs.local_tag }}\`, \`${{ steps.local_image.outputs.local_runner_tag }}\`, \`${{ steps.local_image.outputs.local_digest_tag }}\`"
+            echo "- local image source: \`${{ steps.local_image.outputs.source_ref }}\`"
+            if [ "${{ steps.reuse_existing.outputs.digest != '' }}" = "true" ]; then
+              echo "- info: build skipped; reuse previous image because inputs are unchanged"
+              echo "- skip reason: \`${{ steps.build_decision.outputs.skip_reason }}\`"
+              echo "- reused image ref: \`${{ steps.reuse_existing.outputs.image_ref }}\`"
+              echo "- wheel: \`${{ steps.wheel.outputs.wheel_url }}\`"
+              echo "- wheel md5: \`${{ steps.wheel.outputs.wheel_md5 }}\`"
+              echo "- digest: \`${digest}\`"
+              echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${digest}\`"
+            elif [ "${{ steps.wheel.outputs.wheel_found }}" = "true" ]; then
+              echo "- wheel: \`${{ steps.wheel.outputs.wheel_url }}\`"
+              echo "- wheel md5: \`${{ steps.wheel.outputs.wheel_md5 }}\`"
+              echo "- build mode: \`${{ steps.build_decision.outputs.skip_reason != '' && steps.build_decision.outputs.skip_reason || 'build_required' }}\`"
+              echo "- digest: \`${digest}\`"
+              echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${digest}\`"
+            elif [ "${{ steps.rebuild_mode.outputs.rebuild_with_prev_torch }}" = "true" ]; then
+              echo "- warning: no latest wheel found from URL; image rebuilt with previous torch"
+              echo "- fallback reason: \`${{ steps.wheel.outputs.fallback_reason != '' && steps.wheel.outputs.fallback_reason || 'wheel_unavailable' }}\`"
+              echo "- force rebuild: \`${{ steps.rebuild_mode.outputs.force_rebuild }}\`"
+              echo "- base image ref: \`${{ vars.CI_DEVICE_IMAGE_REF || '' }}\`"
+              echo "- digest: \`${digest}\`"
+              echo "- immutable ref: \`${{ steps.meta.outputs.image }}@${digest}\`"
+            else
+              echo "- warning: no latest wheel found from URL; fallback to previous successful image"
+              echo "- fallback reason: \`${{ steps.wheel.outputs.fallback_reason != '' && steps.wheel.outputs.fallback_reason || 'wheel_unavailable' }}\`"
+              echo "- fallback image ref: \`${{ steps.fallback.outputs.image_ref }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update repository variable CI_DEVICE_IMAGE_REF
+        if: ${{ (env.TAG_INPUT == '' || env.TAG_INPUT == 'stable') && (steps.wheel.outputs.wheel_found == 'true' || steps.build_prev_torch.outputs.digest != '' || steps.reuse_existing.outputs.digest != '') }}
+        env:
+          GH_TOKEN: ${{ secrets.CI_VAR_TOKEN }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest != '' && steps.build.outputs.digest || steps.build_retry.outputs.digest != '' && steps.build_retry.outputs.digest || steps.build_prev_torch.outputs.digest != '' && steps.build_prev_torch.outputs.digest || steps.reuse_existing.outputs.digest }}
+          BUILD_FINGERPRINT: ${{ steps.build_decision.outputs.fingerprint || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::missing digest; cannot update CI_DEVICE_IMAGE_REF"
+            exit 1
+          fi
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::CI_VAR_TOKEN is empty; skip CI_DEVICE_IMAGE_REF update"
+            {
+              echo "- CI_DEVICE_IMAGE_REF: skipped (CI_VAR_TOKEN missing)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          image = os.environ["IMAGE"]
+          digest = os.environ["DIGEST"]
+          build_fingerprint = os.environ.get("BUILD_FINGERPRINT", "")
+          value = f"{image}@{digest}"
+          name = "CI_DEVICE_IMAGE_REF"
+          fingerprint_name = "CI_DEVICE_IMAGE_FINGERPRINT"
+          api_base = f"https://api.github.com/repos/{repo}/actions/variables"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def request(method: str, url: str, payload: dict | None = None) -> tuple[int, str]:
+              body = None if payload is None else json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(url=url, method=method, data=body, headers=headers)
+              if body is not None:
+                  req.add_header("Content-Type", "application/json")
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.status, resp.read().decode("utf-8")
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read().decode("utf-8", errors="replace")
+
+          status, body = request("PATCH", f"{api_base}/{name}", {"name": name, "value": value})
+          created = False
+          if status == 404:
+              status, body = request("POST", api_base, {"name": name, "value": value})
+              created = status in (200, 201)
+              if not created:
+                  raise SystemExit(f"failed to create repo variable {name}: status={status} body={body}")
+          elif status not in (200, 204):
+              raise SystemExit(f"failed to update repo variable {name}: status={status} body={body}")
+
+          mode = "created" if created else "updated"
+          print(f"{mode} repo variable {name}={value}")
+          fp_mode = "unchanged"
+          if build_fingerprint:
+              fp_status, fp_body = request("PATCH", f"{api_base}/{fingerprint_name}", {"name": fingerprint_name, "value": build_fingerprint})
+              fp_created = False
+              if fp_status == 404:
+                  fp_status, fp_body = request("POST", api_base, {"name": fingerprint_name, "value": build_fingerprint})
+                  fp_created = fp_status in (200, 201)
+                  if not fp_created:
+                      raise SystemExit(f"failed to create repo variable {fingerprint_name}: status={fp_status} body={fp_body}")
+              elif fp_status not in (200, 204):
+                  raise SystemExit(f"failed to update repo variable {fingerprint_name}: status={fp_status} body={fp_body}")
+              fp_mode = "created" if fp_created else "updated"
+              print(f"{fp_mode} repo variable {fingerprint_name}={build_fingerprint}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"- CI_DEVICE_IMAGE_REF: `{value}` ({mode})\n")
+              if build_fingerprint:
+                  summary.write(f"- CI_DEVICE_IMAGE_FINGERPRINT: `{build_fingerprint}` ({fp_mode})\n")
+          PY
+
+      - name: Skip repository variable update for non-stable tag
+        if: ${{ env.TAG_INPUT != '' && env.TAG_INPUT != 'stable' }}
+        run: |
+          echo "Skip CI_DEVICE_IMAGE_REF update for non-stable tag: ${{ env.TAG_INPUT }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup staged wheel artifact
+        if: ${{ always() }}
+        run: rm -f .github/docker/corex_torch.whl
