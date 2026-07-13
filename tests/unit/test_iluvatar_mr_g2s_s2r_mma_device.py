@@ -3,7 +3,7 @@
 
 """Opt-in Iluvatar MR G2S -> S2R -> MMA staged device tests.
 
-Chains production ``mr_hgemm_g2s_issue_operands``, ``mr_hgemm_s2r_copy_*``, and a
+Chains production ``mr_gemm_g2s_issue_operands``, ``mr_gemm_s2r_copy_*``, and a
 single ``fx.gemm`` on warp-00 atom (mma_m=0,mma_n=0). No epilogue, no multi-K-tile loop.
 
 This is the first stage test that exercises ``make_tiled_copy_A/B`` on real G2S

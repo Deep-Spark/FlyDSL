@@ -40,14 +40,15 @@ from kernels.gemm.iluvatar.mr.common import (
     DEFAULT_SMEM_CAP_BYTES,
     MR_GEMM_GEOM,
     SMEM_ROWS,
+    mr_stage_smem_ab,
 )
 from kernels.gemm.iluvatar.epilogue import (
     mr_hgemm_epilogue_store_read_c_accum,
     mr_hgemm_epilogue_store_shfl,
     mr_hgemm_epilogue_store_tiled,
 )
-from kernels.gemm.iluvatar.mr.operand_copy import mr_g2s_sme_config, mr_hgemm_g2s_issue_operands
-from kernels.gemm.iluvatar.mr.s2r import mr_hgemm_s2r_load_mma_k
+from kernels.gemm.iluvatar.mr.operand_copy import mr_g2s_sme_config, mr_gemm_g2s_issue_operands
+from kernels.gemm.iluvatar.mr.s2r import mr_gemm_s2r_load_mma_k
 
 DEFAULT_K_ATOMS = 2  # CTA K-tile: ATOM_K_B16 * k_atoms = 32
 STAGES = 2
@@ -254,11 +255,6 @@ def _build_swizzle_kernel(
                 else tile_smem
             )
 
-            def _stage_smem_ab(stage_base):
-                smem_a = fx.add_offset(smem_f16_base, fx.make_int_tuple(stage_base))
-                smem_b = fx.add_offset(smem_a, fx.make_int_tuple(fx.Int32(bm * bk)))
-                return smem_a, smem_b
-
             def issue_stage(k_tile, stage_base):
                 k_A = gA[None, None, k_tile]
                 k_B = gB[None, None, k_tile]
@@ -272,8 +268,8 @@ def _build_swizzle_kernel(
                     b_leading = k
                 sme_A = ixdl.make_sme_gmem_tensor(k_A, leading_stride=a_leading)
                 sme_B = ixdl.make_sme_gmem_tensor(k_B, leading_stride=b_leading)
-                smem_a, smem_b = _stage_smem_ab(stage_base)
-                mr_hgemm_g2s_issue_operands(
+                smem_a, smem_b = mr_stage_smem_ab(smem_f16_base, stage_base, bm * bk)
+                mr_gemm_g2s_issue_operands(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     warp_id=warp_id,
@@ -292,8 +288,8 @@ def _build_swizzle_kernel(
                 )
 
             def _mma_k_load(stage_base, mma_k):
-                smem_a, smem_b = _stage_smem_ab(stage_base)
-                return mr_hgemm_s2r_load_mma_k(
+                smem_a, smem_b = mr_stage_smem_ab(smem_f16_base, stage_base, bm * bk)
+                return mr_gemm_s2r_load_mma_k(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
                     mma_k=mma_k,
@@ -342,7 +338,7 @@ def _build_swizzle_kernel(
                 _mma_frags(a_frags, b_frags)
 
             # Prologue: tile0 G2S → barrier (IXDL drains g2scnt before barrier);
-            # tile1 issue only so Peel S2R on stage0 overlaps tile1 G2S.
+            # tile1 issue only so Peel S2R on stage0 overlaps tile1 G2S. 
             issue_stage(fx.Int32(0), fx.Int32(0))
             fx.gpu.barrier()
 
