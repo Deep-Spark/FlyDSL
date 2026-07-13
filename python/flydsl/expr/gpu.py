@@ -21,7 +21,7 @@ from .._mlir.dialects import gpu
 from .._mlir.dialects._fly_enum_gen import AddressSpace
 from ..compiler.protocol import dsl_align_of, dsl_size_of
 from .meta import dsl_loc_tracing
-from .numeric import Numeric, Uint8
+from .numeric import Int32, Numeric, Uint8
 from .primitive import get_dyn_shared, make_ptr
 from .struct import (
     Arena,
@@ -33,6 +33,31 @@ from .struct import (
     is_struct_type,
 )
 from .typing import Array, PointerType, Tuple3D
+
+
+class _ScalarGPUIndex(Int32):
+    """Lazy token for zero-argument GPU index ops, materialized via ``Int32(...)``."""
+
+    __slots__ = ("_dtype", "_factory")
+    _is_lazy_gpu_index = True
+
+    def __init__(self, factory, dtype=Int32):
+        self._factory = factory
+        self._dtype = dtype
+
+    def _materialize(self):
+        return self._dtype(self._factory())
+
+    @property
+    def value(self):
+        return self._materialize().value
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def ir_value(self):
+        return self._materialize().ir_value()
 
 
 @dsl_loc_tracing
@@ -49,6 +74,8 @@ def block_id(*args, **kwargs):
 def barrier(*args, **kwargs):
     return gpu.barrier(*args, **kwargs)
 
+
+lane_id = _ScalarGPUIndex(gpu.lane_id)
 
 thread_idx = Tuple3D(gpu.thread_id)
 block_idx = Tuple3D(gpu.block_id)
@@ -194,6 +221,7 @@ class SharedAllocator(Arena):
 __all__ = [
     "thread_id",
     "block_id",
+    "lane_id",
     "thread_idx",
     "block_idx",
     "block_dim",
