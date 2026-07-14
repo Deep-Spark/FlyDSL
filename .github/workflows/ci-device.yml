@@ -102,6 +102,8 @@ jobs:
       reason: ${{ steps.decision.outputs.reason }}
       changed_files: ${{ steps.decision.outputs.changed_files }}
       matched_files: ${{ steps.decision.outputs.matched_files }}
+      pytest_targets_count: ${{ steps.decision.outputs.pytest_targets_count }}
+      pytest_targets_preview: ${{ steps.decision.outputs.pytest_targets_preview }}
       runner_labels_json: ${{ steps.decision.outputs.runner_labels_json }}
       skip_message: ${{ steps.decision.outputs.skip_message }}
       device_pytest_args_json: ${{ steps.decision.outputs.device_pytest_args_json }}
@@ -136,6 +138,8 @@ jobs:
             echo "- reason: ${{ steps.decision.outputs.reason }}"
             echo "- changed_files: ${{ steps.decision.outputs.changed_files }}"
             echo "- matched_files: ${{ steps.decision.outputs.matched_files }}"
+            echo "- pytest targets count: ${{ steps.decision.outputs.pytest_targets_count }}"
+            echo "- pytest targets preview: ${{ steps.decision.outputs.pytest_targets_preview }}"
             if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
               echo "- manual reason: ${{ inputs.reason }}"
             fi
