@@ -32,6 +32,7 @@ def ml_byte_permute(a, b, sel: int):
     """Emit ``llvm.nvvm.prmt`` (Iluvatar ``ml_byte_permute_b32``).
 
     ``sel`` is a compile-time nibble selector: bytes 0-3 from ``a``, 4-7 from ``b``.
+    Prefer this over a shift/mask expansion (~16 ALU ops per call).
     """
     from ..numeric import Int32
 
