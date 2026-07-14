@@ -90,6 +90,27 @@ def _matches_path_filters(changed_files: list[str], path_filters: list[str]) -> 
     return (len(matches) > 0), matches
 
 
+def _resolve_pytest_targets(include_globs: list[str], exclude_globs: list[str]) -> list[str]:
+    repo_root = pathlib.Path(".")
+    collected: set[str] = set()
+    for pattern in include_globs:
+        for path in repo_root.glob(pattern):
+            if path.is_file():
+                rel = path.as_posix()
+                collected.add(rel)
+    if not collected:
+        return []
+    targets = sorted(collected)
+    if not exclude_globs:
+        return targets
+    filtered: list[str] = []
+    for rel in targets:
+        if any(fnmatch.fnmatch(rel, pat) for pat in exclude_globs):
+            continue
+        filtered.append(rel)
+    return filtered
+
+
 def _write_output(key: str, value: str) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT", "")
     if not output_path:
@@ -196,6 +217,18 @@ def main() -> int:
         timeouts_cfg = _get_nested(config, "timeouts") or {}
         runner_labels = list(device_cfg.get("runner_labels", ["self-hosted", "linux", "x64", "gpu-iluvatar"]))
         pytest_args = list(device_cfg.get("pytest_args", ["tests/unit", "-m", "l2_device"]))
+        pytest_targets: list[str] = []
+        pytest_target_globs = list(device_cfg.get("pytest_target_globs", []))
+        pytest_exclude_globs = list(device_cfg.get("pytest_exclude_globs", []))
+        pytest_common_args = list(device_cfg.get("pytest_common_args", []))
+        if pytest_target_globs:
+            pytest_targets = _resolve_pytest_targets(pytest_target_globs, pytest_exclude_globs)
+            if not pytest_targets:
+                raise ValueError(
+                    "device.pytest_target_globs resolved to an empty file list; "
+                    "check .github/ci-config.yaml patterns"
+                )
+            pytest_args = pytest_targets + pytest_common_args
         must_pass_tests = list(
             device_cfg.get(
                 "must_pass_tests",
@@ -235,15 +268,20 @@ def main() -> int:
 
     changed_display = ", ".join(changed_files[:20]) if changed_files else "(none)"
     matched_display = ", ".join(matched_files[:20]) if matched_files else "(none)"
+    pytest_targets_display = ", ".join(pytest_targets[:20]) if pytest_targets else "(none)"
     print(f"should_run={str(should_run).lower()}")
     print(f"reason={reason}")
     print(f"changed_files={changed_display}")
     print(f"matched_files={matched_display}")
+    print(f"pytest_targets_count={len(pytest_targets)}")
+    print(f"pytest_targets_preview={pytest_targets_display}")
 
     _write_output("should_run", str(should_run).lower())
     _write_output("reason", reason)
     _write_output("changed_files", changed_display)
     _write_output("matched_files", matched_display)
+    _write_output("pytest_targets_count", str(len(pytest_targets)))
+    _write_output("pytest_targets_preview", pytest_targets_display)
     _write_output("runner_labels_json", json.dumps(runner_labels))
     _write_output("skip_message", skip_msg)
     _write_output("device_pytest_args_json", json.dumps(pytest_args))

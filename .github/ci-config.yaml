@@ -37,8 +37,11 @@
       "cmake/**",
       "CMakeLists.txt"
     ],
-    "pytest_args": [
-      "tests/unit",
+    "pytest_target_globs": [
+      "tests/unit/test_iluvatar_*.py"
+    ],
+    "pytest_exclude_globs": [],
+    "pytest_common_args": [
       "-m",
       "l2_device"
     ],
