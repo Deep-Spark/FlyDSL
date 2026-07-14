@@ -372,7 +372,7 @@ def _bench(
         f"{f' store={epilogue_store}' if epilogue == EPILOGUE_NO_C_READ else ''} "
         f"pattern={major_pattern} M={m} N={n} K={k} grid={grid} block={block} "
         f"threads={block[0]} smem={smem} {us:.1f} us/iter  {tflops:.2f} TFLOPS  "
-        f"(torch {torch_us:.1f} us, {torch_tflops:.2f} TFLOPS, {us / torch_us:.2f}x)"
+        f"(torch {torch_us:.1f} us, {torch_tflops:.2f} TFLOPS)"
     )
 
     expected = _expected_result(A, B, C_in, epilogue)
