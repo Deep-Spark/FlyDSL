@@ -14,6 +14,7 @@ from .mr import (
     make_sme_shared_layout,
     make_sme_shared_layout_k_spanning,
 )
+from .ops import ml_byte_permute
 from .sync import (
     cp_async_commit_group,
     cp_async_wait_group,
@@ -39,4 +40,5 @@ __all__ = [
     "sl_waitmem",
     "sl_pipebar_arrive",
     "sl_pipebar_wait",
+    "ml_byte_permute",
 ]
