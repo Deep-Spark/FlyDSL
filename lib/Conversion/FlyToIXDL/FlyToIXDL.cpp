@@ -852,6 +852,42 @@ public:
   }
 };
 
+/// Fold ``inttoptr(ptrtoint(p))`` on the base of ``llvm.bi.stp.vs.i32`` back to
+/// ``p``.
+///
+/// Root cause is the ``!fly.ptr`` / ``!llvm.ptr`` mismatch: the Python helper
+/// must feed ``llvm.call_intrinsic`` a ``!llvm.ptr``, but tracing only has
+/// ``!fly.ptr``. Crossing via ``fly.ptrtoint`` + ``llvm.inttoptr`` avoids an
+/// ``unrealized_conversion_cast`` deadlock at trace time. After this pass has
+/// already rewritten ``fly.ptr`` → ``llvm.ptr``, the round-trip is redundant
+/// and must be folded so Iluvatar ISel sees a clean descriptor base (not an
+/// inttoptr-derived pointer).
+struct FoldStpVsPtrRoundtrip : public OpRewritePattern<LLVM::CallIntrinsicOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::CallIntrinsicOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getIntrin() != "llvm.bi.stp.vs.i32" || op.getArgs().size() != 5)
+      return failure();
+    Value ptrArg = op.getArgs()[1];
+    auto intToPtr = ptrArg.getDefiningOp<LLVM::IntToPtrOp>();
+    if (!intToPtr)
+      return failure();
+    auto ptrToInt = intToPtr.getArg().getDefiningOp<LLVM::PtrToIntOp>();
+    if (!ptrToInt)
+      return failure();
+    Value base = ptrToInt.getArg();
+    if (base.getType() != ptrArg.getType())
+      return failure();
+
+    SmallVector<Value> newArgs(op.getArgs().begin(), op.getArgs().end());
+    newArgs[1] = base;
+    rewriter.replaceOpWithNewOp<LLVM::CallIntrinsicOp>(
+        op, TypeRange{}, op.getIntrinAttr(), newArgs, op.getFastmathFlagsAttr());
+    return success();
+  }
+};
+
 class FlyToIXDLConversionPass
     : public mlir::impl::FlyToIXDLConversionPassBase<FlyToIXDLConversionPass> {
 public:
@@ -922,6 +958,11 @@ public:
     populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(patterns, typeConverter);
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
+      signalPassFailure();
+
+    RewritePatternSet foldPatterns(context);
+    foldPatterns.add<FoldStpVsPtrRoundtrip>(context);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(foldPatterns))))
       signalPassFailure();
   }
 };

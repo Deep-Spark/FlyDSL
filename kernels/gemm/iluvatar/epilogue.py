@@ -11,7 +11,7 @@ mr_hgemm_epilogue_store dispatches on store_mode.
 """
 
 import flydsl.expr as fx
-from flydsl.expr.ixdl import ml_byte_permute
+from flydsl.expr.ixdl import ml_byte_permute, stp_vs_i32
 from flydsl.expr.typing import Vector as Vec
 
 from kernels.gemm.iluvatar.common import WARP_SIZE
@@ -143,26 +143,32 @@ def mr_igemm_epilogue_store_i32(
     lane_id,
     accs,
     gC_warp,
-    tiled_mma,
+    c_global_n: int,
     warp_atoms_m: int,
     warp_atoms_n: int,
 ):
-    """i32 direct ``make_tiled_copy_C`` store (int8 GEMM, ``D = A @ B.T``)."""
-    gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
+    """i32 store via ``llvm.bi.stp.vs.i32``.
 
-    copy_atom_c_i32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
-    tiled_copy_c_i32 = fx.make_tiled_copy_C(copy_atom_c_i32, tiled_mma)
-    thr_copy_c_i32 = tiled_copy_c_i32.get_slice(lane_id)
+    Bakes lane ``WCO`` once and issues each element as ``stp.vs(val, base, WCO,
+    WSO)`` with constexpr ``WSO`` tile byte offsets. Avoids combined V-offset
+    ``store`` + GEP which shows higher Memory Throttle on ivcore11.
+
+    For each M-atom, walk ``ei`` (row group) outer and ``jn`` (N-atom) inner 
+    so consecutive stores hit the same output row across N.
+    """
+    lane_row = lane_id.shrui(fx.Int32(4))  # TCU_LANE_COLS == 16
+    lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)
+    wco = (lane_row * fx.Int32(c_global_n) + lane_col) * fx.Int32(4)
+
+    c_warp_ptr = fx.get_iter(gC_warp)
+
     for im in fx.range_constexpr(warp_atoms_m):
-        for jn in fx.range_constexpr(warp_atoms_n):
-            c_tile = fx.slice(gC_atoms, (None, None, im, jn))
-            acc = accs[im][jn]
-            fx.copy(
-                copy_atom_c_i32,
-                thr_copy_c_i32.retile(acc),
-                thr_copy_c_i32.partition_S(c_tile),
-                pred=None,
-            )
+        loaded = [Vec(accs[im][jn].load()) for jn in range(warp_atoms_n)]
+        for ei in fx.range_constexpr(4):
+            row_wso = fx.Int32((im * ATOM_M + ei * 4) * c_global_n * 4)
+            for jn in fx.range_constexpr(warp_atoms_n):
+                wso = row_wso + fx.Int32(jn * ATOM_N * 4)
+                stp_vs_i32(loaded[jn][ei], c_warp_ptr, wco, wso)
 
 
 def mr_igemm_epilogue_store_i8_packed(

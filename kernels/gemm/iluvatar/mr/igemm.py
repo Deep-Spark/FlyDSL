@@ -503,7 +503,7 @@ def _build_igemm_kernel(
                 lane_id=lane_id,
                 accs=accs,
                 gC_warp=gC_warp,
-                tiled_mma=tiled_mma,
+                c_global_n=n,
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
             )
