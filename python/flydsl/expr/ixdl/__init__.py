@@ -14,7 +14,19 @@ from .mr import (
     make_sme_shared_layout,
     make_sme_shared_layout_k_spanning,
 )
-from .ops import ml_byte_permute
+from .ops import (
+    ml_byte_permute,
+    stp_vs_i8,
+    stp_vs_i16,
+    stp_vs_i32,
+    stp_vs_i32x4,
+    stp_vs_i64,
+    stp_vs_pred_i8,
+    stp_vs_pred_i16,
+    stp_vs_pred_i32,
+    stp_vs_pred_i32x4,
+    stp_vs_pred_i64,
+)
 from .sync import (
     cp_async_commit_group,
     cp_async_wait_group,
@@ -41,4 +53,14 @@ __all__ = [
     "sl_pipebar_arrive",
     "sl_pipebar_wait",
     "ml_byte_permute",
+    "stp_vs_i8",
+    "stp_vs_i16",
+    "stp_vs_i32",
+    "stp_vs_i64",
+    "stp_vs_i32x4",
+    "stp_vs_pred_i8",
+    "stp_vs_pred_i16",
+    "stp_vs_pred_i32",
+    "stp_vs_pred_i64",
+    "stp_vs_pred_i32x4",
 ]

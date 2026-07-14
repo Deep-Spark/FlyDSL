@@ -852,6 +852,51 @@ public:
   }
 };
 
+/// Fold ``inttoptr(ptrtoint(p))`` on the base of ``llvm.bi.stp.vs[.pred].*``
+/// back to ``p``.
+///
+/// Root cause is the ``!fly.ptr`` / ``!llvm.ptr`` mismatch: the Python helpers
+/// must feed ``llvm.call_intrinsic`` a ``!llvm.ptr``, but tracing only has
+/// ``!fly.ptr``. Crossing via ``fly.ptrtoint`` + ``llvm.inttoptr`` avoids an
+/// ``unrealized_conversion_cast`` deadlock at trace time. After this pass has
+/// already rewritten ``fly.ptr`` to ``llvm.ptr``, the round-trip is redundant
+/// and must be folded so Iluvatar ISel sees a clean descriptor base (not an
+/// inttoptr-derived pointer).
+///
+/// Covers both unpredicated (5 args) and predicated (6 args, pred last) forms
+/// for i8 / i16 / i32 / i64 / v4i32.
+struct FoldStpVsPtrRoundtrip : public OpRewritePattern<LLVM::CallIntrinsicOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::CallIntrinsicOp op,
+                                PatternRewriter &rewriter) const override {
+    StringRef name = op.getIntrin();
+    if (!name.starts_with("llvm.bi.stp.vs."))
+      return failure();
+    // Unpredicated: (val, ptr, wco, wso, kop)
+    // Predicated:    (val, ptr, wco, wso, kop, pred)
+    size_t nArgs = op.getArgs().size();
+    if (nArgs != 5 && nArgs != 6)
+      return failure();
+    Value ptrArg = op.getArgs()[1];
+    auto intToPtr = ptrArg.getDefiningOp<LLVM::IntToPtrOp>();
+    if (!intToPtr)
+      return failure();
+    auto ptrToInt = intToPtr.getArg().getDefiningOp<LLVM::PtrToIntOp>();
+    if (!ptrToInt)
+      return failure();
+    Value base = ptrToInt.getArg();
+    if (base.getType() != ptrArg.getType())
+      return failure();
+
+    SmallVector<Value> newArgs(op.getArgs().begin(), op.getArgs().end());
+    newArgs[1] = base;
+    rewriter.replaceOpWithNewOp<LLVM::CallIntrinsicOp>(
+        op, TypeRange{}, op.getIntrinAttr(), newArgs, op.getFastmathFlagsAttr());
+    return success();
+  }
+};
+
 class FlyToIXDLConversionPass
     : public mlir::impl::FlyToIXDLConversionPassBase<FlyToIXDLConversionPass> {
 public:
@@ -922,6 +967,11 @@ public:
     populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(patterns, typeConverter);
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
+      signalPassFailure();
+
+    RewritePatternSet foldPatterns(context);
+    foldPatterns.add<FoldStpVsPtrRoundtrip>(context);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(foldPatterns))))
       signalPassFailure();
   }
 };
