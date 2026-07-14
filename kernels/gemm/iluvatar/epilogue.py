@@ -11,10 +11,11 @@ mr_hgemm_epilogue_store dispatches on store_mode.
 """
 
 import flydsl.expr as fx
+from flydsl.expr.ixdl import ml_byte_permute
 from flydsl.expr.typing import Vector as Vec
 
 from kernels.gemm.iluvatar.common import WARP_SIZE
-from kernels.gemm.iluvatar.mr.common import ATOM_M, ATOM_N, TCU_LANE_COLS, byte_perm
+from kernels.gemm.iluvatar.mr.common import ATOM_M, ATOM_N, TCU_LANE_COLS
 
 EPILOGUE_STORE_SHFL = "shfl"
 EPILOGUE_STORE_TILED = "tiled"
@@ -182,7 +183,7 @@ def mr_igemm_epilogue_store_i8_packed(
       1. pack each atom's 4 i8 rows into one i32 (truncating cast, wrap on overflow);
       2. scatter the 4 i32 into SMEM (32-bit writes,
          bank-conflict free) -> read back 4 i32 with the transpose swizzle;
-      3. 6x ``__byte_perm`` recombine -> 4 i32, each = 4 contiguous-N i8 of one row;
+      3. 6x ``ml_byte_permute`` recombine -> 4 i32, each = 4 contiguous-N i8 of one row;
       4. one coalesced 32-bit global store per output row.
       
     No quant scale/bias/relu fusion.
@@ -220,7 +221,7 @@ def mr_igemm_epilogue_store_i8_packed(
 
     fx.gpu.barrier()
 
-    # Phase 2: transpose-read + byte_perm recombine + coalesced global store.
+    # Phase 2: transpose-read + ml_byte_permute recombine + coalesced global store.
     c_warp_ptr = fx.get_iter(gC_warp)
     i32_global_ty = fx.PointerType.get(fx.Int32.ir_type, c_warp_ptr.memspace)
     for im in fx.range_constexpr(warp_atoms_m):
@@ -230,14 +231,14 @@ def mr_igemm_epilogue_store_i8_packed(
             for e in fx.range_constexpr(4):
                 idx = block + fx.Int32(e * 64) + (lane_id ^ fx.Int32(e * 4))
                 val.append(fx.ptr_load(fx.add_offset(smem_warp_i32, fx.make_int_tuple(idx))))
-            t0 = byte_perm(val[0], val[1], 0x5140)
-            t1 = byte_perm(val[2], val[3], 0x5140)
-            ret0 = byte_perm(t0, t1, 0x5410)
-            ret1 = byte_perm(t0, t1, 0x7632)
-            t0 = byte_perm(val[0], val[1], 0x7362)
-            t1 = byte_perm(val[2], val[3], 0x7362)
-            ret2 = byte_perm(t0, t1, 0x5410)
-            ret3 = byte_perm(t0, t1, 0x7632)
+            t0 = ml_byte_permute(val[0], val[1], 0x5140)
+            t1 = ml_byte_permute(val[2], val[3], 0x5140)
+            ret0 = ml_byte_permute(t0, t1, 0x5410)
+            ret1 = ml_byte_permute(t0, t1, 0x7632)
+            t0 = ml_byte_permute(val[0], val[1], 0x7362)
+            t1 = ml_byte_permute(val[2], val[3], 0x7362)
+            ret2 = ml_byte_permute(t0, t1, 0x5410)
+            ret3 = ml_byte_permute(t0, t1, 0x7632)
             rets = (ret0, ret1, ret2, ret3)
             col = fx.Int32(g * 64) + lane_col * fx.Int32(4)
             for k in fx.range_constexpr(4):

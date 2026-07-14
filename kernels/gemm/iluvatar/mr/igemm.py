@@ -239,7 +239,7 @@ def _build_igemm_kernel(
         # Static contiguous shared memory (matches hgemm): the compiler sizes the
         # bank, so launch(smem=...) stays unset. Pipeline needs stage_elems * stages
         # int8; the i8 packed epilogue reuses the same bank for SLB staging (bm * bn,
-        # scatter/transpose + byte_perm — no warp shuffle), so size to the max.
+        # scatter/transpose + ml_byte_permute — no warp shuffle), so size to the max.
         smem_elems = max(stage_elems * stages, bm * bn) if epilogue == EPILOGUE_I8 else stage_elems * stages
 
         @fx.struct
