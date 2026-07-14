@@ -1,0 +1,194 @@
+{
+ "schema": 1,
+ "updated": "2026-07-14T08:28:20Z",
+ "repo": "Deep-Spark/FlyDSL",
+ "runs": [
+  {
+   "run_id": 27056234602,
+   "pr": null,
+   "commit": "90b999b2c637dcfef8969ed5aebe73773430782b",
+   "branch": "main",
+   "event": "push",
+   "title": "flash_attn_gfx950: migrate to layout/atom API and clean up the kernel\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/27056234602",
+   "created_at": "2026-06-06T07:29:03Z",
+   "updated_at": "2026-06-07T07:29:41Z",
+   "actor": "Peter9606",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-06T07:29:40Z",
+     "completed_at": "2026-06-07T07:29:40Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/27056234602/job/79861105890"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-06T07:29:40Z",
+     "completed_at": "2026-06-07T07:29:40Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/27056234602/job/79861105892"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-06T07:29:40Z",
+     "completed_at": "2026-06-07T07:29:40Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/27056234602/job/79861105893"
+    }
+   ]
+  },
+  {
+   "run_id": 25898739173,
+   "pr": null,
+   "commit": "11a6f4e92acc538536cb4c3401a84839cf360f8c",
+   "branch": "main",
+   "event": "push",
+   "title": "[Enh] Add shortcut make_rmem_tensor for allocate register tensor (#524)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25898739173",
+   "created_at": "2026-05-15T03:33:32Z",
+   "updated_at": "2026-05-16T03:34:12Z",
+   "actor": "Peter9606",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-15T03:34:10Z",
+     "completed_at": "2026-05-16T03:34:11Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25898739173/job/76117469866"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-15T03:34:10Z",
+     "completed_at": "2026-05-16T03:34:11Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25898739173/job/76117469869"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-15T03:34:10Z",
+     "completed_at": "2026-05-16T03:34:11Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25898739173/job/76117469870"
+    }
+   ]
+  },
+  {
+   "run_id": 25896242502,
+   "pr": null,
+   "commit": "7118a0644336fe95baa6132dab63f92080695b91",
+   "branch": "main",
+   "event": "push",
+   "title": "Report benchmark ratios against main (#526)",
+   "status": "completed",
+   "conclusion": "failure",
+   "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25896242502",
+   "created_at": "2026-05-15T02:02:56Z",
+   "updated_at": "2026-05-15T02:03:40Z",
+   "actor": "Peter9606",
+   "jobs": []
+  },
+  {
+   "run_id": 25100181613,
+   "pr": null,
+   "commit": "7617a6d0b392da38f8e67cf6caae0e2255cc4113",
+   "branch": "main",
+   "event": "push",
+   "title": "Allow PyPI publish review to run with tests (#456)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25100181613",
+   "created_at": "2026-04-29T09:04:12Z",
+   "updated_at": "2026-04-30T09:04:14Z",
+   "actor": "Peter9606",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-29T09:04:13Z",
+     "completed_at": "2026-04-30T09:04:13Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25100181613/job/73547055945"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-29T09:04:13Z",
+     "completed_at": "2026-04-30T09:04:13Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25100181613/job/73547055947"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-29T09:04:13Z",
+     "completed_at": "2026-04-30T09:04:13Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/25100181613/job/73547055953"
+    }
+   ]
+  },
+  {
+   "run_id": 24170891466,
+   "pr": null,
+   "commit": "6ca05b883389d9c40bdd0dea69ac9a7929b4c243",
+   "branch": "main",
+   "event": "push",
+   "title": "[Refactor] Convert norm/softmax kernels from raw buffer_ops to layout\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/24170891466",
+   "created_at": "2026-04-09T03:32:16Z",
+   "updated_at": "2026-04-10T03:32:18Z",
+   "actor": "Peter9606",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-09T03:32:17Z",
+     "completed_at": "2026-04-10T03:32:17Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/24170891466/job/70542201395"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-09T03:32:17Z",
+     "completed_at": "2026-04-10T03:32:17Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/24170891466/job/70542201399"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-09T03:32:17Z",
+     "completed_at": "2026-04-10T03:32:17Z",
+     "url": "https://github.com/Deep-Spark/FlyDSL/actions/runs/24170891466/job/70542201424"
+    }
+   ]
+  }
+ ]
+}
