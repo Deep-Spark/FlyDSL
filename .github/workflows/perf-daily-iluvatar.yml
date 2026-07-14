@@ -253,19 +253,21 @@ jobs:
 
           def parse_bench_metrics(output):
               # Example:
-              # [bench] ... 123.4 us/iter  101.23 TFLOPS  (torch 50.7 us, 42.35 TFLOPS, 0.61x)
+              # [bench] ... 123.4 us/iter  101.23 TFLOPS  (torch 50.7 us, 42.35 TFLOPS)
               pat = re.compile(
                   r"\[bench\].*?"
+                  r"([0-9]+(?:\.[0-9]+)?)\s+us/iter\s+"
                   r"([0-9]+(?:\.[0-9]+)?)\s+TFLOPS\s+"
-                  r"\(torch\s+[0-9]+(?:\.[0-9]+)?\s+us,\s+"
-                  r"([0-9]+(?:\.[0-9]+)?)\s+TFLOPS,\s+"
-                  r"([0-9]+(?:\.[0-9]+)?)x\)"
+                  r"\(torch\s+([0-9]+(?:\.[0-9]+)?)\s+us,\s+"
+                  r"([0-9]+(?:\.[0-9]+)?)\s+TFLOPS"
+                  r"\)"
               )
               m = pat.findall(output)
               if not m:
                   return None
-              cur, torch_ref, speedup = m[-1]
-              return float(cur), float(torch_ref), float(speedup)
+              flydsl_us, flydsl_tflops, torch_us, torch_tflops = m[-1]
+              speedup = float(torch_us) / float(flydsl_us) if float(flydsl_us) > 0 else 0.0
+              return float(flydsl_us), float(flydsl_tflops), float(torch_us), float(torch_tflops), float(speedup)
 
           start_ts = int(time.time())
           repo_root = Path(".").resolve()
@@ -409,6 +411,8 @@ jobs:
                       },
                       "metrics": {},
                       "torch_metrics": {},
+                      "latency_us": {},
+                      "torch_latency_us": {},
                       "speedup_vs_torch": {},
                       "delta_vs_prev_pct": {},
                   }
@@ -461,7 +465,7 @@ jobs:
                       parsed = parse_bench_metrics(merged)
                       if parsed is None:
                           kernel_result["status"] = "invalid_sample"
-                          kernel_result["invalid_reason"] = f"unable to parse TFLOPS for shape {spec}"
+                          kernel_result["invalid_reason"] = f"unable to parse bench metrics for shape {spec}"
                           kernel_result["failure_detail"] = {
                               "shape": spec,
                               "returncode": p.returncode,
@@ -471,9 +475,11 @@ jobs:
                           }
                           break
 
-                      tflops, torch_tflops, speedup = parsed
+                      flydsl_us, tflops, torch_us, torch_tflops, speedup = parsed
                       kernel_result["metrics"][spec] = tflops
                       kernel_result["torch_metrics"][spec] = torch_tflops
+                      kernel_result["latency_us"][spec] = flydsl_us
+                      kernel_result["torch_latency_us"][spec] = torch_us
                       kernel_result["speedup_vs_torch"][spec] = speedup
 
                   result["kernels"][kernel_id] = kernel_result
@@ -543,6 +549,8 @@ jobs:
                       "config": result.get("config", {}),
                       "metrics": result.get("metrics", {}),
                       "torch_metrics": {},
+                      "latency_us": {},
+                      "torch_latency_us": {},
                       "speedup_vs_torch": {},
                       "delta_vs_prev_pct": result.get("delta_vs_prev_pct", {}),
                   }
@@ -658,19 +666,28 @@ jobs:
 
               metrics = kernel_result.get("metrics", {})
               torch_metrics = kernel_result.get("torch_metrics", {})
+              latency_us = kernel_result.get("latency_us", {})
+              torch_latency_us = kernel_result.get("torch_latency_us", {})
               speedups = kernel_result.get("speedup_vs_torch", {})
               deltas = kernel_result.get("delta_vs_prev_pct", {})
 
               lines.append("")
-              lines.append("| shape | TFLOPS | torch TFLOPS | speedup |")
-              lines.append("|---|---:|---:|---:|")
+              lines.append("| shape | FlyDSL us | torch us | FlyDSL TFLOPS | torch TFLOPS | speedup (us: torch_us/flydsl_us) |")
+              lines.append("|---|---:|---:|---:|---:|---:|")
               for spec in sorted(metrics):
+                  cur_us = latency_us.get(spec)
+                  torch_us = torch_latency_us.get(spec)
                   cur = metrics[spec]
                   torch_ref = torch_metrics.get(spec)
                   speedup = speedups.get(spec)
+                  cur_us_text = "n/a" if not isinstance(cur_us, (int, float)) else f"{cur_us:.1f}"
+                  torch_us_text = "n/a" if not isinstance(torch_us, (int, float)) else f"{torch_us:.1f}"
+                  cur_text = "n/a" if not isinstance(cur, (int, float)) else f"{cur:.2f}"
                   torch_text = "n/a" if not isinstance(torch_ref, (int, float)) else f"{torch_ref:.2f}"
                   speedup_text = "n/a" if not isinstance(speedup, (int, float)) else f"{speedup:.2f}x"
-                  lines.append(f"| `{spec}` | `{cur:.2f}` | `{torch_text}` | `{speedup_text}` |")
+                  lines.append(
+                      f"| `{spec}` | `{cur_us_text}` | `{torch_us_text}` | `{cur_text}` | `{torch_text}` | `{speedup_text}` |"
+                  )
 
               lines.append("")
               lines.append("| shape | Δ vs prev | bucket |")
