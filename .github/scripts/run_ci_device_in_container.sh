@@ -68,7 +68,7 @@ corex_libcuda_md5=""
 host_mpi_lib_path=""
 host_mpi_lib_dir=""
 
-if [[ -d "${COREX_ROOT}/.git" ]] && command -v git >/dev/null 2>&1; then
+if command -v git >/dev/null 2>&1; then
   corex_git_commit="$(git -C "${COREX_ROOT}" rev-parse --short HEAD 2>/dev/null || true)"
 fi
 
