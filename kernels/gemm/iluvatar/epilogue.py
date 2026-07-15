@@ -11,7 +11,7 @@ mr_hgemm_epilogue_store dispatches on store_mode.
 """
 
 import flydsl.expr as fx
-from flydsl.expr.ixdl import byte_permute
+from flydsl.expr.ixdl import byte_permute, stp_vs_b32
 from flydsl.expr.typing import Vector as Vec
 
 from kernels.gemm.iluvatar.common import WARP_SIZE
@@ -143,26 +143,33 @@ def mr_igemm_epilogue_store_i32(
     lane_id,
     accs,
     gC_warp,
-    tiled_mma,
+    c_global_n: int,
     warp_atoms_m: int,
     warp_atoms_n: int,
 ):
-    """i32 direct ``make_tiled_copy_C`` store (int8 GEMM, ``D = A @ B.T``)."""
-    gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
+    """i32 store via ``stp_vs_b32`` (``llvm.bi.stp.vs.i32``).
 
-    copy_atom_c_i32 = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
-    tiled_copy_c_i32 = fx.make_tiled_copy_C(copy_atom_c_i32, tiled_mma)
-    thr_copy_c_i32 = tiled_copy_c_i32.get_slice(lane_id)
+    Bakes lane ``voffset`` once and issues each element as
+    ``stp_vs_b32(val, base, voffset, soffset)`` with constexpr ``soffset`` tile
+    byte offsets. Avoids combined V-offset ``store`` + GEP which shows higher
+    Memory Throttle on ivcore11.
+
+    For each M-atom, walk ``ei`` (row group) outer and ``jn`` (N-atom) inner
+    so consecutive stores hit the same output row across N.
+    """
+    lane_row = lane_id.shrui(fx.Int32(4))  # TCU_LANE_COLS == 16
+    lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)
+    voffset = (lane_row * fx.Int32(c_global_n) + lane_col) * fx.Int32(4)
+
+    c_warp_ptr = fx.get_iter(gC_warp)
+
     for im in fx.range_constexpr(warp_atoms_m):
-        for jn in fx.range_constexpr(warp_atoms_n):
-            c_tile = fx.slice(gC_atoms, (None, None, im, jn))
-            acc = accs[im][jn]
-            fx.copy(
-                copy_atom_c_i32,
-                thr_copy_c_i32.retile(acc),
-                thr_copy_c_i32.partition_S(c_tile),
-                pred=None,
-            )
+        loaded = [Vec(accs[im][jn].load()) for jn in range(warp_atoms_n)]
+        for ei in fx.range_constexpr(4):
+            row_soffset = fx.Int32((im * ATOM_M + ei * 4) * c_global_n * 4)
+            for jn in fx.range_constexpr(warp_atoms_n):
+                soffset = row_soffset + fx.Int32(jn * ATOM_N * 4)
+                stp_vs_b32(loaded[jn][ei], c_warp_ptr, voffset, soffset)
 
 
 def mr_igemm_epilogue_store_i8_packed(
@@ -172,7 +179,6 @@ def mr_igemm_epilogue_store_i8_packed(
     accs,
     gC_warp,
     smem_base,
-    tiled_mma,
     warp_atoms_m: int,
     warp_atoms_n: int,
     c_global_n: int,
@@ -184,8 +190,8 @@ def mr_igemm_epilogue_store_i8_packed(
       2. scatter the 4 i32 into SMEM (32-bit writes,
          bank-conflict free) -> read back 4 i32 with the transpose swizzle;
       3. 6x ``byte_permute`` recombine -> 4 i32, each = 4 contiguous-N i8 of one row;
-      4. one coalesced 32-bit global store per output row.
-      
+      4. ``stp_vs_b32`` coalesced store (``voffset`` + ``soffset``) per output row.
+
     No quant scale/bias/relu fusion.
     """
     if fx.const_expr(warp_atoms_n % 4 != 0):
@@ -198,6 +204,7 @@ def mr_igemm_epilogue_store_i8_packed(
     lane_col = lane_id % fx.Int32(TCU_LANE_COLS)  # 0..15
     lane01 = lane_col % fx.Int32(4)
     lane23 = lane_col // fx.Int32(4)
+    voffset = lane_row * fx.Int32(c_global_n) + lane_col * fx.Int32(4)
 
     smem_warp_i32 = fx.recast_iter(
         fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared),
@@ -221,9 +228,8 @@ def mr_igemm_epilogue_store_i8_packed(
 
     fx.gpu.barrier()
 
-    # Phase 2: transpose-read + byte_permute recombine + coalesced global store.
+    # Phase 2: transpose-read + byte_permute recombine + stp.vs store.
     c_warp_ptr = fx.get_iter(gC_warp)
-    i32_global_ty = fx.PointerType.get(fx.Int32.ir_type, c_warp_ptr.memspace)
     for im in fx.range_constexpr(warp_atoms_m):
         for g in fx.range_constexpr(groups_n):
             block = warp_base + fx.Int32((im * groups_n + g) * 256)
@@ -240,12 +246,9 @@ def mr_igemm_epilogue_store_i8_packed(
             ret2 = byte_permute(t0, t1, 0x5410)
             ret3 = byte_permute(t0, t1, 0x7632)
             rets = (ret0, ret1, ret2, ret3)
-            col = fx.Int32(g * 64) + lane_col * fx.Int32(4)
             for k in fx.range_constexpr(4):
-                row = fx.Int32(im * 16 + k * 4) + lane_row
-                byte_off = row * fx.Int32(c_global_n) + col
-                store_ptr = fx.recast_iter(i32_global_ty, fx.add_offset(c_warp_ptr, fx.make_int_tuple(byte_off)))
-                fx.ptr_store(rets[k], store_ptr)
+                soffset = fx.Int32((im * 16 + k * 4) * c_global_n) + fx.Int32(g * 64)
+                stp_vs_b32(rets[k], c_warp_ptr, voffset, soffset)
 
 def mr_hgemm_epilogue_store(
     *,
