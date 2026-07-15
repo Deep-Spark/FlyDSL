@@ -221,22 +221,6 @@ def sme_atom_counts(
     return a_atoms_total, b_atoms_total, cta_a_k_cnt, cta_b_k_cnt
 
 
-def byte_perm(a, b, sel: int):
-    """CUDA ``__byte_perm(a, b, sel)`` equivalent on two ``fx.Int32`` values.
-
-    Source bytes are indexed 0-3 = bytes of ``a`` (low->high), 4-7 = bytes of ``b``.
-    Each of ``sel``'s 4 nibbles selects one source byte for the matching output byte.
-    ``sel`` is a Python compile-time constant, so this unrolls to fixed shift/mask ops.
-    """
-    out = fx.Int32(0)
-    for j in fx.range_constexpr(4):
-        idx = (sel >> (4 * j)) & 0xF
-        src = a if idx < 4 else b
-        byte = src.shrui(fx.Int32(8 * (idx % 4))) & fx.Int32(0xFF)
-        out = out | (byte << fx.Int32(8 * j))
-    return out
-
-
 def mr_stage_smem_ab(smem_base, stage_base, a_stage_elems):
     """Per-stage shared A/B base pointers for the GEMM pipeline.
 
@@ -270,7 +254,6 @@ __all__ = [
     "SMEM_B8_PER_ROW",
     "SMEM_ROWS",
     "TCU_LANE_COLS",
-    "byte_perm",
     "mr_stage_smem_ab",
     "sme_atom_counts",
     "sme_values_per_row",
