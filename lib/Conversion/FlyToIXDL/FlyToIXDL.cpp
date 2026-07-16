@@ -15,6 +15,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/MathExtras.h"
 
 #include "flydsl/Conversion/FlyToIXDL/FlyToIXDL.h"
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
@@ -319,24 +320,32 @@ public:
 
     Value offsetVal;
     auto offsetInt = offsetAttr.extractIntFromLeaf();
+    bool isSmeGmem =
+        isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace());
     if (offsetInt.isStatic()) {
-      offsetVal = arith::ConstantIntOp::create(rewriter, loc, offsetInt.getValue(), 32);
+      int64_t staticOffset = offsetInt.getValue();
+      unsigned bitWidth = !isSmeGmem && !llvm::isInt<32>(staticOffset) ? 64 : 32;
+      offsetVal = arith::ConstantIntOp::create(rewriter, loc, staticOffset, bitWidth);
     } else {
       Operation *defOp = offset.getDefiningOp();
       offsetVal = defOp->getOperand(0);
       Type i32Ty = rewriter.getI32Type();
-      if (offsetVal.getType().isIndex())
+      if (isSmeGmem && offsetVal.getType().isIndex())
         offsetVal = arith::IndexCastOp::create(rewriter, loc, i32Ty, offsetVal);
-      else if (offsetVal.getType() != i32Ty) {
+      else if (isSmeGmem && offsetVal.getType() != i32Ty) {
         unsigned bw = offsetVal.getType().getIntOrFloatBitWidth();
         if (bw < 32)
           offsetVal = arith::ExtSIOp::create(rewriter, loc, i32Ty, offsetVal);
         else if (bw > 32)
           offsetVal = arith::TruncIOp::create(rewriter, loc, i32Ty, offsetVal);
+      } else if (!isSmeGmem && offsetVal.getType().isIndex()) {
+        offsetVal = arith::IndexCastOp::create(rewriter, loc, rewriter.getI64Type(), offsetVal);
+      } else if (!isSmeGmem && offsetVal.getType().getIntOrFloatBitWidth() < 32) {
+        offsetVal = arith::ExtSIOp::create(rewriter, loc, i32Ty, offsetVal);
       }
     }
 
-    if (isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace())) {
+    if (isSmeGmem) {
       // The offset is an element-index delta; convert to a byte delta before
       // accumulating into the fat pointer's byte_offset field.
       int64_t elemBits = flyPtrTy.getElemTy().getIntOrFloatBitWidth();
@@ -386,7 +395,9 @@ public:
              "add_offset: byte-GEP store optimization does not yet handle "
              "sub-byte / non-byte-multiple global element types (e.g. i4/fp4)");
       if (elemBits > 8 && elemBits % 8 == 0) {
-        Value elemBytes = arith::ConstantIntOp::create(rewriter, loc, elemBits / 8, 32);
+        auto offsetIntTy = cast<IntegerType>(offsetVal.getType());
+        Value elemBytes =
+            arith::ConstantIntOp::create(rewriter, loc, offsetIntTy, elemBits / 8);
         offsetVal = arith::MulIOp::create(rewriter, loc, offsetVal, elemBytes);
         elemTy = rewriter.getI8Type();
       }
