@@ -1,0 +1,75 @@
+name: Test Wheels (Iluvatar A-track)
+
+on:
+  workflow_call:
+    inputs:
+      docker_image:
+        description: "Iluvatar test image"
+        type: string
+        required: false
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      wheel_artifact_name:
+        description: "Artifact name produced by build job"
+        type: string
+        required: false
+        default: "flydsl-iluvatar-wheels"
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: "Iluvatar test image"
+        type: string
+        required: false
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      wheel_artifact_name:
+        description: "Artifact name produced by build job"
+        type: string
+        required: false
+        default: "flydsl-iluvatar-wheels"
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 120
+    env:
+      COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.wheel_artifact_name || 'flydsl-iluvatar-wheels' }}
+          path: dist
+
+      - name: Install wheel and run Iluvatar smoke tests
+        env:
+          DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --network host \
+            --ipc host \
+            --device=/dev/kfd \
+            --user root \
+            -v "${PWD}:/workspace" \
+            -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
+            -w /workspace \
+            -e COREX_ROOT="${COREX_ROOT}" \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+              python3 -m venv /tmp/flydsl-whl-test
+              source /tmp/flydsl-whl-test/bin/activate
+              python -m pip install -U pip setuptools
+              python -m pip install numpy
+              python -m pip install dist/*.whl
+              python -c "import flydsl; import flydsl._mlir.ir as ir; print(\"flydsl version:\", flydsl.__version__); print(\"import flydsl._mlir.ir: OK\")"
+              FLYDSL_COMPILE_BACKEND=iluvatar \
+              FLYDSL_RUNTIME_KIND=iluvatar \
+              COMPILE_ONLY=1 \
+              python -m pytest tests/unit/test_iluvatar_compile_backend.py -v
+            '
