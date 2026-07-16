@@ -1,5 +1,6 @@
 add_mlir_conversion_library(MLIRFlyToIXDL
   FlyToIXDL.cpp
+  Transforms/IXDLAddressSimplify.cpp
 
   DEPENDS
   MLIRFlyIXDLIncGen

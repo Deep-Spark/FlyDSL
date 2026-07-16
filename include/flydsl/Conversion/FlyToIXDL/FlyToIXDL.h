@@ -7,6 +7,7 @@
 #include "mlir/Pass/Pass.h"
 
 namespace mlir {
+#define GEN_PASS_DECL_IXDLADDRESSSIMPLIFYPASS
 #define GEN_PASS_DECL_FLYTOIXDLCONVERSIONPASS
 #define GEN_PASS_REGISTRATION
 #include "flydsl/Conversion/FlyToIXDL/Passes.h.inc"
