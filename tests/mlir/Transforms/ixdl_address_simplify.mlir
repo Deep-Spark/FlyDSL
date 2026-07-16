@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 FlyDSL Project Contributors
-// RUN: %fly-opt %s --fly-int-swizzle-simplify | FileCheck %s
+// RUN: %fly-opt %s --fly-ixdl-address-simplify | FileCheck %s
 
 // -----------------------------------------------------------------------------
-// Iluvatar shared-memory copy address after swizzle currently keeps the original
-// lane expression. A later IXDL optimization should fold:
-//   (lane_id ^ 1) ^ 33 -> lane_id ^ 32.
+// Iluvatar shared-memory copy address after swizzle is simplified:
+//   (lane_id ^ 1) ^ 33  ->  lane_id ^ 32.
 // -----------------------------------------------------------------------------
 // CHECK-LABEL: gpu.func @iluvatar_swizzled_addr
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[C1:.+]] = arith.constant 1 : i32
-// CHECK:       %[[C33:.+]] = arith.constant 33 : i32
-// CHECK:       %[[SW0:.+]] = arith.xori %[[LANE]], %[[C1]] : i32
-// CHECK:       %[[SW1:.+]] = arith.xori %[[SW0]], %[[C33]] : i32
-// CHECK:       %[[OFF:.+]] = fly.make_int_tuple(%[[SW1]]) : (i32) -> !fly.int_tuple<?>
+// CHECK:       %[[C32:.+]] = arith.constant 32 : i32
+// CHECK:       %[[OPT:.+]] = arith.xori %[[LANE]], %[[C32]] : i32
+// CHECK:       %[[OFF:.+]] = fly.make_int_tuple(%[[OPT]]) : (i32) -> !fly.int_tuple<?>
 // CHECK:       fly.add_offset(%arg0, %[[OFF]])
 gpu.module @t [#ixdl.target] {
   gpu.func @iluvatar_swizzled_addr(%src: !fly.ptr<f16, shared>, %dst: !fly.ptr<f16, register>) kernel {
