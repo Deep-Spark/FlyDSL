@@ -1,0 +1,114 @@
+name: Build Wheels (Iluvatar A-track)
+
+on:
+  workflow_call:
+    inputs:
+      python_versions:
+        description: "Space-separated python versions, default cp312 first cut"
+        type: string
+        required: false
+        default: "3.12"
+      docker_image:
+        description: "Iluvatar build image"
+        type: string
+        required: false
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+    outputs:
+      wheel_names:
+        description: "Space-separated built wheel filenames"
+        value: ${{ jobs.build.outputs.wheel_names }}
+  workflow_dispatch:
+    inputs:
+      python_versions:
+        description: "Space-separated python versions"
+        type: string
+        required: false
+        default: "3.12"
+      docker_image:
+        description: "Iluvatar build image"
+        type: string
+        required: false
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 180
+    outputs:
+      wheel_names: ${{ steps.collect.outputs.wheel_names }}
+    env:
+      COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
+      IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Login to GHCR (best effort)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build A-track wheels in container
+        env:
+          DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+          PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm \
+            --network host \
+            --ipc host \
+            --user root \
+            -v "${PWD}:/workspace" \
+            -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
+            -w /workspace \
+            -e COREX_ROOT="${COREX_ROOT}" \
+            -e IXCC_MLIR_CMAKE="${IXCC_MLIR_CMAKE}" \
+            -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+              MLIR_PREFIX="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
+              for ver in ${PYTHON_VERSIONS}; do
+                py="python${ver}"
+                py_tag="cp${ver//./}"
+                build_dir="build-fly/build_py${ver//./}"
+                venv=".venvs/release/${py_tag}"
+                "${py}" -m venv "${venv}"
+                source "${venv}/bin/activate"
+                python -m pip install -U pip setuptools wheel numpy nanobind pybind11 auditwheel
+                cmake -S . -B "${build_dir}" -G Ninja \
+                  -DFLYDSL_BACKENDS=iluvatar \
+                  -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
+                  -DCUDAToolkit_ROOT="${COREX_ROOT}" \
+                  -DPython3_EXECUTABLE="$(command -v python)"
+                cmake --build "${build_dir}" -j"$(nproc)"
+                PATH="${venv}/bin:${PATH}" \
+                  FLY_REBUILD=0 \
+                  FLY_BUILD_DIR="${build_dir}" \
+                  MLIR_PATH="${MLIR_PREFIX}" \
+                  python setup.py bdist_wheel
+                deactivate
+              done
+            '
+
+      - name: Collect wheel names
+        id: collect
+        run: |
+          set -euo pipefail
+          WHEELS="$(ls dist/*.whl | xargs -n1 basename | tr '\n' ' ')"
+          echo "wheel_names=${WHEELS}" >> "${GITHUB_OUTPUT}"
+          echo "Built wheels: ${WHEELS}"
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flydsl-iluvatar-wheels
+          path: dist/*.whl
+          retention-days: 3

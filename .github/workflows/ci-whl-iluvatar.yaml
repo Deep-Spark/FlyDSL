@@ -1,0 +1,38 @@
+name: FlyDSL CI Wheels (Iluvatar A-track)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip wheel test stage"
+        type: boolean
+        default: false
+      python_versions:
+        description: "Space-separated python versions for wheel build"
+        type: string
+        default: "3.12"
+      docker_image:
+        description: "Iluvatar build/test image"
+        type: string
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-whl-iluvatar.yaml
+    with:
+      python_versions: ${{ inputs.python_versions || '3.12' }}
+      docker_image: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+
+  test:
+    needs: build
+    if: ${{ !(inputs.skip_tests || false) }}
+    uses: ./.github/workflows/test-whl-iluvatar.yaml
+    with:
+      docker_image: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      wheel_artifact_name: flydsl-iluvatar-wheels
