@@ -12,6 +12,7 @@ Epilogue belongs to ``tests/unit/test_iluvatar_mr_epilogue_device.py``.
 
 This file exercises the production ``compile_iluvatar_mr_hgemm`` launch wrapper across:
 
+* ``elem_dtype`` / torch dtype (float16 / bfloat16)
 * ``major_pattern`` (nn / tn / nt / tt)
 * ``k_atoms`` (BK = 16 * k_atoms, i.e. 32 and 64)
 * ``epilogue_store`` (shfl / tiled for ``no_c_read``)
@@ -32,6 +33,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _PATTERNS = ("nt", "nn", "tn", "tt")
 _K_ATOMS_VALUES = (2, 4)
+_DTYPE_CASES = (
+    ("float16", "Float16"),
+    ("bfloat16", "BFloat16"),
+)
 _EPILOGUE_CASES = (
     ("no_c_read", "tiled"),
     ("no_c_read", "shfl"),
@@ -80,6 +85,7 @@ def _require_hgemm_kernel():
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
     try:
+        import flydsl.expr as fx
         from kernels.gemm.iluvatar.mr.hgemm import (
             EPILOGUE_NO_C_READ,
             EPILOGUE_STORE_SHFL,
@@ -95,12 +101,21 @@ def _require_hgemm_kernel():
         "EPILOGUE_STORE_TILED": EPILOGUE_STORE_TILED,
         "WARP_SIZE": WARP_SIZE,
         "compile_iluvatar_mr_hgemm": compile_iluvatar_mr_hgemm,
+        "fx": fx,
     }
 
 
-def _make_c_tensor(torch, m: int, n: int, epilogue: str, hgemm, *, seed: int):
+def _torch_dtype(torch, torch_dtype_name: str):
+    return getattr(torch, torch_dtype_name)
+
+
+def _fx_elem_dtype(fx, fx_dtype_name: str):
+    return getattr(fx, fx_dtype_name)
+
+
+def _make_c_tensor(torch, m: int, n: int, epilogue: str, hgemm, torch_dtype, *, seed: int):
     if epilogue == hgemm["EPILOGUE_NO_C_READ"]:
-        return torch.zeros(m, n, dtype=torch.float16, device="cuda")
+        return torch.zeros(m, n, dtype=torch_dtype, device="cuda")
     torch.manual_seed(seed)
     return torch.randn(m, n, dtype=torch.float32, device="cuda")
 
@@ -112,12 +127,16 @@ def _expected_result(torch, A, B, C_in, epilogue: str, hgemm):
     return expected
 
 
-def _compare_atol(k: int, k_atoms: int) -> float:
+def _compare_atol(k: int, k_atoms: int, torch_dtype_name: str) -> float:
     bk = 16 * k_atoms
-    return 2e-2 * max(1.0, (k / bk) ** 0.5)
+    # bf16 has a shorter mantissa; scale the f16 baseline by ~2x (matches mma_pipeline_device).
+    scale = 2.0 if torch_dtype_name == "bfloat16" else 1.0
+    return 2e-2 * scale * max(1.0, (k / bk) ** 0.5)
 
 
-def _cta_grid(m: int, n: int, k_atoms: int, *, warp_size: int) -> tuple[tuple[int, int, int], tuple[int, int, int], int]:
+def _cta_grid(
+    m: int, n: int, k_atoms: int, *, warp_size: int
+) -> tuple[tuple[int, int, int], tuple[int, int, int], int]:
     warp_m = 16 * STAGED_WARP_ATOMS_M
     warp_n = 16 * STAGED_WARP_ATOMS_N
     bm = warp_m * STAGED_WARPS_M
@@ -139,13 +158,17 @@ def _check_hgemm_pipeline(
     epilogue: str,
     epilogue_store: str,
     k_atoms: int,
+    torch_dtype_name: str,
+    fx_dtype_name: str,
     seed: int = 0,
 ) -> bool:
     m, n, k = shape
+    torch_dtype = _torch_dtype(torch, torch_dtype_name)
+    elem_dtype = _fx_elem_dtype(hgemm["fx"], fx_dtype_name)
     torch.manual_seed(seed)
-    A = torch.randn(m, k, dtype=torch.float16, device="cuda")
-    B = torch.randn(n, k, dtype=torch.float16, device="cuda")
-    C = _make_c_tensor(torch, m, n, epilogue, hgemm, seed=seed + 1)
+    A = torch.randn(m, k, dtype=torch_dtype, device="cuda")
+    B = torch.randn(n, k, dtype=torch_dtype, device="cuda")
+    C = _make_c_tensor(torch, m, n, epilogue, hgemm, torch_dtype, seed=seed + 1)
     C_in = C.clone()
 
     launcher = hgemm["compile_iluvatar_mr_hgemm"](
@@ -160,6 +183,7 @@ def _check_hgemm_pipeline(
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
+        elem_dtype=elem_dtype,
     )
     a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
@@ -169,7 +193,7 @@ def _check_hgemm_pipeline(
     expected = _expected_result(torch, A, B, C_in, epilogue, hgemm)
     got = C.to(torch.float32) if epilogue == hgemm["EPILOGUE_NO_C_READ"] else C
     diff = (got - expected).abs()
-    atol = _compare_atol(k, k_atoms)
+    atol = _compare_atol(k, k_atoms, torch_dtype_name)
     ok = torch.allclose(got, expected, atol=atol, rtol=2e-2)
     finite_ok = torch.isfinite(got).all().item()
     grid, block, smem = _cta_grid(m, n, k_atoms, warp_size=hgemm["WARP_SIZE"])
@@ -180,8 +204,8 @@ def _check_hgemm_pipeline(
     )
     store_note = f" store={epilogue_store}" if epilogue == hgemm["EPILOGUE_NO_C_READ"] else ""
     print(
-        f"[check] epilogue={epilogue}{store_note} pattern={major_pattern} k_atoms={k_atoms} "
-        f"M={m} N={n} K={k}{cta_note} grid={grid} block={block} smem={smem} "
+        f"[check] dtype={torch_dtype_name} epilogue={epilogue}{store_note} pattern={major_pattern} "
+        f"k_atoms={k_atoms} M={m} N={n} K={k}{cta_note} grid={grid} block={block} smem={smem} "
         f"ok={ok} finite={finite_ok} max_abs={diff.max().item():.3e} "
         f"mean_abs={diff.mean().item():.3e} atol={atol:.2e}"
     )
@@ -191,10 +215,13 @@ def _check_hgemm_pipeline(
     return bool(ok and finite_ok)
 
 
+@pytest.mark.parametrize("torch_dtype_name,fx_dtype_name", _DTYPE_CASES)
 @pytest.mark.parametrize("k_atoms", _K_ATOMS_VALUES)
 @pytest.mark.parametrize("major_pattern", _PATTERNS)
 @pytest.mark.parametrize("epilogue,epilogue_store", _EPILOGUE_CASES)
-def test_iluvatar_mr_hgemm_single_cta_pipeline(major_pattern, epilogue, epilogue_store, k_atoms, monkeypatch):
+def test_iluvatar_mr_hgemm_single_cta_pipeline(
+    major_pattern, epilogue, epilogue_store, k_atoms, torch_dtype_name, fx_dtype_name, monkeypatch
+):
     _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -208,13 +235,18 @@ def test_iluvatar_mr_hgemm_single_cta_pipeline(major_pattern, epilogue, epilogue
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         k_atoms=k_atoms,
+        torch_dtype_name=torch_dtype_name,
+        fx_dtype_name=fx_dtype_name,
     )
 
 
+@pytest.mark.parametrize("torch_dtype_name,fx_dtype_name", _DTYPE_CASES)
 @pytest.mark.parametrize("k_atoms", _K_ATOMS_VALUES)
 @pytest.mark.parametrize("major_pattern", _PATTERNS)
 @pytest.mark.parametrize("epilogue_store", ("tiled", "shfl"))
-def test_iluvatar_mr_hgemm_multi_cta_pipeline(major_pattern, epilogue_store, k_atoms, monkeypatch):
+def test_iluvatar_mr_hgemm_multi_cta_pipeline(
+    major_pattern, epilogue_store, k_atoms, torch_dtype_name, fx_dtype_name, monkeypatch
+):
     _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -228,14 +260,19 @@ def test_iluvatar_mr_hgemm_multi_cta_pipeline(major_pattern, epilogue_store, k_a
         epilogue="no_c_read",
         epilogue_store=epilogue_store,
         k_atoms=k_atoms,
+        torch_dtype_name=torch_dtype_name,
+        fx_dtype_name=fx_dtype_name,
     )
 
 
 @pytest.mark.large_shape
+@pytest.mark.parametrize("torch_dtype_name,fx_dtype_name", _DTYPE_CASES)
 @pytest.mark.parametrize("k_atoms", _K_ATOMS_VALUES)
 @pytest.mark.parametrize("major_pattern", _PATTERNS)
 @pytest.mark.parametrize("epilogue_store", ("shfl",))
-def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(major_pattern, epilogue_store, k_atoms, monkeypatch):
+def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(
+    major_pattern, epilogue_store, k_atoms, torch_dtype_name, fx_dtype_name, monkeypatch
+):
     _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -249,4 +286,6 @@ def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(major_pattern, epilogue_stor
         epilogue="no_c_read",
         epilogue_store=epilogue_store,
         k_atoms=k_atoms,
+        torch_dtype_name=torch_dtype_name,
+        fx_dtype_name=fx_dtype_name,
     )
