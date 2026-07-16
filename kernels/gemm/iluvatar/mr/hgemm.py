@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Iluvatar MR (ivcore11) tiledMma pipeline HGEMM.
+"""Iluvatar MR (ivcore11) tiledMma pipeline HGEMM (f16 / bf16).
 
 Double-buffered smem pipeline: async SME G2S (MRAsyncCpRow16b / MRAsyncCpCol),
 make_sme_shared_layout, Ki-deferred S2R/MMA mainloop, UniversalCopy32b S2R.
 
-Entry: compile_iluvatar_mr_hgemm(M=..., N=..., K=...) -> launch_gemm(A, B, C, stream=...).
+Entry: compile_iluvatar_mr_hgemm(M=..., N=..., K=..., elem_dtype=fx.Float16|fx.BFloat16)
+  -> launch_gemm(A, B, C, stream=...).
 
 Tuning:
-  epilogue no_c_read (default) — D = A @ B.T, fp16 out, acc zeroed. epilogue_store: shfl (default) or tiled.
+  elem_dtype — A/B (and no_c_read C) element type: Float16 (default) or BFloat16.
+    Geometry / SME / S2R are shared; only MRMma multiplicand type differs.
+  epilogue no_c_read (default) — D = A @ B.T, f16/bf16 out, acc zeroed. epilogue_store: shfl (default) or tiled.
   epilogue read_c_accum — C = A @ B.T + C, fp32 out, load C before MMA.
 
   major_pattern — BLAS layout tags nn/nt/tn (default)/tt on logical A(m,k)/B(n,k); see GemmLayout.
@@ -33,6 +36,11 @@ from kernels.gemm.iluvatar.common import (
     WARP_SIZE,
     parse_major_pattern,
 )
+from kernels.gemm.iluvatar.epilogue import (
+    mr_hgemm_epilogue_store_read_c_accum,
+    mr_hgemm_epilogue_store_shfl,
+    mr_hgemm_epilogue_store_tiled,
+)
 from kernels.gemm.iluvatar.mr.common import (
     ATOM_K_B16,
     ATOM_M,
@@ -41,11 +49,6 @@ from kernels.gemm.iluvatar.mr.common import (
     MR_GEMM_GEOM,
     SMEM_ROWS,
     mr_stage_smem_ab,
-)
-from kernels.gemm.iluvatar.epilogue import (
-    mr_hgemm_epilogue_store_read_c_accum,
-    mr_hgemm_epilogue_store_shfl,
-    mr_hgemm_epilogue_store_tiled,
 )
 from kernels.gemm.iluvatar.mr.operand_copy import mr_g2s_sme_config, mr_gemm_g2s_issue_operands
 from kernels.gemm.iluvatar.mr.s2r import mr_gemm_s2r_load_mma_k
@@ -61,6 +64,17 @@ DEFAULT_EPILOGUE = EPILOGUE_NO_C_READ
 EPILOGUE_STORE_TILED = "tiled"
 EPILOGUE_STORE_SHFL = "shfl"
 DEFAULT_EPILOGUE_STORE = EPILOGUE_STORE_SHFL
+
+# A/B (and no_c_read C) element types; both use ATOM_K_B16 / Row16b geometry.
+SUPPORTED_ELEM_DTYPES = (fx.Float16, fx.BFloat16)
+DEFAULT_ELEM_DTYPE = fx.Float16
+
+
+def _validate_elem_dtype(elem_dtype):
+    if elem_dtype not in SUPPORTED_ELEM_DTYPES:
+        names = ", ".join(t.__name__ for t in SUPPORTED_ELEM_DTYPES)
+        raise ValueError(f"elem_dtype must be one of {{{names}}}, got {elem_dtype!r}")
+    return elem_dtype
 
 
 class SwizzleCtaPreset(NamedTuple):
@@ -122,14 +136,16 @@ def _build_swizzle_kernel(
     epilogue: str,
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
+    elem_dtype=DEFAULT_ELEM_DTYPE,
 ):
+    elem_dtype = _validate_elem_dtype(elem_dtype)
     gemm_layout = parse_major_pattern(major_pattern)
     a_mn_major = gemm_layout.a_mn_major
     b_mn_major = gemm_layout.b_mn_major
     load_c = epilogue == EPILOGUE_READ_C_ACCUM
-    out_fp16 = epilogue == EPILOGUE_NO_C_READ
-    no_c_read_shfl_store = out_fp16 and epilogue_store == EPILOGUE_STORE_SHFL
-    no_c_read_tiled_store = out_fp16 and not no_c_read_shfl_store
+    out_b16 = epilogue == EPILOGUE_NO_C_READ
+    no_c_read_shfl_store = out_b16 and epilogue_store == EPILOGUE_STORE_SHFL
+    no_c_read_tiled_store = out_b16 and not no_c_read_shfl_store
     warp_m = ATOM_M * warp_atoms_m
     warp_n = ATOM_N * warp_atoms_n
     bm = warp_m * warps_m
@@ -188,11 +204,11 @@ def _build_swizzle_kernel(
         # Split s0/s1 Array symbols cannot XOR element offsets across banks.
         @fx.struct
         class MrPipelineSmem:
-            buf: fx.Array[fx.Float16, stage_elems * STAGES]
+            buf: fx.Array[elem_dtype, stage_elems * STAGES]
 
-        smem_f16_base = fx.SharedAllocator(static=True).allocate(MrPipelineSmem).peek().buf.ptr
+        smem_ab_base = fx.SharedAllocator(static=True).allocate(MrPipelineSmem).peek().buf.ptr
 
-        mma_atom = fx.make_mma_atom(ixdl.MRMma(ATOM_M, ATOM_N, ATOM_K_B16, fx.Float16, fx.Float16, fx.Float32))
+        mma_atom = fx.make_mma_atom(ixdl.MRMma(ATOM_M, ATOM_N, ATOM_K_B16, elem_dtype, elem_dtype, fx.Float32))
         tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
         thr_mma = tiled_mma.thr_slice(lane_id)
 
@@ -231,29 +247,21 @@ def _build_swizzle_kernel(
             g2s_sme = mr_g2s_sme_config(
                 a_mn_major=a_mn_major,
                 b_mn_major=b_mn_major,
-                elem_dtype=fx.Float16,
+                elem_dtype=elem_dtype,
                 row_atom=ixdl.MRAsyncCpRow16b,
                 row_swizzle=ixdl.SMESwizzle.Row16b,
             )
 
-            copy_atom_s2r_a = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float16)
-            copy_atom_s2r_b = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float16)
+            copy_atom_s2r_a = fx.make_copy_atom(fx.UniversalCopy32b(), elem_dtype)
+            copy_atom_s2r_b = fx.make_copy_atom(fx.UniversalCopy32b(), elem_dtype)
             tiled_copy_a = fx.make_tiled_copy_A(copy_atom_s2r_a, tiled_mma)
             tiled_copy_b = fx.make_tiled_copy_B(copy_atom_s2r_b, tiled_mma)
             thr_copy_a = tiled_copy_a.get_slice(lane_id)
             thr_copy_b = tiled_copy_b.get_slice(lane_id)
 
             tile_smem = fx.make_tile(SMEM_ROWS, vpr)
-            tile_smem_A = (
-                fx.make_tile(vpr, SMEM_ROWS)
-                if fx.const_expr(a_mn_major)
-                else tile_smem
-            )
-            tile_smem_B = (
-                fx.make_tile(vpr, SMEM_ROWS)
-                if fx.const_expr(b_mn_major)
-                else tile_smem
-            )
+            tile_smem_A = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(a_mn_major) else tile_smem
+            tile_smem_B = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(b_mn_major) else tile_smem
 
             def issue_stage(k_tile, stage_base):
                 k_A = gA[None, None, k_tile]
@@ -268,7 +276,7 @@ def _build_swizzle_kernel(
                     b_leading = k
                 sme_A = ixdl.make_sme_gmem_tensor(k_A, leading_stride=a_leading)
                 sme_B = ixdl.make_sme_gmem_tensor(k_B, leading_stride=b_leading)
-                smem_a, smem_b = mr_stage_smem_ab(smem_f16_base, stage_base, bm * bk)
+                smem_a, smem_b = mr_stage_smem_ab(smem_ab_base, stage_base, bm * bk)
                 mr_gemm_g2s_issue_operands(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
@@ -280,7 +288,7 @@ def _build_swizzle_kernel(
                     g2s_sme=g2s_sme,
                     smem_a=smem_a,
                     smem_b=smem_b,
-                    elem_dtype=fx.Float16,
+                    elem_dtype=elem_dtype,
                     bm=bm,
                     bn=bn,
                     bk=bk,
@@ -288,7 +296,7 @@ def _build_swizzle_kernel(
                 )
 
             def _mma_k_load(stage_base, mma_k):
-                smem_a, smem_b = mr_stage_smem_ab(smem_f16_base, stage_base, bm * bk)
+                smem_a, smem_b = mr_stage_smem_ab(smem_ab_base, stage_base, bm * bk)
                 return mr_gemm_s2r_load_mma_k(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
@@ -296,7 +304,7 @@ def _build_swizzle_kernel(
                     g2s_sme=g2s_sme,
                     smem_a=smem_a,
                     smem_b=smem_b,
-                    elem_dtype=fx.Float16,
+                    elem_dtype=elem_dtype,
                     warp_m_id=warp_m_id,
                     warp_n_id=warp_n_id,
                     warp_atoms_m=warp_atoms_m,
@@ -338,7 +346,7 @@ def _build_swizzle_kernel(
                 _mma_frags(a_frags, b_frags)
 
             # Prologue: tile0 G2S → barrier (IXDL drains g2scnt before barrier);
-            # tile1 issue only so Peel S2R on stage0 overlaps tile1 G2S. 
+            # tile1 issue only so Peel S2R on stage0 overlaps tile1 G2S.
             issue_stage(fx.Int32(0), fx.Int32(0))
             fx.gpu.barrier()
 
@@ -389,6 +397,7 @@ def _build_swizzle_kernel(
                 c_global_n=n,
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
+                out_dtype=elem_dtype,
             )
         elif fx.const_expr(no_c_read_tiled_store):
             mr_hgemm_epilogue_store_tiled(
@@ -398,6 +407,7 @@ def _build_swizzle_kernel(
                 tiled_mma=tiled_mma,
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
+                out_dtype=elem_dtype,
             )
         else:
             mr_hgemm_epilogue_store_read_c_accum(
@@ -426,14 +436,17 @@ def compile_iluvatar_mr_hgemm(
     epilogue: str = DEFAULT_EPILOGUE,
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
+    elem_dtype=DEFAULT_ELEM_DTYPE,
 ):
     """Build and return a JIT launch wrapper for the Iluvatar MR HGEMM.
 
     Computes D(M,N) = A(M,K) @ B(N,K).T. epilogue selects output dtype and accumulate mode.
+    elem_dtype is Float16 (default) or BFloat16 for A/B and no_c_read C.
     M/N/K must be multiples of derived bm/bn/bk or ValueError is raised.
     bm = ATOM_M * warp_atoms_m * warps_m, bn = ATOM_N * warp_atoms_n * warps_n,
     bk = ATOM_K_B16 * k_atoms. See module doc for epilogue and major_pattern.
     """
+    elem_dtype = _validate_elem_dtype(elem_dtype)
     parse_major_pattern(major_pattern)
     if epilogue not in (EPILOGUE_NO_C_READ, EPILOGUE_READ_C_ACCUM):
         raise ValueError(f"unknown epilogue: {epilogue}")
@@ -472,6 +485,7 @@ def compile_iluvatar_mr_hgemm(
         epilogue,
         epilogue_store,
         major_pattern,
+        elem_dtype,
     )
     grid = (M // bm, N // bn, 1)
     block = (threads, 1, 1)
@@ -485,6 +499,7 @@ def compile_iluvatar_mr_hgemm(
 
 
 __all__ = [
+    "DEFAULT_ELEM_DTYPE",
     "DEFAULT_EPILOGUE",
     "DEFAULT_EPILOGUE_STORE",
     "DEFAULT_K_ATOMS",
@@ -495,6 +510,7 @@ __all__ = [
     "EPILOGUE_STORE_SHFL",
     "EPILOGUE_STORE_TILED",
     "MAJOR_PATTERN_CHOICES",
+    "SUPPORTED_ELEM_DTYPES",
     "SWIZZLE_CTA_PRESETS",
     "SwizzleCtaPreset",
     "compile_iluvatar_mr_hgemm",
