@@ -252,9 +252,42 @@ jobs:
         run: |
           bash .github/scripts/run_ci_device_in_container.sh
 
+      - name: Run MLIR FileCheck (exclude rocdl-related)
+        env:
+          CI_DEVICE_IMAGE: ${{ needs.should-run-device.outputs.container_image != '' && needs.should-run-device.outputs.container_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+          COREX_ROOT: ${{ env.COREX_ROOT }}
+          IXCC_MLIR_CMAKE: ${{ env.IXCC_MLIR_CMAKE }}
+        run: |
+          set -euo pipefail
+          IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
+          docker run --rm \
+            --network host \
+            --ipc host \
+            --user "$(id -u):$(id -g)" \
+            -v "${PWD}:/workspace" \
+            -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
+            -v "${IXCC_ROOT}:${IXCC_ROOT}:ro" \
+            -v "${IXCC_MLIR_CMAKE}:${IXCC_MLIR_CMAKE}:ro" \
+            -w /workspace \
+            -e COREX_ROOT="${COREX_ROOT}" \
+            -e IXCC_ROOT="${IXCC_ROOT}" \
+            -e IXCC_MLIR_CMAKE="${IXCC_MLIR_CMAKE}" \
+            "${CI_DEVICE_IMAGE_LOCAL:-${CI_DEVICE_IMAGE}}" \
+            bash -lc '
+              set -euo pipefail
+              python3 .github/scripts/run_mlir_filecheck_filtered.py \
+                --repo-root /workspace \
+                --build-dir /workspace/build-fly \
+                --exclude-rocdl-related \
+                2>&1 | tee /workspace/logs/mlir-filecheck.log
+            '
+
       - name: Append must-pass summary
         if: always()
         run: |
+          if [ -f logs/mlir-filecheck.log ]; then
+            python3 -c "import pathlib,re; log=pathlib.Path('logs/mlir-filecheck.log').read_text(encoding='utf-8', errors='replace'); m=re.search(r'SUMMARY total=(\\d+) passed=(\\d+) failed=(\\d+)', log); print(); print('### mlir-filecheck summary'); print(); print(f'- total: {m.group(1)}') if m else print('- summary: unavailable'); print(f'- passed: {m.group(2)}') if m else None; print(f'- failed: {m.group(3)}') if m else None" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ -f logs/device-must-pass-summary.md ]; then
             cat logs/device-must-pass-summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -287,6 +320,7 @@ jobs:
             logs/device-must-pass.log
             logs/device-must-pass-summary.md
             logs/corex-version-summary.md
+            logs/mlir-filecheck.log
             logs/device-container-env.txt
             logs/device-env.txt
 
