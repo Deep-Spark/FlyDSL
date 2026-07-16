@@ -31,7 +31,11 @@ pytestmark = [pytest.mark.l2_device]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-EPILOGUE_STORE_CASES = ("no_c_read_tiled", "no_c_read_shfl", "read_c_accum")
+# no_c_read paths write f16/bf16; read_c_accum stays fp32.
+_NO_C_READ_DTYPE_CASES = (
+    ("float16", "Float16"),
+    ("bfloat16", "BFloat16"),
+)
 
 EPILOGUE_M = 16
 EPILOGUE_N = 32
@@ -68,12 +72,12 @@ def _require_imports():
         import flydsl.expr as fx
         import flydsl.expr.ixdl as ixdl
         from kernels.gemm.iluvatar.common import WARP_SIZE
-        from kernels.gemm.iluvatar.mr.common import ATOM_K_B16, ATOM_M, ATOM_N
         from kernels.gemm.iluvatar.epilogue import (
             mr_hgemm_epilogue_store_read_c_accum,
             mr_hgemm_epilogue_store_shfl,
             mr_hgemm_epilogue_store_tiled,
         )
+        from kernels.gemm.iluvatar.mr.common import ATOM_K_B16, ATOM_M, ATOM_N
     except ModuleNotFoundError as exc:
         pytest.fail(f"FlyDSL Python package is not importable: {exc}")
     return (
@@ -122,11 +126,14 @@ def _compile_epilogue_kernel(
     store_case: str,
     *,
     multi_cta: bool = False,
+    out_dtype=None,
 ):
     shfl_store = store_case == "no_c_read_shfl"
     tiled_store = store_case == "no_c_read_tiled"
     read_c_accum = store_case == "read_c_accum"
-    out_fp16 = not read_c_accum
+    out_b16 = not read_c_accum
+    if out_dtype is None:
+        out_dtype = fx.Float16
     cta_m = MULTI_CTA_EPILOGUE_M if multi_cta else EPILOGUE_M
     cta_n = MULTI_CTA_EPILOGUE_N if multi_cta else EPILOGUE_N
     full_m = MULTI_CTA_FULL_M if multi_cta else EPILOGUE_M
@@ -151,9 +158,7 @@ def _compile_epilogue_kernel(
             gC_warp = gC_full
             c_global_n = cta_n
 
-        mma_atom = fx.make_mma_atom(
-            ixdl.MRMma(atom_m, atom_n, atom_k, fx.Float16, fx.Float16, fx.Float32)
-        )
+        mma_atom = fx.make_mma_atom(ixdl.MRMma(atom_m, atom_n, atom_k, out_dtype, out_dtype, fx.Float32))
         tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
         thr_mma = tiled_mma.thr_slice(lane_id)
         gC_atoms = fx.flat_divide(gC_warp, (atom_m, atom_n))
@@ -188,6 +193,7 @@ def _compile_epilogue_kernel(
                 c_global_n=c_global_n,
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
+                out_dtype=out_dtype,
             )
         elif fx.const_expr(tiled_store):
             mr_hgemm_epilogue_store_tiled(
@@ -197,6 +203,7 @@ def _compile_epilogue_kernel(
                 tiled_mma=tiled_mma,
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
+                out_dtype=out_dtype,
             )
         else:
             mr_hgemm_epilogue_store_read_c_accum(
@@ -212,10 +219,52 @@ def _compile_epilogue_kernel(
     def launch(C: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
         epilogue_kernel(C).launch(grid=grid, block=(warp_size, 1, 1), stream=stream)
 
-    return launch, out_fp16, read_c_accum, full_m, full_n
+    return launch, out_b16, read_c_accum, full_m, full_n
 
 
-@pytest.mark.parametrize("store_case", EPILOGUE_STORE_CASES)
+@pytest.mark.parametrize("torch_dtype_name,fx_dtype_name", _NO_C_READ_DTYPE_CASES)
+@pytest.mark.parametrize("store_case", ("no_c_read_tiled", "no_c_read_shfl"))
+def test_iluvatar_mr_epilogue_fragment_store_device_b16(store_case, torch_dtype_name, fx_dtype_name, monkeypatch):
+    """Store initialized accumulator fragments via f16/bf16 shfl/tiled epilogue."""
+
+    _require_enabled()
+    flyc, fx, ixdl, atom_k, atom_m, atom_n, warp_size, store_shfl, store_tiled, store_read_c = _require_imports()
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+
+    out_dtype = getattr(fx, fx_dtype_name)
+    torch_dtype = getattr(torch, torch_dtype_name)
+    launch, out_b16, read_c_accum, full_m, full_n = _compile_epilogue_kernel(
+        flyc,
+        fx,
+        ixdl,
+        atom_k,
+        atom_m,
+        atom_n,
+        warp_size,
+        store_shfl,
+        store_tiled,
+        store_read_c,
+        store_case,
+        out_dtype=out_dtype,
+    )
+    assert out_b16 and not read_c_accum
+    C = torch.empty((full_m, full_n), device="cuda", dtype=torch_dtype)
+    expected = torch.full((full_m, full_n), EPILOGUE_ACC_VALUE, device="cuda", dtype=torch_dtype)
+
+    launch(C)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        C,
+        expected,
+        rtol=0,
+        atol=0,
+        msg=f"{store_case} {torch_dtype_name} epilogue mismatch",
+    )
+
+
+@pytest.mark.parametrize("store_case", ("read_c_accum",))
 def test_iluvatar_mr_epilogue_fragment_store_device(store_case, monkeypatch):
     """Store initialized accumulator fragments via the mode-specific epilogue helper."""
 
@@ -258,8 +307,9 @@ def test_iluvatar_mr_epilogue_fragment_store_device(store_case, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("torch_dtype_name,fx_dtype_name", _NO_C_READ_DTYPE_CASES)
 @pytest.mark.parametrize("store_case", MULTI_CTA_STORE_CASES)
-def test_iluvatar_mr_epilogue_multi_cta_store_device(store_case, monkeypatch):
+def test_iluvatar_mr_epilogue_multi_cta_store_device(store_case, torch_dtype_name, fx_dtype_name, monkeypatch):
     """Store accumulator fragments through a 2x2 CTA grid (128x128 logical C)."""
 
     _require_enabled()
@@ -267,7 +317,9 @@ def test_iluvatar_mr_epilogue_multi_cta_store_device(store_case, monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
 
-    launch, out_fp16, read_c_accum, full_m, full_n = _compile_epilogue_kernel(
+    out_dtype = getattr(fx, fx_dtype_name)
+    torch_dtype = getattr(torch, torch_dtype_name)
+    launch, out_b16, read_c_accum, full_m, full_n = _compile_epilogue_kernel(
         flyc,
         fx,
         ixdl,
@@ -280,10 +332,11 @@ def test_iluvatar_mr_epilogue_multi_cta_store_device(store_case, monkeypatch):
         store_read_c,
         store_case,
         multi_cta=True,
+        out_dtype=out_dtype,
     )
-    assert out_fp16 and not read_c_accum
-    C = torch.empty((full_m, full_n), device="cuda", dtype=torch.float16)
-    expected = torch.full((full_m, full_n), EPILOGUE_ACC_VALUE, device="cuda", dtype=torch.float16)
+    assert out_b16 and not read_c_accum
+    C = torch.empty((full_m, full_n), device="cuda", dtype=torch_dtype)
+    expected = torch.full((full_m, full_n), EPILOGUE_ACC_VALUE, device="cuda", dtype=torch_dtype)
 
     launch(C)
     torch.cuda.synchronize()
@@ -293,5 +346,5 @@ def test_iluvatar_mr_epilogue_multi_cta_store_device(store_case, monkeypatch):
         expected,
         rtol=0,
         atol=0,
-        msg=f"{store_case} multi-CTA epilogue mismatch",
+        msg=f"{store_case} {torch_dtype_name} multi-CTA epilogue mismatch",
     )

@@ -127,14 +127,16 @@ python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \
 **Production imports:**
 
 ```python
+import flydsl.expr as fx
 from kernels.gemm.iluvatar.mr.hgemm import compile_iluvatar_mr_hgemm
 from kernels.gemm.iluvatar.mr.igemm import compile_iluvatar_mr_igemm
 from kernels.gemm.iluvatar.gemv import compile_iluvatar_gemv
 
 launch_h = compile_iluvatar_mr_hgemm(
     M=4096, N=4096, K=4096,
+    elem_dtype=fx.Float16,      # or fx.BFloat16; A/B (and no_c_read C) dtype
     major_pattern="tn",         # CUTLASS 3.x BLAS tag (default: A/B both K-major)
-    epilogue="no_c_read",       # D = A @ B.T, fp16, no C read
+    epilogue="no_c_read",       # D = A @ B.T, f16/bf16, no C read
     epilogue_store="shfl",      # warp-shuffle epilogue (fastest for no_c_read)
     k_atoms=2,                  # BK = 16 * k_atoms = 32
 )
@@ -206,7 +208,7 @@ similar across all four when host tensors use the expected physical layout.
 
 | Mode | Compute | Output dtype | Global C read | Typical use |
 |------|---------|--------------|---------------|-------------|
-| `no_c_read` | `D = A @ B.T` | fp16 | No | Inference GEMM, peak TFLOPS |
+| `no_c_read` | `D = A @ B.T` | f16 / bf16 (`elem_dtype`) | No | Inference GEMM, peak TFLOPS |
 | `read_c_accum` | `C = A @ B.T + C` | fp32 | Yes | Training / accumulation |
 
 `epilogue_store` applies to `no_c_read` only: **`shfl`** (default, fastest) or

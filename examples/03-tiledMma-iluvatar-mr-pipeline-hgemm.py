@@ -5,7 +5,7 @@
 # doc/comments refer to it as "the tiled-copy teaching example".
 _TILEDCOPY_TEACHING_EXAMPLE = "examples/02-tiledCopy-iluvatar-mr.py"
 
-_DOC = """Iluvatar MR (ivcore11) tiledMma pipeline HGEMM: f16 inputs.
+_DOC = """Iluvatar MR (ivcore11) tiledMma pipeline HGEMM: f16 / bf16 inputs.
 
 Double-buffered shared-memory pipeline with async SME G2S
 (``MRAsyncCpRow16b`` / ``MRAsyncCpCol``), ``make_sme_shared_layout``, Ki-deferred
@@ -93,6 +93,7 @@ import flydsl.expr as fx  # noqa: E402
 from kernels.gemm.iluvatar.common import remap_gemm_tensors  # noqa: E402
 from kernels.gemm.iluvatar.mr.hgemm import (  # noqa: E402
     ATOM_K_B16,
+    DEFAULT_ELEM_DTYPE,
     DEFAULT_MAJOR_PATTERN,
     DEFAULT_SMEM_CAP_BYTES,
     DEFAULT_SWIZZLE_CTA,
@@ -114,6 +115,25 @@ EPILOGUE_BOTH = "both"
 DEFAULT_EPILOGUE = EPILOGUE_BOTH
 DEFAULT_K_ATOMS = 4  # BK = 64; matches SWIZZLE_CTA_PRESETS[*].default_k_atoms
 DEFAULT_EPILOGUE_STORE = EPILOGUE_STORE_TILED
+
+_DTYPE_CHOICES = ("fp16", "bf16", "float16", "bfloat16")
+_DTYPE_TO_FX = {
+    "fp16": fx.Float16,
+    "float16": fx.Float16,
+    "bf16": fx.BFloat16,
+    "bfloat16": fx.BFloat16,
+}
+_DTYPE_TO_TORCH = {
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _resolve_dtype(dtype_name: str):
+    key = dtype_name.lower()
+    return _DTYPE_TO_FX[key], _DTYPE_TO_TORCH[key]
 
 
 def _warn_if_card_busy() -> None:
@@ -149,15 +169,28 @@ def _epilogue_modes(epilogue: str) -> list[str]:
     return [epilogue]
 
 
-def _epilogue_label(epilogue: str, *, epilogue_store: str = DEFAULT_EPILOGUE_STORE) -> str:
+def _epilogue_label(
+    epilogue: str,
+    *,
+    epilogue_store: str = DEFAULT_EPILOGUE_STORE,
+    dtype_name: str = "fp16",
+) -> str:
     if epilogue == EPILOGUE_NO_C_READ:
-        return f"no_c_read (D=A@B.T, fp16, no read C, store={epilogue_store})"
+        return f"no_c_read (D=A@B.T, {dtype_name}, no read C, store={epilogue_store})"
     return "read_c_accum (C=A@B.T+C, fp32, read C)"
 
 
-def _make_c_tensor(m: int, n: int, epilogue: str, *, seed: int, device: str = "cuda"):
+def _make_c_tensor(
+    m: int,
+    n: int,
+    epilogue: str,
+    *,
+    seed: int,
+    device: str = "cuda",
+    torch_dtype=torch.float16,
+):
     if epilogue == EPILOGUE_NO_C_READ:
-        return torch.zeros(m, n, dtype=torch.float16, device=device)
+        return torch.zeros(m, n, dtype=torch_dtype, device=device)
     torch.manual_seed(seed)
     return torch.randn(m, n, dtype=torch.float32, device=device)
 
@@ -175,6 +208,7 @@ def _build_launcher(
     epilogue: str,
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
+    elem_dtype=DEFAULT_ELEM_DTYPE,
 ):
     launcher = compile_iluvatar_mr_hgemm(
         M=m,
@@ -188,6 +222,7 @@ def _build_launcher(
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
+        elem_dtype=elem_dtype,
     )
     bm, bn, _bk, threads, smem = _swizzle_cta_shape(
         warps_m,
@@ -211,9 +246,10 @@ def _expected_result(A, B, C_in, epilogue: str):
     return _reference(A, B, C_in)
 
 
-def _compare_atol(k: int, k_atoms: int) -> float:
+def _compare_atol(k: int, k_atoms: int, *, dtype_name: str = "fp16") -> float:
     bk = ATOM_K_B16 * k_atoms
-    return 2e-2 * max(1.0, (k / bk) ** 0.5)
+    scale = 2.0 if dtype_name in {"bf16", "bfloat16"} else 1.0
+    return 2e-2 * scale * max(1.0, (k / bk) ** 0.5)
 
 
 def _check(
@@ -229,12 +265,14 @@ def _check(
     epilogue: str,
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
+    dtype_name: str = "fp16",
     seed: int = 0,
 ) -> bool:
+    elem_dtype, torch_dtype = _resolve_dtype(dtype_name)
     torch.manual_seed(seed)
-    A = torch.randn(m, k, dtype=torch.float16, device="cuda")
-    B = torch.randn(n, k, dtype=torch.float16, device="cuda")
-    C = _make_c_tensor(m, n, epilogue, seed=seed + 1)
+    A = torch.randn(m, k, dtype=torch_dtype, device="cuda")
+    B = torch.randn(n, k, dtype=torch_dtype, device="cuda")
+    C = _make_c_tensor(m, n, epilogue, seed=seed + 1, torch_dtype=torch_dtype)
     C_in = C.clone()
     launcher, grid, block, smem = _build_launcher(
         m,
@@ -248,6 +286,7 @@ def _check(
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
+        elem_dtype=elem_dtype,
     )
     a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
@@ -260,7 +299,7 @@ def _check(
     else:
         got = C
     diff = (got - expected).abs()
-    atol = _compare_atol(k, k_atoms)
+    atol = _compare_atol(k, k_atoms, dtype_name=dtype_name)
     ok = torch.allclose(got, expected, atol=atol, rtol=2e-2)
     finite_ok = torch.isfinite(got).all().item()
     cta_note = (
@@ -270,7 +309,7 @@ def _check(
     )
     store_note = f" store={epilogue_store}" if epilogue == EPILOGUE_NO_C_READ else ""
     print(
-        f"[check] epilogue={epilogue}{store_note} pattern={major_pattern} "
+        f"[check] dtype={dtype_name} epilogue={epilogue}{store_note} pattern={major_pattern} "
         f"M={m} N={n} K={k}{cta_note} grid={grid} block={block} smem={smem} "
         f"ok={ok} finite={finite_ok} max_abs={diff.max().item():.3e} "
         f"mean_abs={diff.mean().item():.3e} atol={atol:.2e}"
@@ -294,14 +333,16 @@ def _bench(
     epilogue: str,
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
+    dtype_name: str = "fp16",
     iters: int,
     warmup: int,
 ) -> None:
-    print(f"[bench] === {_epilogue_label(epilogue, epilogue_store=epilogue_store)} ===")
+    elem_dtype, torch_dtype = _resolve_dtype(dtype_name)
+    print(f"[bench] === {_epilogue_label(epilogue, epilogue_store=epilogue_store, dtype_name=dtype_name)} ===")
     torch.manual_seed(0)
-    A = torch.randn(m, k, dtype=torch.float16, device="cuda")
-    B = torch.randn(n, k, dtype=torch.float16, device="cuda")
-    C = _make_c_tensor(m, n, epilogue, seed=1)
+    A = torch.randn(m, k, dtype=torch_dtype, device="cuda")
+    B = torch.randn(n, k, dtype=torch_dtype, device="cuda")
+    C = _make_c_tensor(m, n, epilogue, seed=1, torch_dtype=torch_dtype)
     C_in = C.clone()
     launcher, grid, block, smem = _build_launcher(
         m,
@@ -315,6 +356,7 @@ def _bench(
         epilogue=epilogue,
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
+        elem_dtype=elem_dtype,
     )
     a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
@@ -344,12 +386,12 @@ def _bench(
     us = start.elapsed_time(end) * 1e3 / iters
     tflops = _gemm_flops(m, n, k) / (us * 1e-6) / 1e12
 
-    c16 = torch.empty(m, n, dtype=torch.float16, device="cuda")
+    c_ref = torch.empty(m, n, dtype=torch_dtype, device="cuda")
     ref_f32 = torch.empty(m, n, dtype=torch.float32, device="cuda")
 
     def torch_ref():
         if epilogue == EPILOGUE_NO_C_READ:
-            c16.copy_(A @ B.T)
+            c_ref.copy_(A @ B.T)
         else:
             ref_f32.copy_(A.float() @ B.float().T + C_in)
 
@@ -368,11 +410,12 @@ def _bench(
     torch_tflops = _gemm_flops(m, n, k) / (torch_us * 1e-6) / 1e12
 
     print(
-        f"[bench] epilogue={epilogue}"
+        f"[bench] dtype={dtype_name} epilogue={epilogue}"
         f"{f' store={epilogue_store}' if epilogue == EPILOGUE_NO_C_READ else ''} "
-        f"pattern={major_pattern} M={m} N={n} K={k} grid={grid} block={block} "
-        f"threads={block[0]} smem={smem} {us:.1f} us/iter  {tflops:.2f} TFLOPS  "
-        f"(torch {torch_us:.1f} us, {torch_tflops:.2f} TFLOPS)"
+        f"pattern={major_pattern} k_atoms={k_atoms} M={m} N={n} K={k} "
+        f"grid={grid} block={block} threads={block[0]} smem={smem} "
+        f"{us:.1f} us/iter  {tflops:.2f} TFLOPS  "
+        f"(torch {torch_us:.1f} us, {torch_tflops:.2f} TFLOPS, {us / torch_us:.2f}x)"
     )
 
     expected = _expected_result(A, B, C_in, epilogue)
@@ -380,7 +423,7 @@ def _bench(
         got = C.to(torch.float32)
     else:
         got = C
-    atol = _compare_atol(k, k_atoms)
+    atol = _compare_atol(k, k_atoms, dtype_name=dtype_name)
     if not torch.allclose(got, expected, atol=atol, rtol=2e-2):
         diff = (got - expected).abs()
         print(f"  [WARN] post-bench correctness FAILED (max_abs={diff.max().item():.3e})")
@@ -392,10 +435,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--n", type=int, default=1024)
     p.add_argument("--k", type=int, default=512)
     p.add_argument(
+        "--dtype",
+        choices=_DTYPE_CHOICES,
+        default="fp16",
+        help="A/B (and no_c_read C) element type: fp16 (default) or bf16",
+    )
+    p.add_argument(
         "--epilogue",
         choices=(EPILOGUE_NO_C_READ, EPILOGUE_READ_C_ACCUM, EPILOGUE_BOTH),
         default=DEFAULT_EPILOGUE,
-        help="no_c_read=D=A@B.T fp16 no read C; read_c_accum=C+=A@B.T fp32 read C; both=sequential",
+        help="no_c_read=D=A@B.T f16/bf16 no read C; read_c_accum=C+=A@B.T fp32 read C; both=sequential",
     )
     p.add_argument(
         "--epilogue-store",
@@ -492,16 +541,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     compile_only = os.environ.get("COMPILE_ONLY", "").lower() in {"1", "true", "yes", "on"}
+    elem_dtype, torch_dtype = _resolve_dtype(args.dtype)
     if compile_only or not torch.cuda.is_available():
         os.environ["COMPILE_ONLY"] = "1"
         err = _validate_shape(m, n, k, args)
         if err:
             print(f"Error: {err}", file=sys.stderr)
             return 2
-        a = torch.randn(m, k, dtype=torch.float16)
-        b = torch.randn(n, k, dtype=torch.float16)
+        a = torch.randn(m, k, dtype=torch_dtype, device="cpu")
+        b = torch.randn(n, k, dtype=torch_dtype, device="cpu")
         for epilogue in epilogues:
-            c = _make_c_tensor(m, n, epilogue, seed=0, device="cpu")
+            c = _make_c_tensor(m, n, epilogue, seed=0, device="cpu", torch_dtype=torch_dtype)
             launcher, grid, block, smem = _build_launcher(
                 m,
                 n,
@@ -514,12 +564,14 @@ def main(argv: list[str] | None = None) -> int:
                 epilogue=epilogue,
                 epilogue_store=args.epilogue_store,
                 major_pattern=args.major_pattern,
+                elem_dtype=elem_dtype,
             )
             a_dev, b_dev = remap_gemm_tensors(a, b, args.major_pattern)
             launcher(a_dev, b_dev, c)
             store_note = f", store={args.epilogue_store}" if epilogue == EPILOGUE_NO_C_READ else ""
             print(
-                f"Compiled tiledMma pipeline HGEMM (COMPILE_ONLY; epilogue={epilogue}{store_note}, "
+                f"Compiled tiledMma pipeline HGEMM (COMPILE_ONLY; dtype={args.dtype}, "
+                f"epilogue={epilogue}{store_note}, "
                 f"pattern={args.major_pattern}, {m}x{n}x{k}, cta={args.cta}, "
                 f"grid={grid}, block={block}, smem={smem})."
             )
@@ -539,6 +591,7 @@ def main(argv: list[str] | None = None) -> int:
             epilogue=epilogue,
             epilogue_store=args.epilogue_store,
             major_pattern=args.major_pattern,
+            dtype_name=args.dtype,
         )
         all_ok = all_ok and ok
     if not all_ok:
@@ -565,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
                 epilogue=epilogue,
                 epilogue_store=args.epilogue_store,
                 major_pattern=args.major_pattern,
+                dtype_name=args.dtype,
                 iters=args.iters,
                 warmup=args.warmup,
             )
