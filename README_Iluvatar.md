@@ -161,16 +161,17 @@ See module docstrings under `kernels/gemm/iluvatar/` for tuning parameters
 Measured on **Iluvatar BI-V150S** (`ARCH=ivcore11`). All four `major_pattern`
 values (`nt` / `tn` / `nn` / `tt`) × square sizes. **Grey** = matched hand-tuned
 (100%); **green** = FlyDSL % of that baseline, taking the **best FlyDSL config**
-per point — hGEMM best of `k_atoms∈{2,4}` (`no_c_read`+`shfl`, `cta=1024`) vs
-`mr_gemm_fp16_db_trad_opt4 -T=…`; iGEMM `k_rep=2`, `i32`, `cta=1024` vs `opt6`
-(4096³ also vs `opt4`, take higher). Sampling: `warmup=1`, `iters=100`, median
-of 5 runs (`CUDA_VISIBLE_DEVICES=4`).
+per point — fp16/bf16 hGEMM best of `k_atoms∈{2,4}` (`no_c_read`+`shfl`,
+`cta=1024`) vs `mr_gemm_fp16_db_trad_opt4 -T=…` (bf16 has no hand-tuned binary,
+so the same fp16 opt4 peak is the baseline); iGEMM `k_rep=2`, `i32`, `cta=1024`
+vs `opt6` (4096³ also vs `opt4`, take higher). Sampling: `warmup=1`,
+`iters=100`, median of 5 runs.
 
 <p align="center">
   <img src="./docs/images/iluvatar-flydsl-vs-handtuned-pct.png" alt="FlyDSL vs hand-tuned hGEMM/iGEMM" width="100%"/>
 </p>
 
-Reproduce (hGEMM: try both `k_atoms` and keep the better):
+Reproduce (hGEMM: try both `k_atoms` and keep the better; add `--dtype bf16` for the middle panel):
 
 ```bash
 for p in nt tn nn tt; do
