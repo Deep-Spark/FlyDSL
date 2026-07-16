@@ -1199,17 +1199,21 @@ def apply_swizzle(ptr, swizzle):
 
 @dsl_loc_tracing
 @dsl_wrap_result
-def ptr_load(ptr, result_type=None):
+def ptr_load(ptr, result_type=None, *, uniform=False):
     """Load one value (scalar or vector) from *ptr*; dtype defaults to ptr's element type.
 
     Examples:
         v = ptr_load(ptr)
+
+    Set *uniform=True* only when every lane in the wave accesses the same
+    address and the backing memory is not modified during the kernel. Target
+    backends may then select a scalar-memory instruction.
     """
     if result_type is None:
         result_type = ptr.element_type
     if not isinstance(result_type, ir.Type):
         result_type = result_type.ir_type
-    return fly.ptr_load(result_type, ptr)
+    return fly.ptr_load(result_type, ptr, uniform=uniform)
 
 
 @dsl_loc_tracing

@@ -54,6 +54,20 @@ func.func @add_offset_global_b16(%p: !fly.ptr<f16, global>, %dyn: i32) {
   return
 }
 
+// === Large global offsets preserve i64 through byte scaling ===
+
+// CHECK-LABEL: @add_offset_global_b16_i64
+// CHECK-SAME: (%[[P:.*]]: !llvm.ptr<1>, %[[IDX:.*]]: i64)
+// CHECK: %[[EB:.*]] = arith.constant 2 : i64
+// CHECK: %[[BYTES:.*]] = arith.muli %[[IDX]], %[[EB]] : i64
+// CHECK: llvm.getelementptr %[[P]][%[[BYTES]]] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, i8
+func.func @add_offset_global_b16_i64(%p: !fly.ptr<f16, global>, %dyn: i64) {
+  %off = fly.make_int_tuple(%dyn) : (i64) -> !fly.int_tuple<?>
+  %p2 = fly.add_offset(%p, %off)
+      : (!fly.ptr<f16, global>, !fly.int_tuple<?>) -> !fly.ptr<f16, global>
+  return
+}
+
 // === N/A (already byte-addressed): global i8 -> no scale, i8-typed GEP ===
 
 // CHECK-LABEL: @add_offset_global_b8

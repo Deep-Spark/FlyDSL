@@ -461,7 +461,8 @@ def Fly_DecompositionOp : Fly_Op<"decomposition", [Pure, DeclareOpInterfaceMetho
 }
 
 def Fly_PtrLoadOp : Fly_Op<"ptr.load", []> {
-  let arguments = (ins Fly_IteratorLikeType:$ptr);
+  let arguments = (ins Fly_IteratorLikeType:$ptr,
+                       DefaultValuedAttr<BoolAttr, "false">:$uniform);
   let results = (outs AnyType:$result);
 }
 def Fly_PtrStoreOp : Fly_Op<"ptr.store"> {

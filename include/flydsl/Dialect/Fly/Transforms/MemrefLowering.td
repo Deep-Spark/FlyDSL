@@ -7,7 +7,7 @@
 include "mlir/IR/PatternBase.td"
 include "flydsl/Dialect/Fly/IR/FlyOps.td"
 
-def : Pat<(Fly_PtrLoadOp Fly_IntTuple:$int_tuple),
+def : Pat<(Fly_PtrLoadOp Fly_IntTuple:$int_tuple, $uniform),
           (replaceWithValue $int_tuple)>;
 
 def : Pat<(Fly_AddOffsetOp Fly_IntTuple:$int_tuple, Fly_IntTuple:$offset),
@@ -23,7 +23,8 @@ def : Pat<(Fly_DecompositionOp Fly_CoordTensor:$tensor),
           [(Fly_SimpleLayoutCoordTensor $tensor)]>;
 def : Pat<(Fly_MemRefLoadOp Fly_MemRef:$memref, $indices),
           (Fly_PtrLoadOp (Fly_AddOffsetOp (Fly_GetIterOp $memref),
-                                          (Fly_Crd2IdxOp $indices, (Fly_GetLayoutOp $memref))))>;
+                                          (Fly_Crd2IdxOp $indices, (Fly_GetLayoutOp $memref))),
+                         ConstBoolAttrFalse)>;
 def : Pat<(Fly_MemRefStoreOp $value, Fly_MemRef:$memref, $indices),
           (Fly_PtrStoreOp $value, (Fly_AddOffsetOp (Fly_GetIterOp $memref),
                                                    (Fly_Crd2IdxOp $indices, (Fly_GetLayoutOp $memref))))>;

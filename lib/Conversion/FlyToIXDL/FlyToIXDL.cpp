@@ -8,6 +8,7 @@
 #include "mlir/Dialect/LLVMIR/IXDLDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -319,6 +320,8 @@ public:
 
     Value offsetVal;
     auto offsetInt = offsetAttr.extractIntFromLeaf();
+    bool isSmeGmem =
+        isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace());
     if (offsetInt.isStatic()) {
       offsetVal = arith::ConstantIntOp::create(rewriter, loc, offsetInt.getValue(), 32);
     } else {
@@ -327,7 +330,8 @@ public:
       Type i32Ty = rewriter.getI32Type();
       if (offsetVal.getType().isIndex())
         offsetVal = arith::IndexCastOp::create(rewriter, loc, i32Ty, offsetVal);
-      else if (offsetVal.getType() != i32Ty) {
+      else if (offsetVal.getType() != i32Ty &&
+               (isSmeGmem || offsetVal.getType().getIntOrFloatBitWidth() < 64)) {
         unsigned bw = offsetVal.getType().getIntOrFloatBitWidth();
         if (bw < 32)
           offsetVal = arith::ExtSIOp::create(rewriter, loc, i32Ty, offsetVal);
@@ -336,7 +340,7 @@ public:
       }
     }
 
-    if (isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace())) {
+    if (isSmeGmem) {
       // The offset is an element-index delta; convert to a byte delta before
       // accumulating into the fat pointer's byte_offset field.
       int64_t elemBits = flyPtrTy.getElemTy().getIntOrFloatBitWidth();
@@ -386,7 +390,9 @@ public:
              "add_offset: byte-GEP store optimization does not yet handle "
              "sub-byte / non-byte-multiple global element types (e.g. i4/fp4)");
       if (elemBits > 8 && elemBits % 8 == 0) {
-        Value elemBytes = arith::ConstantIntOp::create(rewriter, loc, elemBits / 8, 32);
+        auto offsetIntTy = cast<IntegerType>(offsetVal.getType());
+        Value elemBytes =
+            arith::ConstantIntOp::create(rewriter, loc, offsetIntTy, elemBits / 8);
         offsetVal = arith::MulIOp::create(rewriter, loc, offsetVal, elemBytes);
         elemTy = rewriter.getI8Type();
       }
@@ -434,6 +440,27 @@ public:
     Type loadTy = getTypeConverter()->convertType(op.getResult().getType());
     if (!loadTy)
       return failure();
+
+    if (op.getUniform()) {
+      if (!loadTy.isInteger(32))
+        return rewriter.notifyMatchFailure(op, "uniform ptr.load currently requires i32");
+      if (!isGenericAddressSpace<AddressSpace::Global>(flyPtrTy.getAddressSpace()))
+        return rewriter.notifyMatchFailure(op, "uniform ptr.load currently requires global memory");
+
+      Type i64Ty = rewriter.getI64Type();
+      Value ptrAddr = LLVM::PtrToIntOp::create(rewriter, loc, i64Ty, ptr);
+      Value uniformAddr =
+          LLVM::CallIntrinsicOp::create(rewriter, loc, i64Ty,
+                                        rewriter.getStringAttr("llvm.bi.readfirstlane.i64"),
+                                        ValueRange{ptrAddr})
+              .getResult(0);
+      Value uniformPtr = LLVM::IntToPtrOp::create(
+          rewriter, loc, cast<LLVM::LLVMPointerType>(ptr.getType()), uniformAddr);
+      auto load = LLVM::LoadOp::create(rewriter, loc, loadTy, uniformPtr);
+      load.setInvariant(true);
+      rewriter.replaceOp(op, load.getResult());
+      return success();
+    }
 
     if (auto vecTy = dyn_cast<VectorType>(op.getResult().getType())) {
       auto swizzle = flyPtrTy.getSwizzle();
@@ -920,6 +947,8 @@ public:
 
     populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns, typeConverter);
     populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(patterns, typeConverter);
+
+    scf::populateSCFStructuralTypeConversionsAndLegality(typeConverter, patterns, target);
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
       signalPassFailure();
