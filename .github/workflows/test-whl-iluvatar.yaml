@@ -49,11 +49,48 @@ jobs:
           DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
         run: |
           set -euo pipefail
+          GPU_DEVICES=""
+          RETRY_SECONDS=120
+          RETRY_INTERVAL=5
+          elapsed=0
+          while [ "${elapsed}" -le "${RETRY_SECONDS}" ]; do
+            GPU_DEVICES=""
+            if ls /dev/iluvatar* >/dev/null 2>&1; then
+              for dev in /dev/iluvatar*; do
+                [ -e "${dev}" ] || continue
+                GPU_DEVICES="${GPU_DEVICES} --device=${dev}"
+              done
+            fi
+            if [ -n "${GPU_DEVICES}" ]; then
+              break
+            fi
+            if [ "${elapsed}" -eq "${RETRY_SECONDS}" ]; then
+              break
+            fi
+            echo "Waiting for /dev/iluvatar* nodes (${elapsed}/${RETRY_SECONDS}s)..."
+            sleep "${RETRY_INTERVAL}"
+            elapsed=$((elapsed + RETRY_INTERVAL))
+          done
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            RENDER_DEVICES="$(cat /etc/podinfo/gha-render-devices)"
+          elif [ -e /dev/dri ]; then
+            RENDER_DEVICES="--device /dev/dri"
+          else
+            RENDER_DEVICES=""
+          fi
+
+          if [ -z "${GPU_DEVICES}" ]; then
+            echo "::error::No /dev/iluvatar* nodes found after ${RETRY_SECONDS}s retry window"
+            exit 1
+          fi
+
           docker run --rm \
             --network host \
             --ipc host \
-            --device=/dev/kfd \
             --user root \
+            ${GPU_DEVICES} \
+            ${RENDER_DEVICES} \
             -v "${PWD}:/workspace" \
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
             -w /workspace \
