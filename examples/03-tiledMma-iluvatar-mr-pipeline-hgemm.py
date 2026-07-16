@@ -70,8 +70,26 @@ parameters are documented in that module; CLI flags here mirror those kwargs
 
 Run::
 
+    # Correctness (small shape) and a single default bench:
     python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --check
     python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench
+
+    # Peak-shape reference (Gate2-style contract), fp16 or bf16:
+    python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \\
+      --dtype fp16 --m 4096 --n 4096 --k 4096 --cta 1024 --k-atoms 2 \\
+      --epilogue no_c_read --epilogue-store shfl --major-pattern tn \\
+      --warmup 1 --iters 100
+
+    # Full sweep over layouts x k_atoms (the canonical tuning command; the best
+    # of k_atoms in {{2,4}} per point is the reported FlyDSL config). Replace
+    # 4096 with the target square size (or set M/N/K independently):
+    for p in nt tn nn tt; do
+      for ka in 2 4; do
+        python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \\
+          --epilogue no_c_read --epilogue-store shfl --k-atoms "$ka" --cta 1024 \\
+          --major-pattern "$p" --warmup 1 --iters 100 --m 4096 --n 4096 --k 4096
+      done
+    done
 """
 __doc__ = _DOC.format(tiledcopy_teaching_example=_TILEDCOPY_TEACHING_EXAMPLE)
 
@@ -430,7 +448,21 @@ def _bench(
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Iluvatar ivcore11 tiledMma pipeline HGEMM")
+    p = argparse.ArgumentParser(
+        description="Iluvatar ivcore11 tiledMma pipeline HGEMM",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "canonical tuning sweep (best of k_atoms in {2,4} per point;\n"
+            "replace 4096 with the target shape):\n"
+            "  for p in nt tn nn tt; do\n"
+            "    for ka in 2 4; do\n"
+            "      python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \\\n"
+            "        --epilogue no_c_read --epilogue-store shfl --k-atoms \"$ka\" --cta 1024 \\\n"
+            "        --major-pattern \"$p\" --warmup 1 --iters 100 --m 4096 --n 4096 --k 4096\n"
+            "    done\n"
+            "  done"
+        ),
+    )
     p.add_argument("--m", type=int, default=1024)
     p.add_argument("--n", type=int, default=1024)
     p.add_argument("--k", type=int, default=512)
