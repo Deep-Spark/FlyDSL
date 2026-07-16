@@ -10,10 +10,16 @@
 
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(FlyIXDL, fly_ixdl, mlir::fly_ixdl::FlyIXDLDialect)
 
+void mlirRegisterIXDLAddressSimplifyPass(void) {
+  mlir::registerIXDLAddressSimplifyPass();
+}
 void mlirRegisterFlyToIXDLConversionPass(void) { mlir::registerFlyToIXDLConversionPass(); }
 
 void flydsl_register_iluvatar_dialects(MlirDialectRegistry registry) {
   unwrap(registry)->insert<mlir::fly_ixdl::FlyIXDLDialect>();
 }
 
-void flydsl_register_iluvatar_passes(void) { mlirRegisterFlyToIXDLConversionPass(); }
+void flydsl_register_iluvatar_passes(void) {
+  mlirRegisterIXDLAddressSimplifyPass();
+  mlirRegisterFlyToIXDLConversionPass();
+}

@@ -43,7 +43,7 @@ class IluvatarBackend(BaseBackend):
             "fly-rewrite-func-signature",
             "fly-canonicalize",
             "fly-layout-lowering",
-            "fly-int-swizzle-simplify",
+            "fly-ixdl-address-simplify",
             "canonicalize",
             "fly-convert-atom-call-to-ssa-form",
             "fly-promote-regmem-to-vectorssa",
