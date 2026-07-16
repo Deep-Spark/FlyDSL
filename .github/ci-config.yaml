@@ -7,7 +7,6 @@
   },
   "core": {
     "a_tests": [
-      "tests/unit/test_iluvatar_compile_backend.py",
       "tests/unit/test_iluvatar_backend_cmake.py",
       "tests/unit/test_iluvatar_device_runtime.py",
       "tests/unit/test_iluvatar_jit_runtime_resolution.py"
@@ -30,6 +29,7 @@
     "path_filters": [
       "kernels/**",
       "tests/kernels/**",
+      "tests/mlir/**",
       "tests/unit/test_iluvatar_*",
       "python/flydsl/compiler/**",
       "lib/**",
