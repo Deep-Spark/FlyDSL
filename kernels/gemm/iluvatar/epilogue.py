@@ -176,6 +176,43 @@ def mr_igemm_epilogue_store_i32(
                 stp_vs_b32(loaded[jn][ei], c_warp_ptr, voffset, soffset)
 
 
+def mr_igemm_epilogue_store_i8_pack_only(
+    *,
+    lane_id,
+    accs,
+    gC_warp,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    c_global_n: int,
+):
+    """int8 packed store via PackOnly (no SLB shuffle).
+
+    For each group of 4 N-atoms, pack the same row-register across the group
+    with 3x ``byte_permute`` (trunc-wrap), then ``stp_vs_b32``. Requires B
+    ``N_SWIZZLE=4`` so those 4 atoms already hold consecutive logical N.
+    """
+    if fx.const_expr(warp_atoms_n % 4 != 0):
+        raise ValueError("i8 PackOnly epilogue requires warp_atoms_n %% 4 == 0")
+
+    lane_row = lane_id.shrui(fx.Int32(4))
+    lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)
+    voffset = lane_row * fx.Int32(c_global_n) + lane_col * fx.Int32(4)
+    c_warp_ptr = fx.get_iter(gC_warp)
+    groups_n = warp_atoms_n // 4
+
+    for im in fx.range_constexpr(warp_atoms_m):
+        loaded = [Vec(accs[im][jn].load()) for jn in range(warp_atoms_n)]
+        for g in fx.range_constexpr(groups_n):
+            packed = []
+            for ei in fx.range_constexpr(4):
+                lo = byte_permute(loaded[g * 4 + 0][ei], loaded[g * 4 + 1][ei], 0x40)
+                hi = byte_permute(loaded[g * 4 + 2][ei], loaded[g * 4 + 3][ei], 0x40)
+                packed.append(byte_permute(lo, hi, 0x5410))
+            for ei in fx.range_constexpr(4):
+                soffset = fx.Int32((im * ATOM_M + ei * 4) * c_global_n)
+                stp_vs_b32(packed[ei], c_warp_ptr, voffset, soffset + fx.Int32(g * 64))
+
+
 def mr_igemm_epilogue_store_i8_packed(
     *,
     lane_id,
@@ -186,10 +223,15 @@ def mr_igemm_epilogue_store_i8_packed(
     warp_atoms_m: int,
     warp_atoms_n: int,
     c_global_n: int,
+    pack_only: bool = False,
 ):
     """int8 packed store (int8 GEMM, ``D = A @ B.T``, truncating cast).
-    Per lane each MMA atom owns 4 rows {r, r+4, r+8, r+12} x 1
-    For every group of 4 N-atoms (64 cols):
+
+    ``pack_only=True``: PackOnly (register pack + ``stp_vs_b32``, no SLB); see
+    ``mr_igemm_epilogue_store_i8_pack_only``. Requires matching B ``N_SWIZZLE=4``.
+
+    ``pack_only=False`` (default): PackSlb path. Per lane each MMA
+    atom owns 4 rows {r, r+4, r+8, r+12} x 1. For every group of 4 N-atoms (64 cols):
       1. pack each atom's 4 i8 rows into one i32 (truncating cast, wrap on overflow);
       2. scatter the 4 i32 into SMEM (32-bit writes,
          bank-conflict free) -> read back 4 i32 with the transpose swizzle;
@@ -198,6 +240,17 @@ def mr_igemm_epilogue_store_i8_packed(
 
     No quant scale/bias/relu fusion.
     """
+    if fx.const_expr(pack_only):
+        mr_igemm_epilogue_store_i8_pack_only(
+            lane_id=lane_id,
+            accs=accs,
+            gC_warp=gC_warp,
+            warp_atoms_m=warp_atoms_m,
+            warp_atoms_n=warp_atoms_n,
+            c_global_n=c_global_n,
+        )
+        return
+
     if fx.const_expr(warp_atoms_n % 4 != 0):
         raise ValueError("i8 packed epilogue requires warp_atoms_n %% 4 == 0")
     warp_m = ATOM_M * warp_atoms_m
