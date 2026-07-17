@@ -14,7 +14,6 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -864,50 +863,61 @@ public:
   }
 };
 
-/// Fold ``inttoptr(ptrtoint(p))`` on the base of ``llvm.bi.stp.vs[.pred].*``
-/// back to ``p``.
+/// True when ``llvm.bi.stp.vs[.pred].*`` arg[1] is ``inttoptr(ptrtoint(p))``
+/// with matching pointer types (foldable after fly.ptr -> llvm.ptr).
+static bool isFoldableStpVsPtrRoundtrip(LLVM::CallIntrinsicOp op) {
+  if (!op.getIntrin().starts_with("llvm.bi.stp.vs."))
+    return false;
+  // Unpredicated: (val, ptr, voffset, soffset, kop)
+  // Predicated:    (val, ptr, voffset, soffset, kop, pred)
+  size_t nArgs = op.getArgs().size();
+  if (nArgs != 5 && nArgs != 6)
+    return false;
+  Value ptrArg = op.getArgs()[1];
+  auto intToPtr = ptrArg.getDefiningOp<LLVM::IntToPtrOp>();
+  if (!intToPtr)
+    return false;
+  auto ptrToInt = intToPtr.getArg().getDefiningOp<LLVM::PtrToIntOp>();
+  if (!ptrToInt)
+    return false;
+  return ptrToInt.getArg().getType() == ptrArg.getType();
+}
+
+/// Fold ``inttoptr(ptrtoint(p))`` on the base of every foldable
+/// ``llvm.bi.stp.vs[.pred].*`` under ``root`` back to ``p``.
 ///
 /// Root cause is the ``!fly.ptr`` / ``!llvm.ptr`` mismatch: the Python helpers
 /// must feed ``llvm.call_intrinsic`` a ``!llvm.ptr``, but tracing only has
 /// ``!fly.ptr``. Crossing via ``fly.ptrtoint`` + ``llvm.inttoptr`` avoids an
-/// ``unrealized_conversion_cast`` deadlock at trace time. After this pass has
-/// already rewritten ``fly.ptr`` to ``llvm.ptr``, the round-trip is redundant
-/// and must be folded so Iluvatar ISel sees a clean descriptor base (not an
-/// inttoptr-derived pointer).
+/// ``unrealized_conversion_cast`` deadlock at trace time. Once the main
+/// conversion has rewritten ``fly.ptr`` to ``llvm.ptr``, the round-trip is
+/// redundant and is folded so Iluvatar ISel sees a clean descriptor base (not
+/// an inttoptr-derived pointer). Covers unpredicated (5 args) and predicated
+/// (6 args) forms for i8 / i16 / i32 / i64 / v4i32.
 ///
-/// Covers both unpredicated (5 args) and predicated (6 args, pred last) forms
-/// for i8 / i16 / i32 / i64 / v4i32.
-struct FoldStpVsPtrRoundtrip : public OpRewritePattern<LLVM::CallIntrinsicOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(LLVM::CallIntrinsicOp op,
-                                PatternRewriter &rewriter) const override {
-    StringRef name = op.getIntrin();
-    if (!name.starts_with("llvm.bi.stp.vs."))
-      return failure();
-    // Unpredicated: (val, ptr, voffset, soffset, kop)
-    // Predicated:    (val, ptr, voffset, soffset, kop, pred)
-    size_t nArgs = op.getArgs().size();
-    if (nArgs != 5 && nArgs != 6)
-      return failure();
-    Value ptrArg = op.getArgs()[1];
-    auto intToPtr = ptrArg.getDefiningOp<LLVM::IntToPtrOp>();
-    if (!intToPtr)
-      return failure();
+/// Must run after the main conversion (so ``fly.ptrtoint`` is already
+/// ``llvm.ptrtoint``). This is a trivial local peephole: rewrite each base
+/// operand in place and erase the now-dead round-trip. Done with a plain walk
+/// rather than the greedy driver (which whole-module DCEs unrelated unused Pure
+/// results) or a second dialect conversion (heavyweight, and makes operand
+/// erasure depend on fragile staged-use bookkeeping).
+static void foldStpVsPtrRoundtrips(Operation *root) {
+  // Collect first, then rewrite, to avoid mutating IR mid-walk.
+  SmallVector<LLVM::CallIntrinsicOp> stpVsCalls;
+  root->walk([&](LLVM::CallIntrinsicOp op) {
+    if (isFoldableStpVsPtrRoundtrip(op))
+      stpVsCalls.push_back(op);
+  });
+  for (LLVM::CallIntrinsicOp op : stpVsCalls) {
+    auto intToPtr = op.getArgs()[1].getDefiningOp<LLVM::IntToPtrOp>();
     auto ptrToInt = intToPtr.getArg().getDefiningOp<LLVM::PtrToIntOp>();
-    if (!ptrToInt)
-      return failure();
-    Value base = ptrToInt.getArg();
-    if (base.getType() != ptrArg.getType())
-      return failure();
-
-    SmallVector<Value> newArgs(op.getArgs().begin(), op.getArgs().end());
-    newArgs[1] = base;
-    rewriter.replaceOpWithNewOp<LLVM::CallIntrinsicOp>(
-        op, TypeRange{}, op.getIntrinAttr(), newArgs, op.getFastmathFlagsAttr());
-    return success();
+    op->setOperand(1, ptrToInt.getArg());
+    if (intToPtr->use_empty())
+      intToPtr->erase();
+    if (ptrToInt->use_empty())
+      ptrToInt->erase();
   }
-};
+}
 
 class FlyToIXDLConversionPass
     : public mlir::impl::FlyToIXDLConversionPassBase<FlyToIXDLConversionPass> {
@@ -982,10 +992,7 @@ public:
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
       signalPassFailure();
 
-    RewritePatternSet foldPatterns(context);
-    foldPatterns.add<FoldStpVsPtrRoundtrip>(context);
-    if (failed(applyPatternsGreedily(getOperation(), std::move(foldPatterns))))
-      signalPassFailure();
+    foldStpVsPtrRoundtrips(getOperation());
   }
 };
 
