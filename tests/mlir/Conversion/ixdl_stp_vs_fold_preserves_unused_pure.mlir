@@ -2,20 +2,21 @@
 // Copyright (c) 2025 FlyDSL Project Contributors
 // RUN: %fly-opt %s --convert-fly-to-ixdl | FileCheck %s
 
-// Pre-commit baseline for the stp.vs ptr-roundtrip fold.
+// Regression for foldStpVsPtrRoundtrips.
 //
-// This records CURRENT (pre-fix) behavior. The greedy stp.vs fold seeds every
-// op into the worklist and DCEs trivially-dead Pure results as a side effect,
-// so unused add_offset / make_ptr lowerings vanish and only `return` remains.
-// The follow-up fix scopes the fold to stp.vs calls and flips the FIXME checks
-// below to assert the lowerings survive.
+// The stp.vs inttoptr(ptrtoint) peephole must not whole-module DCE unused Pure
+// results. The old greedy fold seeded every op into the worklist and erased
+// trivially-dead Pure ops as a side effect. The scoped fold now only rewrites
+// stp.vs calls, so unused add_offset / make_ptr lowerings survive while the
+// stp.vs base still folds.
 
 // === unused Pure: global f32 add_offset -> byte GEP (no consumer) ===
-// FIXME(pre-fix): the byte-scaled GEP is DCE'd away.
+// The byte-scaled GEP must survive even though its result has no consumer.
 
 // CHECK-LABEL: @unused_add_offset_global_b32
-// CHECK-NOT:     arith.muli
-// CHECK-NOT:     llvm.getelementptr
+// CHECK:         %[[EB:.*]] = arith.constant 4 : i32
+// CHECK:         %[[BYTES:.*]] = arith.muli %{{.*}}, %[[EB]] : i32
+// CHECK:         llvm.getelementptr %{{.*}}[%[[BYTES]]] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, i8
 func.func @unused_add_offset_global_b32(%p: !fly.ptr<f32, global>, %dyn: i32) {
   %off = fly.make_int_tuple(%dyn) : (i32) -> !fly.int_tuple<?>
   %p2 = fly.add_offset(%p, %off)
@@ -24,10 +25,10 @@ func.func @unused_add_offset_global_b32(%p: !fly.ptr<f32, global>, %dyn: i32) {
 }
 
 // === unused Pure: static shared make_ptr -> addressof (no consumer) ===
-// FIXME(pre-fix): the addressof is DCE'd away.
+// The addressof must survive even though its result has no consumer.
 
 // CHECK-LABEL: @unused_static_shared_make_ptr
-// CHECK-NOT:     llvm.mlir.addressof
+// CHECK:         llvm.mlir.addressof @__shared_alloc_0 : !llvm.ptr<3>
 gpu.module @m {
   func.func @unused_static_shared_make_ptr() {
     %a = fly.make_ptr() {dictAttrs = {allocBytes = 512 : i64, allocAlign = 16 : i64}} : () -> !fly.ptr<i8, shared>
