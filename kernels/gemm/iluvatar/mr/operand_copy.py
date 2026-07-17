@@ -240,13 +240,22 @@ def mr_gemm_g2s_issue_b_warp(
     bn: int,
     bk: int,
     geom: MrOperandGeom,
+    b_n_swizzle: int = 1,
+    b_leading: int = 0,
 ):
     """Issue this warp's B-tile SME async G2S copies for one pipeline stage.
 
     B smem uses ``smem_b`` directly. B mn-major: cta_n = cta_lin % cta_b_n_cnt,
     cta_k = cta_lin // cta_b_n_cnt. B k-major: cta_n = cta_lin // cta_b_k_cnt,
     cta_k = cta_lin % cta_b_k_cnt. Does not commit async.
-    Parameters: see mr_gemm_g2s_issue_operands.
+
+    ``b_n_swizzle`` > 1 (``N_SWIZZLE``) is only valid on
+    k-major B: SME desc stride is ``b_leading * b_n_swizzle``, and each chunk's
+    GMEM base is remapped to ``cta_n % swizzle + (cta_n // swizzle) * SMEM_ROWS
+    * swizzle`` so one Col SME load covers every-``swizzle``-th N row. SMEM
+    placement stays ``cta_lin``-ordered. In that
+    mode ``b_cta_gmem_view`` must be the unsplit SME CTA tensor (not
+    ``zipped_divide``). Parameters: see mr_gemm_g2s_issue_operands.
     """
     cta_grid = mr_cta_smem_grid(
         a_mn_major=a_mn_major,
@@ -265,12 +274,33 @@ def mr_gemm_g2s_issue_b_warp(
         else:
             cta_n = cta_lin // fx.Int32(cta_grid.cta_b_k_cnt)
             cta_k = cta_lin % fx.Int32(cta_grid.cta_b_k_cnt)
-        b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
         # n-outer / k-inner so an MMA atom's K-bricks land contiguous in shared
         # (required by the i8 k-spanning S2R view; f16 uses the same order). For
         # k-major this equals cta_lin; the mirror decode lives in mr_gemm_s2r_b_tile.
         b_linear = cta_n * fx.Int32(cta_grid.cta_b_k_cnt) + cta_k
         b_off = b_linear * fx.Int32(cta_grid.cta_chunk_elems)
+        if fx.const_expr(b_n_swizzle > 1):
+            if fx.const_expr(b_mn_major):
+                raise ValueError("b_n_swizzle > 1 requires k-major B (Col SME)")
+            # N_SWIZZLE GMEM remap (swizzle=4 example):
+            #   cta_n=0..3 -> start rows 0,1,2,3, but SME stride is b_leading*4, so
+            #   one Col load pulls every 4th N row. PackOnly then sees 4 consecutive
+            #   logical N atoms in regs without an SLB transpose.
+            # row_swizzled = phase + group * (SMEM_ROWS * swizzle)
+            #   phase = cta_n % swizzle, group = cta_n // swizzle
+            row_swizzled = (cta_n % fx.Int32(b_n_swizzle)) + (cta_n // fx.Int32(b_n_swizzle)) * fx.Int32(
+                SMEM_ROWS * b_n_swizzle
+            )
+            # Element offset into unsplit k-major B(n,k): N*b_leading + K-brick.
+            elem_off = row_swizzled * fx.Int32(b_leading) + cta_k * fx.Int32(geom.values_per_sme_row)
+            # Layout stride stays b_leading (physical); the *swizzle scale is on the
+            # SME desc in the caller (leading_stride = b_leading * b_n_swizzle).
+            b_src = fx.make_view(
+                fx.add_offset(fx.get_iter(b_cta_gmem_view), fx.make_int_tuple(elem_off)),
+                fx.make_layout((SMEM_ROWS, geom.values_per_sme_row), (b_leading, 1)),
+            )
+        else:
+            b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
         fx.copy_atom_call(
             g2s_sme.sme_atom_b,
             b_src,
@@ -302,6 +332,8 @@ def mr_gemm_g2s_issue_operands(
     bk: int,
     geom: MrOperandGeom,
     commit: bool = True,
+    b_n_swizzle: int = 1,
+    b_leading: int = 0,
 ):
     """Issue this warp's A and B SME async G2S copies for one pipeline stage.
 
@@ -319,7 +351,8 @@ def mr_gemm_g2s_issue_operands(
         a_cta_gmem_view: GMEM A after ixdl.make_sme_gmem_tensor + fx.zipped_divide(..., tile_smem_A);
             issue_a_warp slices (cta_m, cta_k) per chunk.
         b_cta_gmem_view: GMEM B after ixdl.make_sme_gmem_tensor + fx.zipped_divide(..., tile_smem_B);
-            issue_b_warp slices (cta_n, cta_k) per chunk.
+            issue_b_warp slices (cta_n, cta_k) per chunk. With ``b_n_swizzle > 1``, the
+            unsplit SME CTA tensor (see ``mr_gemm_g2s_issue_b_warp``).
         g2s_sme: Copy atoms, swizzle, and smem major from mr_g2s_sme_config.
         smem_a: Shared A buffer for this pipeline stage (f16 shared pointer).
         smem_b: Shared B buffer for this pipeline stage (f16 shared pointer).
@@ -329,6 +362,9 @@ def mr_gemm_g2s_issue_operands(
         bk: CTA K-tile extent for this K-step (not full problem K).
         geom: MrOperandGeom; supplies vpr and cta_chunk_elems for chunk grid.
         commit: If True, commit the async copy group after A and B issues.
+        b_n_swizzle: B ``N_SWIZZLE`` (1 = off). Requires k-major B when >1.
+        b_leading: Logical B N-stride in elements (problem K for k-major B); used
+            only when ``b_n_swizzle > 1``.
     """
     mr_gemm_g2s_issue_a_warp(
         a_mn_major=a_mn_major,
@@ -355,6 +391,8 @@ def mr_gemm_g2s_issue_operands(
         elem_dtype=elem_dtype,
         bm=bm,
         bn=bn,
+        b_n_swizzle=b_n_swizzle,
+        b_leading=b_leading,
         bk=bk,
         geom=geom,
     )
