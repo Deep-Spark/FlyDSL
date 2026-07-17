@@ -16,10 +16,11 @@ Epilogue (``--epilogue``), both ``D = A @ B.T``:
 * ``i32`` (default) -- **direct int32 store** (``UniversalCopy32b`` via
   ``make_tiled_copy_C`` + ``partition_S``). Unlike the f16 ``no_c_read`` path, the
   int32 output is already 4 bytes/element, so there is **no warp-shuffle pack**
-* ``i8`` -- **packed CShuffle int8 store**: i32 accumulator -> saturate ``[-127,127]``
-  -> int8 -> row-major SMEM staging -> coalesced 32-bit (4x int8) global store.
-  This is the int8 analog of the f16 shuffle pack).
-   Quant scale/bias/relu fusion is omitted for now.
+* ``i8`` -- packed int8 store (truncating cast). For k-major B (``tn`` / ``nn``)
+  this uses PackOnly (register pack + ``stp.vs``, no SLB / ``N_SWIZZLE=4``).
+  For mn-major B (``nt`` / ``tt``) it keeps the PackSlb path
+  (SMEM scatter/transpose + ``byte_permute``). Quant scale/bias/relu fusion is
+  omitted for now.
 
 ``major_pattern`` -- CUTLASS BLAS layout tag on logical ``A(m, k)`` / ``B(n, k)``.
 ``tn`` (default; both operands k-major) is the fast path; the mn-major patterns

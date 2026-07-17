@@ -164,6 +164,9 @@ def _build_igemm_kernel(
     layout = parse_major_pattern(major_pattern)
     a_mn_major = layout.a_mn_major
     b_mn_major = layout.b_mn_major
+    # i8 + k-major B -> N_SWIZZLE=4 + PackOnly.
+    b_n_swizzle = 4 if (epilogue == EPILOGUE_I8 and not b_mn_major) else 1
+    use_pack_only = b_n_swizzle > 1
     geom = MR_IGEMM_GEOM
     vpr = geom.values_per_sme_row
     warp_m = ATOM_M * warp_atoms_m
@@ -237,10 +240,13 @@ def _build_igemm_kernel(
         gC = fx.slice(fx.flat_divide(C, (bm, bn)), (None, None, m_tile, n_tile))
 
         # Static contiguous shared memory (matches hgemm): the compiler sizes the
-        # bank, so launch(smem=...) stays unset. Pipeline needs stage_elems * stages
-        # int8; the i8 packed epilogue reuses the same bank for SLB staging (bm * bn,
-        # scatter/transpose + byte_permute — no warp shuffle), so size to the max.
-        smem_elems = max(stage_elems * stages, bm * bn) if epilogue == EPILOGUE_I8 else stage_elems * stages
+        # bank, so launch(smem=...) stays unset. PackOnly needs no C-tile scratch;
+        # PackSlb reuses the same bank for SLB staging (bm * bn).
+        smem_elems = (
+            max(stage_elems * stages, bm * bn)
+            if epilogue == EPILOGUE_I8 and not use_pack_only
+            else stage_elems * stages
+        )
 
         @fx.struct
         class MrIgemmSmem:
@@ -301,8 +307,15 @@ def _build_igemm_kernel(
                 k_A = gA[None, None, k_tile]
                 k_B = gB[None, None, k_tile]
                 sme_A = ixdl.make_sme_gmem_tensor(k_A, leading_stride=a_leading)
-                sme_B = ixdl.make_sme_gmem_tensor(k_B, leading_stride=b_leading)
+                # PackOnly N_SWIZZLE: SME Col desc walks N with stride
+                # b_leading * b_n_swizzle (e.g. *4), so one load covers every
+                # swizzle-th N row. Matches the GMEM row remap in issue_b_warp.
+                sme_B = ixdl.make_sme_gmem_tensor(k_B, leading_stride=b_leading * b_n_swizzle)
                 smem_a, smem_b = mr_stage_smem_ab(smem_base, stage_base, bm * bk)
+                if fx.const_expr(b_n_swizzle > 1):
+                    b_cta_view = sme_B
+                else:
+                    b_cta_view = fx.zipped_divide(sme_B, tile_smem_B)
                 mr_gemm_g2s_issue_operands(
                     a_mn_major=a_mn_major,
                     b_mn_major=b_mn_major,
@@ -310,7 +323,7 @@ def _build_igemm_kernel(
                     a_per_warp=a_per_warp,
                     b_per_warp=b_per_warp,
                     a_cta_gmem_view=fx.zipped_divide(sme_A, tile_smem_A),
-                    b_cta_gmem_view=fx.zipped_divide(sme_B, tile_smem_B),
+                    b_cta_gmem_view=b_cta_view,
                     g2s_sme=g2s_sme,
                     smem_a=smem_a,
                     smem_b=smem_b,
@@ -320,6 +333,8 @@ def _build_igemm_kernel(
                     bk=bk,
                     geom=geom,
                     commit=commit,
+                    b_n_swizzle=b_n_swizzle,
+                    b_leading=b_leading,
                 )
 
             def _mma_k_load(stage_base, mma_k):
@@ -496,6 +511,7 @@ def _build_igemm_kernel(
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
                 c_global_n=n,
+                pack_only=use_pack_only,
             )
         else:
             mr_igemm_epilogue_store_i32(
@@ -507,7 +523,11 @@ def _build_igemm_kernel(
                 warp_atoms_n=warp_atoms_n,
             )
 
-    smem_bytes = max(stage_elems * stages, bm * bn) if epilogue == EPILOGUE_I8 else stage_elems * stages
+    smem_bytes = (
+        max(stage_elems * stages, bm * bn)
+        if epilogue == EPILOGUE_I8 and not use_pack_only
+        else stage_elems * stages
+    )
     return gemm_kernel, threads, smem_bytes, bm, bn, bk
 
 
@@ -553,7 +573,9 @@ def compile_iluvatar_mr_igemm(
         warp_atoms_n=warp_atoms_n,
         stages=stages,
     )
-    smem_bytes = max(pipeline_smem, bm * bn) if epilogue == EPILOGUE_I8 else pipeline_smem
+    # PackOnly (k-major B i8) needs no C-tile scratch beyond the pipeline buffers.
+    use_pack_only = epilogue == EPILOGUE_I8 and not layout.b_mn_major
+    smem_bytes = max(pipeline_smem, bm * bn) if (epilogue == EPILOGUE_I8 and not use_pack_only) else pipeline_smem
     if K % bk:
         raise ValueError(f"K must be a multiple of {bk} (ATOM_K_B8 * k_rep)")
     if M % bm or N % bn:
