@@ -19,6 +19,8 @@ from kernels.gemm.iluvatar.mr.common import ATOM_M, ATOM_N, TCU_LANE_COLS
 EPILOGUE_STORE_SHFL = "shfl"
 EPILOGUE_STORE_TILED = "tiled"
 EPILOGUE_STORE_READ_C_ACCUM = "read_c_accum"
+EPILOGUE_STORE_ATOMIC_SPLITK = "atomic_splitk"
+EPILOGUE_STORE_SERIAL_SPLITK = "serial_splitk"
 
 
 def mr_hgemm_epilogue_store_shfl(
@@ -82,7 +84,7 @@ def mr_hgemm_epilogue_store_shfl(
                 fx.ptr_store(val, store_ptr)
 
 
-def mr_hgemm_epilogue_store_tiled(
+def _mr_hgemm_epilogue_store_tiled_like(
     *,
     lane_id,
     accs,
@@ -90,12 +92,11 @@ def mr_hgemm_epilogue_store_tiled(
     tiled_mma,
     warp_atoms_m: int,
     warp_atoms_n: int,
-    out_dtype=fx.Float16,
+    out_dtype,
+    copy_atom_c,
 ):
-    """f16/bf16 ``make_tiled_copy_C`` store (``EPILOGUE_STORE_TILED``). Parameters: see ``mr_hgemm_epilogue_store``."""
+    """Shared trunc + ``make_tiled_copy_C`` store loop; ``copy_atom_c`` selects plain vs atomic."""
     gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
-
-    copy_atom_c = fx.make_copy_atom(fx.UniversalCopy16b(), out_dtype)
     tiled_copy_c = fx.make_tiled_copy_C(copy_atom_c, tiled_mma)
     thr_copy_c = tiled_copy_c.get_slice(lane_id)
     for mma_m in fx.range_constexpr(warp_atoms_m):
@@ -107,6 +108,108 @@ def mr_hgemm_epilogue_store_tiled(
             fx.copy(
                 copy_atom_c,
                 thr_copy_c.retile(frag),
+                thr_copy_c.partition_S(c_tile),
+                pred=None,
+            )
+
+
+def mr_hgemm_epilogue_store_tiled(
+    *,
+    lane_id,
+    accs,
+    gC_warp,
+    tiled_mma,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    out_dtype=fx.Float16,
+):
+    """f16/bf16 ``make_tiled_copy_C`` store (``EPILOGUE_STORE_TILED``). Parameters: see ``mr_hgemm_epilogue_store``."""
+    copy_atom_c = fx.make_copy_atom(fx.UniversalCopy16b(), out_dtype)
+    _mr_hgemm_epilogue_store_tiled_like(
+        lane_id=lane_id,
+        accs=accs,
+        gC_warp=gC_warp,
+        tiled_mma=tiled_mma,
+        warp_atoms_m=warp_atoms_m,
+        warp_atoms_n=warp_atoms_n,
+        out_dtype=out_dtype,
+        copy_atom_c=copy_atom_c,
+    )
+
+
+def mr_hgemm_epilogue_store_atomic_splitk(
+    *,
+    lane_id,
+    accs,
+    gC_warp,
+    tiled_mma,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    out_dtype=fx.Float16,
+):
+    """Global Split-K atomic accumulate into C (``EPILOGUE_STORE_ATOMIC_SPLITK``).
+
+    Same partitioning as ``mr_hgemm_epilogue_store_tiled``, but the C copy atom is
+    a scalar ``UniversalAtomic`` add so every split-K CTA reduces its partial into
+    C in place. ivcore11 has scalar f16/bf16 atomic fadd but no packed f16x2 atom,
+    so this issues one atomic per element (copy-atom thr layout is scalar). C must
+    be pre-zeroed by the split-K launch wrapper before the GEMM runs.
+    """
+    copy_atom_c = fx.make_copy_atom(
+        fx.UniversalAtomic(fx.AtomicOp.Add, out_dtype, syncscope=fx.SyncScope.System),
+        out_dtype,
+    )
+    _mr_hgemm_epilogue_store_tiled_like(
+        lane_id=lane_id,
+        accs=accs,
+        gC_warp=gC_warp,
+        tiled_mma=tiled_mma,
+        warp_atoms_m=warp_atoms_m,
+        warp_atoms_n=warp_atoms_n,
+        out_dtype=out_dtype,
+        copy_atom_c=copy_atom_c,
+    )
+
+
+def mr_hgemm_epilogue_store_serial_splitk(
+    *,
+    lane_id,
+    accs,
+    gC_warp,
+    tiled_mma,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    out_dtype=fx.Float16,
+):
+    """CUTLASS SplitKSerial epilogue (``EPILOGUE_STORE_SERIAL_SPLITK``).
+
+    Always load-add-store in f32 then trunc-store (ordered RMW — not atomic).
+    The caller must guarantee K-partition order (per-tile cmpxchg turnstile);
+    partition 0 sees a pre-zeroed C and is equivalent to a plain store.
+    """
+    gC_atoms = fx.flat_divide(gC_warp, (ATOM_M, ATOM_N))
+
+    copy_atom_c = fx.make_copy_atom(fx.UniversalCopy16b(), out_dtype)
+    tiled_copy_c = fx.make_tiled_copy_C(copy_atom_c, tiled_mma)
+    thr_copy_c = tiled_copy_c.get_slice(lane_id)
+
+    for mma_m in fx.range_constexpr(warp_atoms_m):
+        for mma_n in fx.range_constexpr(warp_atoms_n):
+            c_tile = fx.slice(gC_atoms, (None, None, mma_m, mma_n))
+            acc = accs[mma_m][mma_n]
+            frag_c = fx.make_fragment_like(acc, out_dtype.ir_type)
+            fx.copy(
+                copy_atom_c,
+                thr_copy_c.partition_S(c_tile),
+                thr_copy_c.retile(frag_c),
+                pred=None,
+            )
+            merged = Vec(acc.load()) + Vec(frag_c.load()).to(fx.Float32)
+            frag_o = fx.make_fragment_like(acc, out_dtype.ir_type)
+            frag_o.store(merged.to(out_dtype))
+            fx.copy(
+                copy_atom_c,
+                thr_copy_c.retile(frag_o),
                 thr_copy_c.partition_S(c_tile),
                 pred=None,
             )
