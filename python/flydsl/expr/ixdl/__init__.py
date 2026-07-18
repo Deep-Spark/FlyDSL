@@ -15,6 +15,7 @@ from .mr import (
     make_sme_shared_layout_k_spanning,
 )
 from .ops import (
+    atomic_cas,
     byte_permute,
     stp_vs_b8,
     stp_vs_b16,
@@ -53,6 +54,7 @@ __all__ = [
     "sl_pipebar_arrive",
     "sl_pipebar_wait",
     "byte_permute",
+    "atomic_cas",
     "stp_vs_b8",
     "stp_vs_b16",
     "stp_vs_b32",
