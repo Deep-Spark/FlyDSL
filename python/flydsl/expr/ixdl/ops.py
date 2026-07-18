@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Iluvatar ALU / descriptor-store intrinsics (non-sync).
+"""Iluvatar ALU / descriptor-store / atomic helpers (non-sync).
 
-Wrappers that emit Iluvatar LLVM intrinsics via ``llvm.call_intrinsic``.
-Synchronization helpers live in :mod:`flydsl.expr.ixdl.sync`.
+Most wrappers emit Iluvatar LLVM intrinsics via ``llvm.call_intrinsic``.
+``atomic_cas`` lowers through ``llvm.cmpxchg`` (same ptr round-trip as
+``stp.vs``). Hardware CAS is width-based; ``llvm.cmpxchg`` needs integer
+operands, so non-integer values of a supported width are bitcast to the
+matching signless integer, then bitcast back on the result. Call sites
+pick a width the target supports (ixcc: 16/32-bit all gens; 64-bit on
+Blazer+). Synchronization helpers live in :mod:`flydsl.expr.ixdl.sync`.
 """
 
 from ..._mlir.dialects import llvm as _llvm
@@ -50,22 +55,106 @@ def byte_permute(a, b, sel: int):
     return Int32(result)
 
 
-def _as1_llvm_ptr(ptr):
-    """Materialize ``!fly.ptr`` as ``!llvm.ptr<1>`` for ``stp.vs`` intrinsics.
+def _llvm_ptr(ptr, *, addrspace: int | None = 1):
+    """Materialize ``!fly.ptr`` as ``!llvm.ptr`` / ``!llvm.ptr<AS>`` via ptrtoint/inttoptr.
 
-    Why the ``fly.ptrtoint`` / ``llvm.inttoptr`` round-trip:
-    Tracing only has ``!fly.ptr``, but ``llvm.call_intrinsic`` for ``stp.vs``
-    requires a ``!llvm.ptr`` operand. There is no first-class FlyIXDL op for
-    these intrinsics, and emitting ``unrealized_conversion_cast`` at trace time
-    deadlocks dialect conversion. Crossing via i64 keeps types legal until
-    FlyToIXDL converts ``fly.ptr`` to ``llvm.ptr`` and folds the round-trip
-    (see ``FoldStpVsPtrRoundtrip``).
+    Same round-trip rationale as ``_as1_llvm_ptr``: tracing only has ``!fly.ptr``,
+    and emitting ``unrealized_conversion_cast`` at trace time deadlocks dialect
+    conversion. FlyToIXDL folds the round-trip after converting ``fly.ptr``.
     """
     from ..._mlir import ir
     from ..primitive import ptrtoint
 
     addr = _arith.unwrap(ptrtoint(ptr))
-    return _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), addr)
+    ty = "!llvm.ptr" if addrspace is None else f"!llvm.ptr<{int(addrspace)}>"
+    return _llvm.inttoptr(ir.Type.parse(ty), addr)
+
+
+def _as1_llvm_ptr(ptr):
+    """Materialize ``!fly.ptr`` as ``!llvm.ptr<1>`` for ``stp.vs`` intrinsics."""
+    return _llvm_ptr(ptr, addrspace=1)
+
+
+def _cmpxchg_int_type(elem_ty):
+    """Map an element IR type to the signless integer used by ``llvm.cmpxchg``.
+
+    Returns ``(int_ty, needs_bitcast)``. Floats (and other same-width non-ints)
+    are bitcast to ``iN`` for the intrinsic, then bitcast back on the result.
+    """
+    from ..._mlir.ir import FloatType, IntegerType
+
+    if isinstance(elem_ty, IntegerType):
+        return elem_ty, False
+    if isinstance(elem_ty, FloatType):
+        return IntegerType.get_signless(int(elem_ty.width)), True
+    raise TypeError(
+        f"atomic_cas unsupported element type {elem_ty}; expected integer or float "
+        "(same-width bitcast to integer for llvm.cmpxchg)"
+    )
+
+
+def atomic_cas(
+    ptr,
+    expected,
+    desired,
+    *,
+    success_ordering,
+    failure_ordering,
+    syncscope: str = "",
+    alignment: int | None = None,
+):
+    """Emit ``llvm.cmpxchg``; return the value previously at ``ptr``.
+
+    Element dtype is taken from ``expected`` / ``desired`` (must match).
+    Comparison is **bit-pattern** CAS: non-integer values are bitcast to the
+    same-width signless integer for ``llvm.cmpxchg``, then the old value is
+    bitcast back. Call sites pick a width the target can lower (ixcc: 16/32-bit
+    all gens; 64-bit on Blazer+/``ivcore40+``).
+
+    ``ptr`` is a ``!fly.ptr`` to that element in global memory.
+    ``success_ordering`` / ``failure_ordering`` are ``llvm.AtomicOrdering``
+    values (e.g. ``acquire``, ``release``, ``acq_rel``). Default
+    ``syncscope=""`` is LLVM system scope. Default ``alignment`` is the
+    element size in bytes.
+
+    Typical turnstile use::
+
+        # wait until *lock == ticket
+        old = ixdl.atomic_cas(lock, ticket, ticket, success_ordering=acquire, ...)
+        # arrive: ticket -> ticket+1
+        ixdl.atomic_cas(lock, ticket, ticket + 1, success_ordering=release, ...)
+    """
+    from ..._mlir.dialects import arith as _std_arith
+    from ..numeric import Numeric
+
+    exp = _arith.unwrap(expected)
+    des = _arith.unwrap(desired)
+    if exp.type != des.type:
+        raise TypeError(f"atomic_cas expected/desired type mismatch: {exp.type} vs {des.type}")
+
+    elem_ty = exp.type
+    int_ty, needs_bitcast = _cmpxchg_int_type(elem_ty)
+    width = int(int_ty.width)
+    if alignment is None:
+        alignment = max(width // 8, 1)
+
+    if needs_bitcast:
+        exp = _std_arith.bitcast(int_ty, exp)
+        des = _std_arith.bitcast(int_ty, des)
+
+    res = _llvm.cmpxchg(
+        _llvm_ptr(ptr, addrspace=None),
+        exp,
+        des,
+        success_ordering,
+        failure_ordering,
+        syncscope=syncscope,
+        alignment=int(alignment),
+    )
+    previous = _llvm.extractvalue(int_ty, res, [0])
+    if needs_bitcast:
+        previous = _std_arith.bitcast(elem_ty, previous)
+    return Numeric.from_ir_type(elem_ty)(previous)
 
 
 def _stp_vs_call(bits: int, val, ptr, voffset, soffset, kop: int = 0, pred=None):
