@@ -127,6 +127,12 @@ from kernels.gemm.iluvatar.mr.hgemm import (  # noqa: E402
     _swizzle_cta_shape,
     compile_iluvatar_mr_hgemm,
 )
+from kernels.gemm.iluvatar.mr.hgemm_splitk import (  # noqa: E402
+    DEFAULT_SPLIT_K_MODE,
+    SPLIT_K_MODE_CHOICES,
+    SPLIT_K_MODE_PARALLEL,
+    compile_iluvatar_mr_hgemm_splitk,
+)
 
 # Harness-only default: run both epilogue modes unless --epilogue selects one.
 EPILOGUE_BOTH = "both"
@@ -208,7 +214,11 @@ def _make_c_tensor(
     torch_dtype=torch.float16,
 ):
     if epilogue == EPILOGUE_NO_C_READ:
-        return torch.zeros(m, n, dtype=torch_dtype, device=device)
+        # Poison so incomplete stores (and missing split-K C-zero) surface;
+        # non-split overwrite and split-K launcher zero both clear it.
+        C = torch.empty(m, n, dtype=torch_dtype, device=device)
+        C.fill_(7777.0)
+        return C
     torch.manual_seed(seed)
     return torch.randn(m, n, dtype=torch.float32, device=device)
 
@@ -227,21 +237,43 @@ def _build_launcher(
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
     elem_dtype=DEFAULT_ELEM_DTYPE,
+    split_k: int = 1,
+    split_k_mode: str = DEFAULT_SPLIT_K_MODE,
 ):
-    launcher = compile_iluvatar_mr_hgemm(
-        M=m,
-        N=n,
-        K=k,
-        warps_m=warps_m,
-        warps_n=warps_n,
-        k_atoms=k_atoms,
-        warp_atoms_m=warp_atoms_m,
-        warp_atoms_n=warp_atoms_n,
-        epilogue=epilogue,
-        epilogue_store=epilogue_store,
-        major_pattern=major_pattern,
-        elem_dtype=elem_dtype,
-    )
+    if split_k > 1:
+        launcher = compile_iluvatar_mr_hgemm_splitk(
+            M=m,
+            N=n,
+            K=k,
+            warps_m=warps_m,
+            warps_n=warps_n,
+            k_atoms=k_atoms,
+            warp_atoms_m=warp_atoms_m,
+            warp_atoms_n=warp_atoms_n,
+            epilogue=epilogue,
+            major_pattern=major_pattern,
+            elem_dtype=elem_dtype,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
+        )
+        # All Global Split-K modes use grid.z=split_k (serial turnstile / parallel / atomic).
+        grid_z = split_k
+    else:
+        launcher = compile_iluvatar_mr_hgemm(
+            M=m,
+            N=n,
+            K=k,
+            warps_m=warps_m,
+            warps_n=warps_n,
+            k_atoms=k_atoms,
+            warp_atoms_m=warp_atoms_m,
+            warp_atoms_n=warp_atoms_n,
+            epilogue=epilogue,
+            epilogue_store=epilogue_store,
+            major_pattern=major_pattern,
+            elem_dtype=elem_dtype,
+        )
+        grid_z = 1
     bm, bn, _bk, threads, smem = _swizzle_cta_shape(
         warps_m,
         warps_n,
@@ -249,7 +281,7 @@ def _build_launcher(
         warp_atoms_m=warp_atoms_m,
         warp_atoms_n=warp_atoms_n,
     )
-    grid = (m // bm, n // bn, 1)
+    grid = (m // bm, n // bn, grid_z)
     block = (threads, 1, 1)
     return launcher, grid, block, smem
 
@@ -285,6 +317,8 @@ def _check(
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
     dtype_name: str = "fp16",
     seed: int = 0,
+    split_k: int = 1,
+    split_k_mode: str = DEFAULT_SPLIT_K_MODE,
 ) -> bool:
     elem_dtype, torch_dtype = _resolve_dtype(dtype_name)
     torch.manual_seed(seed)
@@ -305,6 +339,8 @@ def _check(
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
         elem_dtype=elem_dtype,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
@@ -317,7 +353,11 @@ def _check(
     else:
         got = C
     diff = (got - expected).abs()
+    # atomic / serial truncate through f16/bf16 each partition; parallel keeps
+    # fp32 workspace then one trunc — scale atol for low-precision reduce modes.
     atol = _compare_atol(k, k_atoms, dtype_name=dtype_name)
+    if split_k > 1 and split_k_mode != SPLIT_K_MODE_PARALLEL:
+        atol = atol * (max(1, split_k) ** 0.5)
     ok = torch.allclose(got, expected, atol=atol, rtol=2e-2)
     finite_ok = torch.isfinite(got).all().item()
     cta_note = (
@@ -325,9 +365,13 @@ def _check(
         f" atoms={warp_atoms_m}x{warp_atoms_n}"
         f" threads={warps_m * warps_n * WARP_SIZE}"
     )
-    store_note = f" store={epilogue_store}" if epilogue == EPILOGUE_NO_C_READ else ""
+    if epilogue == EPILOGUE_NO_C_READ:
+        store_note = f" store={split_k_mode}_splitk" if split_k > 1 else f" store={epilogue_store}"
+    else:
+        store_note = ""
+    split_note = f" split_k={split_k} mode={split_k_mode}" if split_k > 1 else ""
     print(
-        f"[check] dtype={dtype_name} epilogue={epilogue}{store_note} pattern={major_pattern} "
+        f"[check] dtype={dtype_name} epilogue={epilogue}{store_note}{split_note} pattern={major_pattern} "
         f"M={m} N={n} K={k}{cta_note} grid={grid} block={block} smem={smem} "
         f"ok={ok} finite={finite_ok} max_abs={diff.max().item():.3e} "
         f"mean_abs={diff.mean().item():.3e} atol={atol:.2e}"
@@ -354,6 +398,8 @@ def _bench(
     dtype_name: str = "fp16",
     iters: int,
     warmup: int,
+    split_k: int = 1,
+    split_k_mode: str = DEFAULT_SPLIT_K_MODE,
 ) -> None:
     elem_dtype, torch_dtype = _resolve_dtype(dtype_name)
     print(f"[bench] === {_epilogue_label(epilogue, epilogue_store=epilogue_store, dtype_name=dtype_name)} ===")
@@ -375,19 +421,29 @@ def _bench(
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
         elem_dtype=elem_dtype,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
+    fxs = fx.Stream(stream)
 
     t0 = time.perf_counter()
-    compiled = flyc.compile(launcher, a_dev, b_dev, C, fx.Stream(stream))
-    torch.cuda.synchronize()
-    print(f"[compile] flyc.compile() took {1e3 * (time.perf_counter() - t0):.1f} ms")
+    if split_k > 1:
+        # Split-K launchers are host wrappers (serial/parallel/atomic), not @flyc.jit.
+        compiled = launcher
+        compiled(a_dev, b_dev, C, fxs)  # trigger JIT of inner kernels
+        torch.cuda.synchronize()
+        print(f"[compile] split-K host wrapper first-launch took {1e3 * (time.perf_counter() - t0):.1f} ms")
+    else:
+        compiled = flyc.compile(launcher, a_dev, b_dev, C, fxs)
+        torch.cuda.synchronize()
+        print(f"[compile] flyc.compile() took {1e3 * (time.perf_counter() - t0):.1f} ms")
 
     for _ in range(warmup):
         if epilogue == EPILOGUE_READ_C_ACCUM:
             C.copy_(C_in)
-        compiled(a_dev, b_dev, C, fx.Stream(stream))
+        compiled(a_dev, b_dev, C, fxs)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -397,7 +453,7 @@ def _bench(
         for _ in range(iters):
             if epilogue == EPILOGUE_READ_C_ACCUM:
                 C.copy_(C_in)
-            compiled(a_dev, b_dev, C, fx.Stream(stream))
+            compiled(a_dev, b_dev, C, fxs)
         end.record()
     torch.cuda.synchronize()
 
@@ -441,7 +497,7 @@ def _bench(
         got = C.to(torch.float32)
     else:
         got = C
-    atol = _compare_atol(k, k_atoms, dtype_name=dtype_name)
+    atol = _compare_atol(k, k_atoms, dtype_name=dtype_name) * (max(1, split_k) ** 0.5)
     if not torch.allclose(got, expected, atol=atol, rtol=2e-2):
         diff = (got - expected).abs()
         print(f"  [WARN] post-bench correctness FAILED (max_abs={diff.max().item():.3e})")
@@ -457,8 +513,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "  for p in nt tn nn tt; do\n"
             "    for ka in 2 4; do\n"
             "      python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \\\n"
-            "        --epilogue no_c_read --epilogue-store shfl --k-atoms \"$ka\" --cta 1024 \\\n"
-            "        --major-pattern \"$p\" --warmup 1 --iters 100 --m 4096 --n 4096 --k 4096\n"
+            '        --epilogue no_c_read --epilogue-store shfl --k-atoms "$ka" --cta 1024 \\\n'
+            '        --major-pattern "$p" --warmup 1 --iters 100 --m 4096 --n 4096 --k 4096\n'
             "    done\n"
             "  done"
         ),
@@ -510,6 +566,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=[256, 256, 64],
         help="correctness shape (default 256 256 64)",
     )
+    p.add_argument(
+        "--split-k",
+        type=int,
+        default=1,
+        help="Global Split-K slices (default 1). >1 requires no_c_read and "
+        "K %% (split_k * bk) == 0; see --split-k-mode",
+    )
+    p.add_argument(
+        "--split-k-mode",
+        choices=list(SPLIT_K_MODE_CHOICES),
+        default=DEFAULT_SPLIT_K_MODE,
+        help="Split-K reduction: serial (default, ordered load-add-store), "
+        "parallel (fp32 workspace + reduce kernel), or atomic (UniversalAtomicAdd)",
+    )
     p.add_argument("--check", action="store_true", help="correctness only")
     p.add_argument("--bench", action="store_true")
     p.add_argument("--warmup", type=int, default=10)
@@ -543,6 +613,8 @@ def _validate_shape(m: int, n: int, k: int, args: argparse.Namespace) -> str | N
             f"SME brick count must divide evenly across {args.warps_m}x{args.warps_n} warps; "
             f"try larger k_atoms (current BK={bk})"
         )
+    if args.split_k > 1 and k % (args.split_k * bk):
+        return f"K must be a multiple of split_k * bk = {args.split_k * bk} for --split-k {args.split_k}"
     if smem_bytes > DEFAULT_SMEM_CAP_BYTES:
         return (
             f"CTA smem {smem_bytes} B exceeds device cap {DEFAULT_SMEM_CAP_BYTES} B "
@@ -566,6 +638,13 @@ def main(argv: list[str] | None = None) -> int:
     m, n, k = args.m, args.n, args.k
     cm, cn, ck = args.check_shape
     epilogues = _epilogue_modes(args.epilogue)
+    if args.split_k > 1 and epilogues != [EPILOGUE_NO_C_READ]:
+        print(
+            f"[WARN] --split-k {args.split_k} requires the {EPILOGUE_NO_C_READ} epilogue; "
+            "ignoring other epilogue modes",
+            file=sys.stderr,
+        )
+        epilogues = [EPILOGUE_NO_C_READ]
     if args.epilogue_store == EPILOGUE_STORE_SHFL and EPILOGUE_READ_C_ACCUM in epilogues:
         print(
             "[WARN] --epilogue-store shfl applies to no_c_read only; read_c_accum still uses f32 tiled_copy",
@@ -597,17 +676,30 @@ def main(argv: list[str] | None = None) -> int:
                 epilogue_store=args.epilogue_store,
                 major_pattern=args.major_pattern,
                 elem_dtype=elem_dtype,
+                split_k=args.split_k,
+                split_k_mode=args.split_k_mode,
             )
             a_dev, b_dev = remap_gemm_tensors(a, b, args.major_pattern)
             launcher(a_dev, b_dev, c)
             store_note = f", store={args.epilogue_store}" if epilogue == EPILOGUE_NO_C_READ else ""
+            split_note = f", split_k={args.split_k}/{args.split_k_mode}" if args.split_k > 1 else ""
             print(
                 f"Compiled tiledMma pipeline HGEMM (COMPILE_ONLY; dtype={args.dtype}, "
-                f"epilogue={epilogue}{store_note}, "
+                f"epilogue={epilogue}{store_note}{split_note}, "
                 f"pattern={args.major_pattern}, {m}x{n}x{k}, cta={args.cta}, "
                 f"grid={grid}, block={block}, smem={smem})."
             )
         return 0
+
+    if args.split_k > 1:
+        check_bk = ATOM_K_B16 * args.k_atoms
+        if ck % (args.split_k * check_bk):
+            print(
+                f"Error: --check-shape K={ck} must be a multiple of split_k * bk = "
+                f"{args.split_k * check_bk} for --split-k {args.split_k}",
+                file=sys.stderr,
+            )
+            return 2
 
     all_ok = True
     for epilogue in epilogues:
@@ -624,6 +716,8 @@ def main(argv: list[str] | None = None) -> int:
             epilogue_store=args.epilogue_store,
             major_pattern=args.major_pattern,
             dtype_name=args.dtype,
+            split_k=args.split_k,
+            split_k_mode=args.split_k_mode,
         )
         all_ok = all_ok and ok
     if not all_ok:
@@ -653,6 +747,8 @@ def main(argv: list[str] | None = None) -> int:
                 dtype_name=args.dtype,
                 iters=args.iters,
                 warmup=args.warmup,
+                split_k=args.split_k,
+                split_k_mode=args.split_k_mode,
             )
         return 0
 

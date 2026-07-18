@@ -218,6 +218,44 @@ similar across all four when host tensors use the expected physical layout.
 IGEMM uses `--epilogue i32` (direct int32 store) or `i8` (packed store with
 truncating cast; no quant scale).
 
+### Global Split-K (HGEMM)
+
+Split-K lives in a **separate** module so the non-split-K golden path in
+`kernels/gemm/iluvatar/mr/hgemm.py` stays untouched (same layout as ROCm
+`hgemm_splitk.py` vs `hgemm`):
+
+* Non-split-K: `compile_iluvatar_mr_hgemm(...)` — `kernels/gemm/iluvatar/mr/hgemm.py`
+* Split-K: `compile_iluvatar_mr_hgemm_splitk(..., split_k, split_k_mode=...)` —
+  `kernels/gemm/iluvatar/mr/hgemm_splitk.py` (`split_k > 1`, `epilogue=no_c_read`,
+  `K % (split_k * bk) == 0` with `bk = 16 * k_atoms`)
+
+The example harness routes `--split-k 1` (default) to the golden path and
+`--split-k N>1` to the split-K entry. Launch stays `(A, B, C, stream=...)` —
+workspace / turnstile locks are allocated and cached inside the split-K wrapper.
+
+| Mode | CUTLASS analogue | Reduction | Extra resources |
+|---|---|---|---|
+| **`serial`** (default) | `SplitKSerial` | Single `grid.z=split_k` launch; per-tile GMEM locks + `llvm.cmpxchg` turnstile order load-add-store into C (f32 add, trunc store). MMA across K-slices can overlap. | `i32[tiles_m * tiles_n]` locks |
+| **`parallel`** | `GemmSplitKParallel` | Each slice writes fp32 partials to workspace; a reduce kernel sums along `split_k` into C | `fp32[split_k, M, N]` workspace |
+| **`atomic`** | (non-CUTLASS) | Zero C, then scalar `UniversalAtomicAdd` (`f16`/`bf16`) with `grid.z=split_k` | none |
+
+`serial` / `atomic` truncate through the output dtype each partition, so absolute
+error grows ~`sqrt(split_k)`. `parallel` keeps fp32 until the final trunc.
+Cosine similarity vs `A @ B.T` stays > 0.999 in all modes.
+
+```bash
+# serial (default) / parallel / atomic — bk=32 at k_atoms=2
+FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
+  python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --check \
+  --dtype bf16 --split-k 4 --split-k-mode serial --check-shape 256 256 2048 --k-atoms 2
+FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
+  python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --check \
+  --dtype fp16 --split-k 4 --split-k-mode parallel --check-shape 256 256 2048 --k-atoms 2
+```
+
+Device unit coverage: `tests/unit/test_iluvatar_mr_splitk_hgemm.py`
+(`FLYDSL_ILUVATAR_RUN_MR_SPLITK=1`).
+
 ## Local correctness gate (no CI)
 
 Use the example **03** harnesses on a machine with an Iluvatar GPU.
