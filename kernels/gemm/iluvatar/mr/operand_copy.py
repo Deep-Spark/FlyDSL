@@ -18,7 +18,6 @@ from typing import NamedTuple
 
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
-
 from kernels.gemm.iluvatar.common import GemmLayout
 from kernels.gemm.iluvatar.mr.common import SMEM_ROWS, MrCtaSmemGrid, MrOperandGeom, sme_atom_counts
 
@@ -28,6 +27,7 @@ class SmeConfig(NamedTuple):
 
     Built by mr_g2s_sme_config. Row vs col SME path follows GemmLayout major mode.
     """
+
     sme_atom_a: object
     sme_atom_b: object
     a_sme_sw: object

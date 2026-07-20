@@ -32,11 +32,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kernels.gemm.iluvatar.common import parse_major_pattern, WARP_SIZE  # noqa: E402
+from kernels.gemm.iluvatar.common import WARP_SIZE, parse_major_pattern  # noqa: E402
 from kernels.gemm.iluvatar.mr.common import SMEM_ROWS  # noqa: E402
 from kernels.gemm.iluvatar.mr.operand_copy import (  # noqa: E402
-    mr_gemm_g2s_issue_operands,
     mr_g2s_sme_config,
+    mr_gemm_g2s_issue_operands,
     mr_sme_shared_view,
 )
 from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
@@ -330,16 +330,8 @@ def _compile_multibrick_async_copy_dump_kernel(
             b_leading = brick_k
 
         tile_smem = fx.make_tile(SMEM_ROWS, vpr)
-        tile_smem_A = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(a_mn_major)
-            else tile_smem
-        )
-        tile_smem_B = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(b_mn_major)
-            else tile_smem
-        )
+        tile_smem_A = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(a_mn_major) else tile_smem
+        tile_smem_B = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(b_mn_major) else tile_smem
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
         a_cta_gmem_view = fx.zipped_divide(sme_A, tile_smem_A)
@@ -532,9 +524,7 @@ def _run_multibrick_g2s_dump_check(
                 a_dev_slice = A_dev[:, bx * brick_m : (bx + 1) * brick_m]
             else:
                 a_dev_slice = a_slice
-            expected_a = expected_multibrick_a_dump(
-                torch, a_slice, a_dev_slice, major_pattern, brick_k, vpr
-            )
+            expected_a = expected_multibrick_a_dump(torch, a_slice, a_dev_slice, major_pattern, brick_k, vpr)
             got_a = A_out[bx * a_atoms_total * cta_chunk_elems : (bx + 1) * a_atoms_total * cta_chunk_elems]
             torch.testing.assert_close(
                 got_a,

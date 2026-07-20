@@ -4,14 +4,14 @@
 """Shared helpers for Iluvatar MR HGEMM staged device tests."""
 
 from kernels.gemm.iluvatar.common import (
-    parse_major_pattern,
-    remap_gemm_tensors,
     WARP_SIZE,
+    parse_major_pattern,
+    remap_gemm_tensors,  # noqa: F401  (re-export used by test_iluvatar_mr_*.py)
 )
 from kernels.gemm.iluvatar.mr.common import (
     MR_GEMM_GEOM,
-    MrOperandGeom,
     SMEM_ROWS,
+    MrOperandGeom,
     sme_atom_counts,
 )
 
