@@ -433,7 +433,7 @@ def _bench(
         f"pattern={major_pattern} k_atoms={k_atoms} M={m} N={n} K={k} "
         f"grid={grid} block={block} threads={block[0]} smem={smem} "
         f"{us:.1f} us/iter  {tflops:.2f} TFLOPS  "
-        f"(torch {torch_us:.1f} us, {torch_tflops:.2f} TFLOPS, {us / torch_us:.2f}x)"
+        f"(torch {torch_us:.1f} us, {torch_tflops:.2f} TFLOPS)"
     )
 
     expected = _expected_result(A, B, C_in, epilogue)
