@@ -6,21 +6,14 @@
 PR-1 lands the V1 scope incrementally via three internal sub-steps
 (see ``docs/iluvatar_flex_attention_v1_plan.md`` §5.4):
 
-* PR-1a (this commit): ``_compile_iluvatar_qk_dot_dev`` — QK^T-only dev helper,
-  writes ``S = Q @ K^T * sm_scale`` (fp32) to gmem. Used to bisect the QK^T half
-  before adding softmax / PV. Will be removed / inlined into
-  ``compile_iluvatar_flex_attention`` in PR-1b.
+* PR-1a: ``_compile_iluvatar_qk_dot_dev`` — QK^T-only dev helper, writes
+  ``S = Q @ K^T * sm_scale`` (fp32) to gmem. Kept as a bisection helper.
 * PR-1b: Full ``compile_iluvatar_flex_attention`` with online softmax + P via SMEM
-  + P@V, no causal.
-* PR-1c: Add ``is_causal=True``.
+  + P@V, non-causal path.
+* PR-1c (this commit): Adds ``is_causal=True`` via an in-kernel triangular mask
+  applied after the ``(sm_scale * log2e)`` scale, before rowmax. Enforces
+  ``Sq == Skv`` (plan §2.2). MHA / D=128 / bf16 scope from PR-1b is unchanged.
 """
-
-# NOTE: do NOT add ``from __future__ import annotations`` — @fx.struct field
-# annotations must be evaluated eagerly against the enclosing function scope so
-# closure-captured tile constants (elem_dtype / q_smem_elems / k_smem_elems)
-# resolve. PEP 563 stringifies them and the DSL layout probe then raises
-# NameError inside the class body. Mirrors the guardrail comment in
-# kernels/gemm/iluvatar/mr/hgemm.py.
 
 import math
 from typing import Callable
@@ -72,7 +65,7 @@ _PR1_SUPPORTED_D = (128,)
 _DTYPE_STR_TO_FX = {"f16": fx.Float16, "bf16": fx.BFloat16}
 
 
-def _validate_v1_scope(
+def _validate_scope(
     *,
     B: int,
     H: int,
@@ -85,7 +78,8 @@ def _validate_v1_scope(
     window_size: int | None,
     softcap: float | None,
 ) -> None:
-    """Enforce the full V1 legal input envelope (per plan §2.4)."""
+    """Validate compile-time inputs: V1 permanent envelope, then PR-1 subset."""
+    # --- V1 permanent envelope (plan §2.4) ---
     if B <= 0 or H <= 0 or Hkv <= 0 or Sq <= 0 or Skv <= 0 or D <= 0:
         raise ValueError(f"all shape dims must be positive; got B={B} H={H} Hkv={Hkv} Sq={Sq} Skv={Skv} D={D}")
     if dtype not in ("f16", "bf16"):
@@ -101,20 +95,7 @@ def _validate_v1_scope(
     if window_size is not None and window_size <= 0:
         raise ValueError(f"window_size must be > 0 when set, got {window_size}")
 
-
-def _validate_pr1_scope(
-    *,
-    dtype: str,
-    D: int,
-    H: int,
-    Hkv: int,
-    Sq: int,
-    Skv: int,
-    is_causal: bool,  # noqa: ARG001  (kept for parity with V1 scope; PR-1c reuses it)
-    window_size: int | None,
-    softcap: float | None,
-) -> None:
-    """PR-1 additionally restricts the legal envelope. Removed in PR-2."""
+    # --- PR-1 temporary subset (delete in PR-2) ---
     if dtype not in _PR1_SUPPORTED_DTYPES:
         raise NotImplementedError(f"PR-1 supports dtype {_PR1_SUPPORTED_DTYPES}; got {dtype!r}. f16 lands in PR-2.")
     if D not in _PR1_SUPPORTED_D:
@@ -399,7 +380,7 @@ def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: 
 
 
 def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cyclomatic score)
-    *, B: int, H: int, Sq: int, Skv: int, D: int, dtype: str, sm_scale_f32: float
+    *, B: int, H: int, Sq: int, Skv: int, D: int, dtype: str, sm_scale_f32: float, is_causal: bool = False
 ) -> Callable:
     """Compile the non-causal flex-attention forward launcher (PR-1b).
 
@@ -782,6 +763,43 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                     acc = S_frags[mma_m][mma_n]
                     acc.store(Vec(acc.load()) * c_scale_log2e)
 
+            # ---- Causal mask (PR-1c) --------------------------------------
+            # Set S[q, k] = NEG_LARGE_F where ``kv_global > q_global``. Applied
+            # AFTER the (sm_scale * log2e) scale above, so the sentinel lives
+            # in the same log2 domain as everything downstream and matches the
+            # m_running init: exp2(NEG_LARGE_F - m_new) ≈ 0 for any bounded
+            # m_new. ``is_causal=True`` enforces ``Sq == Skv`` at compile
+            # time, so q_global and kv_global share the same axis.
+            #
+            # Fragment coord recap (col-major C-TV, see docstring above):
+            #   m = warp_m_id * (WARP_ATOMS_M * ATOM_M) + mma_m * ATOM_M
+            #       + ei * 4 + lane_row       -- varies per ei
+            #   n = warp_n_id * (WARP_ATOMS_N * ATOM_N) + mma_n * ATOM_N
+            #       + lane_col                -- ei-invariant
+            if fx.const_expr(is_causal):
+                q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
+                kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                # Inner ``ei`` loop is a Python list comprehension (like the
+                # O_acc alpha-scale below): a bare ``for ei in range(4):`` is
+                # picked up by the AST rewriter as a dynamic for loop and
+                # rejects Python-list loop-carried state.
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                        acc = S_frags[mma_m][mma_n]
+                        old = Vec(acc.load())
+                        kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                        acc.store(
+                            Vec.from_elements(
+                                [
+                                    (kv_g > q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row).select(
+                                        c_neg_large, old[ei]
+                                    )
+                                    for ei in range(4)
+                                ],
+                                fx.Float32,
+                            )
+                        )
+
             # ---- Local rowmax (within this warp) --------------------------
             # C TV (version A): each of a lane's 4 fp32 elements sits in a
             # DIFFERENT row (m = mma_m * 16 + ei * 4 + lane_row) but the SAME
@@ -1061,7 +1079,7 @@ def _compile_iluvatar_qk_dot_dev(
     Returns:
         ``launch_fn(Q, K, S_out, stream=None)``.
     """
-    _validate_v1_scope(
+    _validate_scope(
         B=B,
         H=H,
         Hkv=H,
@@ -1069,17 +1087,6 @@ def _compile_iluvatar_qk_dot_dev(
         Skv=Skv,
         D=D,
         dtype=dtype,
-        is_causal=False,
-        window_size=None,
-        softcap=None,
-    )
-    _validate_pr1_scope(
-        dtype=dtype,
-        D=D,
-        H=H,
-        Hkv=H,
-        Sq=Sq,
-        Skv=Skv,
         is_causal=False,
         window_size=None,
         softcap=None,
@@ -1110,17 +1117,16 @@ def compile_iluvatar_flex_attention(
 
     See ``docs/iluvatar_flex_attention_v1_plan.md`` for the V1 decision record.
 
-    PR-1b enables the non-causal fused path (Q/K/V/O = bf16, D=128, MHA,
-    ``Sq == Skv``, both aligned to ``BLOCK_M/BLOCK_N``). Passing
-    ``is_causal=True`` raises ``NotImplementedError`` until PR-1c wires up the
-    triangular mask.
+    PR-1 supports the fused path with Q/K/V/O = bf16, D=128, MHA,
+    ``Sq == Skv``, both aligned to ``BLOCK_M/BLOCK_N``. ``is_causal`` can be
+    True (PR-1c) or False (PR-1b); no tile-level pruning for the fully-masked
+    causal tiles yet — that is a PR-2 perf optimisation.
 
     Args:
         B, H, Sq, Skv, D: See plan §2.4. All compile-time constants.
         Hkv: KV head count; ``None`` means MHA (Hkv = H). PR-1 requires Hkv == H.
         dtype: ``"f16"`` or ``"bf16"``. PR-1 accepts only ``"bf16"``.
-        is_causal: Enable lower-triangular causal mask. PR-1b requires False;
-            PR-1c enables True.
+        is_causal: Enable lower-triangular causal mask; requires ``Sq == Skv``.
         window_size: Symmetric sliding-window radius; PR-1 must be ``None``.
         softcap: Gemma-2 softcap constant; PR-1 must be ``None``.
         sm_scale: Query scale; ``None`` defaults to ``1 / sqrt(D)``.
@@ -1134,7 +1140,7 @@ def compile_iluvatar_flex_attention(
     if Hkv is None:
         Hkv = H
 
-    _validate_v1_scope(
+    _validate_scope(
         B=B,
         H=H,
         Hkv=Hkv,
@@ -1146,28 +1152,14 @@ def compile_iluvatar_flex_attention(
         window_size=window_size,
         softcap=softcap,
     )
-    _validate_pr1_scope(
-        dtype=dtype,
-        D=D,
-        H=H,
-        Hkv=Hkv,
-        Sq=Sq,
-        Skv=Skv,
-        is_causal=is_causal,
-        window_size=window_size,
-        softcap=softcap,
-    )
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
     sm_scale = float(sm_scale)
 
-    if is_causal:
-        raise NotImplementedError(
-            "PR-1b lands only the non-causal path; is_causal support lands in PR-1c. " "Pass is_causal=False for now."
-        )
-
-    return _build_flex_attention_launcher(B=B, H=H, Sq=Sq, Skv=Skv, D=D, dtype=dtype, sm_scale_f32=sm_scale)
+    return _build_flex_attention_launcher(
+        B=B, H=H, Sq=Sq, Skv=Skv, D=D, dtype=dtype, sm_scale_f32=sm_scale, is_causal=is_causal
+    )
 
 
 __all__ = ["compile_iluvatar_flex_attention"]
