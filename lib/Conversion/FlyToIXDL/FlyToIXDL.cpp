@@ -863,6 +863,128 @@ public:
   }
 };
 
+/// True when ``ty`` is ``vector<nxi8>`` (1-D).
+static bool isI8Vector(Type ty, int64_t n) {
+  auto vecTy = dyn_cast<VectorType>(ty);
+  return vecTy && vecTy.getRank() == 1 && vecTy.getNumElements() == n &&
+         vecTy.getElementType().isInteger(8);
+}
+
+/// True when ``attr`` is the single-element array ``[value]``.
+static bool isSingleIntArrayAttr(ArrayAttr attr, int64_t value) {
+  if (attr.size() != 1)
+    return false;
+  auto intAttr = dyn_cast<IntegerAttr>(attr[0]);
+  return intAttr && intAttr.getInt() == value;
+}
+
+/// Match ``insert_strided_slice(bitcast(%i32 : vector<4xi8>), %dest, offset)``
+/// with ``%dest : vector<8xi8>`` and unit stride; returns the i32 source.
+static Value matchI8x4InsertFromI32(vector::InsertStridedSliceOp op, int64_t offset) {
+  if (!isI8Vector(op.getType(), 8) || !isI8Vector(op.getValueToStore().getType(), 4))
+    return {};
+  if (!isSingleIntArrayAttr(op.getOffsets(), offset) || !isSingleIntArrayAttr(op.getStrides(), 1))
+    return {};
+  auto bitcast = op.getValueToStore().getDefiningOp<LLVM::BitcastOp>();
+  if (!bitcast || !bitcast.getArg().getType().isInteger(32))
+    return {};
+  return bitcast.getArg();
+}
+
+/// The i8 S2R fragment build: ``vector<8xi8>`` assembled from two
+/// ``i32 -> vector<4xi8>`` bitcasts inserted at offsets 0 and 4.
+struct I8x8ConcatOfTwoI32 {
+  /// Outer insert (offset 4); defines the ``vector<8xi8>`` fragment.
+  vector::InsertStridedSliceOp hiInsert;
+  /// Inner insert (offset 0); dead once the fragment is rebuilt.
+  vector::InsertStridedSliceOp loInsert;
+  Value loI32;
+  Value hiI32;
+};
+
+/// Match the outer insert of an ``I8x8ConcatOfTwoI32`` chain.
+///
+/// Exactly two pieces, because ``vector<8xi8>`` is the per-lane A/B fragment of
+/// one i8 MMA atom (m16n16k32 over 64 lanes) and the S2R atom is fixed at
+/// ``UniversalCopy32b``; k_rep / BK only change how many such fragments exist.
+static std::optional<I8x8ConcatOfTwoI32>
+matchI8x8ConcatOfTwoI32(vector::InsertStridedSliceOp hiInsert) {
+  Value hiI32 = matchI8x4InsertFromI32(hiInsert, 4);
+  if (!hiI32)
+    return std::nullopt;
+  auto loInsert = hiInsert.getDest().getDefiningOp<vector::InsertStridedSliceOp>();
+  if (!loInsert)
+    return std::nullopt;
+  Value loI32 = matchI8x4InsertFromI32(loInsert, 0);
+  if (!loI32)
+    return std::nullopt;
+  return I8x8ConcatOfTwoI32{hiInsert, loInsert, loI32, hiI32};
+}
+
+/// True when ``op`` is a shared (AS 3) load of ``vector<4xi8>``, i.e. the
+/// i8 S2R ``UniversalCopy32b`` atom. Wider / narrower i8 vector loads have no
+/// producer today and are left alone.
+static bool isSharedI8x4Load(LLVM::LoadOp op) {
+  if (!isI8Vector(op.getType(), 4))
+    return false;
+  auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(op.getAddr().getType());
+  return ptrTy && ptrTy.getAddressSpace() == mapToLLVMAddressSpace(AddressSpace::Shared);
+}
+
+/// Rewrite shared ``llvm.load`` of ``vector<4xi8>`` to ``load i32`` +
+/// ``bitcast``. UniversalCopy / PtrLoad stay generic; this Iluvatar-only
+/// peephole prefers a wide integer shared load over a byte-granular vector
+/// load. Runs before ``foldI8x8ConcatsOfTwoI32`` so the bitcasts exist for that
+/// fold. Walk-based (no greedy DCE).
+static void rewriteSharedI8x4LoadsAsI32(Operation *root) {
+  SmallVector<LLVM::LoadOp> candidates;
+  root->walk([&](LLVM::LoadOp op) {
+    if (isSharedI8x4Load(op))
+      candidates.push_back(op);
+  });
+
+  for (LLVM::LoadOp op : candidates) {
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    Value loaded = LLVM::LoadOp::create(b, loc, b.getI32Type(), op.getAddr());
+    Value casted = LLVM::BitcastOp::create(b, loc, op.getType(), loaded);
+    op.replaceAllUsesWith(casted);
+    op.erase();
+  }
+}
+
+/// Fold ``vector<8xi8>`` rebuild from two ``i32 → vector<4xi8>`` bitcasts into
+/// a permute-free ``vector<2xi32>`` bitcast (same little-endian layout).
+///
+/// Without this fold, ``convert-vector-to-llvm`` turns the insert_strided_slice
+/// chain into a byte-granular ``shufflevector`` that ISel lowers to an
+/// expensive byte-permute.
+static void foldI8x8ConcatsOfTwoI32(Operation *root) {
+  SmallVector<I8x8ConcatOfTwoI32> candidates;
+  root->walk([&](vector::InsertStridedSliceOp op) {
+    if (auto concat = matchI8x8ConcatOfTwoI32(op))
+      candidates.push_back(*concat);
+  });
+
+  for (I8x8ConcatOfTwoI32 concat : candidates) {
+    vector::InsertStridedSliceOp hiInsert = concat.hiInsert;
+    OpBuilder rewriter(hiInsert);
+    Location loc = hiInsert.getLoc();
+    Type i32Ty = rewriter.getI32Type();
+    auto v2i32 = VectorType::get({2}, i32Ty);
+    Value poison = LLVM::PoisonOp::create(rewriter, loc, v2i32);
+    Value c0 = LLVM::ConstantOp::create(rewriter, loc, i32Ty, 0);
+    Value c1 = LLVM::ConstantOp::create(rewriter, loc, i32Ty, 1);
+    Value loIns = LLVM::InsertElementOp::create(rewriter, loc, v2i32, poison, concat.loI32, c0);
+    Value hiIns = LLVM::InsertElementOp::create(rewriter, loc, v2i32, loIns, concat.hiI32, c1);
+    Value out = LLVM::BitcastOp::create(rewriter, loc, hiInsert.getType(), hiIns);
+    hiInsert.replaceAllUsesWith(out);
+    hiInsert.erase();
+    if (concat.loInsert->use_empty())
+      concat.loInsert.erase();
+  }
+}
+
 /// True when ``llvm.bi.stp.vs[.pred].*`` arg[1] is ``inttoptr(ptrtoint(p))``
 /// with matching pointer types (foldable after fly.ptr -> llvm.ptr).
 static bool isFoldableStpVsPtrRoundtrip(LLVM::CallIntrinsicOp op) {
@@ -992,6 +1114,9 @@ public:
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
       signalPassFailure();
 
+    // Post-conversion peep-holes (walk-based; do not use greedy DCE).
+    rewriteSharedI8x4LoadsAsI32(getOperation());
+    foldI8x8ConcatsOfTwoI32(getOperation());
     foldStpVsPtrRoundtrips(getOperation());
   }
 };
