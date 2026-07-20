@@ -3,11 +3,14 @@
 
 """Iluvatar flex-attention device tests.
 
-PR-1a covers the ``Q @ K^T * sm_scale`` sub-step only (``_compile_iluvatar_qk_dot_dev``);
-the fused kernel entry point ``compile_iluvatar_flex_attention`` currently raises
-``NotImplementedError`` and is tested in that state.
+PR-1a covers the ``Q @ K^T * sm_scale`` sub-step via ``_compile_iluvatar_qk_dot_dev``
+(kept as a dev-only bisection helper).
 
-PR-1b/PR-1c will expand this file with the full-kernel correctness cases.
+PR-1b adds numerical tests for the full fused non-causal path
+(``compile_iluvatar_flex_attention(..., is_causal=False)``) — MMA1 -> online
+softmax -> P via SMEM -> MMA2 -> normalise -> gmem write.
+
+PR-1c will add ``is_causal=True`` cases.
 """
 
 from __future__ import annotations
@@ -85,6 +88,52 @@ def test_iluvatar_flex_attention_qk_dot_pr1a(monkeypatch, B, H, Sq, Skv):
     torch.testing.assert_close(S, ref, rtol=2e-2, atol=2e-2)
 
 
+# --- PR-1b: full non-causal fused kernel --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "B,H,Sq,Skv",
+    [
+        (1, 4, 64, 64),  # single q_tile / single kv_tile
+        (2, 4, 128, 128),  # multiple q_tiles / multiple kv_tiles
+        (1, 8, 192, 192),  # 3x3 tile grid, larger head count
+    ],
+)
+def test_iluvatar_flex_attention_forward_pr1b(monkeypatch, B, H, Sq, Skv):
+    """PR-1b: full non-causal forward matches ``F.scaled_dot_product_attention``.
+
+    The launcher expects V pre-transposed by the host to ``[B, H, D, Skv]`` so
+    both MMA operands stay k-major "tn"; the test replicates that contract.
+    """
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    D = 128
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+
+    torch.manual_seed(0)
+    Q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype)
+    K = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
+    V_natural = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
+    V_transposed = V_natural.transpose(-1, -2).contiguous()  # [B, H, D, Skv]
+    O = torch.zeros(B, H, Sq, D, device="cuda", dtype=torch_dtype)  # noqa: E741
+
+    launch = mod.compile_iluvatar_flex_attention(B, H, Sq, Skv, D, dtype="bf16", is_causal=False, sm_scale=sm_scale)
+    launch(Q, K, V_transposed, O)
+    torch.cuda.synchronize()
+
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        Q.float(),
+        K.float(),
+        V_natural.float(),
+        is_causal=False,
+        scale=sm_scale,
+    ).to(torch_dtype)
+    torch.testing.assert_close(O, ref, rtol=2e-2, atol=2e-2)
+
+
 # --- Compile-time validation --------------------------------------------------
 
 
@@ -92,6 +141,12 @@ def test_iluvatar_flex_attention_rejects_unsupported_dtype():
     mod = _require_flex_attn_module()
     with pytest.raises(NotImplementedError, match="f16 lands in PR-2"):
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="f16", is_causal=True)
+
+
+def test_iluvatar_flex_attention_defers_is_causal_to_pr1c():
+    mod = _require_flex_attn_module()
+    with pytest.raises(NotImplementedError, match="PR-1c"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", is_causal=True)
 
 
 def test_iluvatar_flex_attention_rejects_unsupported_head_dim():
