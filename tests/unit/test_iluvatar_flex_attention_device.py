@@ -10,7 +10,8 @@ PR-1b adds numerical tests for the full fused non-causal path
 (``compile_iluvatar_flex_attention(..., is_causal=False)``) — MMA1 -> online
 softmax -> P via SMEM -> MMA2 -> normalise -> gmem write.
 
-PR-1c will add ``is_causal=True`` cases.
+PR-1c adds ``is_causal=True`` numerical tests (in-kernel triangular mask
+applied after the ``(sm_scale * log2e)`` scale, before rowmax).
 """
 
 from __future__ import annotations
@@ -134,6 +135,54 @@ def test_iluvatar_flex_attention_forward_pr1b(monkeypatch, B, H, Sq, Skv):
     torch.testing.assert_close(O, ref, rtol=2e-2, atol=2e-2)
 
 
+# --- PR-1c: causal fused kernel ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "B,H,Sq",
+    [
+        (1, 4, 64),  # single tile
+        (2, 4, 128),  # multiple q_tiles / kv_tiles — exercises the triangular pattern across tiles
+        (1, 8, 192),  # 3x3 tile grid, larger head count
+    ],
+)
+def test_iluvatar_flex_attention_forward_pr1c_causal(monkeypatch, B, H, Sq):
+    """PR-1c: causal forward matches ``F.scaled_dot_product_attention(is_causal=True)``.
+
+    ``is_causal=True`` requires ``Sq == Skv``; the causal mask is applied
+    after the ``(sm_scale * log2e)`` scale on ``S = Q @ K^T`` and before the
+    online rowmax, using ``NEG_LARGE_F`` as the log2-domain sentinel.
+    """
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    Skv = Sq
+    D = 128
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+
+    torch.manual_seed(0)
+    Q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype)
+    K = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
+    V_natural = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
+    V_transposed = V_natural.transpose(-1, -2).contiguous()  # [B, H, D, Skv]
+    O = torch.zeros(B, H, Sq, D, device="cuda", dtype=torch_dtype)  # noqa: E741
+
+    launch = mod.compile_iluvatar_flex_attention(B, H, Sq, Skv, D, dtype="bf16", is_causal=True, sm_scale=sm_scale)
+    launch(Q, K, V_transposed, O)
+    torch.cuda.synchronize()
+
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        Q.float(),
+        K.float(),
+        V_natural.float(),
+        is_causal=True,
+        scale=sm_scale,
+    ).to(torch_dtype)
+    torch.testing.assert_close(O, ref, rtol=2e-2, atol=2e-2)
+
+
 # --- Compile-time validation --------------------------------------------------
 
 
@@ -141,12 +190,6 @@ def test_iluvatar_flex_attention_rejects_unsupported_dtype():
     mod = _require_flex_attn_module()
     with pytest.raises(NotImplementedError, match="f16 lands in PR-2"):
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="f16", is_causal=True)
-
-
-def test_iluvatar_flex_attention_defers_is_causal_to_pr1c():
-    mod = _require_flex_attn_module()
-    with pytest.raises(NotImplementedError, match="PR-1c"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", is_causal=True)
 
 
 def test_iluvatar_flex_attention_rejects_unsupported_head_dim():
