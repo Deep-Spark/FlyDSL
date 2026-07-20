@@ -9,7 +9,6 @@ mr_gemm_s2r_load_mma_k loads all warp A/B fragments for one mma_k step.
 """
 
 import flydsl.expr as fx
-
 from kernels.gemm.iluvatar.mr.common import SMEM_ROWS, MrOperandGeom
 from kernels.gemm.iluvatar.mr.operand_copy import (
     SmeConfig,
@@ -99,16 +98,12 @@ def mr_gemm_s2r_a_tile(
                 k_total=geom.atom_k,
             )
         else:
-            smem_view = mr_sme_shared_view(
-                smem_a, off, g2s_sme.a_sme_sw, elem_dtype, major=g2s_sme.a_smem_major
-            )
+            smem_view = mr_sme_shared_view(smem_a, off, g2s_sme.a_sme_sw, elem_dtype, major=g2s_sme.a_smem_major)
     else:
         cta_k_blk = mma_k // sme_row_k
         sme_row_sub = mma_k % sme_row_k
         off = warp_a_base + fx.Int32((mma_m * cta_grid.cta_a_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
-        smem_view = mr_sme_shared_view(
-            smem_a, off, g2s_sme.a_sme_sw, elem_dtype, major=g2s_sme.a_smem_major
-        )
+        smem_view = mr_sme_shared_view(smem_a, off, g2s_sme.a_sme_sw, elem_dtype, major=g2s_sme.a_smem_major)
 
     return fx.slice(fx.zipped_divide(smem_view, tile_atom_a), (None, sme_row_sub))
 
@@ -170,16 +165,12 @@ def mr_gemm_s2r_b_tile(
                 k_total=geom.atom_k,
             )
         else:
-            smem_view = mr_sme_shared_view(
-                smem_b, off, g2s_sme.b_sme_sw, elem_dtype, major=g2s_sme.b_smem_major
-            )
+            smem_view = mr_sme_shared_view(smem_b, off, g2s_sme.b_sme_sw, elem_dtype, major=g2s_sme.b_smem_major)
     else:
         cta_k_blk = mma_k // sme_row_k
         sme_row_sub = mma_k % sme_row_k
         off = warp_b_base + fx.Int32((mma_n * cta_grid.cta_b_k_cnt + cta_k_blk) * cta_grid.cta_chunk_elems)
-        smem_view = mr_sme_shared_view(
-            smem_b, off, g2s_sme.b_sme_sw, elem_dtype, major=g2s_sme.b_smem_major
-        )
+        smem_view = mr_sme_shared_view(smem_b, off, g2s_sme.b_sme_sw, elem_dtype, major=g2s_sme.b_smem_major)
 
     return fx.slice(fx.zipped_divide(smem_view, tile_atom_b), (None, sme_row_sub))
 

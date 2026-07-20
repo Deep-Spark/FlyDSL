@@ -61,7 +61,6 @@ Three unrelated "atom" sizes:
 from typing import NamedTuple
 
 import flydsl.expr as fx
-
 from kernels.gemm.iluvatar.common import GemmLayout
 
 # Per-CTA dynamic shared memory cap on ivcore11 (BI-V150 / MR-50 / MR-100 class).

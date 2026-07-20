@@ -36,7 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from kernels.gemm.iluvatar.common import WARP_SIZE  # noqa: E402
-from kernels.gemm.iluvatar.mr.common import ATOM_K_B32, ATOM_K_B16, ATOM_K_B8, ATOM_M, ATOM_N, SMEM_ROWS  # noqa: E402
+from kernels.gemm.iluvatar.mr.common import ATOM_K_B8, ATOM_K_B16, ATOM_K_B32, ATOM_M, ATOM_N, SMEM_ROWS  # noqa: E402
 from kernels.gemm.iluvatar.mr.s2r import mr_gemm_s2r_copy_a, mr_gemm_s2r_copy_b  # noqa: E402
 from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
     STAGED_BRICK_M,

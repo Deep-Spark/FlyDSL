@@ -53,6 +53,7 @@ _WAITCNT_LAYOUT = (
     ("mbt", 1),  # memory-barrier test
 )
 
+
 def _waitcnt_value(**counters) -> int:
     """Encode an ivcore11 ``sl.waitcnt`` bitfield from named counters.
     Each keyword's value is the threshold to wait down to (``0`` fully drains that
@@ -77,6 +78,7 @@ def _waitcnt_value(**counters) -> int:
     if counters:
         raise ValueError(f"unknown wait counter(s): {', '.join(sorted(counters))}")
     return value
+
 
 def sl_waitmem(**counters):
     """Wait for outstanding memory operations (``ixdl.sl.waitcnt``).

@@ -3,9 +3,9 @@
 
 """Iluvatar CMake backend selection."""
 
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -39,19 +39,15 @@ def test_iluvatar_python_bindings_are_backend_gated():
 
 def test_iluvatar_runtime_skeleton_uses_cuda_compatible_api():
     runtime_cmake = (_REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "CMakeLists.txt").read_text()
-    runtime_cpp = (
-        _REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "FlyIluvatarRuntimeWrappers.cpp"
-    ).read_text()
+    runtime_cpp = (_REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "FlyIluvatarRuntimeWrappers.cpp").read_text()
     python_cmake = (_REPO_ROOT / "python" / "mlir_flydsl" / "CMakeLists.txt").read_text()
 
-    assert 'if("iluvatar" IN_LIST FLYDSL_BACKENDS)' in (
-        _REPO_ROOT / "lib" / "Runtime" / "CMakeLists.txt"
-    ).read_text()
+    assert 'if("iluvatar" IN_LIST FLYDSL_BACKENDS)' in (_REPO_ROOT / "lib" / "Runtime" / "CMakeLists.txt").read_text()
     assert "find_package(CUDAToolkit REQUIRED)" in runtime_cmake
     assert "add_library(FlyIluvatarJitRuntime SHARED FlyIluvatarRuntimeWrappers.cpp)" in runtime_cmake
     assert "CUDA::cuda_driver" in runtime_cmake
     assert 'OUTPUT_NAME "fly_iluvatar_jit_runtime"' in runtime_cmake
-    assert "#include \"cuda.h\"" in runtime_cpp
+    assert '#include "cuda.h"' in runtime_cpp
     assert "cuModuleLoadData" in runtime_cpp
     assert "cuLaunchKernel" in runtime_cpp
     assert "ixModule" not in runtime_cpp
@@ -59,9 +55,7 @@ def test_iluvatar_runtime_skeleton_uses_cuda_compatible_api():
 
 
 def test_iluvatar_runtime_exports_mgpu_symbol_contract():
-    runtime_cpp = (
-        _REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "FlyIluvatarRuntimeWrappers.cpp"
-    ).read_text()
+    runtime_cpp = (_REPO_ROOT / "lib" / "Runtime" / "Iluvatar" / "FlyIluvatarRuntimeWrappers.cpp").read_text()
 
     required_symbols = [
         "mgpuModuleLoad",
@@ -110,22 +104,14 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
     backend_dir.mkdir(parents=True)
     rocm_runtime_dir.mkdir(parents=True)
     iluvatar_runtime_dir.mkdir(parents=True)
-    (cmake_dir / "FlyDSLBackends.cmake").write_text(
-        (_REPO_ROOT / "cmake" / "FlyDSLBackends.cmake").read_text()
-    )
-    (runtime_dir / "CMakeLists.txt").write_text(
-        (_REPO_ROOT / "lib" / "Runtime" / "CMakeLists.txt").read_text()
-    )
-    (rocm_runtime_dir / "CMakeLists.txt").write_text(
-        'set(GUARDRAIL_ENTERED_ROCM_RUNTIME ON CACHE BOOL "" FORCE)\n'
-    )
+    (cmake_dir / "FlyDSLBackends.cmake").write_text((_REPO_ROOT / "cmake" / "FlyDSLBackends.cmake").read_text())
+    (runtime_dir / "CMakeLists.txt").write_text((_REPO_ROOT / "lib" / "Runtime" / "CMakeLists.txt").read_text())
+    (rocm_runtime_dir / "CMakeLists.txt").write_text('set(GUARDRAIL_ENTERED_ROCM_RUNTIME ON CACHE BOOL "" FORCE)\n')
     (iluvatar_runtime_dir / "CMakeLists.txt").write_text(
         'set(GUARDRAIL_ENTERED_ILUVATAR_RUNTIME ON CACHE BOOL "" FORCE)\n'
     )
 
-    (backend_dir / "rocdl.cmake").write_text(
-        'set(GUARDRAIL_SELECTED_ROCDL ON CACHE BOOL "" FORCE)\n'
-    )
+    (backend_dir / "rocdl.cmake").write_text('set(GUARDRAIL_SELECTED_ROCDL ON CACHE BOOL "" FORCE)\n')
     (backend_dir / "iluvatar.cmake").write_text(
         (_REPO_ROOT / "cmake" / "backends" / "iluvatar.cmake").read_text()
         + '\nset(GUARDRAIL_SELECTED_ILUVATAR ON CACHE BOOL "" FORCE)\n'
@@ -151,10 +137,7 @@ def test_iluvatar_backend_descriptor_is_opt_in(tmp_path):
                 'list(FIND _capi_subdirs "FlyIXDL" _flyixdl_capi_idx)',
                 'list(FIND _embed_capi_libs "MLIRCPIFlyIXDL" _flyixdl_embed_idx)',
                 'list(FIND _flyopt_libs "MLIRCPIFlyIXDL" _flyixdl_flyopt_idx)',
-                (
-                    'list(FIND _stubgen_modules "flydsl._mlir._mlir_libs._mlirDialectsFlyIXDL" '
-                    "_flyixdl_stubgen_idx)"
-                ),
+                ('list(FIND _stubgen_modules "flydsl._mlir._mlir_libs._mlirDialectsFlyIXDL" ' "_flyixdl_stubgen_idx)"),
                 'add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/lib/Runtime")',
                 'if(FLYDSL_BACKENDS STREQUAL "iluvatar" AND GUARDRAIL_SELECTED_ROCDL)',
                 '  message(FATAL_ERROR "rocdl descriptor was included for iluvatar-only build")',

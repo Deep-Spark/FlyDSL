@@ -44,6 +44,7 @@ SRC_STRIDE_N = 80
 TOTAL_TILES = (M // TILE_M) * (N // TILE_N)
 GRID_BLOCKS = TOTAL_TILES // WARPS_PER_BLOCK
 
+
 @flyc.kernel(known_block_size=[WARP_SIZE * WARPS_PER_BLOCK, 1, 1])
 def copy_kernel_iluvatar_mr(A: fx.Tensor, B: fx.Tensor):
     lane_id = fx.thread_idx.x % 64
