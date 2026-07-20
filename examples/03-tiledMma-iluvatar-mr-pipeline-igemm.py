@@ -54,7 +54,6 @@ from kernels.gemm.iluvatar.common import (  # noqa: E402
 from kernels.gemm.iluvatar.mr.igemm import (  # noqa: E402
     ATOM_K_I8,
     DEFAULT_EPILOGUE,
-    DEFAULT_K_REP,
     EPILOGUE_CHOICES,
     EPILOGUE_I8,
     compile_iluvatar_mr_igemm,
@@ -69,6 +68,7 @@ CTA_PRESETS = {
     "2048": (4, 8, 4, 2, 4),  # 32 warps x 64 lanes, 64x32/warp
 }
 DEFAULT_CTA = "1024"
+
 
 def _reference(A, B, epilogue):
     acc = A.cpu().to(torch.int32) @ B.cpu().to(torch.int32).T
@@ -113,7 +113,19 @@ def _build_launcher(
 
 
 def _check(
-    m, n, k, *, warps_m, warps_n, k_rep, warp_atoms_m, warp_atoms_n, major_pattern, epilogue=DEFAULT_EPILOGUE, seed=0, stages=2
+    m,
+    n,
+    k,
+    *,
+    warps_m,
+    warps_n,
+    k_rep,
+    warp_atoms_m,
+    warp_atoms_n,
+    major_pattern,
+    epilogue=DEFAULT_EPILOGUE,
+    seed=0,
+    stages=2,
 ):
     torch.manual_seed(seed)
     A = torch.randint(-8, 8, (m, k), dtype=torch.int8, device="cuda")
@@ -228,9 +240,7 @@ def _bench(
         print(f"  [info] torch._int_mm reference unavailable: {repr(exc)[:120]}")
 
     torch_note = (
-        f"  (torch {torch_us:.1f} us, {torch_tops:.2f} TOPS, {torch_us / us:.2f}x)"
-        if torch_us is not None
-        else ""
+        f"  (torch {torch_us:.1f} us, {torch_tops:.2f} TOPS, {torch_us / us:.2f}x)" if torch_us is not None else ""
     )
     print(
         f"[bench] epilogue={epilogue} pattern={major_pattern} M={m} N={n} K={k} grid={grid} block={block} "

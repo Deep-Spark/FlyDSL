@@ -66,9 +66,8 @@ def _fetch_pull_request_files(owner_repo: str, pr_number: int, token: str) -> li
     page = 1
     files: list[str] = []
     while True:
-        url = (
-            f"https://api.github.com/repos/{owner_repo}/pulls/{pr_number}/files?"
-            + urllib.parse.urlencode({"per_page": 100, "page": page})
+        url = f"https://api.github.com/repos/{owner_repo}/pulls/{pr_number}/files?" + urllib.parse.urlencode(
+            {"per_page": 100, "page": page}
         )
         payload = _api_get(url, token)
         if not isinstance(payload, list) or not payload:

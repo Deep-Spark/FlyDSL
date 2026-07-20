@@ -29,6 +29,10 @@ from kernels.gemm.iluvatar.common import (
     WARP_SIZE,
     parse_major_pattern,
 )
+from kernels.gemm.iluvatar.epilogue import (
+    mr_igemm_epilogue_store_i8_packed,
+    mr_igemm_epilogue_store_i32,
+)
 from kernels.gemm.iluvatar.mr.common import (
     ATOM_K_B8,
     ATOM_M,
@@ -38,10 +42,6 @@ from kernels.gemm.iluvatar.mr.common import (
     MrOperandGeom,
     mr_stage_smem_ab,
     sme_atom_counts,
-)
-from kernels.gemm.iluvatar.epilogue import (
-    mr_igemm_epilogue_store_i8_packed,
-    mr_igemm_epilogue_store_i32,
 )
 from kernels.gemm.iluvatar.mr.operand_copy import mr_g2s_sme_config, mr_gemm_g2s_issue_operands
 from kernels.gemm.iluvatar.mr.s2r import mr_gemm_s2r_load_mma_k
@@ -104,12 +104,7 @@ def resolve_igemm_stages(
         return 3
     layout = parse_major_pattern(major_pattern)
     k_spanning = layout.a_mn_major or layout.b_mn_major
-    if (
-        k_spanning
-        and blocks >= AUTO_STAGES_S4_BLOCK_THRESH
-        and ktiles >= 4
-        and 4 * (bm + bn) * bk <= smem_cap
-    ):
+    if k_spanning and blocks >= AUTO_STAGES_S4_BLOCK_THRESH and ktiles >= 4 and 4 * (bm + bn) * bk <= smem_cap:
         return 4
     return 2
 
@@ -442,17 +437,13 @@ def _build_igemm_kernel(
                     _sync_wait()
                     nxt = i + (stages - 1)
                     issue_stage(fx.Int32(nxt), fx.Int32((nxt % stages) * stage_stride), commit=False)
-                    a_def, b_def = _calc_blk(
-                        fx.Int32((i % stages) * stage_stride), i > 0, False, a_def, b_def
-                    )
+                    a_def, b_def = _calc_blk(fx.Int32((i % stages) * stage_stride), i > 0, False, a_def, b_def)
                     _sync_arrive(full_cnt)
 
                 for j in fx.range_constexpr(stages - 1):
                     _sync_wait()
                     t = main_count + j
-                    a_def, b_def = _calc_blk(
-                        fx.Int32((t % stages) * stage_stride), True, j == stages - 2, a_def, b_def
-                    )
+                    a_def, b_def = _calc_blk(fx.Int32((t % stages) * stage_stride), True, j == stages - 2, a_def, b_def)
                     if fx.const_expr(j < stages - 2):
                         _sync_arrive((stages - 2 - (j + 1)) * g2s_load_inst)
             else:
@@ -522,9 +513,7 @@ def _build_igemm_kernel(
             )
 
     smem_bytes = (
-        max(stage_elems * stages, bm * bn)
-        if epilogue == EPILOGUE_I8 and not use_pack_only
-        else stage_elems * stages
+        max(stage_elems * stages, bm * bn) if epilogue == EPILOGUE_I8 and not use_pack_only else stage_elems * stages
     )
     return gemm_kernel, threads, smem_bytes, bm, bn, bk
 

@@ -31,7 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from kernels.gemm.iluvatar.common import WARP_SIZE  # noqa: E402
-from kernels.gemm.iluvatar.mr.common import ATOM_K_B32, ATOM_K_B16, ATOM_K_B8, ATOM_M, ATOM_N  # noqa: E402
+from kernels.gemm.iluvatar.mr.common import ATOM_K_B8, ATOM_K_B16, ATOM_K_B32, ATOM_M, ATOM_N  # noqa: E402
 
 MMA_MAJOR_PATTERNS = ("nt", "nn", "tn", "tt")
 

@@ -9,7 +9,6 @@ These are test-only JIT kernel builders; production HGEMM lives in ``kernels/``.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
-
 from kernels.gemm.iluvatar.common import WARP_SIZE
 from kernels.gemm.iluvatar.mr.common import ATOM_M, ATOM_N, SMEM_ROWS
 from kernels.gemm.iluvatar.mr.operand_copy import (
@@ -110,16 +109,8 @@ def _build_mr_g2s_s2r_a_dump_launch(*, major_pattern: str, k_atoms: int):
             b_leading = brick_k
 
         tile_smem = fx.make_tile(SMEM_ROWS, vpr)
-        tile_smem_A = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(a_mn_major)
-            else tile_smem
-        )
-        tile_smem_B = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(b_mn_major)
-            else tile_smem
-        )
+        tile_smem_A = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(a_mn_major) else tile_smem
+        tile_smem_B = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(b_mn_major) else tile_smem
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
@@ -268,16 +259,8 @@ def _build_mr_g2s_s2r_b_dump_launch(*, major_pattern: str, k_atoms: int):
             b_leading = brick_k
 
         tile_smem = fx.make_tile(SMEM_ROWS, vpr)
-        tile_smem_A = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(a_mn_major)
-            else tile_smem
-        )
-        tile_smem_B = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(b_mn_major)
-            else tile_smem
-        )
+        tile_smem_A = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(a_mn_major) else tile_smem
+        tile_smem_B = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(b_mn_major) else tile_smem
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
@@ -425,16 +408,8 @@ def build_mr_g2s_s2r_mma_warp00_launch(*, major_pattern: str, k_atoms: int):
             b_leading = brick_k
 
         tile_smem = fx.make_tile(SMEM_ROWS, vpr)
-        tile_smem_A = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(a_mn_major)
-            else tile_smem
-        )
-        tile_smem_B = (
-            fx.make_tile(vpr, SMEM_ROWS)
-            if fx.const_expr(b_mn_major)
-            else tile_smem
-        )
+        tile_smem_A = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(a_mn_major) else tile_smem
+        tile_smem_B = fx.make_tile(vpr, SMEM_ROWS) if fx.const_expr(b_mn_major) else tile_smem
         sme_A = ixdl.make_sme_gmem_tensor(g_A[None, None, 0], leading_stride=a_leading)
         sme_B = ixdl.make_sme_gmem_tensor(g_B[None, None, 0], leading_stride=b_leading)
 
