@@ -42,30 +42,19 @@ gpu.module @t [#ixdl.target] {
 }
 
 // -----------------------------------------------------------------------------
-// B8 Row8b S2R address peeps — pre-commit baseline (current pass leaves these
-// unfolded). Follow-up flips CHECKs when Euclidean / ModSwizzle / readfirstlane
-// closed forms land.
-//
-// Intended folds (not yet applied):
-//   1) 4*(lane%16)+64*(lane/16) -> 4*lane
-//      also A=1: (lane%16)+16*(lane/16) -> lane
-//      E in shallow add/sub tree: 4*(lane%16)+1+64*(lane/16) -> 4*lane+1
-//                               4*(lane%16)+64*(lane/16)-1 -> 4*lane-1
-//                               100-4*(lane%16)-64*(lane/16) -> 100-4*lane
-//   2) MS<2,6,2>(x) -> x when x < 256
-//   3) MS(base+256) -> ((base+320)&255)|256 when base < 256
-//   4) warp_base + 4*lane -> readfirstlane(warp_base) + 4*lane
+// B8 Row8b: Euclidean thr→byte fold
+//   4*(lane%16) + 64*(lane/16)  ->  4*lane
+//   Also: A=1 and additive/subtractive noise E inside a shallow add/sub tree:
+//     (lane%16) + 16*(lane/16)           -> lane
+//     4*(lane%16) + 1 + 64*(lane/16)     -> 4*lane + 1
+//     4*(lane%16) + 64*(lane/16) - 1     -> 4*lane - 1
+//     100 - 4*(lane%16) - 64*(lane/16)   -> 100 - 4*lane
 // -----------------------------------------------------------------------------
-
 // CHECK-LABEL: gpu.func @b8_euclidean_lane_addr
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[REM:.+]] = arith.remsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[DIV:.+]] = arith.divsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[LO:.+]] = arith.muli %[[REM]], %{{.+}} : i32
-// CHECK:       %[[HI:.+]] = arith.muli %[[DIV]], %{{.+}} : i32
-// CHECK:       %[[SUM:.+]] = arith.addi %[[LO]], %[[HI]] : i32
-// CHECK:       gpu.printf "%d", %[[SUM]] : i32
+// CHECK:       %[[OUT:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
+// CHECK:       gpu.printf "%d", %[[OUT]] : i32
 gpu.module @b8_euclid [#ixdl.target] {
   gpu.func @b8_euclidean_lane_addr() kernel {
     %lane_idx = gpu.lane_id
@@ -83,16 +72,11 @@ gpu.module @b8_euclid [#ixdl.target] {
   }
 }
 
-// A=1 Euclidean identity: (lane%16)+16*(lane/16) -> lane. Baseline keeps rem/div.
-//
 // CHECK-LABEL: gpu.func @b8_euclidean_identity_a1
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[REM:.+]] = arith.remsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[DIV:.+]] = arith.divsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[HI:.+]] = arith.muli %[[DIV]], %{{.+}} : i32
-// CHECK:       %[[SUM:.+]] = arith.addi %[[REM]], %[[HI]] : i32
-// CHECK:       gpu.printf "%d", %[[SUM]] : i32
+// CHECK:       gpu.printf "%d", %[[LANE]] : i32
+// CHECK-NOT:   arith.remsi
 gpu.module @b8_euclid_a1 [#ixdl.target] {
   gpu.func @b8_euclidean_identity_a1() kernel {
     %lane_idx = gpu.lane_id
@@ -107,19 +91,13 @@ gpu.module @b8_euclid_a1 [#ixdl.target] {
   }
 }
 
-// Euclidean with additive noise E: 4*(lane%16)+1+64*(lane/16) -> 4*lane+1.
-// Baseline keeps rem/div and the mid addi.
-//
 // CHECK-LABEL: gpu.func @b8_euclidean_with_extra
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[REM:.+]] = arith.remsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[DIV:.+]] = arith.divsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[LO:.+]] = arith.muli %[[REM]], %{{.+}} : i32
-// CHECK:       %[[MID:.+]] = arith.addi %[[LO]], %{{.+}} : i32
-// CHECK:       %[[HI:.+]] = arith.muli %[[DIV]], %{{.+}} : i32
-// CHECK:       %[[SUM:.+]] = arith.addi %[[MID]], %[[HI]] : i32
-// CHECK:       gpu.printf "%d", %[[SUM]] : i32
+// CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : i32
+// CHECK:       %[[AX:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
+// CHECK:       %[[OUT:.+]] = arith.addi %[[AX]], %[[C1]] : i32
+// CHECK:       gpu.printf "%d", %[[OUT]] : i32
 gpu.module @b8_euclid_extra [#ixdl.target] {
   gpu.func @b8_euclidean_with_extra() kernel {
     %lane_idx = gpu.lane_id
@@ -139,19 +117,12 @@ gpu.module @b8_euclid_extra [#ixdl.target] {
   }
 }
 
-
-// Euclidean with subtractive E: 4*(lane%16)+64*(lane/16)-1 -> 4*lane-1.
-// Baseline keeps rem/div and the outer subi.
-//
 // CHECK-LABEL: gpu.func @b8_euclidean_with_sub
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[REM:.+]] = arith.remsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[DIV:.+]] = arith.divsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[LO:.+]] = arith.muli %[[REM]], %{{.+}} : i32
-// CHECK:       %[[HI:.+]] = arith.muli %[[DIV]], %{{.+}} : i32
-// CHECK:       %[[SUM:.+]] = arith.addi %[[LO]], %[[HI]] : i32
-// CHECK:       %[[OUT:.+]] = arith.subi %[[SUM]], %{{.+}} : i32
+// CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : i32
+// CHECK:       %[[AX:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
+// CHECK:       %[[OUT:.+]] = arith.subi %[[AX]], %[[C1]] : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
 gpu.module @b8_euclid_sub [#ixdl.target] {
   gpu.func @b8_euclidean_with_sub() kernel {
@@ -172,18 +143,12 @@ gpu.module @b8_euclid_sub [#ixdl.target] {
   }
 }
 
-// Euclidean neg-pair: 100 - 4*(lane%16) - 64*(lane/16) -> 100 - 4*lane.
-// Baseline keeps rem/div and the subi chain.
-//
 // CHECK-LABEL: gpu.func @b8_euclidean_neg_pair
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[REM:.+]] = arith.remsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[DIV:.+]] = arith.divsi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[LO:.+]] = arith.muli %[[REM]], %{{.+}} : i32
-// CHECK:       %[[HI:.+]] = arith.muli %[[DIV]], %{{.+}} : i32
-// CHECK:       %[[T:.+]] = arith.subi %{{.+}}, %[[LO]] : i32
-// CHECK:       %[[OUT:.+]] = arith.subi %[[T]], %[[HI]] : i32
+// CHECK-DAG:   %[[C100:.+]] = arith.constant 100 : i32
+// CHECK:       %[[AX:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
+// CHECK:       %[[OUT:.+]] = arith.subi %[[C100]], %[[AX]] : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
 gpu.module @b8_euclid_neg [#ixdl.target] {
   gpu.func @b8_euclidean_neg_pair() kernel {
@@ -204,31 +169,35 @@ gpu.module @b8_euclid_neg [#ixdl.target] {
   }
 }
 
+// -----------------------------------------------------------------------------
 // B8 ModSwizzle identity (MS<2,6,2> / yyyMask=768, zbMask=255, shift=2).
-// Expanded form:
-//   yyy  = x & 768; shr = yyy >> 2
-//   low  = (x + shr) & 255; high = x & (~255)
-//   MS(x) = high | low
-// When x < 256, MS(x) == x; baseline still emits the full chain.
 //
+// Expanded form used by Row8b S2R addressing:
+//   yyy  = x & 768                  // bits [8,9] of x  (768 = 0b11_0000_0000)
+//   shr  = yyy >> 2                 // inject those bits into [6,7]
+//   low  = (x + shr) & 255          // zb: low 8 bits after wrap add
+//   high = x & (~255)               // nzb: bits above zb (mask = -256)
+//   MS(x) = high | low
+//
+// When x < yyyLo (= 256, lowest set bit of 768), yyy==0 so shr==0 and
+// high==0, therefore MS(x) == x.  Here x = lane_id ∈ [0,64).
+//
+// Before: full MS chain above.  After: printf(lane)  (no ori).
+// -----------------------------------------------------------------------------
 // CHECK-LABEL: gpu.func @b8_modswizzle_identity
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[YYY:.+]] = arith.andi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[SHR:.+]] = arith.shrui %[[YYY]], %{{.+}} : i32
-// CHECK:       %[[SUM:.+]] = arith.addi %[[LANE]], %[[SHR]] : i32
-// CHECK:       %[[LOW:.+]] = arith.andi %[[SUM]], %{{.+}} : i32
-// CHECK:       %[[HIGH:.+]] = arith.andi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[MS:.+]] = arith.ori %[[HIGH]], %[[LOW]] : i32
-// CHECK:       gpu.printf "%d", %[[MS]] : i32
+// CHECK:       gpu.printf "%d", %[[LANE]] : i32
+// CHECK-NOT:   arith.ori
 gpu.module @b8_ms_id [#ixdl.target] {
   gpu.func @b8_modswizzle_identity() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
-    %c768 = arith.constant 768 : i32
-    %c255 = arith.constant 255 : i32
-    %cnzb = arith.constant -256 : i32
-    %c2 = arith.constant 2 : i32
+    // MS<2,6,2> with x = lane < 256 → identity.
+    %c768 = arith.constant 768 : i32   // yyyMask
+    %c255 = arith.constant 255 : i32   // zbMask  (low 8 bits)
+    %cnzb = arith.constant -256 : i32  // ~zbMask (high bits)
+    %c2 = arith.constant 2 : i32       // shift
     %yyy = arith.andi %lane, %c768 : i32
     %shr = arith.shrui %yyy, %c2 : i32
     %sum = arith.addi %lane, %shr : i32
@@ -240,30 +209,45 @@ gpu.module @b8_ms_id [#ixdl.target] {
   }
 }
 
-// B8 Row8b second-word ModSwizzle: x = base+256, base < 256.
-// Intended: MS(base+256) -> ((base+320)&255)|256. Baseline keeps full MS.
+// -----------------------------------------------------------------------------
+// B8 Row8b second-word ModSwizzle closed form (same MS<2,6,2>).
 //
+// Second 256B word of a 512B row tile: x = base + 256 with base < 256
+// (here base = lane_id).  Full expansion:
+//   x    = base + 256
+//   yyy  = x & 768                  // for base∈[0,256): always 256
+//   shr  = yyy >> 2                 // = 64
+//   low  = (x + shr) & 255          // = (base + 256 + 64) & 255 = (base+320)&255
+//   high = x & (~255)               // = 256  (second-word bit)
+//   MS(x) = high | low
+//
+// Closed form (pass folds the chain away):
+//   MS(base+256) -> ((base + 320) & 255) | 256
+//
+// Before: x=base+256 + yyy/shr/sum/low/high/ori.
+// After:  sum=base+320; low=sum&255; out=low|256.
+// -----------------------------------------------------------------------------
 // CHECK-LABEL: gpu.func @b8_modswizzle_second_word
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
-// CHECK:       %[[X:.+]] = arith.addi %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[YYY:.+]] = arith.andi %[[X]], %{{.+}} : i32
-// CHECK:       %[[SHR:.+]] = arith.shrui %[[YYY]], %{{.+}} : i32
-// CHECK:       %[[SUM:.+]] = arith.addi %[[X]], %[[SHR]] : i32
+// CHECK-DAG:   arith.constant 320 : i32
+// CHECK-DAG:   arith.constant 256 : i32
+// CHECK:       %[[SUM:.+]] = arith.addi %[[LANE]], %{{.+}} : i32
 // CHECK:       %[[LOW:.+]] = arith.andi %[[SUM]], %{{.+}} : i32
-// CHECK:       %[[HIGH:.+]] = arith.andi %[[X]], %{{.+}} : i32
-// CHECK:       %[[MS:.+]] = arith.ori %[[HIGH]], %[[LOW]] : i32
-// CHECK:       gpu.printf "%d", %[[MS]] : i32
+// CHECK:       %[[OUT:.+]] = arith.ori %[[LOW]], %{{.+}} : i32
+// CHECK:       gpu.printf "%d", %[[OUT]] : i32
 gpu.module @b8_ms_sw [#ixdl.target] {
   gpu.func @b8_modswizzle_second_word() kernel {
     %lane_idx = gpu.lane_id
-    %lane = arith.index_cast %lane_idx : index to i32
-    %c256 = arith.constant 256 : i32
-    %c768 = arith.constant 768 : i32
-    %c255 = arith.constant 255 : i32
-    %cnzb = arith.constant -256 : i32
-    %c2 = arith.constant 2 : i32
+    %lane = arith.index_cast %lane_idx : index to i32  // base ∈ [0,64) < 256
+    %c256 = arith.constant 256 : i32   // second-word offset
+    %c768 = arith.constant 768 : i32   // yyyMask
+    %c255 = arith.constant 255 : i32   // zbMask
+    %cnzb = arith.constant -256 : i32  // ~zbMask
+    %c2 = arith.constant 2 : i32       // shift
+    // x = base + 256  (second 256B word)
     %x = arith.addi %lane, %c256 : i32
+    // MS(x) = (x & ~255) | (((x + ((x & 768) >> 2)) & 255)
     %yyy = arith.andi %x, %c768 : i32
     %shr = arith.shrui %yyy, %c2 : i32
     %sum = arith.addi %x, %shr : i32
@@ -275,16 +259,16 @@ gpu.module @b8_ms_sw [#ixdl.target] {
   }
 }
 
-// Row S2R: warp_base + 4*lane. Intended: readfirstlane(warp_base)+4*lane.
-// Baseline leaves a plain addi (no llvm.bi.readfirstlane).
-//
+// -----------------------------------------------------------------------------
+// Row S2R: warp_base + 4*lane → readfirstlane(warp_base) + 4*lane
+// -----------------------------------------------------------------------------
 // CHECK-LABEL: gpu.func @b8_row_tid4_readfirstlane
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
 // CHECK-DAG:   %[[BASE:.+]] = arith.muli %{{.+}}, %{{.+}} : i32
 // CHECK-DAG:   %[[LANE4:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
-// CHECK:       %[[OUT:.+]] = arith.addi %[[BASE]], %[[LANE4]] : i32
-// CHECK-NOT:   llvm.call_intrinsic "llvm.bi.readfirstlane"
+// CHECK:       %[[UNI:.+]] = llvm.call_intrinsic "llvm.bi.readfirstlane"(%[[BASE]])
+// CHECK:       %[[OUT:.+]] = arith.addi %[[UNI]], %[[LANE4]] : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
 gpu.module @b8_rfl [#ixdl.target] {
   gpu.func @b8_row_tid4_readfirstlane() kernel {

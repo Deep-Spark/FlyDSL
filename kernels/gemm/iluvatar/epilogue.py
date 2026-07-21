@@ -360,10 +360,11 @@ def mr_igemm_epilogue_store_i8_packed(
     warp_n = ATOM_N * warp_atoms_n
     groups_n = warp_atoms_n // 4
 
-    lane_row = lane_id // fx.Int32(TCU_LANE_COLS)  # 0..3
-    lane_col = lane_id % fx.Int32(TCU_LANE_COLS)  # 0..15
-    lane01 = lane_col % fx.Int32(4)
-    lane23 = lane_col // fx.Int32(4)
+    # Bit ops (not rem/div) so address peeps see a simple lane affine form.
+    lane_row = lane_id.shrui(fx.Int32(4))  # 0..3; TCU_LANE_COLS == 16
+    lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)  # 0..15
+    lane01 = lane_col & fx.Int32(3)
+    lane23 = lane_col.shrui(fx.Int32(2))
     voffset = lane_row * fx.Int32(c_global_n) + lane_col * fx.Int32(4)
 
     smem_warp_i32 = fx.recast_iter(
