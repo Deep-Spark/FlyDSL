@@ -218,10 +218,17 @@ def _build_igemm_kernel(
         else:
             m_tile = bid_x
             n_tile = bid_y
-        warp_id = tid // WARP_SIZE
-        lane_id = tid % WARP_SIZE
-        warp_m_id = warp_id // warps_n
-        warp_n_id = warp_id % warps_n
+        # Prefer hardware lane_id and power-of-two warp split so Row S2R keeps
+        # a natural base+4*lane form (tid%64 / signed floordiv never do).
+        warp_id = tid.shrui(fx.Int32(6))  # WARP_SIZE == 64
+        lane_id = fx.Int32(fx.lane_id)
+        if fx.const_expr((warps_n & (warps_n - 1)) == 0):
+            warp_n_id = warp_id & fx.Int32(warps_n - 1)
+            _wn_bits = int(warps_n).bit_length() - 1
+            warp_m_id = warp_id.shrui(fx.Int32(_wn_bits))
+        else:
+            warp_m_id = warp_id // warps_n
+            warp_n_id = warp_id % warps_n
 
         if fx.const_expr(a_mn_major):
             a_logical_stride = (1, m)

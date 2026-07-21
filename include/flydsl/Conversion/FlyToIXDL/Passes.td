@@ -15,15 +15,18 @@ def FlyToIXDLConversionPass : Pass<"convert-fly-to-ixdl"> {
 }
 
 def IXDLAddressSimplifyPass : Pass<"fly-ixdl-address-simplify"> {
-  let summary = "Simplify IXDL swizzled shared-memory address arithmetic";
+  let summary = "Simplify IXDL shared-memory address arithmetic";
   let description = [{
-      Recognize lane-id expressions in shared-memory copy addresses on IXDL targets
-      and rewrite equivalent affine forms to simpler address arithmetic, such as
-      `(lane_id ^ 1) ^ 33` to `lane_id ^ 32`.
+      On IXDL targets:
+        * Collapse equivalent lane-affine forms in shared copy offsets
+          (e.g. `(lane_id ^ 1) ^ 33` → `lane_id ^ 32`).
+        * B8 Row8b S2R: Euclidean thr→byte + ModSwizzle closed forms, then
+          `readfirstlane` on warp-uniform bases of `base + 4*lane`.
     }];
 
   let dependentDialects = [
     "arith::ArithDialect",
-    "gpu::GPUDialect"
+    "gpu::GPUDialect",
+    "LLVM::LLVMDialect"
   ];
 }
