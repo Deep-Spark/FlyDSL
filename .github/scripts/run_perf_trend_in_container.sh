@@ -119,6 +119,8 @@ docker_args=(
   -v "${COREX_ROOT}:${COREX_ROOT}:ro"
   -w /workspace
   -e COREX_ROOT="${COREX_ROOT}"
+  -e CUDA_HOME="${COREX_ROOT}"
+  -e IXA_HOME="${COREX_ROOT}"
   -e CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
   -e PYTHONUNBUFFERED=1
   -e HOME=/workspace
