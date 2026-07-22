@@ -125,6 +125,7 @@ jobs:
               python -m pip install numpy pytest
               python -m pip install dist/*.whl
               python -c "import flydsl; import flydsl._mlir.ir as ir; print(\"flydsl version:\", flydsl.__version__); print(\"import flydsl._mlir.ir: OK\")"
+              python .github/scripts/verify_installed_flydsl_linkage.py
               FLYDSL_COMPILE_BACKEND=iluvatar \
               FLYDSL_RUNTIME_KIND=iluvatar \
               COMPILE_ONLY=1 \
