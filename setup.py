@@ -289,6 +289,9 @@ def _auditwheel_repair_in_place(wheel_path: Path, dist_dir: Path) -> None:
         str(wheel_path),
         "-w",
         str(wheelhouse),
+        # Runtime scope: do not vendor GPU driver/runtime libraries into wheel.
+        "--exclude",
+        "libcuda.so.*",
         # IMPORTANT: do not bundle ROCm user-space runtime libraries into the wheel.
         "--exclude",
         "libamdhip64.so.*",

@@ -102,6 +102,16 @@ jobs:
               done
             '
 
+      - name: Verify wheel dynamic dependencies
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_wheel_deps.py dist/*.whl
+
+      - name: Verify wheel release payload
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_wheel_contents.py dist/*.whl --summary-json dist/wheel-payload-summary.json
+
       - name: Collect wheel names
         id: collect
         run: |
