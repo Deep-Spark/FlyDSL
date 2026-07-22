@@ -13,6 +13,11 @@ on:
         type: string
         required: false
         default: "flydsl-iluvatar-wheels"
+      build_run_id:
+        description: "Optional workflow run id that produced wheel artifacts"
+        type: string
+        required: false
+        default: ""
   workflow_dispatch:
     inputs:
       docker_image:
@@ -25,6 +30,11 @@ on:
         type: string
         required: false
         default: "flydsl-iluvatar-wheels"
+      build_run_id:
+        description: "Optional workflow run id that produced wheel artifacts"
+        type: string
+        required: false
+        default: ""
 
 jobs:
   test:
@@ -38,11 +48,21 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Download wheel artifacts
+      - name: Download wheel artifacts (current run)
+        if: ${{ (inputs.build_run_id || '') == '' }}
         uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.wheel_artifact_name || 'flydsl-iluvatar-wheels' }}
           path: dist
+
+      - name: Download wheel artifacts (specific build run)
+        if: ${{ (inputs.build_run_id || '') != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.wheel_artifact_name || 'flydsl-iluvatar-wheels' }}
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install wheel and run Iluvatar smoke tests
         env:
@@ -88,7 +108,7 @@ jobs:
           docker run --rm \
             --network host \
             --ipc host \
-            --user root \
+            --user "$(id -u):$(id -g)" \
             ${GPU_DEVICES} \
             ${RENDER_DEVICES} \
             -v "${PWD}:/workspace" \
@@ -102,7 +122,7 @@ jobs:
               python3 -m venv /tmp/flydsl-whl-test
               source /tmp/flydsl-whl-test/bin/activate
               python -m pip install -U pip setuptools
-              python -m pip install numpy
+              python -m pip install numpy pytest
               python -m pip install dist/*.whl
               python -c "import flydsl; import flydsl._mlir.ir as ir; print(\"flydsl version:\", flydsl.__version__); print(\"import flydsl._mlir.ir: OK\")"
               FLYDSL_COMPILE_BACKEND=iluvatar \
