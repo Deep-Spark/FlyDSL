@@ -60,14 +60,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
           docker run --rm \
             --network host \
             --ipc host \
-            --user root \
+            --user "$(id -u):$(id -g)" \
             -v "${PWD}:/workspace" \
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
+            -v "${IXCC_ROOT}:${IXCC_ROOT}:ro" \
+            -v "${IXCC_MLIR_CMAKE}:${IXCC_MLIR_CMAKE}:ro" \
             -w /workspace \
             -e COREX_ROOT="${COREX_ROOT}" \
+            -e IXCC_ROOT="${IXCC_ROOT}" \
             -e IXCC_MLIR_CMAKE="${IXCC_MLIR_CMAKE}" \
             -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
             "${DOCKER_IMAGE}" \
