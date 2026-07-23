@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Opt-in device tests for Iluvatar MR small-M HGEMM (Path A v1).
+"""Device tests for Iluvatar MR small-M HGEMM (Path A v1).
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_SMALL_M=1`` to run (needs an Iluvatar device).
 """
 
 import os
@@ -20,11 +19,6 @@ _DTYPE_CASES = (
     ("bfloat16", "BFloat16"),
 )
 _M_VALUES = (1, 8, 15, 16)
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_SMALL_M", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_SMALL_M=1 to run Iluvatar MR small-M HGEMM tests")
 
 
 def _require_torch():
@@ -59,7 +53,6 @@ def _require_kernel():
 @pytest.mark.parametrize("torch_dtype_name,fx_dtype_name", _DTYPE_CASES)
 @pytest.mark.parametrize("m", _M_VALUES)
 def test_iluvatar_mr_small_m_hgemm_path_a(m, torch_dtype_name, fx_dtype_name, monkeypatch):
-    _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     fx, compile_fn = _require_kernel()

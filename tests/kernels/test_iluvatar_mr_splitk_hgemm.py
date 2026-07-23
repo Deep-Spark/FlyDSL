@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar MR HGEMM Global Split-K device tests.
+"""Iluvatar MR HGEMM Global Split-K device tests.
 
 Covers:
 
@@ -10,7 +10,6 @@ Covers:
    ``serial`` / ``parallel`` / ``atomic`` vs ``A @ B.T``.
 3. ``split_k == 1`` stays on the non-split-K ``compile_iluvatar_mr_hgemm`` path.
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_SPLITK=1`` to run (needs an Iluvatar ivcore11 device).
 """
 
 import os
@@ -24,11 +23,6 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_SPLITK", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_SPLITK=1 to run the Iluvatar MR split-K device tests")
 
 
 def _require_imports():
@@ -74,7 +68,6 @@ _ATOMIC_GRID = 16
 @pytest.mark.parametrize("dtype_name", ["Float16", "BFloat16"])
 def test_universal_atomic_add_multi_cta(dtype_name, monkeypatch):
     """UniversalAtomicAdd on f16/bf16 reduces across CTAs without lost updates."""
-    _require_enabled()
     flyc, fx = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)
@@ -147,7 +140,6 @@ _SPLITK_CASES = [
     ids=[f"{c[0]}_{c[1]}x{c[2]}x{c[3]}_spk{c[4]}_{c[5]}" for c in _SPLITK_CASES],
 )
 def test_mr_splitk_hgemm_device(spec, monkeypatch):
-    _require_enabled()
     flyc, fx = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)
@@ -208,7 +200,6 @@ def test_mr_splitk_hgemm_device(spec, monkeypatch):
 
 def test_split_k_rejects_read_c_accum(monkeypatch):
     """split_k > 1 must reject the read_c_accum epilogue at compile time."""
-    _require_enabled()
     _flyc, fx = _require_imports()
     _set_iluvatar_env(monkeypatch)
 
@@ -221,7 +212,6 @@ def test_split_k_rejects_read_c_accum(monkeypatch):
 
 
 def test_split_k_rejects_unknown_mode(monkeypatch):
-    _require_enabled()
     _flyc, fx = _require_imports()
     _set_iluvatar_env(monkeypatch)
 
@@ -235,7 +225,6 @@ def test_split_k_rejects_unknown_mode(monkeypatch):
 
 def test_split_k_rejects_split_k_one(monkeypatch):
     """The split-K entry point requires split_k > 1; use hgemm.py for split_k == 1."""
-    _require_enabled()
     _flyc, fx = _require_imports()
     _set_iluvatar_env(monkeypatch)
 
