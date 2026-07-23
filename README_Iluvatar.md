@@ -21,7 +21,7 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` — int8×int8 → i32/i8, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
 | **GEMV V1** | `kernels.gemm.iluvatar.gemv` — `F.linear`-aligned M=1, fp16/bf16, fp32 accum |
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |
-| **Unit / device tests** | `tests/unit/test_iluvatar_*` (backend, runtime, G2S/S2R/MMA/epilogue/HGEMM stages, GEMV); IGEMM via example `--check` |
+| **Unit / device tests** | `tests/kernels/test_iluvatar_*` (device kernels: G2S/S2R/MMA/epilogue/HGEMM stages, GEMV, RMSNorm, atomic CAS, split-K) + `tests/unit/test_iluvatar_*` (backend, runtime, JIT launch/binary smokes); select via `-m iluvatar_lower`. IGEMM via example `--check` |
 | **CI (optional)** | Iluvatar `ci-core` / `ci-device`, IX toolchain refresh, publish-image, perf-daily (see `.github/workflows/*iluvatar*`) |
 
 ### Kernel package layout
@@ -92,7 +92,7 @@ export LD_LIBRARY_PATH="${CUDAToolkit_ROOT}/lib64:${PWD}/build-fly/python_packag
 | `ARCH` | `ivcore11` | IXDL chip target (override per card generation) |
 | `COMPILE_ONLY` | `1` | Compile without device execution (CI / no GPU) |
 | `FLYDSL_RUNTIME_ENABLE_CACHE` | `0` | Disable disk cache while iterating on kernel or pass changes |
-| `FLYDSL_ILUVATAR_RUN_MR_*` / `…_GEMV` / `…_JIT_SMOKE` | `1` | Opt-in gates for device pytest modules (default off / skip) |
+| `FLYDSL_ILUVATAR_SMOKE_BLOB_PATH` / `FLYDSL_ILUVATAR_SMOKE_KERNEL` | path / symbol | Blob + kernel name consumed by `tests/unit/test_iluvatar_runtime_smoke.py`; tests are skipped when unset |
 
 Iluvatar examples set the first three via `os.environ.setdefault(...)`.
 
@@ -253,8 +253,8 @@ FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
   --dtype fp16 --split-k 4 --split-k-mode parallel --check-shape 256 256 2048 --k-atoms 2
 ```
 
-Device unit coverage: `tests/unit/test_iluvatar_mr_splitk_hgemm.py`
-(`FLYDSL_ILUVATAR_RUN_MR_SPLITK=1`).
+Device kernel coverage: `tests/kernels/test_iluvatar_mr_splitk_hgemm.py`
+(selected by `-m iluvatar_lower`).
 
 ## Local correctness gate (no CI)
 
@@ -291,9 +291,10 @@ for p in tn nt nn tt; do
 done
 ```
 
-Staged device unit tests (`test_iluvatar_mr_*`, `test_iluvatar_gemv.py`) cover G2S,
-S2R, MMA, epilogue, HGEMM pipeline stages, and GEMV. Enable with the matching
-`FLYDSL_ILUVATAR_RUN_*` environment variables (see test modules).
+Staged device kernel tests (`tests/kernels/test_iluvatar_mr_*`,
+`tests/kernels/test_iluvatar_gemv.py`) cover G2S, S2R, MMA, epilogue, HGEMM
+pipeline stages, and GEMV. Select them with the `iluvatar_lower` pytest
+marker (see the Tests section below).
 
 Example harnesses exit non-zero if any check fails, so they can be used as a manual
 pre-bench / pre-commit gate on machines without CI.
@@ -317,17 +318,22 @@ COMPILE_ONLY=1 FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
   python3 -m pytest tests/unit/test_iluvatar_compile_backend.py -v
 ```
 
-With device (Iluvatar driver + CUDA-enabled PyTorch), opt-in gates required:
+With device (Iluvatar driver + CUDA-enabled PyTorch):
 
 ```bash
 export FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar
-export FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP=1 FLYDSL_ILUVATAR_RUN_MR_MMA=1
-export FLYDSL_ILUVATAR_RUN_MR_S2R=1 FLYDSL_ILUVATAR_RUN_MR_S2R_MMA=1
-export FLYDSL_ILUVATAR_RUN_MR_EPILOGUE=1 FLYDSL_ILUVATAR_RUN_MR_HGEMM_STAGES=1
-export FLYDSL_ILUVATAR_RUN_JIT_SMOKE=1 FLYDSL_ILUVATAR_RUN_GEMV=1
 
-python3 -m pytest tests/unit/test_iluvatar*.py -v
+python3 -m pytest \
+  tests/kernels/test_iluvatar_*.py \
+  tests/unit/test_iluvatar_*.py \
+  -m iluvatar_lower -v
 ```
+
+The `iluvatar_lower` marker matches every Iluvatar L1b/L2 test (kernel
+tests under `tests/kernels/`, plus the JIT / binary / runtime smokes under
+`tests/unit/`). The four backend-agnostic `test_iluvatar_*` files in
+`tests/unit/` intentionally lack the marker so they stay runnable in
+environments without an Iluvatar lowering stack; ci-core covers those.
 
 MLIR FileCheck (needs `fly-opt` + `FileCheck` on `PATH`):
 
