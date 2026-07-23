@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.l2_device]
+pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
 
 
 def _required_path_from_env(name: str) -> Path:

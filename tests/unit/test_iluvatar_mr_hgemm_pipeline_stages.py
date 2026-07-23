@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.l2_device]
+pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
