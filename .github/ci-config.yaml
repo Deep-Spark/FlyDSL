@@ -38,12 +38,13 @@
       "CMakeLists.txt"
     ],
     "pytest_target_globs": [
+      "tests/kernels/test_iluvatar_*.py",
       "tests/unit/test_iluvatar_*.py"
     ],
     "pytest_exclude_globs": [],
     "pytest_common_args": [
       "-m",
-      "l2_device"
+      "iluvatar_lower"
     ],
     "must_pass_tests": [
       "tests/unit/test_iluvatar_binary_pipeline_smoke.py",
