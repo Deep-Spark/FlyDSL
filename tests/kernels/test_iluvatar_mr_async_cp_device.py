@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar MR SME async-copy device correctness tests.
+"""Iluvatar MR SME async-copy device correctness tests.
 
 One case per (dtype, swizzle) SME Load variant: each launches several thread
 blocks that copy a position-encoded matrix global -> shared with one
@@ -9,7 +9,6 @@ warp-collective SME async copy per tile, wait for completion, then read shared
 -> global and check an exact match. Position encoding exposes subtle
 physical-layout / swizzle bugs.
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP=1`` to run (needs an Iluvatar device).
 
 Stage coverage notes
 --------------------
@@ -172,11 +171,6 @@ _CASES = [
         "tile_n": 64,
     },
 ]
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP=1 to run the Iluvatar MR async-copy device tests")
 
 
 def _require_imports():
@@ -568,7 +562,6 @@ def _run_multibrick_g2s_dump_check(
 
 @pytest.mark.parametrize("spec", _CASES, ids=[c["name"] for c in _CASES])
 def test_mr_async_cp_single_atom_layout_device(spec, monkeypatch):
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
 
@@ -732,7 +725,6 @@ def test_mr_async_cp_multibrick_layout_device(major_pattern, dtype_case, monkeyp
     corresponding A/B SME logical view for b8, b16, and b32.
     """
 
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
 
@@ -759,7 +751,6 @@ def test_mr_async_cp_runtime_goffset_loop_device(monkeypatch):
     the ``gOffset += tile_n`` pattern in production Iluvatar SME loops. f32 /
     NoSwizzle is representative -- the gOffset path is dtype-independent.
     """
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
 
@@ -868,7 +859,6 @@ _B16_DTYPE = next(c for c in _MULTIBRICK_DTYPE_CASES if c["name"] == "b16")
 def test_mr_async_cp_multibrick_bk32_device(major_pattern, monkeypatch):
     """G2S multibrick dump at BK=32 (k_atoms=2), the shape that exposed nn/tn bugs."""
 
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -892,7 +882,6 @@ def test_mr_async_cp_multibrick_bk32_device(major_pattern, monkeypatch):
 def test_mr_async_cp_multibrick_multi_cta_m_device(major_pattern, monkeypatch):
     """G2S multibrick dump with grid_m=2 (512x256 logical A, two M CTAs)."""
 
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)

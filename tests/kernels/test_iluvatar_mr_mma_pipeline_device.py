@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar MR TCU MMA device correctness tests.
+"""Iluvatar MR TCU MMA device correctness tests.
 
 One 64-lane warp loads the A / B tiles into register fragments, runs one
 ``ixdl.mmad`` per tile through ``fx.gemm`` on the ``ixdl.MRMma`` atom, and
 writes the accumulator back; the result is checked against ``A @ B.T``.
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_MMA=1`` to run (needs an Iluvatar ivcore11 device).
 """
 
 import os
@@ -31,11 +30,6 @@ _CASES = [
     ("f32_16x16x16", 16, 16, 16, "Float32", "float32", "Float32", "float32"),
     ("s8_16x16x32", 16, 16, 32, "Int8", "int8", "Int32", "int32"),
 ]
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_MMA", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_MMA=1 to run the Iluvatar MR MMA device tests")
 
 
 def _require_imports():
@@ -81,7 +75,6 @@ def _make_inputs(torch, *, m, n, k, torch_dtype, acc_torch_dtype):
 
 @pytest.mark.parametrize("spec", _CASES, ids=[c[0] for c in _CASES])
 def test_mr_mma_device(spec, monkeypatch):
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
 

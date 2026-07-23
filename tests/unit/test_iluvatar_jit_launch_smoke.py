@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar end-to-end FlyDSL JIT launch smoke."""
+"""Iluvatar end-to-end FlyDSL JIT launch smoke."""
 
 import os
 from pathlib import Path
@@ -11,11 +11,6 @@ import pytest
 pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_JIT_SMOKE", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_JIT_SMOKE=1 to run the Iluvatar JIT launch smoke")
 
 
 def _require_imports():
@@ -52,7 +47,6 @@ def _assert_no_runtime_wrapper_errors(captured) -> None:
 def test_iluvatar_jit_launches_minimal_empty_kernel(monkeypatch, capfd):
     """Launch a no-op FlyDSL kernel through the Iluvatar JIT path."""
 
-    _require_enabled()
     flyc, fx = _require_imports()
 
     monkeypatch.setenv("FLYDSL_COMPILE_BACKEND", "iluvatar")
@@ -76,7 +70,6 @@ def test_iluvatar_jit_launches_minimal_empty_kernel(monkeypatch, capfd):
 def test_iluvatar_jit_stores_single_element(monkeypatch, capfd):
     """Launch a scalar store kernel and verify one device element."""
 
-    _require_enabled()
     flyc, fx = _require_imports()
     torch = _require_torch()
 

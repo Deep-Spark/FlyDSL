@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar device tests for ``flydsl.expr.ixdl.atomic_cas``.
+"""Iluvatar device tests for ``flydsl.expr.ixdl.atomic_cas``.
 
 Covers:
 
@@ -11,7 +11,6 @@ Covers:
 4. i16 success / failure smoke (call site uses ``Int16``).
 5. f16 / f32 success / failure smoke (frontend bitcasts to i16 / i32 for cmpxchg).
 
-Set ``FLYDSL_ILUVATAR_RUN_ATOMIC_CAS=1`` to run (needs an Iluvatar ivcore11 device).
 """
 
 import os
@@ -27,11 +26,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from kernels.gemm.iluvatar.common import WARP_SIZE  # noqa: E402
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_ATOMIC_CAS", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_ATOMIC_CAS=1 to run the Iluvatar atomic CAS device tests")
 
 
 def _require_imports():
@@ -72,7 +66,6 @@ def _set_iluvatar_env(monkeypatch) -> None:
 
 def test_atomic_cas_success_and_failure(monkeypatch):
     """CAS returns the old value; success updates memory, failure leaves it."""
-    _require_enabled()
     flyc, fx, ixdl, llvm = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)
@@ -125,7 +118,6 @@ def test_atomic_cas_success_and_failure(monkeypatch):
 
 def test_atomic_cas_i16_success_and_failure(monkeypatch):
     """i16 CAS smoke: success updates memory, failure leaves it (CMPSWAP_B16)."""
-    _require_enabled()
     flyc, fx, ixdl, llvm = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)
@@ -183,7 +175,6 @@ def test_atomic_cas_i16_success_and_failure(monkeypatch):
 )
 def test_atomic_cas_float_success_and_failure(monkeypatch, fx_dtype_name, torch_dtype, desired, fail_desired):
     """Float CAS smoke: same-width bitcast to integer for llvm.cmpxchg."""
-    _require_enabled()
     flyc, fx, ixdl, llvm = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)
@@ -237,7 +228,6 @@ def test_atomic_cas_float_success_and_failure(monkeypatch, fx_dtype_name, torch_
 
 def test_atomic_cas_multi_cta_exclusive(monkeypatch):
     """Exactly one of many CTAs wins ``CAS(0 → 1)`` on a shared lock."""
-    _require_enabled()
     flyc, fx, ixdl, llvm = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)
@@ -283,7 +273,6 @@ def test_atomic_cas_multi_cta_exclusive(monkeypatch):
 
 def test_atomic_cas_ordered_turnstile(monkeypatch):
     """CTAs advance a per-grid lock in ``bid`` order (wait then arrive)."""
-    _require_enabled()
     flyc, fx, ixdl, llvm = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)

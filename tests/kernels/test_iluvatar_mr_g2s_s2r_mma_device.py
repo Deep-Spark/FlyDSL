@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar MR G2S -> S2R -> MMA staged device tests.
+"""Iluvatar MR G2S -> S2R -> MMA staged device tests.
 
 Chains production ``mr_gemm_g2s_issue_operands``, ``mr_gemm_s2r_copy_*``, and a
 single ``fx.gemm`` on warp-00 atom (mma_m=0,mma_n=0). No epilogue, no multi-K-tile loop.
@@ -9,7 +9,6 @@ single ``fx.gemm`` on warp-00 atom (mma_m=0,mma_n=0). No epilogue, no multi-K-ti
 This is the first stage test that exercises ``make_tiled_copy_A/B`` on real G2S
 smem tiles. Scalar S2R readback passing does not imply this path is correct.
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_S2R_MMA=1`` to run (needs an Iluvatar device).
 """
 
 import os
@@ -37,11 +36,6 @@ from tests.unit.iluvatar_mr_staged_kernels import build_mr_g2s_s2r_mma_warp00_la
 
 _G2S_S2R_MMA_PATTERNS = ("nt", "nn", "tn", "tt")
 _G2S_S2R_MMA_K_ATOMS = (2,)
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_S2R_MMA", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_S2R_MMA=1 to run Iluvatar MR G2S->S2R->MMA tests")
 
 
 def _require_imports():
@@ -79,7 +73,6 @@ def _configure_iluvatar_env(monkeypatch) -> None:
 def test_iluvatar_mr_g2s_s2r_mma_warp00_atom_device(major_pattern, k_atoms, monkeypatch):
     """G2S -> production S2R copy -> MMA for warp-00 top-left 16x16 atom."""
 
-    _require_enabled()
     _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)

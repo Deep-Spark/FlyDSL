@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar MR epilogue-only device correctness tests.
+"""Iluvatar MR epilogue-only device correctness tests.
 
 Exercises the three ``kernels.gemm.iluvatar.epilogue`` store helpers directly.
 Accumulator fragments are initialized in register memory (no G2S / S2R / MMA),
@@ -11,7 +11,6 @@ then stored through the shared HGEMM epilogue helper:
 * ``no_c_read + shfl``: f32 accumulator -> fp16 shuffle/packed-i32 C store.
 * ``read_c_accum``: fp32 C load -> accumulator update -> fp32 tiled C store.
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_EPILOGUE=1`` to run (needs an Iluvatar device).
 
 Stage coverage notes
 --------------------
@@ -52,11 +51,6 @@ MULTI_CTA_STORE_CASES = ("no_c_read_tiled", "no_c_read_shfl")
 
 EPILOGUE_ACC_VALUE = 7.5
 EPILOGUE_ACC_DELTA = 3.25
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_EPILOGUE", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_EPILOGUE=1 to run Iluvatar MR epilogue device tests")
 
 
 def _require_imports():
@@ -227,7 +221,6 @@ def _compile_epilogue_kernel(
 def test_iluvatar_mr_epilogue_fragment_store_device_b16(store_case, torch_dtype_name, fx_dtype_name, monkeypatch):
     """Store initialized accumulator fragments via f16/bf16 shfl/tiled epilogue."""
 
-    _require_enabled()
     flyc, fx, ixdl, atom_k, atom_m, atom_n, warp_size, store_shfl, store_tiled, store_read_c = _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -268,7 +261,6 @@ def test_iluvatar_mr_epilogue_fragment_store_device_b16(store_case, torch_dtype_
 def test_iluvatar_mr_epilogue_fragment_store_device(store_case, monkeypatch):
     """Store initialized accumulator fragments via the mode-specific epilogue helper."""
 
-    _require_enabled()
     flyc, fx, ixdl, atom_k, atom_m, atom_n, warp_size, store_shfl, store_tiled, store_read_c = _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -312,7 +304,6 @@ def test_iluvatar_mr_epilogue_fragment_store_device(store_case, monkeypatch):
 def test_iluvatar_mr_epilogue_multi_cta_store_device(store_case, torch_dtype_name, fx_dtype_name, monkeypatch):
     """Store accumulator fragments through a 2x2 CTA grid (128x128 logical C)."""
 
-    _require_enabled()
     flyc, fx, ixdl, atom_k, atom_m, atom_n, warp_size, store_shfl, store_tiled, store_read_c = _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
