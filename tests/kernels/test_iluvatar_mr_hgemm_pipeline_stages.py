@@ -5,10 +5,10 @@
 
 The isolated stage tests live in dedicated files:
 
-G2S belongs to ``tests/unit/test_iluvatar_mr_async_cp_device.py``.
-S2R belongs to ``tests/unit/test_iluvatar_mr_s2r_device.py``.
-MMA belongs to ``tests/unit/test_iluvatar_mr_mma_device.py``.
-Epilogue belongs to ``tests/unit/test_iluvatar_mr_epilogue_device.py``.
+G2S belongs to ``tests/kernels/test_iluvatar_mr_async_cp_device.py``.
+S2R belongs to ``tests/kernels/test_iluvatar_mr_s2r_device.py``.
+MMA belongs to ``tests/kernels/test_iluvatar_mr_mma_device.py``.
+Epilogue belongs to ``tests/kernels/test_iluvatar_mr_epilogue_device.py``.
 
 This file exercises the production ``compile_iluvatar_mr_hgemm`` launch wrapper across:
 
