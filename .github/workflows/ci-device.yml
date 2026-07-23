@@ -243,12 +243,6 @@ jobs:
           FLYDSL_ILUVATAR_SMOKE_BLOB_PATH: ${{ needs.should-run-device.outputs.runtime_smoke_blob_path }}
           FLYDSL_ILUVATAR_SMOKE_KERNEL: ${{ needs.should-run-device.outputs.runtime_smoke_kernel }}
           FLYDSL_ILUVATAR_LAUNCH_KERNEL: ${{ needs.should-run-device.outputs.runtime_smoke_launch_kernel }}
-          FLYDSL_ILUVATAR_RUN_MR_ASYNC_CP: "1"
-          FLYDSL_ILUVATAR_RUN_MR_EPILOGUE: "1"
-          FLYDSL_ILUVATAR_RUN_MR_HGEMM_STAGES: "1"
-          FLYDSL_ILUVATAR_RUN_MR_MMA: "1"
-          FLYDSL_ILUVATAR_RUN_MR_S2R: "1"
-          FLYDSL_ILUVATAR_RUN_MR_S2R_MMA: "1"
         run: |
           bash .github/scripts/run_ci_device_in_container.sh
 

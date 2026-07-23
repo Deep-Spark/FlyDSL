@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar MR S2R device correctness tests.
+"""Iluvatar MR S2R device correctness tests.
 
 These tests sit between the async-copy G2S tests and the MMA tests. They prepare
 the exact A/B operand tile bytes in shared memory with ordinary 32-bit stores,
@@ -9,7 +9,6 @@ then validate that ``make_tiled_copy_A/B`` lands those values in the MMA operand
 fragment layout expected by ``MRMma``. The fragment is copied back to global for
 inspection; no async-copy instruction and no MMA compute is executed here.
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_S2R=1`` to run (needs an Iluvatar device).
 
 Stage coverage notes
 --------------------
@@ -85,11 +84,6 @@ S2R_DTYPE_CASES = [
         "scalar_atom": "UniversalCopy32b",
     },
 ]
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_S2R", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_S2R=1 to run Iluvatar MR S2R device tests")
 
 
 def _require_imports():
@@ -304,7 +298,6 @@ def test_iluvatar_mr_s2r_operand_layout_device(major_pattern, dtype_case, monkey
     any ``MRAsyncCp*`` instruction.
     """
 
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -355,7 +348,6 @@ def test_iluvatar_mr_g2s_s2r_ki_chain_device(major_pattern, k_atoms, operand, mo
     test tickles a FlyDSL JIT cache collision on Iluvatar.
     """
 
-    _require_enabled()
     _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)

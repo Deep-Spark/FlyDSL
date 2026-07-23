@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in full-pipeline smoke tests for Iluvatar MR HGEMM.
+"""Full-pipeline smoke tests for Iluvatar MR HGEMM.
 
 The isolated stage tests live in dedicated files:
 
@@ -18,7 +18,6 @@ This file exercises the production ``compile_iluvatar_mr_hgemm`` launch wrapper 
 * ``epilogue_store`` (shfl / tiled for ``no_c_read``)
 * single-CTA (256 x 256 x 64, grid 1 x 1) and multi-CTA (512 x 512 x 128, grid 2 x 2)
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_HGEMM_STAGES=1`` to run (needs an Iluvatar device).
 """
 
 import os
@@ -56,11 +55,6 @@ from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
 _SINGLE_CTA_SHAPE = (STAGED_BRICK_M, STAGED_BRICK_N, 64)
 _MULTI_CTA_SHAPE = (STAGED_BRICK_M * 2, STAGED_BRICK_N * 2, 128)
 _LARGE_SHAPE = (1024, 1024, 1024)
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_HGEMM_STAGES", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_HGEMM_STAGES=1 to run Iluvatar MR HGEMM staged tests")
 
 
 def _require_torch():
@@ -222,7 +216,6 @@ def _check_hgemm_pipeline(
 def test_iluvatar_mr_hgemm_single_cta_pipeline(
     major_pattern, epilogue, epilogue_store, k_atoms, torch_dtype_name, fx_dtype_name, monkeypatch
 ):
-    _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     hgemm = _require_hgemm_kernel()
@@ -247,7 +240,6 @@ def test_iluvatar_mr_hgemm_single_cta_pipeline(
 def test_iluvatar_mr_hgemm_multi_cta_pipeline(
     major_pattern, epilogue_store, k_atoms, torch_dtype_name, fx_dtype_name, monkeypatch
 ):
-    _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     hgemm = _require_hgemm_kernel()
@@ -273,7 +265,6 @@ def test_iluvatar_mr_hgemm_multi_cta_pipeline(
 def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(
     major_pattern, epilogue_store, k_atoms, torch_dtype_name, fx_dtype_name, monkeypatch
 ):
-    _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     hgemm = _require_hgemm_kernel()

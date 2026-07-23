@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar GEMV V1 correctness tests."""
+"""Iluvatar GEMV V1 correctness tests."""
 
 import os
 import sys
@@ -14,11 +14,6 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_GEMV", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_GEMV=1 to run Iluvatar GEMV tests")
 
 
 def _require_torch():
@@ -51,7 +46,6 @@ def _require_kernel_import():
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("input_is_2d", [False, True])
 def test_iluvatar_gemv_matches_flinear(monkeypatch, dtype_name, rtol, atol, with_bias, input_is_2d):
-    _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     compile_iluvatar_gemv = _require_kernel_import()
@@ -75,7 +69,6 @@ def test_iluvatar_gemv_matches_flinear(monkeypatch, dtype_name, rtol, atol, with
 
 
 def test_iluvatar_gemv_rejects_invalid_input_shape(monkeypatch):
-    _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     compile_iluvatar_gemv = _require_kernel_import()
@@ -89,7 +82,6 @@ def test_iluvatar_gemv_rejects_invalid_input_shape(monkeypatch):
 
 
 def test_iluvatar_gemv_rejects_invalid_dtype(monkeypatch):
-    _require_enabled()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     compile_iluvatar_gemv = _require_kernel_import()

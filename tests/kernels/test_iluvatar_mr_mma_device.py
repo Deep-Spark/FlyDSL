@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Opt-in Iluvatar MR MMA-only device correctness tests.
+"""Iluvatar MR MMA-only device correctness tests.
 
 This file tests the ``MRMma`` instruction boundary only. It does not call G2S,
 async-copy, S2R, or ``make_tiled_copy_A/B``. A/B operand fragments are created in
 register memory and filled directly with constants; only the accumulator fragment
 is copied back to global memory so the result can be checked.
 
-Set ``FLYDSL_ILUVATAR_RUN_MR_MMA=1`` to run (needs an Iluvatar device).
 
 Stage coverage notes
 --------------------
@@ -65,11 +64,6 @@ MMA_DTYPE_CASES = [
         "b_value": 2.0,
     },
 ]
-
-
-def _require_enabled() -> None:
-    if os.environ.get("FLYDSL_ILUVATAR_RUN_MR_MMA", "").lower() not in {"1", "true", "yes", "on"}:
-        pytest.skip("set FLYDSL_ILUVATAR_RUN_MR_MMA=1 to run Iluvatar MR MMA device tests")
 
 
 def _require_imports():
@@ -165,7 +159,6 @@ def test_iluvatar_mr_mma_fragment_constants_device(major_pattern, dtype_case, mo
     in this test.
     """
 
-    _require_enabled()
     flyc, fx, ixdl = _require_imports()
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
