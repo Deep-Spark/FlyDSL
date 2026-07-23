@@ -22,6 +22,7 @@ The project uses a **layered model** so CI and contributors can select tests by 
 | `l1b_target_dialect` | L1b |
 | `l2_device` | L2 |
 | `rocm_lower` | Use **with** `l1b_target_dialect` or `l2_device` when the test assumes the ROCDL stack. |
+| `iluvatar_lower` | Use **with** `l1b_target_dialect` or `l2_device` when the test assumes the Iluvatar (ixdl) stack. |
 
 **Legacy:** `large_shape` — used for slow/large kernel shapes; `scripts/run_tests.sh` skips it unless `RUN_TESTS_FULL=1`.
 
