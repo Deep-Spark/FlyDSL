@@ -238,7 +238,7 @@ jobs:
           IXCC_MLIR_CMAKE: ${{ env.IXCC_MLIR_CMAKE }}
           COREX_VERSION_TAG: ${{ env.COREX_VERSION_TAG }}
           ARCH: ivcore11
-          DEVICE_PYTEST_ARGS_JSON: ${{ needs.should-run-device.outputs.device_pytest_args_json != '' && needs.should-run-device.outputs.device_pytest_args_json || '["tests/unit","-m","l2_device"]' }}
+          DEVICE_PYTEST_ARGS_JSON: ${{ needs.should-run-device.outputs.device_pytest_args_json != '' && needs.should-run-device.outputs.device_pytest_args_json || '["tests/kernels","tests/unit","-m","iluvatar_lower"]' }}
           DEVICE_MUST_PASS_TESTS_JSON: ${{ needs.should-run-device.outputs.device_must_pass_tests_json != '' && needs.should-run-device.outputs.device_must_pass_tests_json || '["tests/unit/test_iluvatar_binary_pipeline_smoke.py","tests/unit/test_iluvatar_compile_backend.py","tests/unit/test_iluvatar_jit_launch_smoke.py","tests/unit/test_iluvatar_jit_runtime_resolution.py"]' }}
           FLYDSL_ILUVATAR_SMOKE_BLOB_PATH: ${{ needs.should-run-device.outputs.runtime_smoke_blob_path }}
           FLYDSL_ILUVATAR_SMOKE_KERNEL: ${{ needs.should-run-device.outputs.runtime_smoke_kernel }}
