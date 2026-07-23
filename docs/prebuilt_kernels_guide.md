@@ -243,6 +243,21 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --warmup 3 --iters 3
 python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 --iters 50
 ```
 
+### 3c. Iluvatar varlen and KV-cache attention
+
+The Iluvatar inference-forward APIs are:
+
+- `kernels.attention.iluvatar.flash_attn_varlen.flash_attn_varlen_func`
+- `kernels.attention.iluvatar.flash_attn_kvcache.flash_attn_with_kvcache`
+
+The varlen path supports bf16, `head_dim == 128`, packed queries, dense packed
+K/V or paged HND/NHD caches, GQA/MQA, and bottom-right causal masking. The
+KV-cache API supports bf16/f16 scalar paths plus bf16 `head_dim == 128` MMA
+decode paths, dense or paged caches, cache update, rotary embedding, split-KV,
+and the documented layout override. Unsupported ALiBi and softmax-LSE options
+raise `NotImplementedError`. Backend/runtime selection must be configured by
+the caller or CI; importing these modules does not change process environment.
+
 ---
 
 ## 4. Shared Utilities

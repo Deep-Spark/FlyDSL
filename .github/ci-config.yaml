@@ -38,7 +38,8 @@
       "CMakeLists.txt"
     ],
     "pytest_target_globs": [
-      "tests/unit/test_iluvatar_*.py"
+      "tests/unit/test_iluvatar_*.py",
+      "tests/kernels/test_iluvatar_*.py"
     ],
     "pytest_exclude_globs": [],
     "pytest_common_args": [
