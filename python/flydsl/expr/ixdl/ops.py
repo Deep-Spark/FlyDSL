@@ -14,7 +14,7 @@ Synchronization helpers live in :mod:`flydsl.expr.ixdl.sync`.
 
 from ..._mlir.dialects import llvm as _llvm
 from .. import arith as _arith
-from ..typing import T
+from ..typing import BFloat16, Float32, T, Vector
 
 # Bit-width -> ``llvm.bi.stp.vs[.pred].*`` (b128 = v4i32).
 _STP_VS = {
@@ -53,6 +53,27 @@ def byte_permute(a, b, sel: int):
         [],
     )
     return Int32(result)
+
+
+def bfdot2(a: Vector, b: Vector, acc):
+    """Accumulate a packed 2xbf16 dot product into ``acc``.
+
+    Lowers to ``llvm.bi.bfdot2`` / ``ml_dot2_add_f32_bf16`` on Iluvatar.
+    The operands must be two-element bf16 register vectors.
+    """
+    if not isinstance(a, Vector) or not isinstance(b, Vector):
+        raise TypeError("bfdot2 operands must be FlyDSL vectors")
+    if a.shape != (2,) or b.shape != (2,) or a.dtype is not BFloat16 or b.dtype is not BFloat16:
+        raise TypeError("bfdot2 operands must be vectors of shape (2,) and dtype BFloat16")
+
+    result = _llvm.call_intrinsic(
+        T.f32,
+        "llvm.bi.bfdot2",
+        [_arith.unwrap(a), _arith.unwrap(b), _arith.unwrap(acc)],
+        [],
+        [],
+    )
+    return Float32(result)
 
 
 def _llvm_ptr(ptr, *, addrspace: int | None = 1):
