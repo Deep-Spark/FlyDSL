@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.l1b_target_dialect]
+pytestmark = [pytest.mark.l1b_target_dialect, pytest.mark.iluvatar_lower]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PYTHON_DIR = _REPO_ROOT / "python"
