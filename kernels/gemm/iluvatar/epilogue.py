@@ -326,6 +326,7 @@ def mr_igemm_epilogue_store_i8_packed(
     warp_atoms_m: int,
     warp_atoms_n: int,
     c_global_n: int,
+    skip_cta_barrier: bool = False,
     pack_only: bool = False,
 ):
     """int8 packed store (int8 GEMM, ``D = A @ B.T``, truncating cast).
@@ -333,13 +334,16 @@ def mr_igemm_epilogue_store_i8_packed(
     ``pack_only=True``: PackOnly (register pack + ``stp_vs_b32``, no SLB); see
     ``mr_igemm_epilogue_store_i8_pack_only``. Requires matching B ``N_SWIZZLE=4``.
 
-    ``pack_only=False`` (default): PackSlb path. Per lane each MMA
-    atom owns 4 rows {r, r+4, r+8, r+12} x 1. For every group of 4 N-atoms (64 cols):
+    ``pack_only=False`` (default): PackSlb path. Per lane each MMA atom owns 4 rows
+    {r, r+4, r+8, r+12} x 1. For every group of 4 N-atoms (64 cols):
       1. pack each atom's 4 i8 rows into one i32 (truncating cast, wrap on overflow);
-      2. scatter the 4 i32 into SMEM (32-bit writes,
-         bank-conflict free) -> read back 4 i32 with the transpose swizzle;
+      2. scatter the 4 i32 into a fixed 1KB/warp SMEM slot (``SK``, reused per
+         group -- no ``bm * bn`` scratch) -> read back 4 i32 with the transpose swizzle;
       3. 6x ``byte_permute`` recombine -> 4 i32, each = 4 contiguous-N i8 of one row;
       4. ``stp_vs_b32`` coalesced store (``voffset`` + ``soffset``) per output row.
+
+    When ``skip_cta_barrier`` is True, ``smem_base`` must be a free pipeline stage
+    that the mainloop no longer reads. Ignored for PackOnly.
 
     No quant scale/bias/relu fusion.
     """
@@ -356,12 +360,9 @@ def mr_igemm_epilogue_store_i8_packed(
 
     if fx.const_expr(warp_atoms_n % 4 != 0):
         raise ValueError("i8 packed epilogue requires warp_atoms_n %% 4 == 0")
-    warp_m = ATOM_M * warp_atoms_m
-    warp_n = ATOM_N * warp_atoms_n
     groups_n = warp_atoms_n // 4
 
-    # Bit ops (not rem/div) so address peeps see a simple lane affine form.
-    lane_row = lane_id.shrui(fx.Int32(4))  # 0..3; TCU_LANE_COLS == 16
+    lane_row = lane_id.shrui(fx.Int32(4))  # 0..3
     lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)  # 0..15
     lane01 = lane_col & fx.Int32(3)
     lane23 = lane_col.shrui(fx.Int32(2))
@@ -371,39 +372,31 @@ def mr_igemm_epilogue_store_i8_packed(
         fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared),
         smem_base,
     )
-    warp_base = warp_id * fx.Int32(warp_m * warp_n // 4)
+    sk = fx.add_offset(smem_warp_i32, fx.make_int_tuple(warp_id * fx.Int32(256)))
 
     def _pack_i32(acc):
         return Vec(acc.load()).to(fx.Int8).bitcast(fx.Int32)[0]
 
-    # Mainloop has finished reading the pipeline smem; safe to reuse for staging.
-    fx.gpu.barrier()
-    # Phase 1: scatter-write all (im, group) blocks.
+    if fx.const_expr(not skip_cta_barrier):
+        # Mainloop has finished reading the pipeline smem; safe to reuse for staging.
+        fx.gpu.barrier()
+    c_warp_ptr = fx.get_iter(gC_warp)
+
+    # Pack + transpose-read + byte_permute recombine per (im, group), reusing a
+    # fixed 1KB/warp SK slot (no bm * bn scratch): each warp's own write-then-read
+    # of its SK bytes needs no barrier between them.
+    all_rets = []
     for im in fx.range_constexpr(warp_atoms_m):
+        group_rets = []
         for g in fx.range_constexpr(groups_n):
-            block = warp_base + fx.Int32((im * groups_n + g) * 256)
             for e in fx.range_constexpr(4):
                 src_e = _pack_i32(accs[im][g * 4 + e])
-                idx = (
-                    block
-                    + lane01 * fx.Int32(64)
-                    + lane_row * fx.Int32(16)
-                    + (lane01 ^ fx.Int32(e)) * fx.Int32(4)
-                    + lane23
-                )
-                fx.ptr_store(src_e, fx.add_offset(smem_warp_i32, fx.make_int_tuple(idx)))
-
-    fx.gpu.barrier()
-
-    # Phase 2: transpose-read + byte_permute recombine + stp.vs store.
-    c_warp_ptr = fx.get_iter(gC_warp)
-    for im in fx.range_constexpr(warp_atoms_m):
-        for g in fx.range_constexpr(groups_n):
-            block = warp_base + fx.Int32((im * groups_n + g) * 256)
+                idx = lane01 * fx.Int32(64) + lane_row * fx.Int32(16) + (lane01 ^ fx.Int32(e)) * fx.Int32(4) + lane23
+                fx.ptr_store(src_e, fx.add_offset(sk, fx.make_int_tuple(idx)))
             val = []
             for e in fx.range_constexpr(4):
-                idx = block + fx.Int32(e * 64) + (lane_id ^ fx.Int32(e * 4))
-                val.append(fx.ptr_load(fx.add_offset(smem_warp_i32, fx.make_int_tuple(idx))))
+                idx = fx.Int32(e * 64) + (lane_id ^ fx.Int32(e * 4))
+                val.append(fx.ptr_load(fx.add_offset(sk, fx.make_int_tuple(idx))))
             t0 = byte_permute(val[0], val[1], 0x5140)
             t1 = byte_permute(val[2], val[3], 0x5140)
             ret0 = byte_permute(t0, t1, 0x5410)
@@ -412,10 +405,15 @@ def mr_igemm_epilogue_store_i8_packed(
             t1 = byte_permute(val[2], val[3], 0x7362)
             ret2 = byte_permute(t0, t1, 0x5410)
             ret3 = byte_permute(t0, t1, 0x7632)
-            rets = (ret0, ret1, ret2, ret3)
-            for k in fx.range_constexpr(4):
-                soffset = fx.Int32((im * 16 + k * 4) * c_global_n) + fx.Int32(g * 64)
-                stp_vs_b32(rets[k], c_warp_ptr, voffset, soffset)
+            group_rets.append((ret0, ret1, ret2, ret3))
+        all_rets.append(group_rets)
+
+    # Store burst: im -> ei -> g so consecutive stores hit the same output row.
+    for im in fx.range_constexpr(warp_atoms_m):
+        for ei in fx.range_constexpr(4):
+            row_soffset = fx.Int32((im * ATOM_M + ei * 4) * c_global_n)
+            for g in fx.range_constexpr(groups_n):
+                stp_vs_b32(all_rets[im][g][ei], c_warp_ptr, voffset, row_soffset + fx.Int32(g * 64))
 
 
 def mr_hgemm_epilogue_store(

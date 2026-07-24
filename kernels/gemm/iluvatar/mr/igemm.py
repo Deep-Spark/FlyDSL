@@ -44,7 +44,13 @@ from kernels.gemm.iluvatar.mr.common import (
     sme_atom_counts,
 )
 from kernels.gemm.iluvatar.mr.operand_copy import mr_g2s_sme_config, mr_gemm_g2s_issue_operands
-from kernels.gemm.iluvatar.mr.s2r import mr_gemm_s2r_load_mma_k
+from kernels.gemm.iluvatar.mr.s2r import (
+    mr_gemm_s2r_a_tile,
+    mr_gemm_s2r_b_tile,
+    mr_gemm_s2r_copy_a,
+    mr_gemm_s2r_copy_b,
+    mr_gemm_s2r_load_mma_k,
+)
 
 # int8 operand geometry: 16x16x32 MMA atom, 64 int8 per 512-bit SME row.
 MR_IGEMM_GEOM = MrOperandGeom.b8()
@@ -54,6 +60,13 @@ I8_VPR = MR_IGEMM_GEOM.values_per_sme_row
 DEFAULT_K_REP = 2  # CTA K-tile: ATOM_K_B8 * k_rep = 64 (one int8 SME row width)
 STAGES = 2
 K_LOOP_UNROLL = 2
+# Multistage pipebar main: full ``range_constexpr`` only for small trip counts.
+# Large mains use ``scf.for`` so IR/compile stay bounded; recover issue density
+# with the partial unroll below.
+MULTISTAGE_CONSTEXPR_MAIN_MAX = 16
+# Partial unroll for the scf multistage main. Prefer a multiple of common stage
+# depths (2/4) so ``i % stages`` folds per-lane in the unrolled body.
+MULTISTAGE_K_LOOP_UNROLL = 4
 
 # Threadblock rasterization swizzle: group this many M-tiles per N
 # column in launch order to raise L2 reuse on large GEMMs.
@@ -70,11 +83,15 @@ def _block_swizzle_group_m(grid_m: int, cap: int = BLOCK_SWIZZLE_GROUP_M) -> int
 
 # Multi-stage wins on latency-bound, small
 # grids; large grids are compute/occupancy-bound and prefer the 65KB 2-stage
-# double buffer. Empirical crossover on ivcore11: <=16 CTAs -> 3-stage.
+# double buffer — except deep S4 when S2R is k-spanning, or i32 square/short-K.
+# Empirical crossover on ivcore11: <=16 CTAs -> 3-stage.
 AUTO_STAGES_BLOCK_THRESH = 16
-# Large grids whose operands span the MMA K-atom across >1 SME brick (every
-# pattern with an mn-major operand) peak at a deeper 4-stage pipeline: the extra
-# buffer hides the non-contiguous S2R latency.
+# Large grids (>= this many CTAs, >= 4 K-tiles, 4-stage SMEM within cap):
+#   - mn-major / k-spanning operands -> S4 (hides non-contiguous S2R)
+#   - i32 pure k-major (tn): S4 only when K <= min(M, N) (square/short-K);
+#     tall-K (including K == max(M,N) on rectangular shapes) stays on S2.
+#     ``max(M,N)`` wrongly pushed those tall cases onto S4.
+#   - i8 pure k-major (tn) -> keep S2 (deeper pipe costs occupancy)
 AUTO_STAGES_S4_BLOCK_THRESH = 192
 
 
@@ -88,12 +105,15 @@ def resolve_igemm_stages(
     bk: int,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
     smem_cap: int = DEFAULT_SMEM_CAP_BYTES,
+    epilogue: str | None = None,
 ) -> int:
     """Resolve the SMEM pipeline depth. ``stages=None`` => auto:
 
     - small/latency-bound grids (<= AUTO_STAGES_BLOCK_THRESH CTAs, >= 3 K-tiles) => 3 stages
-    - large k-spanning grids (>= AUTO_STAGES_S4_BLOCK_THRESH CTAs, >= 4 K-tiles,
-      4-stage SMEM within ``smem_cap``, an mn-major operand) => 4 stages
+    - large grids (>= AUTO_STAGES_S4_BLOCK_THRESH CTAs, >= 4 K-tiles, 4-stage
+      SMEM within ``smem_cap``): S4 when an operand is mn-major (k-spanning S2R),
+      or when ``epilogue`` is i32 **and** ``K <= min(M, N)`` (square/short-K i32
+      k-major). i8 pure k-major and tall-K i32 k-major stay on S2.
     - otherwise the proven 2-stage double buffer.
     """
     if stages is not None:
@@ -104,8 +124,16 @@ def resolve_igemm_stages(
         return 3
     layout = parse_major_pattern(major_pattern)
     k_spanning = layout.a_mn_major or layout.b_mn_major
-    if k_spanning and blocks >= AUTO_STAGES_S4_BLOCK_THRESH and ktiles >= 4 and 4 * (bm + bn) * bk <= smem_cap:
-        return 4
+    if blocks >= AUTO_STAGES_S4_BLOCK_THRESH and ktiles >= 4 and 4 * (bm + bn) * bk <= smem_cap:
+        # i8 k-major: deeper pipe costs occupancy / issue for little latency hide.
+        if epilogue == EPILOGUE_I8 and not k_spanning:
+            return 2
+        if k_spanning:
+            return 4
+        # i32 pure k-major: S4 helps square/short-K; tall K prefers S2 occupancy.
+        # min(M, N) keeps K==max(M,N) rectangular tall cases on S2 (max() did not).
+        if epilogue == EPILOGUE_I32 and K <= min(M, N):
+            return 4
     return 2
 
 
@@ -172,10 +200,18 @@ def _build_igemm_kernel(
     grid_m = m // bm
     grid_n = n // bn
     swizzle_group_m = _block_swizzle_group_m(grid_m)
+    # Block swizzle helps multi-wave L2 reuse; on single-wave grids (<=16 CTAs on
+    # ivcore11) it only adds prologue div/mod and does not improve L2. Skip it.
+    if grid_m * grid_n <= AUTO_STAGES_BLOCK_THRESH:
+        swizzle_group_m = 1
 
     assert k % bk == 0
     assert m % bm == 0 and n % bn == 0
     assert bk % vpr == 0, f"bk={bk} must be a multiple of {vpr} for int8 SME"
+    # Half-M S2R/MMA split assumes two equal M-atom clusters.
+    assert (
+        warp_atoms_m >= 2 and warp_atoms_m % 2 == 0
+    ), f"warp_atoms_m={warp_atoms_m} must be even and >= 2 for half-M schedule"
 
     a_atoms_total, b_atoms_total, _, _ = sme_atom_counts(layout, bm, bn, bk, values_per_sme_row=vpr)
     assert a_atoms_total % num_warps == 0, "A SME chunks must divide across warps"
@@ -188,9 +224,9 @@ def _build_igemm_kernel(
     main_k_trip = max(0, k_tiles_const - 2)
     main_k_full = (main_k_trip // K_LOOP_UNROLL) * K_LOOP_UNROLL
     main_k_remainder = main_k_trip - main_k_full
-    # multi-stage (>=3): pipebar + sl.waitcnt keeps stages-1 G2S in
-    # flight. 2-stage keeps the proven full-barrier double-buffer path.
-    use_multistage = stages >= 3 and k_tiles_const >= stages
+    # pipebar + sl.waitcnt for STAGE>=2 (CTA barrier peel is the legacy
+    # fallback when stages==1 or k_tiles < stages).
+    use_multistage = stages >= 2 and k_tiles_const >= stages
     g2s_load_inst = a_per_warp + b_per_warp
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
@@ -211,9 +247,9 @@ def _build_igemm_kernel(
         else:
             m_tile = bid_x
             n_tile = bid_y
-        # Prefer hardware lane_id and power-of-two warp split so Row S2R keeps
-        # a natural base+4*lane form (tid%64 / signed floordiv never do).
-        warp_id = tid.shrui(fx.Int32(6))  # WARP_SIZE == 64
+        warp_id = tid.shrui(fx.Int32(6))  # WARP_SIZE==64; avoid signed floordivsi
+        # Prefer hardware lane_id over tid%64 so Row S2R keeps a natural
+        # base+4*lane form (lane&63 never lowers to hardware lane id).
         lane_id = fx.Int32(fx.lane_id)
         if fx.const_expr((warps_n & (warps_n - 1)) == 0):
             warp_n_id = warp_id & fx.Int32(warps_n - 1)
@@ -241,7 +277,8 @@ def _build_igemm_kernel(
 
         # Static contiguous shared memory (matches hgemm): the compiler sizes the
         # bank, so launch(smem=...) stays unset. PackOnly needs no C-tile scratch;
-        # PackSlb reuses the same bank for SLB staging (bm * bn).
+        # PackSlb may reuse a free pipeline stage (or fall back to bm * bn when
+        # stages cannot FreeSLB).
         smem_elems = (
             max(stage_elems * stages, bm * bn)
             if epilogue == EPILOGUE_I8 and not use_pack_only
@@ -362,10 +399,106 @@ def _build_igemm_kernel(
                     geom=geom,
                 )
 
+            def _load_a_frag(stage_base, mma_k, mma_m):
+                smem_a, _smem_b = mr_stage_smem_ab(smem_base, stage_base, bm * bk)
+                return mr_gemm_s2r_copy_a(
+                    copy_atom=copy_atom_s2r_a,
+                    thr_copy_a=thr_copy_a,
+                    thr_mma=thr_mma,
+                    smem_a_tile=mr_gemm_s2r_a_tile(
+                        a_mn_major=a_mn_major,
+                        b_mn_major=b_mn_major,
+                        mma_m=mma_m,
+                        mma_k=mma_k,
+                        g2s_sme=g2s_sme,
+                        smem_a=smem_a,
+                        elem_dtype=fx.Int8,
+                        warp_m_id=warp_m_id,
+                        warp_atoms_m=warp_atoms_m,
+                        bm=bm,
+                        bn=bn,
+                        bk=bk,
+                        geom=geom,
+                    ),
+                )
+
+            def _load_b_frag(stage_base, mma_k, mma_n):
+                _smem_a, smem_b = mr_stage_smem_ab(smem_base, stage_base, bm * bk)
+                return mr_gemm_s2r_copy_b(
+                    copy_atom=copy_atom_s2r_b,
+                    thr_copy_b=thr_copy_b,
+                    thr_mma=thr_mma,
+                    smem_b_tile=mr_gemm_s2r_b_tile(
+                        a_mn_major=a_mn_major,
+                        b_mn_major=b_mn_major,
+                        mma_n=mma_n,
+                        mma_k=mma_k,
+                        g2s_sme=g2s_sme,
+                        smem_b=smem_b,
+                        elem_dtype=fx.Int8,
+                        warp_n_id=warp_n_id,
+                        warp_atoms_n=warp_atoms_n,
+                        bm=bm,
+                        bn=bn,
+                        bk=bk,
+                        geom=geom,
+                    ),
+                )
+
             def _mma_frags(a_frags, b_frags):
+                # Half-M split: first half of A atoms x all B, then second half.
+                # Keeps waitcnt clusters tight vs one fat 4x4 burst;
+                half_m = warp_atoms_m // 2
                 for mma_n in fx.range_constexpr(warp_atoms_n):
-                    for mma_m in fx.range_constexpr(warp_atoms_m):
-                        fx.gemm(mma_atom, accs[mma_m][mma_n], a_frags[mma_m], b_frags[mma_n], accs[mma_m][mma_n])
+                    for mma_m in fx.range_constexpr(half_m):
+                        fx.gemm(
+                            mma_atom,
+                            accs[mma_m][mma_n],
+                            a_frags[mma_m],
+                            b_frags[mma_n],
+                            accs[mma_m][mma_n],
+                        )
+                for mma_n in fx.range_constexpr(warp_atoms_n):
+                    for mma_m in fx.range_constexpr(half_m, warp_atoms_m):
+                        fx.gemm(
+                            mma_atom,
+                            accs[mma_m][mma_n],
+                            a_frags[mma_m],
+                            b_frags[mma_n],
+                            accs[mma_m][mma_n],
+                        )
+
+            def _s2r_mma_k_split(stage_base, mma_k):
+                # A-lo + all B, MMA lo; then A-hi S2R, MMA hi (B reuse).
+                half_m = warp_atoms_m // 2
+                hi_m = warp_atoms_m - half_m
+                a_lo = []
+                for mma_m in fx.range_constexpr(half_m):
+                    a_lo.append(_load_a_frag(stage_base, mma_k, mma_m))
+                b_frags = []
+                for mma_n in fx.range_constexpr(warp_atoms_n):
+                    b_frags.append(_load_b_frag(stage_base, mma_k, mma_n))
+                for mma_n in fx.range_constexpr(warp_atoms_n):
+                    for mma_m in fx.range_constexpr(half_m):
+                        fx.gemm(
+                            mma_atom,
+                            accs[mma_m][mma_n],
+                            a_lo[mma_m],
+                            b_frags[mma_n],
+                            accs[mma_m][mma_n],
+                        )
+                a_hi = []
+                for mma_m in fx.range_constexpr(half_m, warp_atoms_m):
+                    a_hi.append(_load_a_frag(stage_base, mma_k, mma_m))
+                for mma_n in fx.range_constexpr(warp_atoms_n):
+                    for mma_m in fx.range_constexpr(hi_m):
+                        fx.gemm(
+                            mma_atom,
+                            accs[half_m + mma_m][mma_n],
+                            a_hi[mma_m],
+                            b_frags[mma_n],
+                            accs[half_m + mma_m][mma_n],
+                        )
 
             def _copy_frag(dst, src):
                 dst.store(src.load())
@@ -380,26 +513,14 @@ def _build_igemm_kernel(
 
             def _s2r_mma_defer_last_into(stage_base, a_def, b_def):
                 for mma_k in fx.range_constexpr(k_rep - 1):
-                    a_frags, b_frags = _mma_k_load(stage_base, mma_k)
-                    _mma_frags(a_frags, b_frags)
+                    _s2r_mma_k_split(stage_base, mma_k)
                 a_last, b_last = _mma_k_load(stage_base, k_rep - 1)
                 _copy_a_frags(a_def, a_last)
                 _copy_b_frags(b_def, b_last)
 
-            def _s2r_mma_rest_defer_last(stage_base, a0, b0):
-                # Prefetch-aware variant for the multistage pipebar path: consume
-                # prefetched mma_k=0 frags, stream mma_k 1..k_rep-2, and return the
-                # last frags (register-resident) to defer their MMA to the next tile.
-                _mma_frags(a0, b0)
-                for mma_k in fx.range_constexpr(1, k_rep - 1):
-                    a_frags, b_frags = _mma_k_load(stage_base, mma_k)
-                    _mma_frags(a_frags, b_frags)
-                return _mma_k_load(stage_base, k_rep - 1)
-
             def _s2r_mma_defer_last(stage_base):
                 for mma_k in fx.range_constexpr(k_rep - 1):
-                    a_frags, b_frags = _mma_k_load(stage_base, mma_k)
-                    _mma_frags(a_frags, b_frags)
+                    _s2r_mma_k_split(stage_base, mma_k)
                 return _mma_k_load(stage_base, k_rep - 1)
 
             def _s2r_mma_all(stage_base):
@@ -418,39 +539,64 @@ def _build_igemm_kernel(
             if fx.const_expr(use_multistage):
                 # N-stage: keep stages-1 G2S tiles in flight via pipebar
                 # (split barrier) + sl.waitcnt; NO full barrier here (the pipebar
-                # protocol forbids mixing sl_barrier with pipebar reqs). Main loop is
-                # constexpr-unrolled so the mma_k-deferred MMA fragments thread through
-                # as registers (only used for small/latency-bound shapes).
+                # protocol forbids mixing sl_barrier with pipebar reqs).
+                # Prologue/epilogue stay constexpr (trip = stages-1, tiny).
+                # Main loop: constexpr only when main_count is small; large-K uses
+                # scf.for so IR/compile stay bounded (deferred frags mutate in place,
+                # same as the 2-stage barrier path).
                 full_cnt = (stages - 2) * g2s_load_inst
-
-                def _calc_blk(stage_base, first, last, a_def, b_def):
-                    # Prefetch mma_k=0 first to overlap its (strided) S2R with the
-                    # deferred MMA of the previous tile, then defer this tile's last.
-                    a0, b0 = _mma_k_load(stage_base, 0)
-                    if fx.const_expr(first):
-                        _mma_frags(a_def, b_def)
-                    na, nb = _s2r_mma_rest_defer_last(stage_base, a0, b0)
-                    if fx.const_expr(last):
-                        _mma_frags(na, nb)
-                    return na, nb
 
                 for s in fx.range_constexpr(stages - 1):
                     issue_stage(fx.Int32(s), fx.Int32(s * stage_stride), commit=False)
                 _sync_arrive(full_cnt)
 
                 main_count = k_tiles_const - stages + 1
-                a_def = b_def = None
-                for i in fx.range_constexpr(main_count):
+                # First tile: allocate deferred frags; later tiles reuse via ``into``.
+                _sync_wait()
+                issue_stage(
+                    fx.Int32(stages - 1),
+                    fx.Int32(((stages - 1) % stages) * stage_stride),
+                    commit=False,
+                )
+                a_def, b_def = _s2r_mma_defer_last(fx.Int32(0))
+                _sync_arrive(full_cnt)
+
+                def _multistage_main_body(i):
                     _sync_wait()
                     nxt = i + (stages - 1)
                     issue_stage(fx.Int32(nxt), fx.Int32((nxt % stages) * stage_stride), commit=False)
-                    a_def, b_def = _calc_blk(fx.Int32((i % stages) * stage_stride), i > 0, False, a_def, b_def)
+                    _mma_frags(a_def, b_def)
+                    _s2r_mma_defer_last_into(fx.Int32((i % stages) * stage_stride), a_def, b_def)
                     _sync_arrive(full_cnt)
+
+                # i runs [1, main_count); tile 0 was peeled above.
+                rest = max(0, main_count - 1)
+                if fx.const_expr(main_count <= MULTISTAGE_CONSTEXPR_MAIN_MAX):
+                    for i in fx.range_constexpr(1, main_count):
+                        _multistage_main_body(i)
+                elif fx.const_expr(rest > 0):
+                    # scf.for + constexpr partial unroll. Prefer
+                    # MULTISTAGE_K_LOOP_UNROLL so stage-phase patterns stay
+                    # visible without full-unrolling a long main trip count.
+                    u_factor = MULTISTAGE_K_LOOP_UNROLL
+                    rest_full = (rest // u_factor) * u_factor
+                    rest_rem = rest - rest_full
+                    if fx.const_expr(rest_full > 0):
+                        for i_base in fx.range(1, 1 + rest_full, u_factor):
+                            for u in fx.range_constexpr(u_factor):
+                                _multistage_main_body(i_base + u)
+                    if fx.const_expr(rest_rem > 0):
+                        for u in fx.range_constexpr(rest_rem):
+                            _multistage_main_body(1 + rest_full + u)
 
                 for j in fx.range_constexpr(stages - 1):
                     _sync_wait()
                     t = main_count + j
-                    a_def, b_def = _calc_blk(fx.Int32((t % stages) * stage_stride), True, j == stages - 2, a_def, b_def)
+                    _mma_frags(a_def, b_def)
+                    if fx.const_expr(j == stages - 2):
+                        _s2r_mma_all(fx.Int32((t % stages) * stage_stride))
+                    else:
+                        _s2r_mma_defer_last_into(fx.Int32((t % stages) * stage_stride), a_def, b_def)
                     if fx.const_expr(j < stages - 2):
                         _sync_arrive((stages - 2 - (j + 1)) * g2s_load_inst)
             else:
@@ -498,15 +644,26 @@ def _build_igemm_kernel(
         _run_pipeline()
 
         if fx.const_expr(epilogue == EPILOGUE_I8):
+            # PackOnly (N_SWIZZLE path): no SLB. PackSlb: reuse a free pipeline
+            # stage when StageSize >= WarpCnt*1024 — pack into the stage not read
+            # by the final S2R and skip the CTA barrier.
+            epi_smem = smem_base
+            skip_bar = False
+            if fx.const_expr(not use_pack_only and stages == 2 and stage_elems >= num_warps * 1024):
+                skip_bar = True
+                if fx.const_expr(main_k_trip % 2 != 0):
+                    # Final S2R reads stage 0 -> free is stage 1.
+                    epi_smem = fx.add_offset(smem_base, fx.make_int_tuple(fx.Int32(stage_stride)))
             mr_igemm_epilogue_store_i8_packed(
                 lane_id=lane_id,
                 warp_id=warp_id,
                 accs=accs,
                 gC_warp=gC_warp,
-                smem_base=smem_base,
+                smem_base=epi_smem,
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
                 c_global_n=n,
+                skip_cta_barrier=skip_bar,
                 pack_only=use_pack_only,
             )
         else:
@@ -549,6 +706,8 @@ def compile_iluvatar_mr_igemm(
     layout = parse_major_pattern(major_pattern)
     if epilogue not in EPILOGUE_CHOICES:
         raise ValueError(f"unknown epilogue: {epilogue}")
+    if warp_atoms_m < 2 or warp_atoms_m % 2 != 0:
+        raise ValueError(f"warp_atoms_m={warp_atoms_m} must be even and >= 2 (half-M S2R/MMA schedule)")
 
     bm, bn, bk, threads, _ = _igemm_cta_shape(
         warps_m,
@@ -558,7 +717,7 @@ def compile_iluvatar_mr_igemm(
         warp_atoms_n=warp_atoms_n,
         stages=2,
     )
-    stages = resolve_igemm_stages(stages, M, N, K, bm, bn, bk, major_pattern=major_pattern)
+    stages = resolve_igemm_stages(stages, M, N, K, bm, bn, bk, major_pattern=major_pattern, epilogue=epilogue)
     bm, bn, bk, threads, pipeline_smem = _igemm_cta_shape(
         warps_m,
         warps_n,
