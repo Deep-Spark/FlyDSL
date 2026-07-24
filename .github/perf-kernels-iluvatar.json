@@ -1,13 +1,39 @@
-[
-  {
-    "name": "iluvatar_mr_hgemm",
-    "entry": "examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py",
-    "major_pattern": "nt",
-    "epilogue": "no_c_read",
-    "epilogue_store": "shfl",
-    "k_atoms": 2,
-    "warmup": 5,
-    "iters": 15,
-    "shapes": "1024x1024x1024,2048x2048x2048,4096x4096x4096"
-  }
-]
+{
+  "suite": "iluvatar-daily",
+  "defaults": {
+    "delta_flat_pct": 3,
+    "env": {
+      "FLYDSL_COMPILE_BACKEND": "iluvatar",
+      "FLYDSL_RUNTIME_KIND": "iluvatar",
+      "ARCH": "ivcore11",
+      "FLYDSL_RUNTIME_ENABLE_CACHE": "0",
+      "PYTHONUNBUFFERED": "1"
+    }
+  },
+  "cases": [
+    {
+      "id": "iluvatar_mr_hgemm",
+      "type": "bench_tflops",
+      "name": "iluvatar_mr_hgemm",
+      "entry": "examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py",
+      "params": {
+        "major_pattern": "nt",
+        "epilogue": "no_c_read",
+        "epilogue_store": "shfl",
+        "k_atoms": 2,
+        "warmup": 5,
+        "iters": 15,
+        "shapes": [
+          "1024x1024x1024",
+          "2048x2048x2048",
+          "4096x4096x4096"
+        ]
+      },
+      "gate": {
+        "compare": "delta_vs_prev",
+        "metric": "tflops",
+        "flat_pct": 3
+      }
+    }
+  ]
+}
