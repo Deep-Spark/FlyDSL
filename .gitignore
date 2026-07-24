@@ -40,7 +40,9 @@ lib/python*/site-packages/
 
 # IDE
 .vscode/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/*
 .idea/
 *.swp
 *.swo
