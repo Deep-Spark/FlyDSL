@@ -1,0 +1,67 @@
+---
+description: For Iluvatar kernels, prefer `fx.Int32(fx.lane_id)` over `tid % WARP_SIZE`
+alwaysApply: true
+---
+
+# Use `fx.Int32(fx.lane_id)` for the lane index (Iluvatar backend)
+
+**In Iluvatar kernel code, always compute the lane index from the hardware
+intrinsic `fx.lane_id`, not from `tid % WARP_SIZE`.**
+
+This rule targets the **Iluvatar backend** on this branch. Upstream AMD/CDNA/RDNA
+kernels use their own idioms — they typically don't materialise a `lane_id`
+variable via `tid % WARP_SIZE` at all (grep across `kernels/` confirms this
+pattern only appears under `kernels/**/iluvatar/**`) — and are out of scope; do
+not drive-by rewrite them.
+
+```python
+# ✅ GOOD — hardware intrinsic, single register read
+lane_id = fx.Int32(fx.lane_id)
+
+# ❌ BAD — synthesises the same value with a modulo the backend now has to
+# recognise and optimise away
+lane_id = tid % WARP_SIZE
+```
+
+## Why
+
+- `fx.lane_id` (`python/flydsl/expr/gpu.py`: `lane_id = _ScalarGPUIndex(gpu.lane_id)`)
+  lowers to a single hardware register read on Iluvatar via the FlyToIXDL
+  conversion pipeline (`lib/Conversion/FlyToIXDL/`).
+- `tid % WARP_SIZE` needs constant folding + strength reduction to become the
+  same thing; the Iluvatar lowering pipeline does not always recognise the
+  pattern and can emit a real modulo.
+- The intrinsic form makes intent explicit: this value is the **lane
+  identity**, not an arbitrary arithmetic result.
+
+## Explicit `fx.Int32(...)` wrapping is required
+
+`fx.lane_id` is a lazy `_ScalarGPUIndex` token; wrap it in `fx.Int32(...)` so it
+materialises immediately and the resulting SSA value has an explicit type.
+This mirrors the existing precedent in `kernels/gemm/iluvatar/mr/*.py`
+(`hgemm.py`, `hgemm_splitk.py`, `small_m_hgemm.py`), which all use
+`lane_id = fx.Int32(fx.lane_id)`. The stray `lane_id = tid % WARP_SIZE` in
+`kernels/gemm/iluvatar/mr/igemm.py` L222 is exactly what this rule is meant to
+prevent from spreading.
+
+## Scope
+
+- **Iluvatar backend only.** Upstream AMD/CDNA/RDNA kernels (`kernels/gemm/rdna_*`,
+  `kernels/gemm/preshuffle_gemm.py`, `kernels/attention/flash_attn_*.py`,
+  `kernels/moe/moe_gemm_2stage*`, gfx1250 files, etc.) are out of scope; do not
+  migrate them.
+- Applies to the lane index only. There is no analogous hardware intrinsic for
+  `warp_id` (Iluvatar) / `wave_id` (legacy AMD/RDNA): keep computing those as
+  `tid // WARP_SIZE` (Iluvatar) or `tid // WAVE_SIZE` (legacy AMD/RDNA, see
+  `kernel-id-naming.mdc`).
+- Applies inside `@flyc.kernel` / `@flyc.jit` bodies (kernel authoring). Test
+  and host code are unaffected.
+
+## Migration
+
+- **New Iluvatar code**: MUST use `fx.Int32(fx.lane_id)` from the first line.
+- **Iluvatar files being substantively edited** for another reason: fold the
+  rename in.
+- **Pure drive-by rewrite** in unrelated Iluvatar files: do **not** touch —
+  only migrate when the user asks or the file is being edited anyway.
+- **Non-Iluvatar files**: never migrate through this rule.
