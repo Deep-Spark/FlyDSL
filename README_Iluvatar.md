@@ -158,6 +158,65 @@ See module docstrings under `kernels/gemm/iluvatar/` for tuning parameters
 
 ## Performance reference
 
+### Add a daily performance case
+
+The `perf-daily-iluvatar` workflow is configuration-driven. Its suite lives in
+`.github/perf-kernels-iluvatar.json`; adding a supported case does not require
+editing the workflow.
+
+For a pytest-based benchmark:
+
+1. Add a deterministic test that prints one final metrics marker:
+
+   ```python
+   print(
+       "PERF_CASE_JSON="
+       + json.dumps(
+           {
+               "metrics": {
+                   "4096x8192.f16": {
+                       "latency_us": latency_us,
+                       "torch_latency_us": torch_latency_us,
+                   }
+               }
+           }
+       )
+   )
+   ```
+
+   Point names and metric names are stable artifact keys. Metric values must be
+   numeric.
+2. Add a `pytest_perf` case to the suite:
+
+   ```json
+   {
+     "id": "my_perf_case",
+     "type": "pytest_perf",
+     "name": "my_perf_case",
+     "entry": "tests/kernels/test_my_perf_case.py",
+     "params": {
+       "markers": "iluvatar_lower",
+       "extra_args": ["-k", "test_my_perf_case"]
+     },
+     "gate": {
+       "metric": "latency_us"
+     }
+   }
+   ```
+
+Use a stable `id` so later runs can find the previous result in the
+`perf-metrics` artifact. A missing baseline (for example, on the first run)
+produces `n/a` deltas and is not an error. Benchmark, parser, or toolchain
+failures invalidate the sample and fail the workflow; a measured regression is
+reported in the summary but does not block. The suite-level
+`defaults.delta_flat_pct` controls the summary threshold; `gate.metric` selects
+the metric compared with the previous run.
+
+Existing GEMM-style scripts can use the `bench_tflops` case type. New
+non-GEMM tests should prefer the `PERF_CASE_JSON` contract above. A new parser
+under `.github/scripts/perf_parsers/` is only needed for a genuinely different
+execution or output model.
+
 Measured on **Iluvatar BI-V150S** (`ARCH=ivcore11`). All four `major_pattern`
 values (`nt` / `tn` / `nn` / `tt`) × square sizes. **Grey** = matched hand-tuned
 (100%); **green** = FlyDSL % of that baseline, taking the **best FlyDSL config**
