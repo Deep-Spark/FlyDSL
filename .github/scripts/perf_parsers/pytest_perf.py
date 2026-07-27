@@ -60,7 +60,7 @@ class PytestPerfHandler(CaseHandler):
             result.invalid_reason = "missing entry"
             return result
 
-        cmd: List[str] = ["python3", "-m", "pytest", entry, "-q"]
+        cmd: List[str] = ["python3", "-m", "pytest", entry, "-q", "-s"]
         markers = str(params.get("markers", "")).strip()
         if markers:
             cmd.extend(["-m", markers])
