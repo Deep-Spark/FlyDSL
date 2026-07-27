@@ -7,6 +7,7 @@
       "FLYDSL_RUNTIME_KIND": "iluvatar",
       "ARCH": "ivcore11",
       "FLYDSL_RUNTIME_ENABLE_CACHE": "0",
+      "FLYDSL_ILUVATAR_RUN_SOFTMAX_PERF": "1",
       "PYTHONUNBUFFERED": "1"
     }
   },
@@ -33,6 +34,23 @@
         "compare": "delta_vs_prev",
         "metric": "tflops",
         "flat_pct": 3
+      }
+    },
+    {
+      "id": "iluvatar_softmax",
+      "type": "pytest_perf",
+      "name": "iluvatar_softmax",
+      "entry": "tests/kernels/test_iluvatar_softmax_device.py",
+      "params": {
+        "markers": "iluvatar_lower",
+        "extra_args": [
+          "-k",
+          "test_iluvatar_softmax_perf_vs_torch"
+        ]
+      },
+      "gate": {
+        "compare": "delta_vs_prev",
+        "metric": "latency_us"
       }
     }
   ]
