@@ -11,7 +11,11 @@ from .layernorm_kernel import (
     build_layernorm_module,
     build_layernorm_smoothquant_module,
 )
-from .rmsnorm_kernel import compile_iluvatar_rmsnorm, compile_iluvatar_rmsnorm_dynamicquant
+from .rmsnorm_kernel import (
+    compile_iluvatar_rmsnorm,
+    compile_iluvatar_rmsnorm_dynamicquant,
+    compile_iluvatar_rmsnorm_smoothquant,
+)
 from .softmax_kernel import compile_iluvatar_softmax
 
 __all__ = [
@@ -23,5 +27,6 @@ __all__ = [
     "build_fused_add_layernorm_smoothquant_module",
     "compile_iluvatar_rmsnorm",
     "compile_iluvatar_rmsnorm_dynamicquant",
+    "compile_iluvatar_rmsnorm_smoothquant",
     "compile_iluvatar_softmax",
 ]
