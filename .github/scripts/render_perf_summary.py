@@ -106,6 +106,28 @@ def primary_metric_for_case(case_result: Dict[str, Any]) -> str:
     return "tflops"
 
 
+def generic_metric_sort_key(metric_name: str) -> Tuple[int, int, str]:
+    raw_metric_order = {
+        "latency_us": 0,
+        "torch_latency_us": 1,
+        "ixdnn_latency_us": 2,
+        "ixblas_latency_us": 3,
+    }
+    derived_metric_order = {
+        "speedup": 0,
+        "speedup_torch": 1,
+        "speedup_ixdnn": 2,
+        "speedup_ixblas": 3,
+    }
+    if metric_name in raw_metric_order:
+        return (0, raw_metric_order[metric_name], metric_name)
+    if metric_name in derived_metric_order:
+        return (1, derived_metric_order[metric_name], metric_name)
+    if metric_name.startswith("speedup"):
+        return (1, len(derived_metric_order), metric_name)
+    return (0, len(raw_metric_order), metric_name)
+
+
 def render(result: Dict[str, Any], flat_threshold_pct: float, input_reason: str) -> str:
     cases = normalize_cases(result)
     cfg = result.get("config") or {}
@@ -261,7 +283,7 @@ def render(result: Dict[str, Any], flat_threshold_pct: float, input_reason: str)
                     speedup_text = "n/a"
                 lines.append(f"| `{point}` | `{cur_text}` | `{torch_text}` | `{speedup_text}` |")
         else:
-            # Generic metric table: point + all numeric metrics for that point.
+            # Generic metric table: raw measurements first, then derived metrics.
             metric_names = sorted(
                 {
                     str(mk)
@@ -269,7 +291,8 @@ def render(result: Dict[str, Any], flat_threshold_pct: float, input_reason: str)
                     if isinstance(values, dict)
                     for mk, mv in values.items()
                     if isinstance(mv, (int, float))
-                }
+                },
+                key=generic_metric_sort_key,
             )
             if not metric_names:
                 metric_names = [primary]

@@ -128,6 +128,21 @@ docker_args=(
   -e FLYDSL_RUNTIME_CACHE_DIR="${PERF_CACHE_DIR}"
 )
 
+# Forward suite defaults.env / host FLYDSL_* (+ ARCH) into the container.
+# run_perf_suite.py sets these on the host subprocess; without -e they never
+# reach pytest inside docker (e.g. FLYDSL_ILUVATAR_RUN_SOFTMAX_PERF gate).
+if [[ -n "${ARCH:-}" ]]; then
+  docker_args+=(-e "ARCH=${ARCH}")
+fi
+while IFS= read -r env_name; do
+  [[ -z "${env_name}" ]] && continue
+  # Keep the explicit cache-dir mapping above; skip overriding it from host.
+  if [[ "${env_name}" == "FLYDSL_RUNTIME_CACHE_DIR" ]]; then
+    continue
+  fi
+  docker_args+=(-e "${env_name}=${!env_name}")
+done < <(compgen -e | awk '/^FLYDSL_/ { print }' | sort)
+
 if [[ "${CI_DEVICE_PRIVILEGED}" == "1" ]]; then
   docker_args+=(--privileged)
 fi
