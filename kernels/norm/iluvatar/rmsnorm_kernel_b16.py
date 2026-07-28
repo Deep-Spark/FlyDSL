@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar FP16/BF16 RMSNorm forward kernel.
+"""Iluvatar FP16/BF16 RMSNorm with per-row INT8 dynamic quantization.
 
 Each block normalizes one row. Odd-width rows use one element per thread, while
 even-width rows use two adjacent elements and two FP32 accumulators per thread.
-FP16 and BF16 share one builder and are specialized at compile time.
+The normalized result is quantized to INT8 with one FP32 scale per row.
 """
 
 import math
@@ -18,6 +18,7 @@ from flydsl.expr import math as fmath
 from kernels.gemm.iluvatar.common import WARP_SIZE
 
 MAX_THREADS_PER_BLOCK = 4096
+QUANT_I8_MAX = 127.0
 SUPPORTED_DTYPES = ("f16", "bf16")
 _TORCH_DTYPE_NAMES = {
     "f16": "torch.float16",
@@ -73,8 +74,8 @@ def _build_rmsnorm_b16_kernel(*, N: int, eps: float, dtype: str):
     # Tensor shapes and element types:
     #   x:      (M, N), elem_dtype (Float16 or BFloat16)
     #   gamma:  (N,),   elem_dtype (Float16 or BFloat16)
-    #   out:    (M, N), elem_dtype (Float16 or BFloat16)
-    #   rsigma: (M,),   Float32
+    #   out:     (M, N), Int8
+    #   y_scale: (M,),   Float32
     #
     # Work distribution:
     #   grid.x = M: block bid processes row x[bid, :].
@@ -86,7 +87,7 @@ def _build_rmsnorm_b16_kernel(*, N: int, eps: float, dtype: str):
         x: fx.Tensor,
         gamma: fx.Tensor,
         out: fx.Tensor,
-        rsigma: fx.Tensor,
+        y_scale: fx.Tensor,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -95,6 +96,10 @@ def _build_rmsnorm_b16_kernel(*, N: int, eps: float, dtype: str):
 
         fm_fast = arith.FastMathFlags.fast
         c_zero_f = fx.Float32(0.0)
+        c_one_f = fx.Float32(1.0)
+        c_neg_inf = fx.Float32(float("-inf"))
+        c_qmax = fx.Float32(QUANT_I8_MAX)
+        c_abs_mask = fx.Uint32(0x7FFFFFFF)
         n_float = float(N)
         eps_c = eps
 
@@ -109,6 +114,32 @@ def _build_rmsnorm_b16_kernel(*, N: int, eps: float, dtype: str):
                 peer = reduced.shuffle_xor(offset, WARP_SIZE)
                 reduced = reduced.addf(peer, fastmath=fm_fast)
             return reduced
+
+        def _warp_reduce_max(value):
+            """Reduce one FP32 maximum across a warp64."""
+            reduced = value
+            for sh_exp in range_constexpr(int(math.log2(WARP_SIZE))):
+                offset = WARP_SIZE // (2 << sh_exp)
+                peer = reduced.shuffle_xor(offset, WARP_SIZE)
+                reduced = reduced.maximumf(peer)
+            return reduced
+
+        def _block_reduce_max(value):
+            """Reduce a maximum across all warps in the block."""
+            warp_max = _warp_reduce_max(value)
+            if lane == 0:
+                fx.memref_store(warp_max, partials, warp)
+            gpu.barrier()
+
+            if warp == 0:
+                valid = lane < reduction_warps
+                lane_safe = valid.select(lane, 0)
+                partial = fx.memref_load(partials, lane_safe)
+                block_max = _warp_reduce_max(valid.select(partial, c_neg_inf))
+                if lane == 0:
+                    fx.memref_store(block_max, partials, 0)
+            gpu.barrier()
+            return fx.memref_load(partials, 0)
 
         row = fx.Int32(bid)
         sum0 = c_zero_f
@@ -159,8 +190,8 @@ def _build_rmsnorm_b16_kernel(*, N: int, eps: float, dtype: str):
         mean = fx.memref_load(partials, 0)
         rrms = fmath.rsqrt((mean / n_float) + eps_c, fastmath=fm_fast)
 
-        # Pass 2: apply the learned scale and reciprocal RMS, then convert back
-        # to the input element type.
+        # Pass 2: recompute normalized values and find the row absolute maximum.
+        thread_amax = c_zero_f
         for base in range_constexpr(0, N, block_threads * elements_per_load):
             offset = tid + base // elements_per_load
             idx0 = offset * elements_per_load
@@ -174,7 +205,8 @@ def _build_rmsnorm_b16_kernel(*, N: int, eps: float, dtype: str):
                     y0 = fx.Float32(product0) * rrms
                 else:
                     y0 = x0 * g0 * rrms
-                out[row, idx0] = y0.to(elem_dtype)
+                abs0 = (y0.bitcast(fx.Uint32) & c_abs_mask).bitcast(fx.Float32)
+                thread_amax = thread_amax.maximumf(abs0)
 
             if const_expr(elements_per_load == 2):
                 idx1 = idx0 + 1
@@ -183,11 +215,38 @@ def _build_rmsnorm_b16_kernel(*, N: int, eps: float, dtype: str):
                     g1 = fx.Float32(gamma[idx1])
                     product1 = (x1 * g1).to(elem_dtype)
                     y1 = fx.Float32(product1) * rrms
-                    out[row, idx1] = y1.to(elem_dtype)
+                    abs1 = (y1.bitcast(fx.Uint32) & c_abs_mask).bitcast(fx.Float32)
+                    thread_amax = thread_amax.maximumf(abs1)
 
-        # One FP32 reciprocal RMS value is produced per row.
+        row_max = _block_reduce_max(thread_amax)
+        scale = row_max / c_qmax
+        final_scale = (scale == c_zero_f).select(c_one_f, scale)
         if tid == 0:
-            rsigma[row] = rrms
+            y_scale[row] = final_scale
+        inv_scale = c_one_f / final_scale
+
+        # Pass 3: recompute normalized values, quantize, and store INT8 output.
+        for base in range_constexpr(0, N, block_threads * elements_per_load):
+            offset = tid + base // elements_per_load
+            idx0 = offset * elements_per_load
+            if idx0 < N:
+                x0 = fx.Float32(x[row, idx0])
+                g0 = fx.Float32(gamma[idx0])
+                if const_expr(elements_per_load == 2):
+                    product0 = (x0 * g0).to(elem_dtype)
+                    y0 = fx.Float32(product0) * rrms
+                else:
+                    y0 = x0 * g0 * rrms
+                out[row, idx0] = (y0 * inv_scale).to(fx.Int8)
+
+            if const_expr(elements_per_load == 2):
+                idx1 = idx0 + 1
+                if idx1 < N:
+                    x1 = fx.Float32(x[row, idx1])
+                    g1 = fx.Float32(gamma[idx1])
+                    product1 = (x1 * g1).to(elem_dtype)
+                    y1 = fx.Float32(product1) * rrms
+                    out[row, idx1] = (y1 * inv_scale).to(fx.Int8)
 
     return _rmsnorm_b16_kernel, block_threads
 
@@ -198,10 +257,10 @@ def compile_iluvatar_rmsnorm_b16(
     eps: float,
     dtype: str,
 ) -> Callable:
-    """Build an RMSNorm launcher specialized for FP16 or BF16.
+    """Build an FP16/BF16 RMSNorm-to-INT8 launcher.
 
     Returns:
-        ``launch_rmsnorm_b16(x, gamma, out, rsigma, M, stream=None)``.
+        ``launch_rmsnorm_b16(x, gamma, out, y_scale, M, stream=None)``.
     """
 
     if N <= 0:
@@ -218,17 +277,17 @@ def compile_iluvatar_rmsnorm_b16(
         x: fx.Tensor,
         gamma: fx.Tensor,
         out: fx.Tensor,
-        rsigma: fx.Tensor,
+        y_scale: fx.Tensor,
         m_in: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        kernel(x, gamma, out, rsigma).launch(
+        kernel(x, gamma, out, y_scale).launch(
             grid=(m_in, 1, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
 
-    def launch_rmsnorm_b16(x, gamma, out, rsigma, M: int, stream=None):
+    def launch_rmsnorm_b16(x, gamma, out, y_scale, M: int, stream=None):
         """Validate tensors, launch one block per row, and return the outputs."""
         if not isinstance(M, int):
             raise ValueError(f"M must be int, got {type(M).__name__}")
@@ -241,8 +300,8 @@ def compile_iluvatar_rmsnorm_b16(
             raise ValueError(f"expected gamma shape (N,), got dim={gamma.dim()} shape={tuple(gamma.shape)}")
         if out.dim() != 2:
             raise ValueError(f"expected out shape (M,N), got dim={out.dim()} shape={tuple(out.shape)}")
-        if rsigma.dim() != 1:
-            raise ValueError(f"expected rsigma shape (M,), got dim={rsigma.dim()} shape={tuple(rsigma.shape)}")
+        if y_scale.dim() != 1:
+            raise ValueError(f"expected y_scale shape (M,), got dim={y_scale.dim()} shape={tuple(y_scale.shape)}")
 
         if tuple(x.shape) != (M, N):
             raise ValueError(f"expected x shape (M,N)=({M},{N}), got {tuple(x.shape)}")
@@ -250,8 +309,8 @@ def compile_iluvatar_rmsnorm_b16(
             raise ValueError(f"expected gamma shape (N,)=({N},), got {tuple(gamma.shape)}")
         if tuple(out.shape) != (M, N):
             raise ValueError(f"expected out shape (M,N)=({M},{N}), got {tuple(out.shape)}")
-        if tuple(rsigma.shape) != (M,):
-            raise ValueError(f"expected rsigma shape (M,)=({M},), got {tuple(rsigma.shape)}")
+        if tuple(y_scale.shape) != (M,):
+            raise ValueError(f"expected y_scale shape (M,)=({M},), got {tuple(y_scale.shape)}")
 
         if not x.is_contiguous():
             raise ValueError("x must be contiguous")
@@ -259,43 +318,46 @@ def compile_iluvatar_rmsnorm_b16(
             raise ValueError("gamma must be contiguous")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
-        if not rsigma.is_contiguous():
-            raise ValueError("rsigma must be contiguous")
+        if not y_scale.is_contiguous():
+            raise ValueError("y_scale must be contiguous")
 
-        for name, tensor in (("x", x), ("gamma", gamma), ("out", out)):
+        for name, tensor in (("x", x), ("gamma", gamma)):
             actual_dtype = _dtype_name(tensor)
             if actual_dtype != torch_dtype_name:
                 raise ValueError(f"{name} dtype must be {torch_dtype_name}, got {actual_dtype}")
-        if _dtype_name(rsigma) != "torch.float32":
-            raise ValueError(f"rsigma dtype must be torch.float32, got {_dtype_name(rsigma)}")
+        if _dtype_name(out) != "torch.int8":
+            raise ValueError(f"out dtype must be torch.int8, got {_dtype_name(out)}")
+        if _dtype_name(y_scale) != "torch.float32":
+            raise ValueError(f"y_scale dtype must be torch.float32, got {_dtype_name(y_scale)}")
 
-        if not (x.device == gamma.device == out.device == rsigma.device):
+        if not (x.device == gamma.device == out.device == y_scale.device):
             raise ValueError(
-                f"x/gamma/out/rsigma must be on same device, got "
-                f"{x.device}/{gamma.device}/{out.device}/{rsigma.device}"
+                f"x/gamma/out/y_scale must be on same device, got "
+                f"{x.device}/{gamma.device}/{out.device}/{y_scale.device}"
             )
 
         if _tensors_overlap(x, out):
             raise ValueError("out must not overlap with x")
         if _tensors_overlap(gamma, out):
             raise ValueError("out must not overlap with gamma")
-        if _tensors_overlap(rsigma, x) or _tensors_overlap(rsigma, gamma) or _tensors_overlap(rsigma, out):
-            raise ValueError("rsigma must not overlap with x, gamma, or out")
+        if _tensors_overlap(y_scale, x) or _tensors_overlap(y_scale, gamma) or _tensors_overlap(y_scale, out):
+            raise ValueError("y_scale must not overlap with x, gamma, or out")
 
         if M == 0:
-            return out, rsigma
+            return out, y_scale
 
         if stream is None:
-            _launch_kernel(x, gamma, out, rsigma, M)
+            _launch_kernel(x, gamma, out, y_scale, M)
         else:
-            _launch_kernel(x, gamma, out, rsigma, M, stream=stream)
-        return out, rsigma
+            _launch_kernel(x, gamma, out, y_scale, M, stream=stream)
+        return out, y_scale
 
     return launch_rmsnorm_b16
 
 
 __all__ = [
     "MAX_THREADS_PER_BLOCK",
+    "QUANT_I8_MAX",
     "SUPPORTED_DTYPES",
     "compile_iluvatar_rmsnorm_b16",
 ]
