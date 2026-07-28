@@ -19,6 +19,7 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Tensor core MMA** | `MRMma` — **16×16×16 f16** and **16×16×32 i8→i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` — double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |
 | **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` — int8×int8 → i32/i8, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
+| **MoE GEMM V1** | `kernels.moe.iluvatar.mr` — sorted grouped GEMM, `int8` / `int8smooth`, f16/bf16/f32 out (A gather + B SME) |
 | **GEMV V1** | `kernels.gemm.iluvatar.gemv` — `F.linear`-aligned M=1, fp16/bf16, fp32 accum |
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |
 | **Unit / device tests** | `tests/kernels/test_iluvatar_*` (device kernels: G2S/S2R/MMA/epilogue/HGEMM stages, GEMV, RMSNorm, LayerNorm, atomic CAS, split-K) + `tests/unit/test_iluvatar_*` (backend, runtime, JIT launch/binary smokes); select via `-m iluvatar_lower`. IGEMM via example `--check` |
@@ -37,6 +38,9 @@ kernels/gemm/iluvatar/
     igemm.py         # compile_iluvatar_mr_igemm
     operand_copy.py  # mr_gemm_g2s_issue_* (dtype-generic)
     s2r.py           # mr_gemm_s2r_* (dtype-generic; i8 k-spanning)
+
+kernels/moe/iluvatar/mr/
+  moe_gemm.py        # compile_iluvatar_mr_moe_gemm (int8 / int8smooth V1)
 ```
 
 ## Supported hardware
