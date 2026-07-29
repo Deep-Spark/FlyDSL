@@ -29,14 +29,36 @@ def _load_backends(monkeypatch):
     return importlib.import_module("flydsl.compiler.backends")
 
 
+def _assert_ixdl_chip_wiring(backend, chip: str) -> None:
+    """Every chip-bearing site must use *chip* explicitly (no silent MR default)."""
+    fragments = backend.pipeline_fragments(compile_hints={})
+    attach = f"ixdl-attach-target{{O=2 chip={chip} triple=bi-iluvatar-ilurt}}"
+    assert backend.target.arch == chip
+    assert backend.gpu_module_targets() == [f'#ixdl.target<chip = "{chip}">']
+    assert attach in fragments
+    assert fragments.index(attach) < fragments.index("gpu-module-to-binary{format=fatbin}")
+    # Guard against accidentally hard-coding the other generation's chip.
+    other = "ivcore11" if chip == "ivcore30" else "ivcore30"
+    assert f"chip={other}" not in " ".join(fragments)
+    assert f'chip = "{other}"' not in " ".join(backend.gpu_module_targets())
+
+
 def test_iluvatar_backend_explicit_arch(monkeypatch):
     backends = _load_backends(monkeypatch)
     backend = backends.get_backend("iluvatar", arch="ivcore11")
 
     assert backend.target.backend == "iluvatar"
-    assert backend.target.arch == "ivcore11"
     assert backend.target.warp_size == 64
-    assert backend.gpu_module_targets() == ['#ixdl.target<chip = "ivcore11">']
+    _assert_ixdl_chip_wiring(backend, "ivcore11")
+
+
+def test_iluvatar_backend_explicit_cq_arch(monkeypatch):
+    backends = _load_backends(monkeypatch)
+    backend = backends.get_backend("iluvatar", arch="ivcore30")
+
+    assert backend.target.backend == "iluvatar"
+    assert backend.target.warp_size == 64
+    _assert_ixdl_chip_wiring(backend, "ivcore30")
 
 
 def test_iluvatar_backend_detects_arch_from_env(monkeypatch):
@@ -46,8 +68,8 @@ def test_iluvatar_backend_detects_arch_from_env(monkeypatch):
     backend = backends.get_backend("iluvatar")
 
     assert backend.target.backend == "iluvatar"
-    assert backend.target.arch == "ivcore30"
     assert backend.target.warp_size == 64
+    _assert_ixdl_chip_wiring(backend, "ivcore30")
 
 
 def test_iluvatar_backend_defaults_to_ivcore11(monkeypatch):
@@ -56,8 +78,8 @@ def test_iluvatar_backend_defaults_to_ivcore11(monkeypatch):
 
     backend = backends.get_backend("iluvatar")
 
-    assert backend.target.arch == "ivcore11"
     assert backend.target.warp_size == 64
+    _assert_ixdl_chip_wiring(backend, "ivcore11")
 
 
 def test_iluvatar_pipeline_uses_ixdl_attach_and_binary_codegen(monkeypatch):
@@ -69,15 +91,23 @@ def test_iluvatar_pipeline_uses_ixdl_attach_and_binary_codegen(monkeypatch):
     assert "convert-fly-to-ixdl" in fragments
     assert any("convert-gpu-to-ixdl" in fragment for fragment in fragments)
     assert not any("fly-scf-for-loop-unroll" in fragment for fragment in fragments)
-    assert "ixdl-attach-target{O=2 chip=ivcore11 triple=bi-iluvatar-ilurt}" in fragments
     assert "gpu-module-to-binary{format=fatbin}" in fragments
-    assert backend.gpu_module_targets() == ['#ixdl.target<chip = "ivcore11">']
-    assert fragments.index("ixdl-attach-target{O=2 chip=ivcore11 triple=bi-iluvatar-ilurt}") < fragments.index(
-        "gpu-module-to-binary{format=fatbin}"
-    )
+    _assert_ixdl_chip_wiring(backend, "ivcore11")
     assert not any("rocdl-attach-target" in fragment for fragment in fragments)
     assert not any("fly-rocdl-cluster-attr" in fragment for fragment in fragments)
     assert not any("runtime" in fragment.lower() for fragment in fragments)
+
+
+def test_iluvatar_cq_pipeline_uses_explicit_ivcore30_chip(monkeypatch):
+    backends = _load_backends(monkeypatch)
+    backend = backends.get_backend("iluvatar", arch="ivcore30")
+
+    fragments = backend.pipeline_fragments(compile_hints={})
+
+    assert "convert-fly-to-ixdl" in fragments
+    assert any("convert-gpu-to-ixdl" in fragment for fragment in fragments)
+    _assert_ixdl_chip_wiring(backend, "ivcore30")
+    assert "gpu-module-to-binary{format=fatbin}" in fragments
 
 
 def test_iluvatar_runtime_metadata_uses_iluvatar_libraries(monkeypatch):
