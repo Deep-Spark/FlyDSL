@@ -13,8 +13,6 @@ Targets ``1 <= m <= 16`` with N/K tile-aligned.
 Default: ``16x64x64`` stage-2 (1x2 warps, 1x2 atoms, k_atoms=4).
 """
 
-# NOTE: do NOT add ``from __future__ import annotations`` (Constexpr introspection).
-
 from contextlib import contextmanager
 
 import flydsl.compiler as flyc
