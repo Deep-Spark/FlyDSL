@@ -6,12 +6,19 @@ from typing import List
 from ...utils import env
 from .base import BaseBackend, GPUTarget
 
+# Python-side default when ARCH is omitted. IXDL target attributes and passes
+# still receive an explicit chip value.
 _DEFAULT_ARCH = "ivcore11"
 _WARP_SIZE = 64
 
 
 class IluvatarBackend(BaseBackend):
-    """Iluvatar compile backend."""
+    """Iluvatar compile backend.
+
+    ``ARCH`` / ``target.arch`` is the chip string (e.g. ``ivcore11`` for MR,
+    ``ivcore30`` for CQ). Python defaults an omitted architecture to MR, while
+    every IXDL chip-bearing site receives the resolved value explicitly.
+    """
 
     @staticmethod
     def supports_target(target: GPUTarget) -> bool:
@@ -49,6 +56,8 @@ class IluvatarBackend(BaseBackend):
             "fly-promote-regmem-to-vectorssa",
             "convert-fly-to-ixdl",
             "canonicalize",
+            # convert-gpu-to-ixdl has no chipset option; chip is carried only
+            # via #ixdl.target / ixdl-attach-target below.
             "gpu.module(convert-scf-to-cf,cse,"
             "convert-gpu-to-ixdl{index-bitwidth=0 use-bare-ptr-memref-call-conv=true})",
             f"ixdl-attach-target{{{self._format_pass_opts(ixdl_opts)}}}",
