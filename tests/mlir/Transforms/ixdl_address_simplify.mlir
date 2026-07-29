@@ -13,7 +13,7 @@
 // CHECK:       %[[OPT:.+]] = arith.xori %[[LANE]], %[[C32]] : i32
 // CHECK:       %[[OFF:.+]] = fly.make_int_tuple(%[[OPT]]) : (i32) -> !fly.int_tuple<?>
 // CHECK:       fly.add_offset(%arg0, %[[OFF]])
-gpu.module @t [#ixdl.target] {
+gpu.module @t [#ixdl.target<chip = "ivcore11">] {
   gpu.func @iluvatar_swizzled_addr(%src: !fly.ptr<f16, shared>, %dst: !fly.ptr<f16, register>) kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
