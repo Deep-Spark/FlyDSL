@@ -21,8 +21,6 @@ Output epilogue: ``i32`` (default, direct int32 store) or ``i8`` (packed store,
 truncating cast, no quant scale).
 """
 
-# NOTE: do NOT add ``from __future__ import annotations`` (Constexpr introspection).
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl

@@ -23,8 +23,6 @@ Tuning:
   Default compile kwargs: 4x4 warps, 4x4 atoms, k_atoms=2 (BK=32).
 """
 
-# NOTE: do NOT add ``from __future__ import annotations`` (Constexpr introspection).
-
 from typing import NamedTuple
 
 import flydsl.compiler as flyc

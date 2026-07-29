@@ -16,8 +16,6 @@ Modes (see ``splitk_utils``):
 * **atomic** — zero C then scalar UniversalAtomicAdd.
 """
 
-# NOTE: do NOT add ``from __future__ import annotations`` (Constexpr introspection).
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
