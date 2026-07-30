@@ -5,12 +5,12 @@
 
 Modes (see ``compile_iluvatar_mr_hgemm_splitk(..., split_k_mode=...)``):
 
-* **serial** — CUTLASS SplitKSerial: single ``grid.z=split_k`` launch; per-tile
+* **serial** -- CUTLASS SplitKSerial: single ``grid.z=split_k`` launch; per-tile
   GMEM locks + ``ixdl.atomic_cas`` turnstile order the load-add-store into C
   (compute overlaps; only the epilogue is serialized per output tile).
-* **parallel** — each K-slice writes an fp32 partial to workspace; a separate
+* **parallel** -- each K-slice writes an fp32 partial to workspace; a separate
   reduce kernel sums along ``split_k`` into C.
-* **atomic** — host/stream-ordered C-zero then scalar ``UniversalAtomicAdd``.
+* **atomic** -- host/stream-ordered C-zero then scalar ``UniversalAtomicAdd``.
 """
 
 import flydsl.compiler as flyc
@@ -68,7 +68,7 @@ def serial_turnstile_wait(lock_ptr, expected):
 
 
 def serial_turnstile_arrive(lock_ptr, expected):
-    """Release the turnstile: CAS ``expected → expected+1`` (release)."""
+    """Release the turnstile: CAS ``expected -> expected+1`` (release)."""
     nextv = expected + fx.Int32(1)
     ixdl.atomic_cas(
         lock_ptr,

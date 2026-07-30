@@ -3,9 +3,9 @@
 
 """Reusable Iluvatar MR HGEMM epilogue helpers.
 
-  mr_hgemm_epilogue_store_shfl — f16/bf16 via warp shuffle + packed i32 store
-  mr_hgemm_epilogue_store_tiled — f16/bf16 via trunc_f + make_tiled_copy_C
-  mr_hgemm_epilogue_store_read_c_accum — fp32 make_tiled_copy_C
+  mr_hgemm_epilogue_store_shfl -- f16/bf16 via warp shuffle + packed i32 store
+  mr_hgemm_epilogue_store_tiled -- f16/bf16 via trunc_f + make_tiled_copy_C
+  mr_hgemm_epilogue_store_read_c_accum -- fp32 make_tiled_copy_C
 
 mr_hgemm_epilogue_store dispatches on store_mode.
 """
@@ -183,7 +183,7 @@ def mr_hgemm_epilogue_store_serial_splitk(
 ):
     """CUTLASS SplitKSerial epilogue (``EPILOGUE_STORE_SERIAL_SPLITK``).
 
-    Always load-add-store in f32 then trunc-store (ordered RMW — not atomic).
+    Always load-add-store in f32 then trunc-store (ordered RMW -- not atomic).
     The caller must guarantee K-partition order (per-tile cmpxchg turnstile);
     partition 0 sees a pre-zeroed C and is equivalent to a plain store.
     """

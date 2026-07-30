@@ -115,7 +115,7 @@ public:
       return success();
     } else if (isTargetAddressSpace<SmeGmemAddressAttr>(addrSpaceAttr)) {
       // sme_gmem make_ptr takes 2 positional args: [base_global_ptr, leading_stride].
-      // Assumption (design doc §6 #1): the second arg is the leading (outermost)
+      // Assumption (design doc section 6 #1): the second arg is the leading (outermost)
       // stride in *element* units; stride_byte = leading_stride * elemBytes.
       auto args = adaptor.getArgs();
       if (args.size() != 2)

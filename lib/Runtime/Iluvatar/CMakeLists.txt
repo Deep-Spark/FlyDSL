@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 #
-# FlyIluvatarJitRuntime — CUDA-compatible Iluvatar JIT runtime wrappers.
+# FlyIluvatarJitRuntime -- CUDA-compatible Iluvatar JIT runtime wrappers.
 
 find_package(CUDAToolkit REQUIRED)
 

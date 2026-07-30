@@ -10,9 +10,9 @@ Index naming uses four prefixes (do not mix):
   sme_row_* S2R sub-slice inside one 512-bit SME row (MrOperandGeom)
   phys_*    epilogue GMEM byte/element offsets
 
-atom_m/n/k — size (elements) of one MRMma / fx.gemm tile (f16: 16). Not a loop var.
-mma_m/n/k  — 0-based index of which atom_* tile the warp uses within the CTA bk step.
-values_per_sme_row (vpr) — elements per 512-bit SME row; f16 32, i8 64, f32 16.
+atom_m/n/k -- size (elements) of one MRMma / fx.gemm tile (f16: 16). Not a loop var.
+mma_m/n/k  -- 0-based index of which atom_* tile the warp uses within the CTA bk step.
+values_per_sme_row (vpr) -- elements per 512-bit SME row; f16 32, i8 64, f32 16.
 
 G2S chunk grid (cta_*, mr_gemm_g2s_issue_*_warp):
   One G2S issue moves cta_chunk_elems = 16 smem rows x vpr into smem.
@@ -30,7 +30,7 @@ G2S chunk grid (cta_*, mr_gemm_g2s_issue_*_warp):
 
 SME row sub-slicing (sme_row_*, S2R only):
   Several atom_*-wide operand slices may sit side-by-side along one SME row; S2R picks
-  the slice for the current mma_k (or mma_m / mma_n). Not cta_* — a G2S chunk spans
+  the slice for the current mma_k (or mma_m / mma_n). Not cta_* -- a G2S chunk spans
   16 smem rows; sme_row_* slices within a single row.
 
   sme_row_k_slices  = vpr // atom_k  when K is along the row (k-major)
@@ -46,16 +46,16 @@ SME row sub-slicing (sme_row_*, S2R only):
   split along the row on nt.
 
 Common pitfalls:
-  major_pattern ("tn", etc.) — which operand is k-major on logical A(m,k)/B(n,k);
+  major_pattern ("tn", etc.) -- which operand is k-major on logical A(m,k)/B(n,k);
     not whole-matrix row/column major. See kernels.gemm.iluvatar.common.GemmLayout.
-  mma_k — K step within one CTA bk tile; not cta_k (G2S chunk coord) and not the
+  mma_k -- K step within one CTA bk tile; not cta_k (G2S chunk coord) and not the
     outer loop over full problem K.
-  MrCtaSmemGrid — cta_lin decode divisors; not a CuTe Layout.
+  MrCtaSmemGrid -- cta_lin decode divisors; not a CuTe Layout.
 
 Three unrelated "atom" sizes:
-  atom_m/n/k     — MRMma compute tile (MmaAtom)
-  S2R copy atom  — UniversalCopy via make_tiled_copy_A/B
-  G2S smem chunk — one MRAsyncCp issue (cta_lin); 16 smem rows x vpr elems
+  atom_m/n/k     -- MRMma compute tile (MmaAtom)
+  S2R copy atom  -- UniversalCopy via make_tiled_copy_A/B
+  G2S smem chunk -- one MRAsyncCp issue (cta_lin); 16 smem rows x vpr elems
 """
 
 from typing import NamedTuple
@@ -102,7 +102,7 @@ class MrOperandGeom(NamedTuple):
       nn: mn/k  -> sme_row_a_m_atoms; sme_row_k_slices on B
       tt: k/mn  -> sme_row_k_slices on A; sme_row_b_n_atoms on B
 
-    sme_row_* — S2R only (in-row sub-slices from mma_k / mma_m / mma_n).
+    sme_row_* -- S2R only (in-row sub-slices from mma_k / mma_m / mma_n).
 
     G2S reads only vpr (values_per_sme_row) and cta_chunk_elems (= 16 * vpr) via
     mr_cta_smem_grid; smem offset is cta_lin * cta_chunk_elems within smem_a/smem_b.
@@ -171,11 +171,11 @@ class MrCtaSmemGrid(NamedTuple):
     Not the same as sme_row_* in MrOperandGeom (in-row S2R sub-slices for mma_k).
 
     Fields (vpr = geom.values_per_sme_row; f16: 32, i8: 64):
-      cta_chunk_elems — smem element stride per chunk
-      cta_a_k_cnt_k_major — A k-major K count (G2S %)
-      cta_a_k_cnt — A K-span (S2R A; bk/vpr or bk/16 by major)
-      cta_b_k_cnt — B k-major K count
-      cta_b_n_cnt — B mn-major N count (G2S %)
+      cta_chunk_elems -- smem element stride per chunk
+      cta_a_k_cnt_k_major -- A k-major K count (G2S %)
+      cta_a_k_cnt -- A K-span (S2R A; bk/vpr or bk/16 by major)
+      cta_b_k_cnt -- B k-major K count
+      cta_b_n_cnt -- B mn-major N count (G2S %)
 
     See mr_gemm_g2s_issue_a_warp / mr_gemm_g2s_issue_b_warp for formulas.
     """

@@ -17,7 +17,7 @@ set_property(CACHE FLYDSL_BACKENDS PROPERTY STRINGS rocdl iluvatar)
 # ---- Validate ----
 list(LENGTH FLYDSL_BACKENDS _n_backends)
 if(_n_backends EQUAL 0)
-  message(FATAL_ERROR "FLYDSL_BACKENDS is empty — at least one backend is required.")
+  message(FATAL_ERROR "FLYDSL_BACKENDS is empty -- at least one backend is required.")
 endif()
 if(_n_backends GREATER 5)
   message(FATAL_ERROR "FLYDSL_FOR_EACH_BACKEND supports at most 5 backends.")

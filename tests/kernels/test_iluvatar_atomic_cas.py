@@ -6,7 +6,7 @@
 Covers:
 
 1. Success / failure return value and memory update (single CTA, i32).
-2. Multi-CTA exclusive claim: only one CTA wins ``CAS(0 → 1)``.
+2. Multi-CTA exclusive claim: only one CTA wins ``CAS(0 -> 1)``.
 3. Ordered turnstile: CTA ``z`` waits for ``lock == z`` then advances to ``z+1``.
 4. i16 success / failure smoke (call site uses ``Int16``).
 5. f16 / f32 success / failure smoke (frontend bitcasts to i16 / i32 for cmpxchg).
@@ -227,7 +227,7 @@ def test_atomic_cas_float_success_and_failure(monkeypatch, fx_dtype_name, torch_
 
 
 def test_atomic_cas_multi_cta_exclusive(monkeypatch):
-    """Exactly one of many CTAs wins ``CAS(0 → 1)`` on a shared lock."""
+    """Exactly one of many CTAs wins ``CAS(0 -> 1)`` on a shared lock."""
     flyc, fx, ixdl, llvm = _require_imports()
     torch = _require_torch()
     _set_iluvatar_env(monkeypatch)

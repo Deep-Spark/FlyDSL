@@ -87,7 +87,7 @@ endif()
 # Doing so statically embeds a copy of MLIRPass (and its pass registry) into
 # _mlirRegisterEverything.so. Passes registered via registerFlyPasses() then
 # go into that LOCAL registry, while PassManager.parse() queries the GLOBAL
-# registry in FlyPythonCAPI.so → "does not refer to a registered pass".
+# registry in FlyPythonCAPI.so -> "does not refer to a registered pass".
 #
 # Instead, pass registration is done through CAPI functions
 # (mlirRegisterFlyPasses, mlirRegisterFlyToROCDLConversionPass) defined in
@@ -151,8 +151,8 @@ add_mlir_python_common_capi_library(FlyPythonCAPI
 # (libamd_comgr.so).
 #
 # Strategy:
-#   1. -fvisibility=hidden  — hide symbols compiled by FlyDSL itself
-#   2. Version script       — controls the FINAL exported symbol set:
+#   1. -fvisibility=hidden  -- hide symbols compiled by FlyDSL itself
+#   2. Version script       -- controls the FINAL exported symbol set:
 #                             exports mlir C API + mlir:: C++ symbols
 #                             (needed by _mlirDialectsFly.so, _mlir.so, etc.),
 #                             hides everything else (llvm::, LLVM C API).
@@ -160,7 +160,7 @@ add_mlir_python_common_capi_library(FlyPythonCAPI
 # NOTE: Triton uses --exclude-libs,ALL because it ships a single
 # libtriton.so with no downstream consumers.  FlyDSL cannot use
 # --exclude-libs,ALL because GNU ld's --exclude-libs forces symbols
-# to LOCAL *before* the version script is evaluated — wildcard patterns
+# to LOCAL *before* the version script is evaluated -- wildcard patterns
 # in the version script cannot re-export them.  The version script
 # alone is sufficient: its `local: *;` catch-all hides LLVM internals.
 # ---------------------------------------------------------------------------

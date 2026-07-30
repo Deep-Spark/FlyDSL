@@ -601,7 +601,7 @@ def _build_igemm_kernel(
                         _sync_arrive((stages - 2 - (j + 1)) * g2s_load_inst)
             else:
                 # Prologue (match hgemm double-buffer peel):
-                #   issue0 → barrier (IXDL drains g2scnt) → issue1 (no wait) →
+                #   issue0 -> barrier (IXDL drains g2scnt) -> issue1 (no wait) ->
                 #   peel stage0 so S2R/MMA overlaps tile1 G2S.
                 issue_stage(fx.Int32(0), fx.Int32(0))
                 fx.gpu.barrier()
@@ -613,7 +613,7 @@ def _build_igemm_kernel(
 
                 def _k_iter_body(k_idx):
                     # Match hgemm: after barrier the compute stage is ready and
-                    # the other stage is free — issue next G2S before deferred MMA so
+                    # the other stage is free -- issue next G2S before deferred MMA so
                     # copies overlap that MMA. Stage pick is branchless via %2 + XOR.
                     fx.gpu.barrier()
                     k_tile = k_idx + 2

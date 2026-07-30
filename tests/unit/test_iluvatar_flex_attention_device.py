@@ -7,7 +7,7 @@ PR-1a covers the ``Q @ K^T * sm_scale`` sub-step via ``_compile_iluvatar_qk_dot_
 (kept as a dev-only bisection helper).
 
 PR-1b adds numerical tests for the full fused non-causal path
-(``compile_iluvatar_flex_attention(..., is_causal=False)``) — MMA1 -> online
+(``compile_iluvatar_flex_attention(..., is_causal=False)``) -- MMA1 -> online
 softmax -> P via SMEM -> MMA2 -> normalise -> gmem write.
 
 PR-1c adds ``is_causal=True`` numerical tests (in-kernel triangular mask
@@ -142,7 +142,7 @@ def test_iluvatar_flex_attention_forward_pr1b(monkeypatch, B, H, Sq, Skv):
     "B,H,Sq",
     [
         (1, 4, 64),  # single tile
-        (2, 4, 128),  # multiple q_tiles / kv_tiles — exercises the triangular pattern across tiles
+        (2, 4, 128),  # multiple q_tiles / kv_tiles -- exercises the triangular pattern across tiles
         (1, 8, 192),  # 3x3 tile grid, larger head count
     ],
 )
