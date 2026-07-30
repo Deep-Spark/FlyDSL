@@ -4,7 +4,8 @@
 """Iluvatar RMSNorm forward kernels.
 
 Entries:
-- ``compile_iluvatar_rmsnorm`` (V1): fp32 input/output, ``out = x * rrms * gamma``.
+- ``compile_iluvatar_rmsnorm`` (V1): fp32/fp16/bf16 input/output,
+  ``out = x * rrms * gamma``, with optional FP32 ``rstd`` output.
 - ``compile_iluvatar_rmsnorm_dynamicquant`` (V2): fp32 input, i8 output with
   per-row dynamic symmetric quantization.
   ``y = x * rrms * gamma``; ``y_scale = amax(|y|) / 127`` (0 → 1 protected);
@@ -28,7 +29,13 @@ from kernels.gemm.iluvatar.common import WARP_SIZE
 
 BLOCK_THREADS = 256
 RED_SLOTS = BLOCK_THREADS // WARP_SIZE
-SUPPORTED_DTYPE = "f32"
+DEFAULT_DTYPE = "f32"
+SUPPORTED_DTYPES = ("f32", "bf16", "f16")
+_TORCH_DTYPE_NAMES = {
+    "f32": "torch.float32",
+    "bf16": "torch.bfloat16",
+    "f16": "torch.float16",
+}
 TORCH_F32_NAME = "torch.float32"
 TORCH_I8_NAME = "torch.int8"
 
@@ -58,14 +65,29 @@ def _tensors_overlap(a, b) -> bool:
     return max(a0, b0) < min(a1, b1)
 
 
-def _build_rmsnorm_kernel(*, N: int, eps: float):
+def _normalize_dtype(dtype: str) -> str:
+    if dtype == "fp16":
+        return "f16"
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(f"dtype must be one of {SUPPORTED_DTYPES}, got {dtype!r}")
+    return dtype
+
+
+def _build_rmsnorm_kernel(*, N: int, eps: float, dtype: str, store_rstd: bool):
     if RED_SLOTS <= 0:
         raise ValueError(f"internal error: RED_SLOTS must be positive, got {RED_SLOTS}")
+    elem_dtype = {
+        "f32": fx.Float32,
+        "bf16": fx.BFloat16,
+        "f16": fx.Float16,
+    }[dtype]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def _rmsnorm_kernel(x: fx.Tensor, gamma: fx.Tensor, out: fx.Tensor):
+    def _rmsnorm_kernel(x: fx.Tensor, gamma: fx.Tensor, out: fx.Tensor, rstd: fx.Tensor):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
+        lane_id = fx.Int32(fx.lane_id)
+        warp_id = tid // WARP_SIZE
 
         fm_fast = arith.FastMathFlags.fast
         c_zero_f = fx.Float32(0.0)
@@ -86,9 +108,6 @@ def _build_rmsnorm_kernel(*, N: int, eps: float):
         def _block_reduce_add(xf):
             if const_expr(RED_SLOTS == 1):
                 return _warp_reduce_add(xf)
-
-            lane_id = fx.Int32(fx.lane_id)
-            warp_id = tid // WARP_SIZE
 
             w_red = _warp_reduce_add(xf)
             if lane_id == 0:
@@ -119,52 +138,64 @@ def _build_rmsnorm_kernel(*, N: int, eps: float):
 
         sum_sq = _block_reduce_add(thread_sumsq)
         rrms = fmath.rsqrt((sum_sq / n_float) + eps_c, fastmath=fm_fast)
+        if const_expr(store_rstd):
+            if tid == 0:
+                rstd[row] = rrms
 
         for base_idx in range_constexpr(0, N, BLOCK_THREADS):
             idx = tid + base_idx
             if idx < N:
                 x_val = fx.Float32(x[row, idx])
                 g_val = fx.Float32(gamma[idx])
-                out[row, idx] = x_val * rrms * g_val
+                out_val = x_val * rrms * g_val
+                out[row, idx] = out_val if const_expr(dtype == "f32") else out_val.to(elem_dtype)
 
     return _rmsnorm_kernel
 
 
-def compile_iluvatar_rmsnorm(*, N: int, eps: float, dtype: str = SUPPORTED_DTYPE) -> Callable:
+def compile_iluvatar_rmsnorm(
+    *,
+    N: int,
+    eps: float,
+    dtype: str = DEFAULT_DTYPE,
+    store_rstd: bool = False,
+) -> Callable:
     """Build Iluvatar RMSNorm V1 launcher.
 
     Args:
         N: Hidden size. Compile-time constant and must be ``> 0``.
         eps: Compile-time epsilon and must be ``> 0``.
-        dtype: Exposed for future extension; V1 only accepts ``"f32"``.
+        dtype: One of ``"f32"``, ``"bf16"`` or ``"f16"`` (``"fp16"`` alias).
+        store_rstd: Whether the launcher accepts and fills an FP32 ``rstd``.
 
     Returns:
-        ``launch_rmsnorm(x, gamma, out, M, stream=None)``
+        Without ``store_rstd``: ``launch(x, gamma, out, M, stream=None)``.
+        With ``store_rstd``: ``launch(x, gamma, out, rstd, M, stream=None)``.
     """
     if N <= 0:
         raise ValueError(f"N must be > 0, got {N}")
     if eps <= 0:
         raise ValueError(f"eps must be > 0, got {eps}")
-    if dtype != SUPPORTED_DTYPE:
-        raise ValueError(f"dtype must be '{SUPPORTED_DTYPE}', got {dtype!r}")
-
-    kernel = _build_rmsnorm_kernel(N=N, eps=float(eps))
+    dtype = _normalize_dtype(dtype)
+    expected_dtype = _TORCH_DTYPE_NAMES[dtype]
+    kernel = _build_rmsnorm_kernel(N=N, eps=float(eps), dtype=dtype, store_rstd=store_rstd)
 
     @flyc.jit
     def _launch_kernel(
         x: fx.Tensor,
         gamma: fx.Tensor,
         out: fx.Tensor,
+        rstd: fx.Tensor,
         m_in: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        kernel(x, gamma, out).launch(
+        kernel(x, gamma, out, rstd).launch(
             grid=(m_in, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
-    def launch_rmsnorm(x, gamma, out, M: int, stream=None):
+    def _validate(x, gamma, out, rstd, M):
         if not isinstance(M, int):
             raise ValueError(f"M must be int, got {type(M).__name__}")
         if M < 0:
@@ -183,6 +214,8 @@ def compile_iluvatar_rmsnorm(*, N: int, eps: float, dtype: str = SUPPORTED_DTYPE
             raise ValueError(f"expected out shape (M,N)=({M},{N}), got {tuple(out.shape)}")
         if tuple(gamma.shape) != (N,):
             raise ValueError(f"expected gamma shape (N,)=({N},), got {tuple(gamma.shape)}")
+        if store_rstd and tuple(rstd.shape) != (M,):
+            raise ValueError(f"expected rstd shape (M,)=({M},), got {tuple(rstd.shape)}")
 
         if not x.is_contiguous():
             raise ValueError("x must be contiguous")
@@ -190,31 +223,57 @@ def compile_iluvatar_rmsnorm(*, N: int, eps: float, dtype: str = SUPPORTED_DTYPE
             raise ValueError("gamma must be contiguous")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
+        if store_rstd and not rstd.is_contiguous():
+            raise ValueError("rstd must be contiguous")
 
         x_dtype = _dtype_name(x)
         g_dtype = _dtype_name(gamma)
         out_dtype = _dtype_name(out)
-        if x_dtype != TORCH_F32_NAME:
-            raise ValueError(f"x dtype must be {TORCH_F32_NAME}, got {x_dtype}")
-        if g_dtype != TORCH_F32_NAME:
-            raise ValueError(f"gamma dtype must be {TORCH_F32_NAME}, got {g_dtype}")
-        if out_dtype != TORCH_F32_NAME:
-            raise ValueError(f"out dtype must be {TORCH_F32_NAME}, got {out_dtype}")
+        if x_dtype != expected_dtype:
+            raise ValueError(f"x dtype must be {expected_dtype}, got {x_dtype}")
+        if g_dtype != expected_dtype:
+            raise ValueError(f"gamma dtype must be {expected_dtype}, got {g_dtype}")
+        if out_dtype != expected_dtype:
+            raise ValueError(f"out dtype must be {expected_dtype}, got {out_dtype}")
+        if store_rstd and _dtype_name(rstd) != TORCH_F32_NAME:
+            raise ValueError(f"rstd dtype must be {TORCH_F32_NAME}, got {_dtype_name(rstd)}")
 
         if x.device != gamma.device or x.device != out.device:
             raise ValueError(f"x/gamma/out must be on same device, got {x.device}/{gamma.device}/{out.device}")
+        if store_rstd and rstd.device != x.device:
+            raise ValueError(f"rstd must be on the same device as x, got {rstd.device}/{x.device}")
 
         if _tensors_overlap(x, out):
             raise ValueError("out must not overlap with x")
+        if store_rstd:
+            for name, tensor in (("x", x), ("gamma", gamma), ("out", out)):
+                if _tensors_overlap(rstd, tensor):
+                    raise ValueError(f"rstd must not overlap with {name}")
 
-        if M == 0:
+    if store_rstd:
+
+        def launch_rmsnorm(x, gamma, out, rstd, M: int, stream=None):
+            _validate(x, gamma, out, rstd, M)
+            if M == 0:
+                return out, rstd
+            if stream is None:
+                _launch_kernel(x, gamma, out, rstd, M)
+            else:
+                _launch_kernel(x, gamma, out, rstd, M, stream=stream)
+            return out, rstd
+
+    else:
+
+        def launch_rmsnorm(x, gamma, out, M: int, stream=None):
+            _validate(x, gamma, out, None, M)
+            if M == 0:
+                return out
+            # The kernel's rstd argument is unused in this specialization.
+            if stream is None:
+                _launch_kernel(x, gamma, out, out, M)
+            else:
+                _launch_kernel(x, gamma, out, out, M, stream=stream)
             return out
-
-        if stream is None:
-            _launch_kernel(x, gamma, out, M)
-        else:
-            _launch_kernel(x, gamma, out, M, stream=stream)
-        return out
 
     return launch_rmsnorm
 
@@ -680,8 +739,9 @@ def compile_iluvatar_rmsnorm_smoothquant(*, N: int, eps: float) -> Callable:
 
 __all__ = [
     "BLOCK_THREADS",
+    "DEFAULT_DTYPE",
     "QUANT_I8_MAX",
-    "SUPPORTED_DTYPE",
+    "SUPPORTED_DTYPES",
     "compile_iluvatar_rmsnorm",
     "compile_iluvatar_rmsnorm_dynamicquant",
     "compile_iluvatar_rmsnorm_smoothquant",
