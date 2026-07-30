@@ -42,7 +42,7 @@ gpu.module @t [#ixdl.target<chip = "ivcore11">] {
 }
 
 // -----------------------------------------------------------------------------
-// B8 Row8b: Euclidean thr→byte fold
+// B8 Row8b: Euclidean thr->byte fold
 //   4*(lane%16) + 64*(lane/16)  ->  4*lane
 //   Also: A=1 and additive/subtractive noise E inside a shallow add/sub tree:
 //     (lane%16) + 16*(lane/16)           -> lane
@@ -180,7 +180,7 @@ gpu.module @b8_euclid_neg [#ixdl.target<chip = "ivcore11">] {
 //   MS(x) = high | low
 //
 // When x < yyyLo (= 256, lowest set bit of 768), yyy==0 so shr==0 and
-// high==0, therefore MS(x) == x.  Here x = lane_id ∈ [0,64).
+// high==0, therefore MS(x) == x.  Here x = lane_id in [0,64).
 //
 // Before: full MS chain above.  After: printf(lane)  (no ori).
 // -----------------------------------------------------------------------------
@@ -193,7 +193,7 @@ gpu.module @b8_ms_id [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_modswizzle_identity() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
-    // MS<2,6,2> with x = lane < 256 → identity.
+    // MS<2,6,2> with x = lane < 256 -> identity.
     %c768 = arith.constant 768 : i32   // yyyMask
     %c255 = arith.constant 255 : i32   // zbMask  (low 8 bits)
     %cnzb = arith.constant -256 : i32  // ~zbMask (high bits)
@@ -215,7 +215,7 @@ gpu.module @b8_ms_id [#ixdl.target<chip = "ivcore11">] {
 // Second 256B word of a 512B row tile: x = base + 256 with base < 256
 // (here base = lane_id).  Full expansion:
 //   x    = base + 256
-//   yyy  = x & 768                  // for base∈[0,256): always 256
+//   yyy  = x & 768                  // for base in [0,256): always 256
 //   shr  = yyy >> 2                 // = 64
 //   low  = (x + shr) & 255          // = (base + 256 + 64) & 255 = (base+320)&255
 //   high = x & (~255)               // = 256  (second-word bit)
@@ -239,7 +239,7 @@ gpu.module @b8_ms_id [#ixdl.target<chip = "ivcore11">] {
 gpu.module @b8_ms_sw [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_modswizzle_second_word() kernel {
     %lane_idx = gpu.lane_id
-    %lane = arith.index_cast %lane_idx : index to i32  // base ∈ [0,64) < 256
+    %lane = arith.index_cast %lane_idx : index to i32  // base in [0,64) < 256
     %c256 = arith.constant 256 : i32   // second-word offset
     %c768 = arith.constant 768 : i32   // yyyMask
     %c255 = arith.constant 255 : i32   // zbMask
@@ -260,7 +260,7 @@ gpu.module @b8_ms_sw [#ixdl.target<chip = "ivcore11">] {
 }
 
 // -----------------------------------------------------------------------------
-// Row S2R: warp_base + 4*lane → readfirstlane(warp_base) + 4*lane
+// Row S2R: warp_base + 4*lane -> readfirstlane(warp_base) + 4*lane
 // -----------------------------------------------------------------------------
 // CHECK-LABEL: gpu.func @b8_row_tid4_readfirstlane
 // CHECK:       %[[LANE_IDX:.+]] = gpu.lane_id

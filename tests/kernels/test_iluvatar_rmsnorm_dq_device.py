@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar RMSNorm V2 dynamic-quant device tests (fp32 input → i8 output)."""
+"""Iluvatar RMSNorm V2 dynamic-quant device tests (fp32 input -> i8 output)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from kernels.norm.iluvatar.rmsnorm_kernel import (  # noqa: E402
 )
 
 EPS = 1e-5
-# fp reduction (sumsq, amax) reorder → up to 1-LSB drift in i8 space; scale drift
+# fp reduction (sumsq, amax) reorder -> up to 1-LSB drift in i8 space; scale drift
 # stays well under 1e-3 relative for the shapes tested here.
 OUTPUT_ATOL_LSB = 1
 SCALE_RTOL = 1e-3
@@ -47,8 +47,8 @@ def _configure_iluvatar_env(monkeypatch) -> None:
 
 
 def _reference_rmsnorm_dq_fp32(x: torch.Tensor, gamma: torch.Tensor, eps: float):
-    # Semantic mirror of the kernel: 3-pass f32 rmsnorm → per-row amax → sym scale
-    # → truncate-toward-zero cast. Kept in float64 for the amax/scale step so any
+    # Semantic mirror of the kernel: 3-pass f32 rmsnorm -> per-row amax -> sym scale
+    # -> truncate-toward-zero cast. Kept in float64 for the amax/scale step so any
     # divergence from the kernel comes from reduction reorder, not the reference.
     mean_sq = (x * x).mean(dim=1, keepdim=True)
     rrms = torch.rsqrt(mean_sq + eps)
@@ -104,7 +104,7 @@ def test_iluvatar_rmsnorm_dq_forward_v2_i8(monkeypatch, M, N):
 
 
 def test_iluvatar_rmsnorm_dq_all_zero_row(monkeypatch):
-    # Degenerate row: scale would divide by zero → kernel pins final_scale=1
+    # Degenerate row: scale would divide by zero -> kernel pins final_scale=1
     # and stores out=0. Verifies the ``select(scale==0, 1, scale)`` protection.
     M, N = 3, 128
     x = torch.zeros((M, N), device="cuda", dtype=torch.float32).contiguous()

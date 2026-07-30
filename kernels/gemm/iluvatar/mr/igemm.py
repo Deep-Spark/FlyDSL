@@ -83,7 +83,7 @@ def _block_swizzle_group_m(grid_m: int, cap: int = BLOCK_SWIZZLE_GROUP_M) -> int
 
 # Multi-stage wins on latency-bound, small
 # grids; large grids are compute/occupancy-bound and prefer the 65KB 2-stage
-# double buffer — except deep S4 when S2R is k-spanning, or i32 square/short-K.
+# double buffer -- except deep S4 when S2R is k-spanning, or i32 square/short-K.
 # Empirical crossover on ivcore11: <=16 CTAs -> 3-stage.
 AUTO_STAGES_BLOCK_THRESH = 16
 # Large grids (>= this many CTAs, >= 4 K-tiles, 4-stage SMEM within cap):
@@ -601,7 +601,7 @@ def _build_igemm_kernel(
                         _sync_arrive((stages - 2 - (j + 1)) * g2s_load_inst)
             else:
                 # Prologue (match hgemm double-buffer peel):
-                #   issue0 → barrier (IXDL drains g2scnt) → issue1 (no wait) →
+                #   issue0 -> barrier (IXDL drains g2scnt) -> issue1 (no wait) ->
                 #   peel stage0 so S2R/MMA overlaps tile1 G2S.
                 issue_stage(fx.Int32(0), fx.Int32(0))
                 fx.gpu.barrier()
@@ -613,7 +613,7 @@ def _build_igemm_kernel(
 
                 def _k_iter_body(k_idx):
                     # Match hgemm: after barrier the compute stage is ready and
-                    # the other stage is free — issue next G2S before deferred MMA so
+                    # the other stage is free -- issue next G2S before deferred MMA so
                     # copies overlap that MMA. Stage pick is branchless via %2 + XOR.
                     fx.gpu.barrier()
                     k_tile = k_idx + 2
@@ -645,7 +645,7 @@ def _build_igemm_kernel(
 
         if fx.const_expr(epilogue == EPILOGUE_I8):
             # PackOnly (N_SWIZZLE path): no SLB. PackSlb: reuse a free pipeline
-            # stage when StageSize >= WarpCnt*1024 — pack into the stage not read
+            # stage when StageSize >= WarpCnt*1024 -- pack into the stage not read
             # by the final S2R and skip the CTA barrier.
             epi_smem = smem_base
             skip_bar = False

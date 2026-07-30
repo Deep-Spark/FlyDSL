@@ -19,7 +19,7 @@ namespace mlir::fly_ixdl {
 namespace {
 
 // MR TCU multiplicand type -> IXDL MMAD element type. Signless/signed i8 -> s8,
-// unsigned i8 -> u8 (matches ixcc getMmadIntrinsicId keys).
+// unsigned i8 -> u8.
 std::optional<IXDL::MMADTypes> mmadMultiplicandType(Type t) {
   if (t.isF16())
     return IXDL::MMADTypes::f16;
@@ -51,7 +51,7 @@ Value materializeFragment(OpBuilder &builder, Location loc, Value v, VectorType 
 FailureOr<Value> buildMmad(OpBuilder &builder, Location loc, int32_t m, int32_t n, int32_t k,
                            Type elemTyA, Type elemTyB, Type elemTyAcc, Value aVal, Value bVal,
                            Value cVal) {
-  // Per-lane element counts: A/B = M*K/64 = N*K/64; C/D = M*N/64.
+  // Per-lane element counts divide each fragment across the warp.
   int64_t abCount = static_cast<int64_t>(m) * k / 64;
   int64_t accCount = static_cast<int64_t>(m) * n / 64;
   if (abCount <= 0 || accCount <= 0)
@@ -117,7 +117,7 @@ Value MmaOpMRMmaType::rebuildStaticValue(OpBuilder &, Location, Value) const { r
 
 // Warp-collective TCU MMA: all 64 lanes participate and the per-lane fragment
 // ownership is exposed to layout algebra (unlike the SME async copy, which hides
-// the warp). Mirrors CuTe `ThrID = Layout<_64>`.
+// the warp).
 Attribute MmaOpMRMmaType::getThrLayout() const { return FxLayout(FxC(64), FxC(1)); }
 
 Attribute MmaOpMRMmaType::getShapeMNK() const {
@@ -129,9 +129,8 @@ Type MmaOpMRMmaType::getValTypeB() const { return getElemTyB(); }
 Type MmaOpMRMmaType::getValTypeC() const { return getElemTyAcc(); }
 Type MmaOpMRMmaType::getValTypeD() const { return getElemTyAcc(); }
 
-// A/B/C fragment thread-value layouts, transcribed from CuTe ivcore11
-// (mma_traits_ivcorex.hpp). Codomain is the (M,N) tile; ThrID part is (16,4) =
-// 64 lanes, value part is the per-lane element count.
+// A/B/C fragment thread-value layouts for ivcore11. Codomain is the (M,N) tile;
+// ThrID part is (16,4) = 64 lanes, value part is the per-lane element count.
 Attribute MmaOpMRMmaType::getThrValLayoutA() const {
   unsigned bits = getElemTyA().getIntOrFloatBitWidth();
   if (bits == 32) // f32: Layout_16x16_32b_AC

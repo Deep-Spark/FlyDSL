@@ -11,9 +11,9 @@ Entry: ``compile_iluvatar_mr_hgemm_splitk(..., split_k, split_k_mode=...)``
 
 Modes (see ``splitk_utils``):
 
-* **serial** — ordered load-add-store; per-tile GMEM locks + cmpxchg turnstile.
-* **parallel** — fp32 workspace[split_k,M,N] + reduce kernel.
-* **atomic** — zero C then scalar UniversalAtomicAdd.
+* **serial** -- ordered load-add-store; per-tile GMEM locks + cmpxchg turnstile.
+* **parallel** -- fp32 workspace[split_k,M,N] + reduce kernel.
+* **atomic** -- zero C then scalar UniversalAtomicAdd.
 """
 
 import flydsl.compiler as flyc

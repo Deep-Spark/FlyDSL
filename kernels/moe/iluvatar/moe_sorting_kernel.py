@@ -8,9 +8,9 @@ V1 scope is intentionally narrow:
 - Independent entry ``compile_iluvatar_moe_sorting`` (no fused softmax).
 - No ``expert_mask`` (EP mode) and no ``moe_buf`` zero-init side product.
 - Single kernel, single block (``grid=(1,1,1)``, ``block=(256,1,1)``), three
-  phases (histogram → prefix / expert_ids / sentinel fill → scatter)
+  phases (histogram -> prefix / expert_ids / sentinel fill -> scatter)
   separated by ``__syncthreads()``.
-- Two-pass per-expert scan, completely atomic-free — output is deterministic
+- Two-pass per-expert scan, completely atomic-free -- output is deterministic
   and bit-exact reproducible.
 - Compile-time ``num_experts / topk / unit_size``, runtime ``M``.
 
@@ -86,7 +86,7 @@ def _build_moe_sorting_kernel(*, num_experts: int, topk: int, unit_size: int):
     log2_warp = int(math.log2(WARP_SIZE))
     assert (1 << log2_warp) == WARP_SIZE, "WARP_SIZE must be a power of two"
 
-    # Shared-memory layout — depends on compile-time E, so the struct is defined
+    # Shared-memory layout -- depends on compile-time E, so the struct is defined
     # inside the factory rather than at module scope.
     @fx.struct
     class _SmemLayout:
@@ -190,7 +190,7 @@ def _build_moe_sorting_kernel(*, num_experts: int, topk: int, unit_size: int):
         sentinel = (fx.Int32(K) << fx.Int32(24)) | M
 
         # ---------------------------------------------------------------
-        # Phase 1: histogram — count[e] = #{(t,k) : topk_ids[t,k] == e}
+        # Phase 1: histogram -- count[e] = #{(t,k) : topk_ids[t,k] == e}
         # ---------------------------------------------------------------
         for e in range(E):
             my_count = c_zero_i
@@ -210,7 +210,7 @@ def _build_moe_sorting_kernel(*, num_experts: int, topk: int, unit_size: int):
             gpu.barrier()
 
         # ---------------------------------------------------------------
-        # Phase 2: single-thread sequential — prefix, expert_ids, sentinel, nv
+        # Phase 2: single-thread sequential -- prefix, expert_ids, sentinel, nv
         # ---------------------------------------------------------------
         if tid == 0:
             ids_cursor = c_zero_i
@@ -234,7 +234,7 @@ def _build_moe_sorting_kernel(*, num_experts: int, topk: int, unit_size: int):
         gpu.barrier()
 
         # ---------------------------------------------------------------
-        # Phase 3: scatter — write packed_id + weight into per-expert range
+        # Phase 3: scatter -- write packed_id + weight into per-expert range
         # ---------------------------------------------------------------
         for e in range(E):
             prefix_e = fx.memref_load(s_prefix, fx.Int32(e))

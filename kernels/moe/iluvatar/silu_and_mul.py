@@ -171,7 +171,7 @@ def build_iluvatar_silu_and_mul_module(
         n = fx.Int32(inter_dim)
         k = fx.Int32(topk)
 
-        # Step 1 — Decode the sorted row.
+        # Step 1 -- Decode the sorted row.
         # Recover token_id and top-k slot_id from sorted_ids[bid]. A padded
         # sorting entry conventionally encodes token_id == token_num and
         # slot_id == topk, making it fail the validity predicate below.
@@ -185,7 +185,7 @@ def build_iluvatar_silu_and_mul_module(
         )
 
         if is_valid:
-            # Step 2 — Map back to the original token-slot row.
+            # Step 2 -- Map back to the original token-slot row.
             # Activation storage stays in original order even though CTAs are
             # launched in expert-sorted order.
             row = token_id * k + slot_id
@@ -234,20 +234,20 @@ def build_iluvatar_silu_and_mul_module(
                         gate_col = col
                         up_col = col + n
 
-                    # Step 3 — Load this column's gate/up pair.
+                    # Step 3 -- Load this column's gate/up pair.
                     # BF16 stage1 values are promoted to FP32 before bias,
                     # activation, and multiplication.
                     gate = x[row, gate_col].to(fx.Float32)
                     up = x[row, up_col].to(fx.Float32)
 
-                    # Step 4 — Optionally add expert-specific bias.
+                    # Step 4 -- Optionally add expert-specific bias.
                     if const_expr(enable_bias):
                         # Bias uses logical separated gate/up coordinates,
                         # independent of x's physical gui_layout.
                         gate = gate + bias[expert_id, col].to(fx.Float32)
                         up = up + bias[expert_id, col + n].to(fx.Float32)
 
-                    # Step 5 — Apply the selected gate activation and perform
+                    # Step 5 -- Apply the selected gate activation and perform
                     # the elementwise Hadamard product with the up branch.
                     if const_expr(act == "swiglu"):
                         # Project-specific SwiGLU:
@@ -274,7 +274,7 @@ def build_iluvatar_silu_and_mul_module(
                         sigmoid = one / (one + exp2_approx(-gate * log2e))
                         value = gate * sigmoid * up
 
-                    # Step 6 — Convert the FP32 result to BF16 and write it
+                    # Step 6 -- Convert the FP32 result to BF16 and write it
                     # back to the original token-slot row.
                     out[row, col] = value.to(fx.BFloat16)
 

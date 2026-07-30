@@ -17,7 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 _CASES = (
     # label, tokens, experts, topk, dtype_str, renormalize
-    # Token counts sized for WARPS_PER_BLOCK=16 (E=64→TPB=256, E=128→128, E=256→64)
+    # Token counts sized for WARPS_PER_BLOCK=16 (E=64->TPB=256, E=128->128, E=256->64)
     # so prefill/dsv2 still exercise multi-block grids.
     ("decode_f32", 1, 64, 8, "f32", True),
     ("prefill_f32", 512, 64, 8, "f32", True),
@@ -137,8 +137,8 @@ def test_iluvatar_topk_gating_layout_values():
 
     build_fn = _require_kernel()
     launch = build_fn(num_experts=128, topk=8, dtype_str="f32")
-    # Prefer largest VPT: E=128 → VPT=16, TPT=8, tokens/warp=8,
-    # tokens/block = WARPS_PER_BLOCK * 8 (16 → 128).
+    # Prefer largest VPT: E=128 -> VPT=16, TPT=8, tokens/warp=8,
+    # tokens/block = WARPS_PER_BLOCK * 8 (16 -> 128).
     assert launch.layout["VPT"] == 16
     assert launch.layout["THREADS_PER_TOKEN"] == 8
     assert launch.layout["TOKENS_PER_WARP"] == 8

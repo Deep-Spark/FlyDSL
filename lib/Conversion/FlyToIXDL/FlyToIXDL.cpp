@@ -115,7 +115,7 @@ public:
       return success();
     } else if (isTargetAddressSpace<SmeGmemAddressAttr>(addrSpaceAttr)) {
       // sme_gmem make_ptr takes 2 positional args: [base_global_ptr, leading_stride].
-      // Assumption (design doc §6 #1): the second arg is the leading (outermost)
+      // Assumption (design doc section 6 #1): the second arg is the leading (outermost)
       // stride in *element* units; stride_byte = leading_stride * elemBytes.
       auto args = adaptor.getArgs();
       if (args.size() != 2)
@@ -953,7 +953,7 @@ static void rewriteSharedI8x4LoadsAsI32(Operation *root) {
   }
 }
 
-/// Fold ``vector<8xi8>`` rebuild from two ``i32 → vector<4xi8>`` bitcasts into
+/// Fold ``vector<8xi8>`` rebuild from two ``i32 -> vector<4xi8>`` bitcasts into
 /// a permute-free ``vector<2xi32>`` bitcast (same little-endian layout).
 ///
 /// Without this fold, ``convert-vector-to-llvm`` turns the insert_strided_slice

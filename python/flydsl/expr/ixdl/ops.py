@@ -8,8 +8,8 @@ Most wrappers emit Iluvatar LLVM intrinsics via ``llvm.call_intrinsic``.
 ``stp.vs``). Hardware CAS is width-based; ``llvm.cmpxchg`` needs integer
 operands, so non-integer values of a supported width are bitcast to the
 matching signless integer, then bitcast back on the result. Call sites
-pick a width the target supports (ixcc: 16/32-bit all gens; 64-bit on
-Blazer+). Synchronization helpers live in :mod:`flydsl.expr.ixdl.sync`.
+pick a width the target supports (16/32-bit all gens; 64-bit on Blazer+).
+Synchronization helpers live in :mod:`flydsl.expr.ixdl.sync`.
 """
 
 from ..._mlir.dialects import llvm as _llvm
@@ -108,8 +108,8 @@ def atomic_cas(
     Element dtype is taken from ``expected`` / ``desired`` (must match).
     Comparison is **bit-pattern** CAS: non-integer values are bitcast to the
     same-width signless integer for ``llvm.cmpxchg``, then the old value is
-    bitcast back. Call sites pick a width the target can lower (ixcc: 16/32-bit
-    all gens; 64-bit on Blazer+/``ivcore40+``).
+    bitcast back. Call sites pick a width the target can lower (16/32-bit all
+    gens; 64-bit on Blazer+/``ivcore40+``).
 
     ``ptr`` is a ``!fly.ptr`` to that element in global memory.
     ``success_ordering`` / ``failure_ordering`` are ``llvm.AtomicOrdering``
@@ -162,12 +162,12 @@ def _stp_vs_call(bits: int, val, ptr, voffset, soffset, kop: int = 0, pred=None)
 
     Args are ``(val, base, voffset, soffset, kop[, pred])``:
 
-    * ``ptr`` / ``base`` — AS1 pointer to the tile origin (``!fly.ptr``,
+    * ``ptr`` / ``base`` -- AS1 pointer to the tile origin (``!fly.ptr``,
       lowered via ptrtoint/inttoptr and folded in ``convert-fly-to-ixdl``)
-    * ``voffset`` — per-lane byte offset (bake once per lane)
-    * ``soffset`` — per-store secondary byte offset (often a constexpr tile offset)
-    * ``kop`` — store cache policy immediate (default 0)
-    * ``pred`` — optional i1; when set, emits the ``.pred`` intrinsic (pred last)
+    * ``voffset`` -- per-lane byte offset (bake once per lane)
+    * ``soffset`` -- per-store secondary byte offset (often a constexpr tile offset)
+    * ``kop`` -- store cache policy immediate (default 0)
+    * ``pred`` -- optional i1; when set, emits the ``.pred`` intrinsic (pred last)
 
     Public helpers are named by store bit-width only (``b8`` / ``b16`` /
     ``b32`` / ``b64`` / ``b128``), not by element dtype.
