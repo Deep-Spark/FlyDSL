@@ -6,11 +6,11 @@
 Single sorted grouped projection: ``Out[t,s,:] = dequant(X_row @ W[e].T) [* route_w]``.
 
 A is vector-gathered into row-major SMEM ``[bm, bk]`` (not SME). B uses the
-dense MR G2S helpers (``tn`` → Col SME for k-major B; row atom/swizzle args are
+dense MR G2S helpers (``tn`` -> Col SME for k-major B; row atom/swizzle args are
 ``MRAsyncCpRow8b`` / ``SMESwizzle.Row8b`` for the shared config). MMA is
 ``MRMma(16,16,32, Int8, Int8, Int32)`` with a 2-stage software pipeline.
 
-Entry: ``compile_iluvatar_mr_moe_gemm(...)`` → ``@flyc.jit`` launcher.
+Entry: ``compile_iluvatar_mr_moe_gemm(...)`` -> ``@flyc.jit`` launcher.
 """
 
 import flydsl.compiler as flyc

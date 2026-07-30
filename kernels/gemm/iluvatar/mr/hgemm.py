@@ -10,15 +10,15 @@ Entry: compile_iluvatar_mr_hgemm(M=..., N=..., K=..., elem_dtype=fx.Float16|fx.B
   -> launch_gemm(A, B, C, stream=...).
 
 Tuning:
-  elem_dtype — A/B (and no_c_read C) element type: Float16 (default) or BFloat16.
+  elem_dtype -- A/B (and no_c_read C) element type: Float16 (default) or BFloat16.
     Geometry / SME / S2R are shared; only MRMma multiplicand type differs.
-  epilogue no_c_read (default) — D = A @ B.T, f16/bf16 out, acc zeroed. epilogue_store: shfl (default) or tiled.
-  epilogue read_c_accum — C = A @ B.T + C, fp32 out, load C before MMA.
+  epilogue no_c_read (default) -- D = A @ B.T, f16/bf16 out, acc zeroed. epilogue_store: shfl (default) or tiled.
+  epilogue read_c_accum -- C = A @ B.T + C, fp32 out, load C before MMA.
 
-  major_pattern — BLAS layout tags nn/nt/tn (default)/tt on logical A(m,k)/B(n,k); see GemmLayout.
+  major_pattern -- BLAS layout tags nn/nt/tn (default)/tt on logical A(m,k)/B(n,k); see GemmLayout.
     Default tn: both k-major, PyTorch (m,k)/(n,k) need no host transpose.
 
-  CTA shape — warps_m/n, warp_atoms_m/n, k_atoms (BK = ATOM_K_B16 * k_atoms).
+  CTA shape -- warps_m/n, warp_atoms_m/n, k_atoms (BK = ATOM_K_B16 * k_atoms).
   SWIZZLE_CTA_PRESETS: 1024 (4x4 warps, 4x4 atoms/warp, 256x256 tile), 2048 (4x8 warps, 4x2 atoms).
   Default compile kwargs: 4x4 warps, 4x4 atoms, k_atoms=2 (BK=32).
 """
@@ -343,7 +343,7 @@ def _build_swizzle_kernel(
                 a_frags, b_frags = _s2r_mma_defer_last(stage_base)
                 _mma_frags(a_frags, b_frags)
 
-            # Prologue: tile0 G2S → barrier (IXDL drains g2scnt before barrier);
+            # Prologue: tile0 G2S -> barrier (IXDL drains g2scnt before barrier);
             # tile1 issue only so Peel S2R on stage0 overlaps tile1 G2S.
             issue_stage(fx.Int32(0), fx.Int32(0))
             fx.gpu.barrier()

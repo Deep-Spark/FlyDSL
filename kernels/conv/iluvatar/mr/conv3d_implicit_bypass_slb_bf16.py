@@ -931,9 +931,9 @@ def conv3d_implicit_bypass_slb(
     )
 
     # Step 3: execute the implicit GEMM:
-    # xp： [N, D, H, W, G*C_padded]
-    # wp： [G, N_padded, K_reduction_padded] # K_reduction_padded -> TRSC
-    # yw： [M_padded, G*N_padded]            # N_padded -> K
+    # xp: [N, D, H, W, G*C_padded]
+    # wp: [G, N_padded, K_reduction_padded] # K_reduction_padded -> TRSC
+    # yw: [M_padded, G*N_padded]            # N_padded -> K
     #
     #   xp (implicit A) @ wp.T (packed B)
     #   --> yw [M_padded, G*N_padded].

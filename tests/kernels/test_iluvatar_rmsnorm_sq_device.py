@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar RMSNorm V3 SmoothQuant device tests (fp32 + x_scale → i8)."""
+"""Iluvatar RMSNorm V3 SmoothQuant device tests (fp32 + x_scale -> i8)."""
 
 from __future__ import annotations
 

@@ -354,7 +354,7 @@ def _check(
         got = C
     diff = (got - expected).abs()
     # atomic / serial truncate through f16/bf16 each partition; parallel keeps
-    # fp32 workspace then one trunc — scale atol for low-precision reduce modes.
+    # fp32 workspace then one trunc -- scale atol for low-precision reduce modes.
     atol = _compare_atol(k, k_atoms, dtype_name=dtype_name)
     if split_k > 1 and split_k_mode != SPLIT_K_MODE_PARALLEL:
         atol = atol * (max(1, split_k) ** 0.5)
