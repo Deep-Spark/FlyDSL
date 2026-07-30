@@ -10,7 +10,7 @@ Design choices for V1:
   (``BLOCK_THREADS = 64``).
 - Multi-width vectorized fast paths (``UniversalCopy{128,64,32}b``) plus
   scalar fallback for arbitrary ``N``.
-- Supported dtypes: f16 / bf16. Accumulation is always f32.
+- Supported dtypes: f16 / bf16 / f32. Accumulation is always f32.
 - Exponentiation: Schraudolph-style bitcast ``exp2`` approximation.
 """
 
@@ -24,9 +24,10 @@ from flydsl.expr.vector import ReductionOp
 from kernels.gemm.iluvatar.common import WARP_SIZE
 
 BLOCK_THREADS = 64
-SUPPORTED_DTYPES = ("f16", "bf16")
+SUPPORTED_DTYPES = ("f16", "bf16", "f32")
 TORCH_F16_NAME = "torch.float16"
 TORCH_BF16_NAME = "torch.bfloat16"
+TORCH_F32_NAME = "torch.float32"
 
 
 def _dtype_to_elem_type(dtype_str: str):
@@ -34,7 +35,9 @@ def _dtype_to_elem_type(dtype_str: str):
         return fx.Float16
     if dtype_str == "bf16":
         return fx.BFloat16
-    raise ValueError(f"Iluvatar softmax supports only 'f16'/'bf16', got {dtype_str!r}")
+    if dtype_str == "f32":
+        return fx.Float32
+    raise ValueError(f"Iluvatar softmax supports only {SUPPORTED_DTYPES}, got {dtype_str!r}")
 
 
 def _dtype_name(tensor) -> str:
@@ -46,7 +49,9 @@ def _torch_dtype_name(dtype_str: str) -> str:
         return TORCH_F16_NAME
     if dtype_str == "bf16":
         return TORCH_BF16_NAME
-    raise ValueError(f"Iluvatar softmax supports only 'f16'/'bf16', got {dtype_str!r}")
+    if dtype_str == "f32":
+        return TORCH_F32_NAME
+    raise ValueError(f"Iluvatar softmax supports only {SUPPORTED_DTYPES}, got {dtype_str!r}")
 
 
 def _byte_range(tensor) -> tuple[int, int]:
@@ -67,6 +72,11 @@ def _build_softmax_kernel(*, N: int, dtype_str: str):
             f"internal error: V1 softmax expects single-warp block, got "
             f"BLOCK_THREADS={BLOCK_THREADS} WARP_SIZE={WARP_SIZE}"
         )
+
+    elem_bits = 32 if dtype_str == "f32" else 16
+    vec128_width = 128 // elem_bits
+    vec64_width = 64 // elem_bits
+    vec32_width = 32 // elem_bits
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def _softmax_kernel(x: fx.Tensor, out: fx.Tensor):
@@ -162,12 +172,12 @@ def _build_softmax_kernel(*, N: int, dtype_str: str):
                 _store_vec(out_e, out_div, out_idx)
 
         # Fast paths: aligned vectorized copy via UniversalCopy{128,64,32}b.
-        if const_expr(N >= BLOCK_THREADS * 8 and N % (BLOCK_THREADS * 8) == 0):
-            _run_vectorized(8, fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype))
-        elif const_expr(N >= BLOCK_THREADS * 4 and N % (BLOCK_THREADS * 4) == 0):
-            _run_vectorized(4, fx.make_copy_atom(fx.UniversalCopy64b(), elem_dtype))
-        elif const_expr(N >= BLOCK_THREADS * 2 and N % (BLOCK_THREADS * 2) == 0):
-            _run_vectorized(2, fx.make_copy_atom(fx.UniversalCopy32b(), elem_dtype))
+        if const_expr(N >= BLOCK_THREADS * vec128_width and N % (BLOCK_THREADS * vec128_width) == 0):
+            _run_vectorized(vec128_width, fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype))
+        elif const_expr(N >= BLOCK_THREADS * vec64_width and N % (BLOCK_THREADS * vec64_width) == 0):
+            _run_vectorized(vec64_width, fx.make_copy_atom(fx.UniversalCopy64b(), elem_dtype))
+        elif const_expr(N >= BLOCK_THREADS * vec32_width and N % (BLOCK_THREADS * vec32_width) == 0):
+            _run_vectorized(vec32_width, fx.make_copy_atom(fx.UniversalCopy32b(), elem_dtype))
         else:
             # Generic path: scalar for arbitrary N.
             row_buffer = []
@@ -213,7 +223,7 @@ def compile_iluvatar_softmax(*, N: int, dtype: str = "f16") -> Callable:
 
     Args:
         N: Hidden size. Compile-time constant and must be ``> 0``.
-        dtype: ``"f16"`` or ``"bf16"``.
+        dtype: ``"f16"``, ``"bf16"``, or ``"f32"``.
 
     Returns:
         ``launch_softmax(x, out, M, stream=None) -> out``.

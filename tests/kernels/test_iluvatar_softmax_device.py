@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar Softmax V1 device tests (f16/bf16 row-wise)."""
+"""Iluvatar Softmax V1 device tests (f16/bf16/f32 row-wise)."""
 
 from __future__ import annotations
 
@@ -50,6 +50,8 @@ def _torch_dtype(dtype_str: str):
         return torch.float16
     if dtype_str == "bf16":
         return torch.bfloat16
+    if dtype_str == "f32":
+        return torch.float32
     raise ValueError(dtype_str)
 
 
@@ -216,6 +218,9 @@ def _maybe_bench_ixdnn_softmax_us(x, *, warmup: int, iters: int):
         (32, 1024, "bf16", 2e-2),
         (16, 7296, "bf16", 2e-2),
         (31, 1003, "bf16", 2e-2),
+        (64, 256, "f32", 1e-2),
+        (64, 250, "f32", 1e-2),
+        (16, 7424, "f32", 1e-2),
         (0, 256, "f16", 1e-2),
     ),
 )
@@ -265,7 +270,7 @@ def test_iluvatar_softmax_compile_time_guards():
     with pytest.raises(ValueError, match="N must be > 0"):
         compile_iluvatar_softmax(N=0, dtype="f16")
     with pytest.raises(ValueError, match="dtype must be one of"):
-        compile_iluvatar_softmax(N=128, dtype="f32")
+        compile_iluvatar_softmax(N=128, dtype="f64")
 
 
 def test_iluvatar_softmax_runtime_guards(monkeypatch):
@@ -303,6 +308,7 @@ def test_iluvatar_softmax_perf_vs_torch(monkeypatch):
     for m, n, dtype_str in (
         (4096, 8192, "f16"),
         (4096, 8192, "bf16"),
+        (4096, 8192, "f32"),
     ):
         launch = compile_iluvatar_softmax(N=n, dtype=dtype_str)
 
