@@ -242,7 +242,7 @@ def build_iluvatar_topk_gating_softmax(
         for v in range_constexpr(VPT):
             prob_list.append(exp_list[v] * inv_sum)
 
-        # Pass 4: iterative TopK (sub-warp argmax → mask). No delayed_softmax.
+        # Pass 4: iterative TopK (sub-warp argmax -> mask). No delayed_softmax.
         selected_weights = []
         selected_indices = []
         selected_sum = c_zero_f

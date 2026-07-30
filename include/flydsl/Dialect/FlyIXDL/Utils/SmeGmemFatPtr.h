@@ -27,7 +27,7 @@ namespace mlir::fly_ixdl {
 // (a 32-bit per-tile offset) rather than folded into the 64-bit base. This lets
 // the backend keep one descriptor and advance only the narrow offset -- constant
 // offsets fold into the goffimm immediate, variable ones stay 32-bit adds
-// (see design doc §10).
+// (see design doc section 10).
 class SmeGmemFatPtr {
   static constexpr unsigned kGmemAddrSpace = 1;   // global
   static constexpr unsigned kStrideBitWidth = 32; // leading stride in bytes

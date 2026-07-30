@@ -60,7 +60,7 @@ Attribute CopyOpMRAsyncCpType::getThrBitLayoutDst() const {
 Attribute CopyOpMRAsyncCpType::getThrBitLayoutRef() const { return getThrBitLayoutDst(); }
 
 // MRAsyncCp lowers a one-directional async copy global(#fly_ixdl.sme_gmem) ->
-// shared into the ixcc `ixdl.cp_async.*` op family. The core lives in the
+// shared into the `ixdl.cp_async.*` op family. The core lives in the
 // non-predicated emitAtomCall; SSA / predicated entry points delegate to it
 // (mirrors FlyROCDL BufferCopyLDS).
 
@@ -89,7 +89,7 @@ LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc
   // as the hardware gOffset operand (a 32-bit offset added on top of the
   // descriptor base) instead of being folded into the 64-bit base, so the
   // descriptor hoists out of a tile loop and only the narrow offset advances
-  // (constant offsets fold into the goffimm immediate; see design doc §10).
+  // (constant offsets fold into the goffimm immediate; see design doc section 10).
   SmeGmemFatPtr srcFat(srcMemTy.getPointerType(), src);
   Value gBase = srcFat.smeDescriptorVec(builder, loc);
   Value gOffset = srcFat.byteOffset(builder, loc);

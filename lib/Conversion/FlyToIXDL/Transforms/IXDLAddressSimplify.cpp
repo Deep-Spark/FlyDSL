@@ -3,8 +3,8 @@
 
 // IXDL shared-memory address peeps (kept minimal for measured S2R benefit):
 //   1) HGEMM: collapse equivalent lane-affine forms in shared copy offsets
-//      (e.g. (lane^1)^33 → lane^32).
-//   2) B8 / Row8b S2R: Euclidean thr→byte + ModSwizzle closed forms, then
+//      (e.g. (lane^1)^33 -> lane^32).
+//   2) B8 / Row8b S2R: Euclidean thr->byte + ModSwizzle closed forms, then
 //      readfirstlane on warp-uniform bases of `base + 4*lane`.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -276,7 +276,7 @@ void optAddrInFunc(gpu::GPUFuncOp fn, int warpSize) {
 }
 
 // =============================================================================
-// B8 / Row8b: Euclidean thr→byte fold + ModSwizzle closed forms
+// B8 / Row8b: Euclidean thr->byte fold + ModSwizzle closed forms
 // =============================================================================
 //
 // Row8b S2R lowers CuTe-style ModSwizzle MS<B,M,S> into bit arithmetic. For the
@@ -296,10 +296,10 @@ void optAddrInFunc(gpu::GPUFuncOp fn, int warpSize) {
 //
 // Folds (need UpperBound to prove ranges):
 //   1) Identity: if x < yyyLo (= lowest set bit of yyyMask = 256), then
-//      yyy==0 ⇒ MS(x) == x.
+//      yyy==0 => MS(x) == x.
 //   2) Second word: if x = base+256 with base < 256, then for MS<2,6,2>
 //      yyy==256, shr==64, high==256, so
-//        MS(base+256) → ((base + 320) & 255) | 256
+//        MS(base+256) -> ((base + 320) & 255) | 256
 //      (320 = 256+64 folds the constant into the low-byte add).
 //
 // These closed forms leave a natural `base + 4*lane` shape for the later
@@ -330,7 +330,7 @@ uint64_t UpperBound::fromDef(Value v) {
   if (!def)
     return kUnknown;
 
-  // ivcore11 warp is 64; lane_id ∈ [0, 64).
+  // ivcore11 warp is 64; lane_id in [0, 64).
   if (isa<gpu::LaneIdOp>(def))
     return 64;
   if (isa<gpu::ThreadIdOp>(def))
@@ -423,7 +423,7 @@ std::optional<uint64_t> UpperBound::getExclusive(Value v) {
   return u;
 }
 
-/// One term in a flattened add/sub tree: ``sign * v`` with ``sign ∈ {+1,-1}``.
+/// One term in a flattened add/sub tree: ``sign * v`` with ``sign in {+1,-1}``.
 struct SignedSummand {
   Value v;
   int sign;
@@ -514,9 +514,9 @@ static bool matchScaledRemOrDiv(Value v, bool wantRem, Value &x, int64_t &scale,
   return matchRemDiv(v, /*s=*/1);
 }
 
-/// A*(x%N) + E + (A*N)*(x/N)  →  A*x + E   (also A==1: x%N + N*(x/N) → x)
+/// A*(x%N) + E + (A*N)*(x/N)  ->  A*x + E   (also A==1: x%N + N*(x/N) -> x)
 /// when x is known non-negative. ``E`` is any remaining signed add/sub summands.
-/// Rem/div must share the same sign (both + → +A*x; both − → −A*x).
+/// Rem/div must share the same sign (both + -> +A*x; both - -> -A*x).
 /// Flatten depth is capped (kMaxAddDepth) to keep matching local.
 static void strengthReduceEuclideanLaneAddr(gpu::GPUFuncOp fn, UpperBound &bounds) {
   constexpr int kMaxAddDepth = 4;
@@ -622,10 +622,10 @@ static void strengthReduceEuclideanLaneAddr(gpu::GPUFuncOp fn, UpperBound &bound
 /// Match expanded ModSwizzle
 ///   MS(x) = (x & ~zb) | (((x + ((x & yyy) >> s)) & zb)
 /// and fold:
-///   - Identity:  MS(x) → x  when exclusive upper bound of x ≤ yyyLo
+///   - Identity:  MS(x) -> x  when exclusive upper bound of x <= yyyLo
 ///                (yyyLo = lowest set bit of yyy; for yyy=768, yyyLo=256).
 ///   - Second word (MS<2,6,2> only: yyy=768, zb=255, s=2):
-///                MS(base+256) → ((base+320)&255)|256  when base < 256.
+///                MS(base+256) -> ((base+320)&255)|256  when base < 256.
 /// See section comment above for the algebra.
 static void simplifyModSwizzle(gpu::GPUFuncOp fn, UpperBound &bounds) {
   SmallVector<arith::OrIOp> modCandidates;
@@ -674,7 +674,7 @@ static void simplifyModSwizzle(gpu::GPUFuncOp fn, UpperBound &bounds) {
     auto hi = bounds.getExclusive(x);
     if (!hi)
       continue;
-    // Identity: x < yyyLo ⇒ (x & yyy) == 0 ⇒ MS(x) == x.
+    // Identity: x < yyyLo => (x & yyy) == 0 => MS(x) == x.
     uint64_t yyyLo = yyy & -yyy;
     if (yyyLo != 0 && *hi <= yyyLo) {
       ori.replaceAllUsesWith(x);
@@ -684,7 +684,7 @@ static void simplifyModSwizzle(gpu::GPUFuncOp fn, UpperBound &bounds) {
 
     // Second-word closed form for MS<2,6,2> on x = base+256, base < 256:
     //   (x&768)>>2 == 64, x&~255 == 256
-    //   ⇒ MS = ((base+320)&255)|256.
+    //   => MS = ((base+320)&255)|256.
     if (yyy == 768 && zb == 255 && *shiftC == 2) {
       if (auto add256 = x.getDefiningOp<arith::AddIOp>()) {
         auto imm = getConstantIntValue(add256.getRhs());
@@ -756,9 +756,9 @@ static bool isWarpUniformAddr(Value v, Value lane, int depth = 0) {
 
   // TODO: Replace the tidHighBits special-cases below with sampling, in the
   // same spirit as matchLaneAffine/evalLaneExprAt. Treat v as f(tid, lane):
-  // for several warp bases W, bind tid = 64*W+lane over lane∈[0,63] and check
-  // that f is constant within each W (eval failure → divergent). Do not sample
-  // only tid∈[0,63] (misses false positives like tid/100 across warps).
+  // for several warp bases W, bind tid = 64*W+lane over lane in [0,63] and check
+  // that f is constant within each W (eval failure -> divergent). Do not sample
+  // only tid in [0,63] (misses false positives like tid/100 across warps).
   //
   // warp_id = tid >> 6  (or tid / 64) is warp-uniform.
   auto tidHighBits = [&](Value x) -> bool {
@@ -792,7 +792,7 @@ static bool isWarpUniformAddr(Value v, Value lane, int depth = 0) {
       return true;
   }
   if (auto andi = dyn_cast<arith::AndIOp>(def)) {
-    // Masking off low 6 bits of tid → warp-uniform high bits.
+    // Masking off low 6 bits of tid -> warp-uniform high bits.
     if (auto m = getConstantIntValue(andi.getRhs()); m && (*m & 63) == 0) {
       if (tidHighBits(andi.getLhs()))
         return true;
@@ -828,7 +828,7 @@ static bool isLaneTimes4(Value v, Value lane) {
   return scaled && scaled == lane;
 }
 
-/// Collapse trivial MS residue when ``k==0``: ``(4*lane)&255`` → ``4*lane``.
+/// Collapse trivial MS residue when ``k==0``: ``(4*lane)&255`` -> ``4*lane``.
 static void collapseTrivialLane4Masks(gpu::GPUFuncOp fn) {
   Value lane = findI32LaneId(fn);
   if (!lane)
@@ -865,7 +865,7 @@ static bool isSharedAddrRootCombine(Operation *op) {
   return true;
 }
 
-/// ``base + 4*lane`` / ``base + (4*lane + U)`` → ``readfirstlane(base[+U]) + 4*lane``.
+/// ``base + 4*lane`` / ``base + (4*lane + U)`` -> ``readfirstlane(base[+U]) + 4*lane``.
 static void promoteLane4BaseWithReadFirstLane(gpu::GPUFuncOp fn) {
   Value lane = findI32LaneId(fn);
   if (!lane)

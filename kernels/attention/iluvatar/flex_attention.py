@@ -3,14 +3,10 @@
 
 """Iluvatar flex-attention forward kernel (V1).
 
-This is a **variant subset** of PyTorch flex_attention (causal / SWA / softcap),
-not a general ``score_mod`` compiler. See ``docs/iluvatar_flex_attention_v1_plan.md``.
-
-Landed:
-* PR-1a/1b/1c: fused forward, bf16 / D=128 / MHA / aligned self-attn, ``is_causal``.
-* PR-2a: ``softcap`` (Gemma-2) + ``window_size`` (SWA); independent of causal.
-* PR-2b: ``dtype`` in {f16, bf16} and ``D`` in {64, 128}.
-* PR-2c: GQA, cross-attn (``Sq != Skv``), and arbitrary ``Sq``/``Skv`` via phys pad.
+This is a variant subset of PyTorch flex_attention, not a general ``score_mod``
+compiler. It supports f16/bf16 inputs, head dimensions 64 and 128, MHA/GQA,
+self/cross-attention, physical sequence padding, causal masking, sliding-window
+attention, and Gemma-2 softcap.
 """
 
 import math
@@ -40,8 +36,7 @@ from kernels.gemm.iluvatar.mr.common import (
 
 WARP_SIZE = 64
 
-# --- PR-1 fixed tile parameters -----------------------------------------------
-# Frozen internal constants per plan Q10 (c). PR-2 keeps them internal.
+# --- Fixed tile parameters ----------------------------------------------------
 BLOCK_M = 64
 BLOCK_N = 64
 WARPS_M = 2
@@ -53,12 +48,12 @@ BLOCK_THREADS = NUM_WARPS * WARP_SIZE
 
 assert BLOCK_M == ATOM_M * WARP_ATOMS_M * WARPS_M
 assert BLOCK_N == ATOM_N * WARP_ATOMS_N * WARPS_N
-# PR-1b's cross-warp softmax reduce is written unconditionally (no
-# ``if WARPS_N > 1``) to sidestep AST-rewriter branch-scoping; enforce here.
-assert WARPS_N > 1, "PR-1b requires WARPS_N > 1 for the SMEM rowmax/rowsum reduce"
+# The cross-warp softmax reduce is unconditional to sidestep AST-rewriter
+# branch scoping, so this configuration requires more than one N warp.
+assert WARPS_N > 1, "WARPS_N must be > 1 for the SMEM rowmax/rowsum reduce"
 
 
-# --- Supported variants (V1 / PR-2c) ------------------------------------------
+# --- Supported variants -------------------------------------------------------
 _SUPPORTED_DTYPES = ("f16", "bf16")
 _SUPPORTED_D = (64, 128)
 _DTYPE_STR_TO_FX = {"f16": fx.Float16, "bf16": fx.BFloat16}
@@ -86,7 +81,7 @@ def _validate_scope(
     window_size: int | None,
     softcap: float | None,
 ) -> None:
-    """Validate compile-time inputs against the V1 envelope (plan §2.4)."""
+    """Validate compile-time inputs against the supported V1 envelope."""
     if B <= 0 or H <= 0 or Hkv <= 0 or Sq <= 0 or Skv <= 0 or D <= 0:
         raise ValueError(f"all shape dims must be positive; got B={B} H={H} Hkv={Hkv} Sq={Sq} Skv={Skv} D={D}")
     if dtype not in _SUPPORTED_DTYPES:
@@ -104,7 +99,7 @@ def _validate_scope(
 
 
 def _validate_qk_dot_subset(*, H: int, Hkv: int, Sq: int, Skv: int) -> None:
-    """Keep the PR-1a qk_dot helper on MHA + BLOCK-aligned self-attn only."""
+    """Keep the qk_dot helper on MHA and block-aligned self-attention only."""
     if H != Hkv:
         raise NotImplementedError(
             f"qk_dot helper is MHA-only (Hkv=H); got H={H}, Hkv={Hkv}. " "Use compile_iluvatar_flex_attention for GQA."
@@ -126,15 +121,14 @@ def _tensor_shape(t) -> tuple[int, ...]:
 
 
 def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: str, sm_scale_f32: float) -> Callable:
-    """Compile a plain ``S = (Q @ K^T) * sm_scale`` launcher (PR-1a dev helper).
+    """Compile a plain ``S = (Q @ K^T) * sm_scale`` development launcher.
 
     Layouts:
       * Q, K : ``[B, H, S*, D]`` bf16 (or f16), k-major in D.
       * S    : ``[B, H, Sq, Skv]`` fp32 output.
 
-    One CTA processes one (b, h, q-tile) triple; loops over kv-tiles internally.
-    Single-buffered K (no G2S/S2R pipelining) for PR-1a — perf tuning is a PR-1b
-    concern once end-to-end numerical correctness is established.
+    One CTA processes one (b, h, q-tile) triple and loops over kv-tiles
+    internally. K is single-buffered without G2S/S2R pipelining.
     """
     from kernels.gemm.iluvatar.epilogue import mr_hgemm_epilogue_store_read_c_accum
     from kernels.gemm.iluvatar.mr.operand_copy import (
@@ -147,7 +141,7 @@ def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: 
     elem_dtype = _DTYPE_STR_TO_FX[dtype]
     num_q_tiles = Sq // BLOCK_M
     num_kv_tiles = Skv // BLOCK_N
-    bk = D  # inner MMA K axis == full head dim; no D-axis pipeline in PR-1a.
+    bk = D  # Inner MMA K axis is the full head dimension; no D-axis pipeline.
     k_atoms = bk // ATOM_K_B16  # e.g. 128 / 16 = 8
 
     a_atoms_total, b_atoms_total, _, _ = sme_atom_counts(
@@ -249,7 +243,7 @@ def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: 
         vpr = MR_GEMM_GEOM.values_per_sme_row
         tile_smem_qk = fx.make_tile(SMEM_ROWS, vpr)
 
-        # Template S tile bound to (q_tile_idx, 0) — only its shape is used to size the
+        # Template S tile bound to (q_tile_idx, 0) -- only its shape is used to size the
         # per-warp accumulator fragments. Actual gmem addresses come from a runtime
         # (q_tile_idx, kv_idx) slice inside the KV loop.
         gS_template = fx.slice(gS_all, (None, None, q_tile_idx, fx.Int32(0)))
@@ -382,7 +376,7 @@ def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: 
     return launch_qk_dot
 
 
-def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cyclomatic score)
+def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic score)
     *,
     B: int,
     H: int,
@@ -396,25 +390,24 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     window_size: int | None = None,
     softcap: float | None = None,
 ) -> Callable:
-    """Compile the flex-attention forward launcher (PR-1 .. PR-2c).
+    """Compile the flex-attention forward launcher.
 
     FA-1 chain: Q resident in SMEM; per-KV-tile MMA1 (Q @ K^T) -> online softmax
     with rowmax/rowsum cross-warp reduce -> P via SMEM (bf16, plain logical
-    ``(BLOCK_M, BLOCK_N)`` layout — NOT SME-swizzled; the write side uses C
+    ``(BLOCK_M, BLOCK_N)`` layout -- NOT SME-swizzled; the write side uses C
     operand TV via ``make_tiled_copy_C.partition_S`` and the read side uses A
     operand TV via ``make_tiled_copy_A.partition_S``, so both agree on the
     logical MN coordinates without a permutation) -> MMA2 (P @ V, host-side
     transposed V so both operands are k-major "tn") -> divide by rowsum ->
     write bf16 O back to gmem.
 
-    Score mods (plan §2.3), after MMA1:
-      * softcap set: ``S *= sm_scale`` → ``softcap * tanh(S/softcap)`` → ``S *= log2e``
-      * softcap None: fused ``S *= (sm_scale * log2e)`` (bit-exact with PR-1)
+    Score modifications after MMA1:
+      * softcap set: ``S *= sm_scale`` -> ``softcap * tanh(S/softcap)`` -> ``S *= log2e``
+      * softcap None: fused ``S *= (sm_scale * log2e)``
       * then optional causal (``kv > q``) and SWA (``q - kv > window_size``) masks
         in the log2 domain with ``NEG_LARGE_F``.
-      * PR-2c: when ``Skv`` is not a multiple of ``BLOCK_N``, also mask
-        ``kv_g >= Skv`` (folded with ``const_expr`` so aligned shapes stay
-        bit-exact). Callers must pass contiguous phys-padded Q/K/V/O.
+      * when ``Skv`` is not a multiple of ``BLOCK_N``, also mask
+        ``kv_g >= Skv``. Callers must pass contiguous phys-padded Q/K/V/O.
 
     Loop-carried state per lane: one ``(m_running, l_running)`` fp32 pair per
     ``mma_m`` (i.e. ``ROWS_PER_LANE = WARP_ATOMS_M = 2`` pairs = 4 scalars),
@@ -427,7 +420,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     ``getThrValLayoutC = FxLayout(FxShape(FxThr(16, 4), FxVal(4)),
     FxStride(FxThr(16, 1), FxVal(4)))``): with CuTe column-major codomain
     convention (M inner, N outer, ``flat = m + n * 16``), the mapping is
-    ``(m, n) = (lane_row + 4 * ei, lane_col)`` — i.e., 4 accums per lane occupy
+    ``(m, n) = (lane_row + 4 * ei, lane_col)`` -- i.e., 4 accums per lane occupy
     4 different rows within the SAME column ``n = lane_col``. So rowmax /
     rowsum reduce over ``mma_n`` (per-``ei`` pairing) and then over the 16
     ``lane_col`` values via ``shuffle_xor(8, 4, 2, 1)``. Each lane ends up
@@ -494,7 +487,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     b_per_warp_qk = b_atoms_qk // NUM_WARPS
     b_per_warp_pv = b_atoms_v // NUM_WARPS
 
-    # SMEM sizing (bf16 = 2 B). PR-1b totals: Q+K+V+P = 8+8+8+4 KiW = 56 KiB @ D=128.
+    # SMEM sizing (bf16 = 2 B): Q+K+V+P = 8+8+8+4 KiW = 56 KiB at D=128.
     q_smem_elems = BLOCK_M * bk_qk
     k_smem_elems = BLOCK_N * bk_qk
     v_smem_elems = D * bk_pv
@@ -533,10 +526,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def flex_attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor):  # noqa: E741
-        # Declared inside the kernel body so @fx.struct annotations resolve against
-        # the local closure (see the PR-1a guardrail comment above for the PEP 563
-        # rationale).
-        # NB: fx.Array[T, size, align] — the third param is ALIGNMENT (bytes),
+        # Declared inside the kernel body so @fx.struct annotations resolve
+        # against the local closure.
+        # NB: fx.Array[T, size, align] -- the third param is ALIGNMENT (bytes),
         # not a second shape dim. Passing a shape tuple e.g. ``[BLOCK_M, WARPS_N]``
         # trips ``recast_iter`` with "alignment must be a positive multiple of
         # element byte size (4), got 2" whenever WARPS_N happens to be < the
@@ -630,9 +622,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
         # as long as the SMEM has plain logical layout (no SME swizzle).
         # Use 16b copy atom for the C-TV write: the C fragment's 4 vals are at
         # codomains {0, 4, 8, 12} (in the (16, 16) col-major atom), i.e., 4
-        # bf16 slots apart — NOT byte-contiguous. A 32b (2-bf16 packed) copy
+        # bf16 slots apart -- NOT byte-contiguous. A 32b (2-bf16 packed) copy
         # would silently corrupt half the elements. The MMA2 A-side read uses
-        # 32b because A-TV vals are at codomains {0, 1, 8, 9} — pair (0, 1)
+        # 32b because A-TV vals are at codomains {0, 1, 8, 9} -- pair (0, 1)
         # and pair (8, 9) are contiguous in memory.
         copy_atom_p_r2s = fx.make_copy_atom(fx.UniversalCopy16b(), elem_dtype)
         tiled_copy_p_r2s = fx.make_tiled_copy_C(copy_atom_p_r2s, tiled_mma)
@@ -685,7 +677,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
         p_write_atoms = fx.flat_divide(p_write_warp, (ATOM_M, ATOM_N))
 
         # MMA2 A-side read: each warp needs the FULL BLOCK_N in K, so slice P
-        # only along M (warp_m_id) — all warps in a warp_m row group share the
+        # only along M (warp_m_id) -- all warps in a warp_m row group share the
         # 32 x BLOCK_N P strip.
         p_read_warp = fx.slice(
             fx.flat_divide(p_full, (ATOM_M * WARP_ATOMS_M, BLOCK_N)),
@@ -722,11 +714,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
         fx.gpu.barrier()
 
         # ---- KV loop: unrolled at Python trace time (num_kv_tiles fixed) --
-        # PR-1b uses range_constexpr so m_running / l_running propagate as
-        # plain Python-scope lists of DSL scalars — no scf.for loop-carried
-        # state chain needed. When num_kv_tiles grows large we can revisit
-        # with fx.range(init=...), but for the initial correctness pass this
-        # keeps side effects on register-backed fragments (O_acc / S_frags)
+        # range_constexpr lets m_running / l_running propagate as
+        # plain Python-scope lists of DSL scalars -- no scf.for loop-carried
+        # state chain is needed, and register-backed fragment side effects stay
         # inside the same MLIR region.
         m_prev = [c_neg_large for _ in range(ROWS_PER_LANE)]
         l_prev = [c_zero_f for _ in range(ROWS_PER_LANE)]
@@ -793,10 +783,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                         )
 
             # ---- Scale / softcap / enter log2 domain ----------------------
-            # Plan §2.3: S *= sm_scale → optional softcap → masks → softmax.
+            # S *= sm_scale -> optional softcap -> masks -> softmax.
             # Softmax uses exp2, so we enter log2 domain with *log2e after
-            # softcap. When softcap is unset, keep the fused *(sm_scale*log2e)
-            # path bit-exact with PR-1.
+            # softcap. When softcap is unset, fuse *(sm_scale*log2e).
             if fx.const_expr(has_softcap):
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                     for mma_n in fx.range_constexpr(WARP_ATOMS_N):
@@ -824,11 +813,11 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                         acc = S_frags[mma_m][mma_n]
                         acc.store(Vec(acc.load()) * c_scale_log2e)
 
-            # ---- Causal mask (PR-1c) --------------------------------------
+            # ---- Causal mask ----------------------------------------------
             # Set S[q, k] = NEG_LARGE_F where ``kv_global > q_global``. Applied
             # AFTER entering the log2 domain above, so the sentinel lives in
             # the same domain as everything downstream and matches the
-            # m_running init: exp2(NEG_LARGE_F - m_new) ≈ 0 for any bounded
+            # m_running init: exp2(NEG_LARGE_F - m_new) ~= 0 for any bounded
             # m_new. ``is_causal=True`` enforces ``Sq == Skv`` at compile
             # time, so q_global and kv_global share the same axis.
             #
@@ -861,10 +850,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                             )
                         )
 
-            # ---- Sliding-window mask (PR-2a) ------------------------------
-            # Plan §2.3: mask where ``q_global - kv_global > window_size``
+            # ---- Sliding-window mask --------------------------------------
+            # Mask where ``q_global - kv_global > window_size``
             # (distance == window_size remains visible). Independent of
-            # ``is_causal`` — callers wanting a causal window must set both.
+            # ``is_causal`` -- callers wanting a causal window must set both.
             if fx.const_expr(has_swa):
                 q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
                 kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
@@ -885,10 +874,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                             )
                         )
 
-            # ---- KV tail mask (PR-2c) -------------------------------------
+            # ---- KV tail mask ---------------------------------------------
             # Phys pad runs full BLOCK_N G2S tiles; mask columns beyond the
             # logical Skv so pad K/V never enter softmax. Folded away when
-            # Skv == Skv_phys (aligned path stays bit-exact with PR-2b).
+            # Skv == Skv_phys.
             if fx.const_expr(has_kv_tail):
                 kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
@@ -924,7 +913,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
             # SMEM is (BLOCK_M, WARPS_N). Each lane owns 4 * WARP_ATOMS_M rows
             # (m = warp_m_id * 32 + mma_m * 16 + ei * 4 + lane_row); after the
             # cross-lane_col reduce, all 16 lane_cols hold the same value per
-            # row, so gate the store on lane_col == 0. PR-1 fixed tile has
+            # row, so gate the store on lane_col == 0. The fixed tile has
             # WARPS_N > 1 (asserted at file top) so the reduce is unconditional;
             # wrapping in ``if WARPS_N > 1`` trips the AST rewriter
             # (Python-constant conditions still lower to scf.if scopes and
@@ -1187,11 +1176,10 @@ def _compile_iluvatar_qk_dot_dev(
     dtype: str = "bf16",
     sm_scale: float | None = None,
 ) -> Callable:
-    """Dev-only PR-1a helper: build a launcher that writes ``S = Q @ K^T * sm_scale``.
+    """Build a development launcher that writes ``S = Q @ K^T * sm_scale``.
 
-    Not part of the stable API. Exists to bisect the QK^T half of flex-attention
-    before the softmax + PV halves land in PR-1b. Removed once
-    ``compile_iluvatar_flex_attention`` is fully implemented.
+    This helper is not part of the stable API. It isolates the QK^T half of
+    flex-attention for debugging.
 
     Args:
         B, H, Sq, Skv, D: See ``compile_iluvatar_flex_attention``. Same
@@ -1240,11 +1228,10 @@ def compile_iluvatar_flex_attention(
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
-    See ``docs/iluvatar_flex_attention_v1_plan.md`` for the V1 decision record.
     This is a variant subset (causal / SWA / softcap), not a general score_mod
     compiler.
 
-    V1 scope (through PR-2c): Q/K/V/O = f16 or bf16, D in {64, 128}, GQA
+    Supported scope: Q/K/V/O = f16 or bf16, D in {64, 128}, GQA
     (``H % Hkv == 0``), arbitrary ``Sq``/``Skv`` (callers pass phys-padded
     contiguous tensors; see below), ``is_causal`` / ``window_size`` / ``softcap``
     in any combination (``is_causal`` requires ``Sq == Skv``).

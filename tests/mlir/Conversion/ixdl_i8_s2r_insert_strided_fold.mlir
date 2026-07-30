@@ -3,9 +3,9 @@
 // RUN: %fly-opt %s --convert-fly-to-ixdl | FileCheck %s
 
 // i8 S2R peep-holes in convert-fly-to-ixdl:
-// 1) two i32→v4i8 bitcasts packed via vector.insert_strided_slice into
+// 1) two i32->v4i8 bitcasts packed via vector.insert_strided_slice into
 //    vector<8xi8> fold to a permute-free vector<2xi32> bitcast
-// 2) shared→reg UniversalCopy of vector<4xi8> rewrites to i32 load + bitcast
+// 2) shared->reg UniversalCopy of vector<4xi8> rewrites to i32 load + bitcast
 //
 // Without (1), convert-vector-to-llvm emits a byte-granular shufflevector that
 // ISel lowers to an expensive byte-permute.

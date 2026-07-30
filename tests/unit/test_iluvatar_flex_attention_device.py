@@ -4,12 +4,10 @@
 """Iluvatar flex-attention device tests.
 
 Covers:
-* PR-1a: QK^T-only helper vs ``torch.matmul``.
-* PR-1b: non-causal fused forward vs ``F.scaled_dot_product_attention``.
-* PR-1c: causal fused forward vs SDPA ``is_causal=True``.
-* PR-2a: softcap / SWA (+ combinations) vs hand-written fp32 reference.
-* PR-2b: D=64 variant-cross + f16 dtype coverage.
-* PR-2c: GQA / cross-attn / phys-pad tail + plan §3.2 shape-cross.
+* QK^T-only helper vs ``torch.matmul``.
+* Non-causal and causal fused forward vs scaled dot-product attention.
+* Softcap and sliding-window combinations vs a hand-written fp32 reference.
+* f16/bf16, D=64/128, MHA/GQA, cross-attention, and physical-padding tails.
 """
 
 from __future__ import annotations
@@ -58,7 +56,7 @@ def _phys_seq(seq: int, block: int) -> int:
     return ((seq + block - 1) // block) * block
 
 
-# --- PR-1a: Q @ K^T only ------------------------------------------------------
+# --- Q @ K^T only -------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -69,7 +67,7 @@ def _phys_seq(seq: int, block: int) -> int:
     ],
 )
 def test_iluvatar_flex_attention_qk_dot_pr1a(monkeypatch, B, H, Sq, Skv):
-    """PR-1a: fused ``S = (Q @ K^T) * sm_scale`` matches fp32 reference within bf16 tolerance."""
+    """The fused QK score matches the fp32 reference within bf16 tolerance."""
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     mod = _require_flex_attn_module()
@@ -91,7 +89,7 @@ def test_iluvatar_flex_attention_qk_dot_pr1a(monkeypatch, B, H, Sq, Skv):
     torch.testing.assert_close(S, ref, rtol=2e-2, atol=2e-2)
 
 
-# --- PR-1b: full non-causal fused kernel --------------------------------------
+# --- Full non-causal fused kernel ---------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -103,7 +101,7 @@ def test_iluvatar_flex_attention_qk_dot_pr1a(monkeypatch, B, H, Sq, Skv):
     ],
 )
 def test_iluvatar_flex_attention_forward_pr1b(monkeypatch, B, H, Sq, Skv):
-    """PR-1b: full non-causal forward matches ``F.scaled_dot_product_attention``.
+    """Full non-causal forward matches ``F.scaled_dot_product_attention``.
 
     The launcher expects V pre-transposed by the host to ``[B, H, D, Skv]`` so
     both MMA operands stay k-major "tn"; the test replicates that contract.
@@ -137,19 +135,19 @@ def test_iluvatar_flex_attention_forward_pr1b(monkeypatch, B, H, Sq, Skv):
     torch.testing.assert_close(O, ref, rtol=2e-2, atol=2e-2)
 
 
-# --- PR-1c: causal fused kernel ----------------------------------------------
+# --- Causal fused kernel ------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "B,H,Sq",
     [
         (1, 4, 64),  # single tile
-        (2, 4, 128),  # multiple q_tiles / kv_tiles — exercises the triangular pattern across tiles
+        (2, 4, 128),  # multiple q_tiles / kv_tiles -- exercises the triangular pattern across tiles
         (1, 8, 192),  # 3x3 tile grid, larger head count
     ],
 )
 def test_iluvatar_flex_attention_forward_pr1c_causal(monkeypatch, B, H, Sq):
-    """PR-1c: causal forward matches ``F.scaled_dot_product_attention(is_causal=True)``.
+    """Causal forward matches ``F.scaled_dot_product_attention(is_causal=True)``.
 
     ``is_causal=True`` requires ``Sq == Skv``; the causal mask is applied
     after the ``(sm_scale * log2e)`` scale on ``S = Q @ K^T`` and before the
@@ -249,7 +247,7 @@ def test_iluvatar_flex_attention_qk_dot_rejects_gqa():
         mod._validate_qk_dot_subset(H=4, Hkv=2, Sq=64, Skv=64)
 
 
-# --- PR-2a: softcap / SWA ----------------------------------------------------
+# --- Softcap / SWA ------------------------------------------------------------
 
 
 def _reference_flex_attention_fp32(
@@ -262,7 +260,7 @@ def _reference_flex_attention_fp32(
     window_size: int | None = None,
     softcap: float | None = None,
 ):
-    """Plan §3.1 hand-written fp32 reference for score mods (supports GQA)."""
+    """Hand-written fp32 reference for score modifications, including GQA."""
     torch = _require_torch()
     H = Q.shape[1]
     Hkv = K.shape[1]
@@ -385,13 +383,13 @@ def test_iluvatar_flex_attention_forward_pr2a_variants(monkeypatch, is_causal, w
 
 
 def test_iluvatar_flex_attention_pr2a_softcap_none_matches_pr1b(monkeypatch):
-    """No softcap / no SWA must stay aligned with the fused-scale PR-1 path."""
+    """No softcap or SWA stays aligned with the fused-scale path."""
     torch = _require_torch()
     out, ref, tol = _run_flex_attn(monkeypatch, B=1, H=4, Sq=64, Skv=64, is_causal=False)
     torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
 
 
-# --- PR-2b: f16 + D=64 -------------------------------------------------------
+# --- f16 + D=64 ---------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -406,7 +404,7 @@ def test_iluvatar_flex_attention_pr2a_softcap_none_matches_pr1b(monkeypatch):
     ],
 )
 def test_iluvatar_flex_attention_forward_pr2b_d64_variants(monkeypatch, is_causal, window_size, softcap):
-    """Plan §3.2 variant-cross base shape with D=64."""
+    """Cover score-modification variants with D=64."""
     out, ref, tol = _run_flex_attn(
         monkeypatch,
         B=2,
@@ -424,7 +422,7 @@ def test_iluvatar_flex_attention_forward_pr2b_d64_variants(monkeypatch, is_causa
 
 
 def test_iluvatar_flex_attention_forward_pr2b_f16_causal(monkeypatch):
-    """Plan §3.2 dtype-cross (smaller aligned shape for CI time)."""
+    """Cover the f16 causal path with an aligned CI-sized shape."""
     out, ref, tol = _run_flex_attn(
         monkeypatch,
         B=2,
@@ -474,7 +472,7 @@ def test_iluvatar_flex_attention_qk_dot_pr2b_d64_smoke(monkeypatch):
     torch.testing.assert_close(S, ref, rtol=2e-2, atol=2e-2)
 
 
-# --- PR-2c: GQA / cross / tail + plan §3.2 shape-cross ------------------------
+# --- GQA / cross-attention / sequence tails ----------------------------------
 
 
 @pytest.mark.parametrize(
@@ -484,13 +482,12 @@ def test_iluvatar_flex_attention_qk_dot_pr2b_d64_smoke(monkeypatch):
         (1, 4, 2, 128, 128, 64, True),  # GQA self
         (2, 8, 8, 512, 512, 128, True),  # medium self
         (1, 4, 4, 64, 256, 64, False),  # cross-attn
-        # Plan table lists is_causal=True for shape-cross, but Sq≠Skv forbids it
-        # (same note as #4); use False so the Skv tail path is actually exercised.
+        # Causal mode requires Sq == Skv; use False to exercise the Skv tail.
         (1, 4, 4, 128, 250, 64, False),  # unaligned Skv tail
     ],
 )
 def test_iluvatar_flex_attention_forward_pr2c_shape_cross(monkeypatch, B, H, Hkv, Sq, Skv, D, is_causal):
-    """Plan §3.2 shape-cross (5 groups)."""
+    """Cover MHA, GQA, cross-attention, and an unaligned Skv tail."""
     out, ref, tol = _run_flex_attn(
         monkeypatch,
         B=B,

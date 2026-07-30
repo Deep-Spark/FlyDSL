@@ -4,12 +4,12 @@
 """Per-process GPU device runtime.
 
 Exactly one :class:`DeviceRuntime` implementation is active per process.
-It must match the selected compile backend (e.g. ``rocm`` compile backend ↔
+It must match the selected compile backend (e.g. ``rocm`` compile backend <->
 ``rocm`` runtime / HIP).
 
 Environment:
 
-* ``FLYDSL_RUNTIME_KIND`` — selects the built-in runtime implementation
+* ``FLYDSL_RUNTIME_KIND`` -- selects the built-in runtime implementation
   (default: ``rocm``). Must agree with ``FLYDSL_COMPILE_BACKEND`` via
   :data:`COMPILE_BACKEND_TO_RUNTIME_KIND` (and optional extension mappings).
 """
@@ -44,7 +44,7 @@ def register_compile_runtime_mapping(compile_backend: str, runtime_kind: str) ->
     """Map a compile-backend id to a device-runtime *kind*.
 
     Use when a third-party :func:`flydsl.compiler.backends.register_backend`
-    targets an existing runtime stack (e.g. custom name → ``rocm``).
+    targets an existing runtime stack (e.g. custom name -> ``rocm``).
     """
     _EXTRA_MAPPINGS[compile_backend.strip().lower()] = runtime_kind.strip().lower()
 
@@ -108,7 +108,7 @@ def _selected_runtime_kind_from_env() -> str:
 def ensure_compile_runtime_pairing_from_env(compile_backend_id: str) -> None:
     """Raise if *compile_backend_id* does not match the configured runtime kind.
 
-    Uses only environment and registration state — does not construct
+    Uses only environment and registration state -- does not construct
     :class:`DeviceRuntime`. Suitable for compiler paths (e.g. ``COMPILE_ONLY``)
     where initializing the runtime is unnecessary.
     """
@@ -152,7 +152,7 @@ def get_device_runtime() -> DeviceRuntime:
     """Return the single process-wide :class:`DeviceRuntime` instance.
 
     Compile/runtime pairing runs once when the singleton is first created (see
-    :func:`ensure_compile_runtime_pairing_from_env`), not on every call — the
+    :func:`ensure_compile_runtime_pairing_from_env`), not on every call -- the
     active backend and runtime kind are treated as fixed for the process after
     that point.
     """

@@ -5,7 +5,7 @@
 
 Targets ``1 <= m <= 16`` with N/K tile-aligned.
 
-* ``bm=16`` — one SME row-brick (no wasted MMA on cropped rows).
+* ``bm=16`` -- one SME row-brick (no wasted MMA on cropped rows).
 * A and B both SME async G2S, ``STAGES=2`` (same pipeline as ``mr/hgemm.py``).
 * Short M: DontCheck G2S (rows ``[m,16)`` may be OOB garbage); store ``row < m``.
 * CTA auto-pick grows BN for large N when divisible.
@@ -83,9 +83,9 @@ def _cta_ok(warps_m, warps_n, warp_atoms_m, warp_atoms_n, k_atoms, N, K):
 
 
 def _pick_cta(N: int, K: int):
-    # (warps_m, warps_n, warp_atoms_m, warp_atoms_n, k_atoms) — always bm=16
+    # (warps_m, warps_n, warp_atoms_m, warp_atoms_n, k_atoms) -- always bm=16
     candidates = [
-        (1, 4, 1, 4, 8),  # 16x256x128, 4 warps — wide N
+        (1, 4, 1, 4, 8),  # 16x256x128, 4 warps -- wide N
         (1, 4, 1, 2, 8),  # 16x128x128, 4 warps
         (1, 2, 1, 4, 4),  # 16x128x64, 2 warps
         (1, 2, 1, 2, 4),  # 16x64x64, 2 warps

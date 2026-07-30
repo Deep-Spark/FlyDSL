@@ -8,7 +8,7 @@ Entries:
   ``out = x * rrms * gamma``, with optional FP32 ``rstd`` output.
 - ``compile_iluvatar_rmsnorm_dynamicquant`` (V2): fp32 input, i8 output with
   per-row dynamic symmetric quantization.
-  ``y = x * rrms * gamma``; ``y_scale = amax(|y|) / 127`` (0 → 1 protected);
+  ``y = x * rrms * gamma``; ``y_scale = amax(|y|) / 127`` (0 -> 1 protected);
   ``out = truncate_to_i8(y / y_scale)``.
 - ``compile_iluvatar_rmsnorm_smoothquant`` (V3): V2 plus per-channel
   ``x_scale[N]`` applied after gamma:
@@ -961,7 +961,7 @@ def _build_rmsnorm_quant_kernel(*, N: int, eps: float, is_smooth: bool):
     DQ keeps ``(x, gamma, out, y_scale)``; SQ is
     ``(x, gamma, x_scale, out, y_scale)``. Bodies are duplicated inside each
     kernel so nested reducers stay visible to the AST rewriter (module-level /
-    outer-factory helpers would skip it — same constraint as V1/V2).
+    outer-factory helpers would skip it -- same constraint as V1/V2).
     """
     if RED_SLOTS <= 0:
         raise ValueError(f"internal error: RED_SLOTS must be positive, got {RED_SLOTS}")
@@ -1318,7 +1318,7 @@ def compile_iluvatar_rmsnorm_dynamicquant(*, N: int, eps: float) -> Callable:
     """Build Iluvatar RMSNorm dynamic-quant launcher (V2).
 
     Semantics: ``y = x * rsqrt(mean(x^2) + eps) * gamma``, then per-row symmetric
-    dynamic quantization ``y_scale = amax(|y|) / 127`` (0 → 1 protected),
+    dynamic quantization ``y_scale = amax(|y|) / 127`` (0 -> 1 protected),
     ``out = truncate_to_i8(y / y_scale)``.
 
     Args:
@@ -1368,7 +1368,7 @@ def compile_iluvatar_rmsnorm_smoothquant(*, N: int, eps: float) -> Callable:
 
     Semantics: ``y = x * rsqrt(mean(x^2) + eps) * gamma * x_scale``, then
     per-row symmetric dynamic quantization ``y_scale = amax(|y|) / 127``
-    (0 → 1 protected), ``out = truncate_to_i8(y / y_scale)``.
+    (0 -> 1 protected), ``out = truncate_to_i8(y / y_scale)``.
 
     Args:
         N: Hidden size. Compile-time constant and must be ``> 0``.

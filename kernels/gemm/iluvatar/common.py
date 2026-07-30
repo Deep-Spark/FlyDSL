@@ -8,9 +8,9 @@ from typing import NamedTuple
 # Warp width for Iluvatar devices.
 WARP_SIZE = 64
 
-# CUTLASS 3.x / CuTe BLAS layout tags for logical A(m,k) @ B(n,k).T (M×K · N×K).
+# CUTLASS 3.x / CuTe BLAS layout tags for logical A(m,k) @ B(n,k).T (MxK * NxK).
 # SME/G2S index naming: kernels.gemm.iluvatar.mr.common (cta_*, mma_*, sme_row_*).
-# BLAS layout tags nn/nt/tn/tt — opaque names on logical A(m,k)/B(n,k); not per-operand M/N/K major letters.
+# BLAS layout tags nn/nt/tn/tt -- opaque names on logical A(m,k)/B(n,k); not per-operand M/N/K major letters.
 # Host shapes are PyTorch tensor.shape after remap_gemm_tensors:
 #   nt: A mn, B mn  -> A (k,m), B (k,n)
 #   tn: A k,  B k   -> A (m,k), B (n,k)  [default]
