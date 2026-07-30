@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar RMSNorm V1 device tests (fp32 forward only)."""
+"""Iluvatar RMSNorm V1 device tests."""
 
 from __future__ import annotations
 
@@ -96,8 +96,8 @@ def test_iluvatar_rmsnorm_compile_time_guards():
         compile_iluvatar_rmsnorm(N=0, eps=EPS, dtype="f32")
     with pytest.raises(ValueError, match="eps must be > 0"):
         compile_iluvatar_rmsnorm(N=128, eps=0.0, dtype="f32")
-    with pytest.raises(ValueError, match="dtype must be 'f32'"):
-        compile_iluvatar_rmsnorm(N=128, eps=EPS, dtype="bf16")
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        compile_iluvatar_rmsnorm(N=128, eps=EPS, dtype="i8")
 
 
 def test_iluvatar_rmsnorm_runtime_guards(monkeypatch):
@@ -129,3 +129,12 @@ def test_iluvatar_rmsnorm_runtime_guards(monkeypatch):
     assert tuple(out_nc.shape) == (M, N) and not out_nc.is_contiguous()
     with pytest.raises(ValueError, match="out must be contiguous"):
         launch(x, gamma, out_nc, M)
+
+    launch_with_rstd = compile_iluvatar_rmsnorm(N=N, eps=EPS, dtype="f32", store_rstd=True)
+    rstd = torch.empty((M,), device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="expected rstd shape"):
+        launch_with_rstd(x, gamma, out, rstd[: M - 1], M)
+    with pytest.raises(ValueError, match="rstd dtype must be torch.float32"):
+        launch_with_rstd(x, gamma, out, rstd.to(torch.float16), M)
+    with pytest.raises(ValueError, match="rstd must not overlap with x"):
+        launch_with_rstd(x, gamma, out, x.view(-1)[:M], M)
