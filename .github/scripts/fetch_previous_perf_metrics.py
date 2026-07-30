@@ -7,10 +7,31 @@ import io
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+class StripAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+    """Drop Authorization when the API redirects an artifact zip to blob storage.
+
+    The signed blob URL rejects the GitHub bearer token with HTTP 401.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        if urllib.parse.urlsplit(newurl).hostname != "api.github.com":
+            for store in (new_req.headers, getattr(new_req, "unredirected_hdrs", {})):
+                for key in [k for k in store if k.lower() == "authorization"]:
+                    store.pop(key)
+        return new_req
+
+
+_OPENER = urllib.request.build_opener(StripAuthOnRedirect)
 
 
 def api_get(url: str, token: str, accept: str = "application/vnd.github+json") -> bytes:
@@ -22,7 +43,7 @@ def api_get(url: str, token: str, accept: str = "application/vnd.github+json") -
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with _OPENER.open(req, timeout=60) as resp:
         return resp.read()
 
 
@@ -115,8 +136,9 @@ def main() -> int:
         if not download_url:
             continue
         try:
-            # archive_download_url redirects to a short-lived zip URL.
-            raw_zip = api_get(download_url, token, accept="application/octet-stream")
+            # archive_download_url redirects to a short-lived zip URL; the API
+            # itself rejects any Accept that is not JSON with HTTP 415.
+            raw_zip = api_get(download_url, token)
         except urllib.error.HTTPError as exc:
             print(f"::warning::failed to download artifact from run {rid}: {exc}")
             continue
