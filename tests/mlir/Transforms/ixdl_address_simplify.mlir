@@ -55,7 +55,7 @@ gpu.module @t [#ixdl.target<chip = "ivcore11">] {
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
 // CHECK:       %[[OUT:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
-gpu.module @b8_euclid [#ixdl.target] {
+gpu.module @b8_euclid [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_euclidean_lane_addr() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
@@ -77,7 +77,7 @@ gpu.module @b8_euclid [#ixdl.target] {
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
 // CHECK:       gpu.printf "%d", %[[LANE]] : i32
 // CHECK-NOT:   arith.remsi
-gpu.module @b8_euclid_a1 [#ixdl.target] {
+gpu.module @b8_euclid_a1 [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_euclidean_identity_a1() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
@@ -98,7 +98,7 @@ gpu.module @b8_euclid_a1 [#ixdl.target] {
 // CHECK:       %[[AX:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
 // CHECK:       %[[OUT:.+]] = arith.addi %[[AX]], %[[C1]] : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
-gpu.module @b8_euclid_extra [#ixdl.target] {
+gpu.module @b8_euclid_extra [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_euclidean_with_extra() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
@@ -124,7 +124,7 @@ gpu.module @b8_euclid_extra [#ixdl.target] {
 // CHECK:       %[[AX:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
 // CHECK:       %[[OUT:.+]] = arith.subi %[[AX]], %[[C1]] : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
-gpu.module @b8_euclid_sub [#ixdl.target] {
+gpu.module @b8_euclid_sub [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_euclidean_with_sub() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
@@ -150,7 +150,7 @@ gpu.module @b8_euclid_sub [#ixdl.target] {
 // CHECK:       %[[AX:.+]] = arith.muli %[[LANE]], %{{.+}} : i32
 // CHECK:       %[[OUT:.+]] = arith.subi %[[C100]], %[[AX]] : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
-gpu.module @b8_euclid_neg [#ixdl.target] {
+gpu.module @b8_euclid_neg [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_euclidean_neg_pair() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
@@ -189,7 +189,7 @@ gpu.module @b8_euclid_neg [#ixdl.target] {
 // CHECK:       %[[LANE:.+]] = arith.index_cast %[[LANE_IDX]] : index to i32
 // CHECK:       gpu.printf "%d", %[[LANE]] : i32
 // CHECK-NOT:   arith.ori
-gpu.module @b8_ms_id [#ixdl.target] {
+gpu.module @b8_ms_id [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_modswizzle_identity() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
@@ -236,7 +236,7 @@ gpu.module @b8_ms_id [#ixdl.target] {
 // CHECK:       %[[LOW:.+]] = arith.andi %[[SUM]], %{{.+}} : i32
 // CHECK:       %[[OUT:.+]] = arith.ori %[[LOW]], %{{.+}} : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
-gpu.module @b8_ms_sw [#ixdl.target] {
+gpu.module @b8_ms_sw [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_modswizzle_second_word() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32  // base ∈ [0,64) < 256
@@ -270,7 +270,7 @@ gpu.module @b8_ms_sw [#ixdl.target] {
 // CHECK:       %[[UNI:.+]] = llvm.call_intrinsic "llvm.bi.readfirstlane"(%[[BASE]])
 // CHECK:       %[[OUT:.+]] = arith.addi %[[UNI]], %[[LANE4]] : i32
 // CHECK:       gpu.printf "%d", %[[OUT]] : i32
-gpu.module @b8_rfl [#ixdl.target] {
+gpu.module @b8_rfl [#ixdl.target<chip = "ivcore11">] {
   gpu.func @b8_row_tid4_readfirstlane() kernel {
     %lane_idx = gpu.lane_id
     %lane = arith.index_cast %lane_idx : index to i32
