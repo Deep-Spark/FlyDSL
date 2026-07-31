@@ -13,6 +13,8 @@ Entries:
 - ``compile_iluvatar_rmsnorm_smoothquant`` (V3): V2 plus per-channel
   ``x_scale[N]`` applied after gamma:
   ``y = x * rrms * gamma * x_scale``.
+- ``compile_iluvatar_rmsnorm_fused_add`` (V4a): prenorm residual forward,
+  ``residual_out = x + residual_in`` and ``out = rmsnorm(residual_out)``.
 
 All kernels use one CTA per row (``grid=(M, 1, 1)``, ``block=(256, 1, 1)``)
 and a scalar generic algorithm over arbitrary ``N`` (tail-safe).
@@ -276,6 +278,188 @@ def compile_iluvatar_rmsnorm(
             return out
 
     return launch_rmsnorm
+
+
+def _build_rmsnorm_fused_add_kernel(*, N: int, eps: float):
+    if RED_SLOTS <= 0:
+        raise ValueError(f"internal error: RED_SLOTS must be positive, got {RED_SLOTS}")
+
+    @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
+    def _rmsnorm_fused_add_kernel(
+        x: fx.Tensor,
+        residual_in: fx.Tensor,
+        gamma: fx.Tensor,
+        out: fx.Tensor,
+        residual_out: fx.Tensor,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+
+        fm_fast = arith.FastMathFlags.fast
+        c_zero_f = fx.Float32(0.0)
+        n_float = float(N)
+        eps_c = eps
+
+        smem = fx.SharedAllocator().allocate(_RmsNormSmem).peek()
+        s_red = smem.s_red.view(fx.make_layout(RED_SLOTS, 1))
+
+        def _warp_reduce_add(xf):
+            w = xf
+            for sh_exp in range_constexpr(int(math.log2(WARP_SIZE))):
+                off = WARP_SIZE // (2 << sh_exp)
+                peer = w.shuffle_xor(off, WARP_SIZE)
+                w = w.addf(peer, fastmath=fm_fast)
+            return w
+
+        def _block_reduce_add(xf):
+            if const_expr(RED_SLOTS == 1):
+                return _warp_reduce_add(xf)
+
+            lane_id = fx.Int32(fx.lane_id)
+            warp_id = tid // WARP_SIZE
+
+            w_red = _warp_reduce_add(xf)
+            if lane_id == 0:
+                fx.memref_store(w_red, s_red, warp_id)
+            gpu.barrier()
+
+            if warp_id == 0:
+                in_range = lane_id < RED_SLOTS
+                lane_safe = in_range.select(lane_id, 0)
+                v = fx.memref_load(s_red, lane_safe)
+                ww = in_range.select(v, c_zero_f)
+                ww = _warp_reduce_add(ww)
+                if lane_id == 0:
+                    fx.memref_store(ww, s_red, 0)
+            gpu.barrier()
+
+            return fx.memref_load(s_red, 0)
+
+        row = fx.Int32(bid)
+        thread_sumsq = c_zero_f
+        for base_idx in range_constexpr(0, N, BLOCK_THREADS):
+            idx = tid + base_idx
+            valid = idx < N
+            idx_safe = valid.select(idx, 0)
+            x_val = fx.Float32(x[row, idx_safe])
+            residual_val = fx.Float32(residual_in[row, idx_safe])
+            added = x_val + residual_val
+            thread_sumsq = thread_sumsq + valid.select(added * added, c_zero_f)
+            if idx < N:
+                residual_out[row, idx] = added
+
+        sum_sq = _block_reduce_add(thread_sumsq)
+        rrms = fmath.rsqrt((sum_sq / n_float) + eps_c, fastmath=fm_fast)
+
+        for base_idx in range_constexpr(0, N, BLOCK_THREADS):
+            idx = tid + base_idx
+            if idx < N:
+                added = fx.Float32(residual_out[row, idx])
+                g_val = fx.Float32(gamma[idx])
+                out[row, idx] = added * rrms * g_val
+
+    return _rmsnorm_fused_add_kernel
+
+
+def _validate_fused_add_launch_args(x, residual_in, gamma, out, residual_out, M: int, N: int) -> None:
+    if not isinstance(M, int):
+        raise ValueError(f"M must be int, got {type(M).__name__}")
+    if M < 0:
+        raise ValueError(f"M must be >= 0, got {M}")
+
+    matrix_tensors = {
+        "x": x,
+        "residual_in": residual_in,
+        "out": out,
+        "residual_out": residual_out,
+    }
+    for name, tensor in matrix_tensors.items():
+        if tensor.dim() != 2:
+            raise ValueError(f"expected {name} shape (M,N), got dim={tensor.dim()} shape={tuple(tensor.shape)}")
+        if tuple(tensor.shape) != (M, N):
+            raise ValueError(f"expected {name} shape (M,N)=({M},{N}), got {tuple(tensor.shape)}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        dtype = _dtype_name(tensor)
+        if dtype != TORCH_F32_NAME:
+            raise ValueError(f"{name} dtype must be {TORCH_F32_NAME}, got {dtype}")
+
+    if gamma.dim() != 1:
+        raise ValueError(f"expected gamma shape (N,), got dim={gamma.dim()} shape={tuple(gamma.shape)}")
+    if tuple(gamma.shape) != (N,):
+        raise ValueError(f"expected gamma shape (N,)=({N},), got {tuple(gamma.shape)}")
+    if not gamma.is_contiguous():
+        raise ValueError("gamma must be contiguous")
+    gamma_dtype = _dtype_name(gamma)
+    if gamma_dtype != TORCH_F32_NAME:
+        raise ValueError(f"gamma dtype must be {TORCH_F32_NAME}, got {gamma_dtype}")
+
+    devices = [x.device, residual_in.device, gamma.device, out.device, residual_out.device]
+    if any(device != devices[0] for device in devices[1:]):
+        joined = "/".join(str(device) for device in devices)
+        raise ValueError(f"x/residual_in/gamma/out/residual_out must be on same device, got {joined}")
+
+    inputs = {"x": x, "residual_in": residual_in, "gamma": gamma}
+    outputs = {"out": out, "residual_out": residual_out}
+    for output_name, output in outputs.items():
+        for input_name, input_tensor in inputs.items():
+            if _tensors_overlap(output, input_tensor):
+                raise ValueError(f"{output_name} must not overlap with {input_name}")
+    if _tensors_overlap(out, residual_out):
+        raise ValueError("out must not overlap with residual_out")
+
+
+def compile_iluvatar_rmsnorm_fused_add(*, N: int, eps: float, dtype: str = "f32") -> Callable:
+    """Build Iluvatar prenorm fused-add RMSNorm launcher (V4a).
+
+    Semantics: ``residual_out = x + residual_in``, followed by
+    ``out = residual_out * rsqrt(mean(residual_out^2) + eps) * gamma``.
+
+    Args:
+        N: Hidden size. Compile-time constant and must be ``> 0``.
+        eps: Compile-time epsilon and must be ``> 0``.
+        dtype: Only ``"f32"`` is supported.
+
+    Returns:
+        ``launch(x, residual_in, gamma, out, residual_out, M, stream=None)``
+        returning ``(out, residual_out)``.
+    """
+    if N <= 0:
+        raise ValueError(f"N must be > 0, got {N}")
+    if eps <= 0:
+        raise ValueError(f"eps must be > 0, got {eps}")
+    if dtype != "f32":
+        raise ValueError(f"dtype must be 'f32', got {dtype!r}")
+
+    kernel = _build_rmsnorm_fused_add_kernel(N=N, eps=float(eps))
+
+    @flyc.jit
+    def _launch_kernel(
+        x: fx.Tensor,
+        residual_in: fx.Tensor,
+        gamma: fx.Tensor,
+        out: fx.Tensor,
+        residual_out: fx.Tensor,
+        m_in: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        kernel(x, residual_in, gamma, out, residual_out).launch(
+            grid=(m_in, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    def launch_rmsnorm_fused_add(x, residual_in, gamma, out, residual_out, M: int, stream=None):
+        _validate_fused_add_launch_args(x, residual_in, gamma, out, residual_out, M, N)
+        if M == 0:
+            return out, residual_out
+        if stream is None:
+            _launch_kernel(x, residual_in, gamma, out, residual_out, M)
+        else:
+            _launch_kernel(x, residual_in, gamma, out, residual_out, M, stream=stream)
+        return out, residual_out
+
+    return launch_rmsnorm_fused_add
 
 
 def _build_rmsnorm_quant_kernel(*, N: int, eps: float, is_smooth: bool):
@@ -744,5 +928,6 @@ __all__ = [
     "SUPPORTED_DTYPES",
     "compile_iluvatar_rmsnorm",
     "compile_iluvatar_rmsnorm_dynamicquant",
+    "compile_iluvatar_rmsnorm_fused_add",
     "compile_iluvatar_rmsnorm_smoothquant",
 ]

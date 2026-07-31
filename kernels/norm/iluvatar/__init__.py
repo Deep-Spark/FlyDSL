@@ -15,6 +15,7 @@ from .rmsnorm_bwd_kernel import compile_iluvatar_rmsnorm_bwd
 from .rmsnorm_kernel import (
     compile_iluvatar_rmsnorm,
     compile_iluvatar_rmsnorm_dynamicquant,
+    compile_iluvatar_rmsnorm_fused_add,
     compile_iluvatar_rmsnorm_smoothquant,
 )
 from .softmax_kernel import compile_iluvatar_softmax
@@ -29,6 +30,7 @@ __all__ = [
     "compile_iluvatar_rmsnorm_bwd",
     "compile_iluvatar_rmsnorm",
     "compile_iluvatar_rmsnorm_dynamicquant",
+    "compile_iluvatar_rmsnorm_fused_add",
     "compile_iluvatar_rmsnorm_smoothquant",
     "compile_iluvatar_softmax",
 ]
