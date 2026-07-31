@@ -52,8 +52,8 @@ FailureOr<Value> buildMmad(OpBuilder &builder, Location loc, int32_t m, int32_t 
                            Type elemTyA, Type elemTyB, Type elemTyAcc, Value aVal, Value bVal,
                            Value cVal) {
   // Per-lane element counts divide each fragment across the warp.
-  int64_t abCount = static_cast<int64_t>(m) * k / 64;
-  int64_t accCount = static_cast<int64_t>(m) * n / 64;
+  int64_t abCount = static_cast<int64_t>(m) * k / kWarpSize;
+  int64_t accCount = static_cast<int64_t>(m) * n / kWarpSize;
   if (abCount <= 0 || accCount <= 0)
     return failure();
 
@@ -118,7 +118,7 @@ Value MmaOpMRMmaType::rebuildStaticValue(OpBuilder &, Location, Value) const { r
 // Warp-collective TCU MMA: all 64 lanes participate and the per-lane fragment
 // ownership is exposed to layout algebra (unlike the SME async copy, which hides
 // the warp).
-Attribute MmaOpMRMmaType::getThrLayout() const { return FxLayout(FxC(64), FxC(1)); }
+Attribute MmaOpMRMmaType::getThrLayout() const { return FxLayout(FxC(kWarpSize), FxC(1)); }
 
 Attribute MmaOpMRMmaType::getShapeMNK() const {
   return IntTupleAttr::get(ArrayAttr::get(getContext(), {FxC(getM()), FxC(getN()), FxC(getK())}));
