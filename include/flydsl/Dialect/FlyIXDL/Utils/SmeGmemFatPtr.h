@@ -9,6 +9,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include <cstdint>
+
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
 #include "flydsl/Dialect/FlyIXDL/IR/Dialect.h"
 
@@ -87,9 +89,9 @@ public:
   }
 
   // Pack into a vector<4xi32> SmeDescriptor: [0..1] = raw gmem_ptr (loop-invariant,
-  // byte_offset is NOT folded in -- it goes to the gOffset operand), [2] =
-  // placeholder (0 on ivcore11), [3] = stride_byte.
-  Value smeDescriptorVec(OpBuilder &b, Location loc) const {
+  // byte_offset is NOT folded in -- it goes to the gOffset operand), [2] is
+  // chipset-specific (0 on MR, -1 on CQ), [3] = stride_byte.
+  Value smeDescriptorVec(OpBuilder &b, Location loc, int32_t descriptorWord2 = 0) const {
     auto i32Ty = IntegerType::get(b.getContext(), 32);
     auto i64Ty = IntegerType::get(b.getContext(), 64);
     auto vec2Ty = VectorType::get({2}, i32Ty);
@@ -105,7 +107,7 @@ public:
 
     Value lo = LLVM::ExtractElementOp::create(b, loc, ptrPair, c0);
     Value hi = LLVM::ExtractElementOp::create(b, loc, ptrPair, c1);
-    Value placeholder = arith::ConstantIntOp::create(b, loc, 0, 32);
+    Value placeholder = arith::ConstantIntOp::create(b, loc, descriptorWord2, 32);
 
     Value vec = LLVM::UndefOp::create(b, loc, vec4Ty);
     vec = LLVM::InsertElementOp::create(b, loc, vec, lo, c0);
