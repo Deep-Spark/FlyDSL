@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2025 FlyDSL Project Contributors
+// Copyright (c) 2026 FlyDSL Project Contributors
 
 #ifndef FLY_PASSES
 #define FLY_PASSES
@@ -35,9 +35,18 @@ def FlyRewriteFuncSignaturePass : Pass<"fly-rewrite-func-signature"> {
 }
 
 def FlyCanonicalizePass : Pass<"fly-canonicalize"> {
-  let summary = "Canonicalize Pattern";
+  let summary = "Canonicalize Fly constructors to int-tuple form";
   let description = [{
-    Canonicalize Fly operations.
+    Rewrites `fly.make_shape`, `fly.make_stride`, and `fly.make_coord`
+    constructors to the canonical `fly.make_int_tuple` form.
+  }];
+}
+
+def FlyFoldStaticPass : Pass<"fly-fold-static"> {
+  let summary = "Rebuild statically known Fly operation results";
+  let description = [{
+    Rebuilds operation results whose Fly types are fully static using the
+    type-specific materialization provided by `MayStaticTypeInterface`.
   }];
 }
 

@@ -23,7 +23,8 @@ pytestmark = [pytest.mark.l1b_target_dialect, pytest.mark.rocm_lower]
 
 
 FLY_PIPELINE = (
-    "builtin.module(fly-canonicalize,fly-layout-lowering,fly-canonicalize,convert-fly-to-rocdl,canonicalize,cse)"
+    "builtin.module(fly-canonicalize,fly-fold-static,fly-layout-lowering,"
+    "fly-canonicalize,fly-fold-static,convert-fly-to-rocdl,canonicalize,cse)"
 )
 
 

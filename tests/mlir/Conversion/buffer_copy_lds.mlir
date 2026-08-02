@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2025 FlyDSL Project Contributors
-// RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize --fly-layout-lowering --convert-fly-to-rocdl | FileCheck %s
-// RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize --fly-layout-lowering --convert-fly-to-rocdl --convert-arith-to-llvm --canonicalize | FileCheck %s --check-prefix=LLVM
+// Copyright (c) 2026 FlyDSL Project Contributors
+// RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize --fly-fold-static --fly-layout-lowering --convert-fly-to-rocdl | FileCheck %s
+// RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize --fly-fold-static --fly-layout-lowering --convert-fly-to-rocdl --convert-arith-to-llvm --canonicalize | FileCheck %s --check-prefix=LLVM
 
 // BufferCopyLDS (buffer_desc -> shared) lowering tests
 

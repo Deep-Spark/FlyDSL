@@ -52,6 +52,7 @@ On first call, ``@flyc.jit`` runs the following pipeline:
 
       - ``fly-rewrite-func-signature``
       - ``fly-canonicalize``
+      - ``fly-fold-static``
       - ``fly-layout-lowering``
       - ``fly-int-swizzle-simplify``
       - ``canonicalize``
@@ -116,5 +117,6 @@ The ``fly-opt`` tool is a command-line interface for running MLIR passes on
 .. code-block:: bash
 
    fly-opt --fly-canonicalize input.mlir
+   fly-opt --fly-fold-static input.mlir
    fly-opt --fly-layout-lowering input.mlir
    fly-opt --help

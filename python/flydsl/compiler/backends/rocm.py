@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 
 from typing import List, Tuple
 
@@ -80,6 +80,7 @@ class RocmBackend(BaseBackend):
         pre_binary_fragments = [
             "fly-rewrite-func-signature",
             "fly-canonicalize",
+            "fly-fold-static",
             "fly-layout-lowering",
             "fly-int-swizzle-simplify",
             "canonicalize",

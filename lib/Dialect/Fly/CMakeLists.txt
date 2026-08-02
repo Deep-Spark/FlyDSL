@@ -11,6 +11,7 @@ add_mlir_dialect_library(MLIRFlyDialect
   Utils/PointerUtils.cpp
   Transforms/LayoutLowering.cpp
   Transforms/Canonicalize.cpp
+  Transforms/FoldStatic.cpp
   Transforms/RewriteFuncSignature.cpp
   Transforms/ConvertAtomCallToSSAForm.cpp
   Transforms/PromoteRegMemToVectorSSA.cpp

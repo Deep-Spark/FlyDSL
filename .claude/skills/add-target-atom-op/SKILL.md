@@ -375,7 +375,7 @@ wrapper like `MFMA_CDNA5(m, n, k, elem, ...)` in `python/flydsl/expr/rocdl/unive
 
 ```mlir
 // RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize \
-// RUN:   --fly-layout-lowering --convert-fly-to-rocdl | FileCheck %s
+// RUN:   --fly-fold-static --fly-layout-lowering --convert-fly-to-rocdl | FileCheck %s
 // CHECK: rocdl.mfma.f32.16x16x32f16
 ```
 

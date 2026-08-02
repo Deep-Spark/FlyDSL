@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2025 FlyDSL Project Contributors
-// RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize --fly-layout-lowering --convert-fly-to-rocdl | FileCheck %s
+// Copyright (c) 2026 FlyDSL Project Contributors
+// RUN: %fly-opt %s --fly-rewrite-func-signature --fly-canonicalize --fly-fold-static --fly-layout-lowering --convert-fly-to-rocdl | FileCheck %s
 
 // MemRef load/store lowering tests:
 //   - Scalar: fly.memref.load/store -> llvm.getelementptr + llvm.load/store

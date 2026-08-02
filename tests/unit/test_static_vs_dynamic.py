@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 
 """Static vs dynamic layout types test (mirrors a reference notebook Cell 11).
 
@@ -27,7 +27,8 @@ pytestmark = [pytest.mark.l1b_target_dialect, pytest.mark.rocm_lower]
 
 
 FLY_PIPELINE = (
-    "builtin.module(fly-canonicalize,fly-layout-lowering,fly-canonicalize,convert-fly-to-rocdl,canonicalize,cse)"
+    "builtin.module(fly-canonicalize,fly-fold-static,fly-layout-lowering,"
+    "fly-canonicalize,fly-fold-static,convert-fly-to-rocdl,canonicalize,cse)"
 )
 
 

@@ -170,6 +170,7 @@ Python Function (@flyc.kernel / @flyc.jit)
    │ Stage A — pre_binary_fragments  (Fly → ROCDL)          │
    │   fly-rewrite-func-signature                           │
    │   fly-canonicalize                                     │
+   │   fly-fold-static                                      │
    │   fly-layout-lowering                                  │
    │   fly-int-swizzle-simplify                             │
    │   canonicalize                                         │
@@ -215,28 +216,29 @@ external LLVM toolchain only for Stage C (`gpu-module-to-binary`).
 | # | Pass | Description |
 |---|---|---|
 | 1 | `fly-rewrite-func-signature` | Rewrite DSL types at function and SCF control-flow boundaries; lowers `IntTuple` / `Layout` / `ComposedLayout` / `CoordTensor` / `MemRef` to packed LLVM struct types and reconstructs them in the body via constructor ops. |
-| 2 | `fly-canonicalize` | FlyDSL-specific canonicalization (folds `!fly.layout` algebra when shapes are static). |
-| 3 | `fly-layout-lowering` | Lowers layout algebra (`fly.crd2idx`, partitions, divides) to concrete `arith` + `vector` ops. |
-| 4 | `fly-int-swizzle-simplify` | Algebraically simplifies the swizzle-shaped arith sequences emitted by `applySwizzle`. |
-| 5 | `canonicalize` | Standard MLIR canonicalization (constant folding, etc.). |
-| 6 | `fly-convert-atom-call-to-ssa-form` | Converts `copy_atom_call` / `mma_atom_call` to their SSA counterparts; promotes register tensors to vector SSA values. |
-| 7 | `fly-promote-regmem-to-vectorssa` | Promotes `fly.make_ptr(register)` memory semantics to vector SSA values (requires #6). |
-| 8 | `convert-fly-to-rocdl` | Lowers remaining Fly ops to MLIR upstream + ROCDL dialects (copy atoms → `rocdl.buffer_load/store`, or gfx1250 TDM → `rocdl.tensor.load.to.lds` / `store.from.lds`; MMA atoms → `rocdl.mfma.*` on CDNA, `rocdl.wmma.*` on gfx11/gfx1250). |
-| 9 | `canonicalize` | Second canonicalization round after ROCDL lowering. |
-| 10 | `gpu.module(convert-scf-to-cf, cse, convert-gpu-to-rocdl{chipset=gfxNNN ...}, fly-rocdl-cluster-attr)` | Inside the GPU module: SCF→CF, CSE, GPU intrinsics→ROCDL, then `fly-rocdl-cluster-attr` injects `amdgpu-cluster-dims` into the `llvm.func` `passthrough`. |
+| 2 | `fly-canonicalize` | Normalizes `fly.make_shape`, `fly.make_stride`, and `fly.make_coord` constructors to `fly.make_int_tuple`. |
+| 3 | `fly-fold-static` | Rebuilds fully static Fly operation results using each type's existing materialization strategy. |
+| 4 | `fly-layout-lowering` | Lowers layout algebra (`fly.crd2idx`, partitions, divides) to concrete `arith` + `vector` ops. |
+| 5 | `fly-int-swizzle-simplify` | Algebraically simplifies the swizzle-shaped arith sequences emitted by `applySwizzle`. |
+| 6 | `canonicalize` | Standard MLIR canonicalization (constant folding, etc.). |
+| 7 | `fly-convert-atom-call-to-ssa-form` | Converts `copy_atom_call` / `mma_atom_call` to their SSA counterparts; promotes register tensors to vector SSA values. |
+| 8 | `fly-promote-regmem-to-vectorssa` | Promotes `fly.make_ptr(register)` memory semantics to vector SSA values (requires #7). |
+| 9 | `convert-fly-to-rocdl` | Lowers remaining Fly ops to MLIR upstream + ROCDL dialects (copy atoms → `rocdl.buffer_load/store`, or gfx1250 TDM → `rocdl.tensor.load.to.lds` / `store.from.lds`; MMA atoms → `rocdl.mfma.*` on CDNA, `rocdl.wmma.*` on gfx11/gfx1250). |
+| 10 | `canonicalize` | Second canonicalization round after ROCDL lowering. |
+| 11 | `gpu.module(convert-scf-to-cf, cse, convert-gpu-to-rocdl{chipset=gfxNNN ...}, fly-rocdl-cluster-attr)` | Inside the GPU module: SCF→CF, CSE, GPU intrinsics→ROCDL, then `fly-rocdl-cluster-attr` injects `amdgpu-cluster-dims` into the `llvm.func` `passthrough`. |
 
 **Stage B — `binary_prep_fragments`** (LLVM lowering, host + kernel)
 
 | # | Pass | Description |
 |---|---|---|
-| 11 | `rocdl-attach-target{chip=gfxNNN ...}` | Attaches `#rocdl.target<chip=gfxNNN>` (plus `fast`/`unsafe-math`/`wave64` options) to the GPU module for codegen. |
-| 12 | `convert-scf-to-cf` | Host-side SCF → ControlFlow. |
-| 13 | `convert-cf-to-llvm` | ControlFlow → LLVM dialect. |
-| 14 | `gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}` | GPU types and host launcher → LLVM. |
-| 15 | `convert-vector-to-llvm` | Vector → LLVM. |
-| 16 | `convert-arith-to-llvm` | Arith → LLVM. |
-| 17 | `convert-func-to-llvm` | Func → LLVM. |
-| 18 | `reconcile-unrealized-casts` | Final cast cleanup. |
+| 12 | `rocdl-attach-target{chip=gfxNNN ...}` | Attaches `#rocdl.target<chip=gfxNNN>` (plus `fast`/`unsafe-math`/`wave64` options) to the GPU module for codegen. |
+| 13 | `convert-scf-to-cf` | Host-side SCF → ControlFlow. |
+| 14 | `convert-cf-to-llvm` | ControlFlow → LLVM dialect. |
+| 15 | `gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}` | GPU types and host launcher → LLVM. |
+| 16 | `convert-vector-to-llvm` | Vector → LLVM. |
+| 17 | `convert-arith-to-llvm` | Arith → LLVM. |
+| 18 | `convert-func-to-llvm` | Func → LLVM. |
+| 19 | `reconcile-unrealized-casts` | Final cast cleanup. |
 
 When `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`, Stage B appends
 `ensure-debug-info-scope-on-llvm-func{emission-kind=LineTablesOnly}` after
@@ -246,7 +248,7 @@ When `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`, Stage B appends
 
 | # | Pass | Description |
 |---|---|---|
-| 19 | `gpu-module-to-binary{format=fatbin opts="..."}` | Invokes the LLVM AMDGPU backend and emits an HSA fatbin. |
+| 20 | `gpu-module-to-binary{format=fatbin opts="..."}` | Invokes the LLVM AMDGPU backend and emits an HSA fatbin. |
 
 `gpu-kernel-outlining` is no longer a pass in the runtime pipeline — kernel
 outlining happens during Python tracing, when `@flyc.kernel` emits

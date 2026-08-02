@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2025 FlyDSL Project Contributors
+// Copyright (c) 2026 FlyDSL Project Contributors
 
-#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/IR/SymbolTable.h"
-#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -35,29 +32,6 @@ class RewriteToMakeIntTuple final : public OpRewritePattern<IntTupleLikeOp> {
   }
 };
 
-class RebuildStaticValue : public RewritePattern {
-public:
-  RebuildStaticValue(MLIRContext *context, PatternBenefit benefit = 1)
-      : RewritePattern(MatchAnyOpTypeTag(), benefit, context) {}
-
-  LogicalResult matchAndRewrite(Operation *op, PatternRewriter &rewriter) const override {
-    if (op->getNumResults() != 1)
-      return failure();
-    Type resultType = op->getResult(0).getType();
-
-    auto mayStatic = dyn_cast<MayStaticTypeInterface>(resultType);
-    if (!mayStatic || !mayStatic.isStatic())
-      return failure();
-
-    Value rebuild = mayStatic.rebuildStaticValue(rewriter, op->getLoc(), op->getResult(0));
-    if (!rebuild)
-      return failure();
-
-    rewriter.replaceOp(op, rebuild);
-    return success();
-  }
-};
-
 class FlyCanonicalizePass : public mlir::fly::impl::FlyCanonicalizePassBase<FlyCanonicalizePass> {
 public:
   using mlir::fly::impl::FlyCanonicalizePassBase<FlyCanonicalizePass>::FlyCanonicalizePassBase;
@@ -68,7 +42,6 @@ public:
 
     patterns.add<RewriteToMakeIntTuple<MakeShapeOp>, RewriteToMakeIntTuple<MakeStrideOp>,
                  RewriteToMakeIntTuple<MakeCoordOp>>(context);
-    patterns.add<RebuildStaticValue>(context);
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();

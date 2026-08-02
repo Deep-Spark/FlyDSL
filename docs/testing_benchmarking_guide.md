@@ -35,7 +35,7 @@ MLIR-based tests organized by category, verified using the `fly-opt` tool. Valid
 |---|---|---|
 | `LayoutAlgebra/` | `coalesce.mlir`, `composition.mlir`, `construction.mlir`, `coordinate.mlir`, `divide.mlir`, `int_tuple.mlir`, `product.mlir`, `size_cosize.mlir` | Layout algebra operations |
 | `Conversion/` | `gpu_ops.mlir`, `memref_alloca.mlir`, `memref_ops.mlir`, `mma_atom.mlir`, `pointer_ops.mlir`, `type_conversion.mlir` | Dialect conversion passes |
-| `Transforms/` | `canonicalize.mlir`, `layout_lowering.mlir` | Transformation passes |
+| `Transforms/` | `canonicalize.mlir`, `fold_static.mlir`, `layout_lowering.mlir` | Transformation passes |
 
 **Running individually:**
 ```bash

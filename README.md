@@ -240,7 +240,8 @@ Python Function (@flyc.kernel / @flyc.jit)
    ┌──────────────────────────────────────────────────────────┐
    │ A. pre_binary_fragments  (Fly → ROCDL)                   │
    │    fly-rewrite-func-signature → fly-canonicalize →       │
-   │    fly-layout-lowering → fly-int-swizzle-simplify →      │
+   │    fly-fold-static → fly-layout-lowering →               │
+   │    fly-int-swizzle-simplify →                            │
    │    canonicalize → fly-convert-atom-call-to-ssa-form →    │
    │    fly-promote-regmem-to-vectorssa →                     │
    │    convert-fly-to-rocdl → canonicalize →                 │
