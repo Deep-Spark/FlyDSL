@@ -4,7 +4,8 @@
 // RUN: %fly-opt %s | FileCheck %s --check-prefix=ROUNDTRIP
 
 // CQAsyncCp models enhanced-SME global-to-shared copies only. Shared-to-register
-// matrix loads (`loadn`) use a separate atom.
+// matrix loads (`loadn16`/`loadn64` → `ixdl.mtx_loadn_*`) use `cq.mtx_loadn`
+// (SmexMtx path; see ixdl_cq_mtx_loadn.mlir).
 
 // ROUNDTRIP-LABEL: @test_cq_async_cp_type
 // ROUNDTRIP-SAME: !fly_ixdl.cq.async_copy<64, 64, transpose = 0>

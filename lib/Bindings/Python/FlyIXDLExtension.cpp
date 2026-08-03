@@ -51,6 +51,25 @@ struct PyCopyOpCQAsyncCpType : PyConcreteType<PyCopyOpCQAsyncCpType> {
   }
 };
 
+struct PyCopyOpCQMtxLoadnType : PyConcreteType<PyCopyOpCQMtxLoadnType> {
+  FLYDSL_REGISTER_TYPE_BINDING(CopyOpCQMtxLoadnType, "CopyOpCQMtxLoadnType");
+
+  static void bindDerived(ClassTy &c) {
+    c.def_static(
+        "get",
+        [](int32_t pattern, int32_t direction, int32_t bitWidth, int32_t x2,
+           DefaultingPyMlirContext context) {
+          MLIRContext *ctx = unwrap(context.get()->get());
+          return PyCopyOpCQMtxLoadnType(
+              context->getRef(),
+              wrap(CopyOpCQMtxLoadnType::get(ctx, pattern, direction, bitWidth, x2)));
+        },
+        "pattern"_a, "direction"_a, "bit_width"_a, "x2"_a, nb::kw_only(), "context"_a = nb::none(),
+        "Create CopyOpCQMtxLoadnType (pattern: 0=loadn16/1=loadn64; direction: 0=row/1=col; "
+        "bit_width: 8|16; x2: 0|1)");
+  }
+};
+
 struct PyMmaOpMRMmaType : PyConcreteType<PyMmaOpMRMmaType> {
   FLYDSL_REGISTER_TYPE_BINDING(MmaOpMRMmaType, "MmaOpMRMmaType");
 
@@ -99,6 +118,7 @@ NB_MODULE(_mlirDialectsFlyIXDL, m) {
 
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpMRAsyncCpType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpCQAsyncCpType::bind(m);
+  ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpCQMtxLoadnType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyMmaOpMRMmaType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyMmaOpCQMmaType::bind(m);
 }

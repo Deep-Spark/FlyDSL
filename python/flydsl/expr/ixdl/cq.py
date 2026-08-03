@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""High-level API for Iluvatar CQ (ivcore30) TCU MMA atoms.
+"""High-level API for Iluvatar CQ (ivcore30) TCU MMA and SmexMtx S2R atoms.
 
-Exposes ``CQMma`` for CQ TCU matrix-multiply-accumulate atoms (base + long-mtx).
+Exposes ``CQMma`` for CQ TCU MMA and ``CQMtxLoadn`` for shared->register
+matrix loads (``loadn16`` / ``loadn64`` → ``ixdl.mtx_loadn_*``).
 """
 
 from ..._mlir import ir
-from ..._mlir._mlir_libs._mlirDialectsFlyIXDL import MmaOpCQMmaType
+from ..._mlir._mlir_libs._mlirDialectsFlyIXDL import CopyOpCQMtxLoadnType, MmaOpCQMmaType
 
 
 def _to_ir_type(t) -> "ir.Type":
@@ -17,6 +18,42 @@ def _to_ir_type(t) -> "ir.Type":
     if hasattr(t, "ir_type"):
         return t.ir_type
     raise TypeError(f"expected a NumericType or ir.Type, got {t!r}")
+
+
+class CQMtxPattern:
+    """SmexMtx shared-layout pattern (pairs with SME mtx G2S).
+
+    Incompatible with LegacySme (``ldmatrix`` / byte swizzle) on the same buffer.
+    Swizzle policy for SmexMtx is Bypass — dword/SMEX layout is handled by the
+    matrix-load / SMEX path, not MR LegacyByteSwizzle.
+    """
+
+    Loadn16 = 0  # pairs with smex_loadn_16x1b64_mtx
+    Loadn64 = 1  # pairs with smex_loadn_64x1b64_mtx
+
+
+class CQMtxDir:
+    """S2R gather direction (SoT: Row = A, Col = B)."""
+
+    Row = 0
+    Col = 1
+
+
+def CQMtxLoadn(pattern, direction, bit_width, x2=True):
+    """Create a CQ SmexMtx shared->register matrix-load atom.
+
+    Args:
+        pattern: ``CQMtxPattern.Loadn16`` or ``Loadn64`` (both lower to
+            ``ixdl.mtx_loadn_*``; the value documents G2S pairing / EmPart).
+        direction: ``CQMtxDir.Row`` (A) or ``Col`` (B).
+        bit_width: multiplicand element width, ``8`` or ``16``.
+        x2: if true (default), load 64b / ``vector<2xi32>`` per lane (full
+            base-tile MMA fragment half); if false, 32b / ``i32``.
+
+    Thr layouts match CQ MMA base-tile A/B fragments so ``make_tiled_copy_A/B``
+    can couple this atom to ``CQMma``.
+    """
+    return CopyOpCQMtxLoadnType.get(int(pattern), int(direction), int(bit_width), int(bool(x2)))
 
 
 def CQMma(m, n, k, elem_ty_a, elem_ty_b, elem_ty_acc):
