@@ -1,7 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-from .cq import CQMma, CQMtxDir, CQMtxLoadn, CQMtxPattern
+from .cq import (
+    CQAsyncCp,
+    CQAsyncCp1x64b64,
+    CQAsyncCp64x16Col,
+    CQAsyncCp64x16Row,
+    CQAsyncCp64x32Row,
+    CQAsyncCp64x64Row,
+    CQMma,
+    CQMtxDir,
+    CQMtxLoadn,
+    CQMtxPattern,
+)
 from .mr import (
     MRAsyncCp,
     MRAsyncCpCol,
@@ -48,6 +59,12 @@ __all__ = [
     "MRAsyncCpRow8b",
     "MRAsyncCpRow16b",
     "MRMma",
+    "CQAsyncCp",
+    "CQAsyncCp64x64Row",
+    "CQAsyncCp64x32Row",
+    "CQAsyncCp1x64b64",
+    "CQAsyncCp64x16Row",
+    "CQAsyncCp64x16Col",
     "CQMma",
     "CQMtxPattern",
     "CQMtxDir",

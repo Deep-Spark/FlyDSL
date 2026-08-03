@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""High-level API for Iluvatar CQ (ivcore30) TCU MMA and SmexMtx S2R atoms.
+"""High-level API for Iluvatar CQ (ivcore30) MMA / async-copy / SmexMtx S2R atoms.
 
-Exposes ``CQMma`` for CQ TCU MMA and ``CQMtxLoadn`` for shared->register
-matrix loads (``loadn16`` / ``loadn64`` → ``ixdl.mtx_loadn_*``).
+Mirrors :mod:`flydsl.expr.ixdl.mr` naming:
+
+- ``CQMma`` — CQ TCU MMA (``ixdl.mmad``)
+- ``CQAsyncCp*`` — enhanced-SME global->shared async copy
+- ``CQMtxLoadn`` — SmexMtx shared->register matrix load (``ixdl.mtx_loadn_*``)
 """
 
 from ..._mlir import ir
-from ..._mlir._mlir_libs._mlirDialectsFlyIXDL import CopyOpCQMtxLoadnType, MmaOpCQMmaType
+from ..._mlir._mlir_libs._mlirDialectsFlyIXDL import (
+    CopyOpCQAsyncCpType,
+    CopyOpCQMtxLoadnType,
+    MmaOpCQMmaType,
+)
 
 
 def _to_ir_type(t) -> "ir.Type":
@@ -37,6 +44,32 @@ class CQMtxDir:
 
     Row = 0
     Col = 1
+
+
+def CQAsyncCp(row, col, transpose=0):
+    """Create an Iluvatar CQ enhanced-SME async copy atom (G2S only).
+
+    Shape uses ixcc AsyncCopyUtils' normalized ``(row, col, transpose)``
+    convention. Verified shapes:
+
+    - ``(64, 64, 0)`` — b8 row (``ixdl.cp_async.64x64.b8.row``)
+    - ``(64, 32, 0)`` — b16 row (``ixdl.cp_async.64x32.b16.row``)
+    - ``(1, 1024, 0)`` — b32 interleave (``ixdl.cp_async.1x64b64``)
+    - ``(64, 16, 0)`` — b32 row (``ixdl.cp_async.64x16.b32.row``)
+    - ``(64, 16, 1)`` — b32 col (``ixdl.cp_async.64x16.b32.col``)
+
+    Element bit-width is carried by ``fx.make_copy_atom(..., elem_type)``, not
+    by this Op type. CQ S2R matrix loads use :func:`CQMtxLoadn` instead.
+    """
+    return CopyOpCQAsyncCpType.get(int(row), int(col), int(transpose))
+
+
+# Convenience aliases for the verified enhanced-SME shapes (mirrors MRAsyncCp*).
+CQAsyncCp64x64Row = lambda: CQAsyncCp(64, 64, 0)  # b8 row
+CQAsyncCp64x32Row = lambda: CQAsyncCp(64, 32, 0)  # b16 row
+CQAsyncCp1x64b64 = lambda: CQAsyncCp(1, 1024, 0)  # b32 interleave
+CQAsyncCp64x16Row = lambda: CQAsyncCp(64, 16, 0)  # b32 row
+CQAsyncCp64x16Col = lambda: CQAsyncCp(64, 16, 1)  # b32 col / transpose
 
 
 def CQMtxLoadn(pattern, direction, bit_width, x2=True):

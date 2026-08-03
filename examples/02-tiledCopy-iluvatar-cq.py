@@ -22,7 +22,6 @@ import torch  # noqa: E402
 import flydsl.compiler as flyc  # noqa: E402
 import flydsl.expr as fx  # noqa: E402
 import flydsl.expr.ixdl as ixdl  # noqa: E402
-from flydsl._mlir._mlir_libs._mlirDialectsFlyIXDL import CopyOpCQAsyncCpType  # noqa: E402
 from kernels.gemm.iluvatar.common import WARP_SIZE  # noqa: E402
 
 SMEM_BYTES = 4096
@@ -41,8 +40,7 @@ def _compile_case(*, fx_dtype, scalar_atom_factory, row, col, transpose, logical
         sme_src = ixdl.make_sme_gmem_tensor(src, leading_stride=source_stride)
         smem = fx.make_view(fx.get_dyn_shared(fx_dtype), fx.make_layout(tile_elems, 1))
 
-        async_op = CopyOpCQAsyncCpType.get(row, col, int(transpose))
-        async_atom = fx.make_copy_atom(async_op, fx_dtype)
+        async_atom = fx.make_copy_atom(ixdl.CQAsyncCp(row, col, transpose), fx_dtype)
         tiled_ld = fx.make_tiled_copy_tv(
             async_atom,
             fx.make_layout((1, 1), (1, 1)),

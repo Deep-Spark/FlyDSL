@@ -47,7 +47,8 @@ struct PyCopyOpCQAsyncCpType : PyConcreteType<PyCopyOpCQAsyncCpType> {
                                        wrap(CopyOpCQAsyncCpType::get(ctx, row, col, transpose)));
         },
         "row"_a, "col"_a, "transpose"_a, nb::kw_only(), "context"_a = nb::none(),
-        "Create a private CopyOpCQAsyncCpType for CQ async-copy examples and tests");
+        "Create a CopyOpCQAsyncCpType (row, col, transpose: verified enhanced-SME "
+        "shapes (64,64,0), (64,32,0), (1,1024,0), (64,16,0), (64,16,1))");
   }
 };
 
