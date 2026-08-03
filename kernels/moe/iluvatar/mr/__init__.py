@@ -13,6 +13,9 @@ from kernels.moe.iluvatar.mr.moe_gemm import (
     QUANT_INT8SMOOTH,
     compile_iluvatar_mr_moe_gemm,
 )
+from kernels.moe.iluvatar.mr.moe_gemm_2stage import (
+    compile_iluvatar_mr_moe_reduction_b16,
+)
 
 __all__ = [
     "OUT_BF16",
@@ -23,4 +26,5 @@ __all__ = [
     "QUANT_INT8",
     "QUANT_INT8SMOOTH",
     "compile_iluvatar_mr_moe_gemm",
+    "compile_iluvatar_mr_moe_reduction_b16",
 ]
