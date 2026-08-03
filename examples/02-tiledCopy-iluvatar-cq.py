@@ -4,9 +4,10 @@
 """Tiled copy teaching example: CQ SmexMtx G2S + loadn S2R (ivcore30).
 
 Minimal single-warp path for debugging layout / Bypass swizzle / ``loadn`` before
-CQ MMA/GEMM. Companion to ``examples/02-tiledCopy-iluvatar-mr.py``. Exhaustive
-LegacySme enhanced-SME shape compile/check lives in
-``examples/02-tiledCopy-iluvatar-cq-async-shapes.py``.
+CQ MMA/GEMM. Companion to ``examples/02-tiledCopy-iluvatar-mr.py``. Next step for
+G2S + loadn S2R + CQMma + epilogue store is
+``examples/03-tiledMma-iluvatar-cq-pipeline.py``. Exhaustive LegacySme enhanced-SME
+shape compile/check lives in ``examples/02-tiledCopy-iluvatar-cq-async-shapes.py``.
 
 Phases (CuTe-style TiledCopy on the S2R side):
 

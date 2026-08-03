@@ -4,7 +4,9 @@
 """CQ MMA tile / FeatureLongMtx correctness harness.
 
 Single-warp CQMma with constant A/B fragments (no G2S/S2R pipeline). Use this to
-validate base vs long-mtx tiles on ivcore30 before full CQ HGEMM/IGEMM.
+validate base vs long-mtx tiles on ivcore30 before full CQ HGEMM/IGEMM. For the
+minimal G2S + loadn S2R + MMA + store smoke path, see
+``examples/03-tiledMma-iluvatar-cq-pipeline.py``.
 
 Examples::
 
