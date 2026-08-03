@@ -51,11 +51,10 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from kernels.gemm.iluvatar.common import WARP_SIZE
+from kernels.moe.iluvatar.silu_and_mul import compile_iluvatar_silu_and_mul
 
 from .gemm_common_b16 import (
     B16_DTYPES,
-    _DTYPE_FX,
     build_grouped_b16_kernel,
     validate_grouped_b16_config,
 )
@@ -66,7 +65,6 @@ DEFAULT_WARP_ATOMS_M = 1
 DEFAULT_WARP_ATOMS_N = 2
 DEFAULT_K_ATOMS = 2
 DEFAULT_STAGES = 2
-ACTIVATION_THREADS = 4 * WARP_SIZE
 
 
 @functools.lru_cache(maxsize=256)
@@ -117,7 +115,6 @@ def compile_iluvatar_mr_moe_gemm1_b16(
         k_atoms=k_atoms,
         stages=stages,
     )
-    elem_dtype = _DTYPE_FX[dtype]
     # Stage1 projection specializes grouped_b16_kernel as follows:
     #   X:         [tokens, model_dim], row-major [model_dim, 1]
     #   W1:        [experts, 2*inter_dim, model_dim], row-major
@@ -142,65 +139,24 @@ def compile_iluvatar_mr_moe_gemm1_b16(
         stages=stages,
         config=config,
     )
-
-    @flyc.kernel(known_block_size=[ACTIVATION_THREADS, 1, 1])
-    def activate(
-        Out: fx.Tensor,
-        Workspace: fx.Tensor,
-        sorted_token_ids: fx.Tensor,
-        sorted_weights: fx.Tensor,
-        num_valid_ids: fx.Tensor,
-        tokens_in: fx.Int32,
-    ):
-        sorted_row = fx.Int32(fx.block_idx.x)
-        tid = fx.Int32(fx.thread_idx.x)
-        fused = fx.Int32(sorted_token_ids[sorted_row])
-        token = fused & fx.Int32(0xFFFFFF)
-        slot = fused.shrui(fx.Int32(24))
-        valid = (
-            (sorted_row < fx.Int32(num_valid_ids[0]))
-            & (token < fx.Int32(tokens_in))
-            & (slot < fx.Int32(topk))
-        )
-        if valid:
-            route = (
-                fx.Float32(sorted_weights[sorted_row])
-                if fx.const_expr(apply_route_weight)
-                else fx.Float32(1.0)
-            )
-            one = fx.Float32(1.0)
-            log2e = fx.Float32(1.4426950408889634)
-            exp_scale = fx.Float32(8388608.0)
-            exp_bias = fx.Float32(1065353216.0)
-            lo = fx.Float32(-126.0)
-            hi = fx.Float32(126.0)
-
-            def exp2_approx(value):
-                value = (value > hi).select(hi, value)
-                value = (value < lo).select(lo, value)
-                return fx.Int32(value * exp_scale + exp_bias).bitcast(fx.Float32)
-
-            for base in fx.range_constexpr(0, inter_dim, ACTIVATION_THREADS):
-                col = tid + fx.Int32(base)
-                if col < fx.Int32(inter_dim):
-                    gate = Workspace[token, slot, col].to(fx.Float32)
-                    up = Workspace[token, slot, col + fx.Int32(inter_dim)].to(
-                        fx.Float32
-                    )
-                    sigmoid = one / (one + exp2_approx(-gate * log2e))
-                    Out[token, slot, col] = (
-                        gate * sigmoid * up * route
-                    ).to(elem_dtype)
+    activation = compile_iluvatar_silu_and_mul(
+        inter_dim=inter_dim,
+        topk=topk,
+        quant_mode="none",
+        gui_layout=False,
+        act="silu",
+        enable_bias=False,
+        dtype=dtype,
+        apply_route_weight=apply_route_weight,
+    )
 
     @flyc.jit
-    def launch_jit(
-        Out: fx.Tensor,
+    def launch_projection_jit(
         Workspace: fx.Tensor,
         X: fx.Tensor,
         W1: fx.Tensor,
         sorted_token_ids: fx.Tensor,
         sorted_expert_ids: fx.Tensor,
-        sorted_weights: fx.Tensor,
         num_valid_ids: fx.Tensor,
         tokens_in: fx.Int32,
         num_expert_blocks: fx.Int32,
@@ -212,24 +168,12 @@ def compile_iluvatar_mr_moe_gemm1_b16(
             W1,
             sorted_token_ids,
             sorted_expert_ids,
-            sorted_weights,
+            sorted_token_ids,
             num_valid_ids,
             tokens_in,
         ).launch(
             grid=(config.n_tiles, num_expert_blocks, 1),
             block=(config.threads, 1, 1),
-            stream=stream,
-        )
-        activate(
-            Out,
-            Workspace,
-            sorted_token_ids,
-            sorted_weights,
-            num_valid_ids,
-            tokens_in,
-        ).launch(
-            grid=(num_expert_blocks * fx.Int32(config.bm), 1, 1),
-            block=(ACTIVATION_THREADS, 1, 1),
             stream=stream,
         )
 
@@ -249,19 +193,35 @@ def compile_iluvatar_mr_moe_gemm1_b16(
         if apply_route_weight and sorted_weights is None:
             raise ValueError("sorted_weights is required when apply_route_weight=True")
         weights = sorted_token_ids if sorted_weights is None else sorted_weights
-        args = (
-            Out,
+        projection_args = (
             Workspace,
             X,
             W1,
             sorted_token_ids,
             sorted_expert_ids,
-            weights,
             num_valid_ids,
             fx.Int32(int(tokens)),
             fx.Int32(int(num_expert_blocks)),
         )
-        launch_jit(*args) if stream is None else launch_jit(*args, stream=stream)
+        if stream is None:
+            launch_projection_jit(*projection_args)
+        else:
+            launch_projection_jit(*projection_args, stream=stream)
+
+        rows = int(tokens) * topk
+        activation(
+            Workspace.view(rows, 2 * inter_dim),
+            Out.view(rows, inter_dim),
+            None,
+            sorted_token_ids,
+            num_valid_ids,
+            None,
+            None,
+            int(tokens),
+            int(num_expert_blocks) * config.bm,
+            stream=stream,
+            sorted_weights=weights,
+        )
         return Out
 
     launch.workspace_shape = lambda tokens: (int(tokens), topk, 2 * inter_dim)
