@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar BF16 silu-and-mul device tests."""
+"""Iluvatar FP16/BF16 silu-and-mul device tests."""
 
 from __future__ import annotations
 
@@ -191,6 +191,68 @@ def test_iluvatar_silu_and_mul_correctness(
     )
 
 
+@pytest.mark.parametrize(
+    "dtype,torch_dtype",
+    [("f16", torch.float16), ("bf16", torch.bfloat16)],
+)
+def test_iluvatar_silu_and_mul_dtype_and_route_weight(
+    monkeypatch, dtype, torch_dtype
+):
+    _configure_iluvatar_env(monkeypatch)
+    token_num, topk, inter_dim = 3, 2, 256
+    rows = token_num * topk
+    torch.manual_seed(123)
+    x = (
+        torch.randn(rows, 2 * inter_dim, device="cuda", dtype=torch.float32)
+        * 0.5
+    ).to(torch_dtype)
+    sorted_ids = _make_sorted_ids(token_num, topk, 0)
+    route_by_row = torch.rand(rows, device="cuda", dtype=torch.float32)
+    sorted_weights = torch.empty(
+        rows, device="cuda", dtype=torch.float32
+    )
+    for sorted_row, fused in enumerate(sorted_ids.tolist()):
+        token = fused & 0xFFFFFF
+        slot = fused >> 24
+        sorted_weights[sorted_row] = route_by_row[token * topk + slot]
+    num_valid_ids = torch.tensor(
+        [rows], device="cuda", dtype=torch.int32
+    )
+    out = torch.empty(rows, inter_dim, device="cuda", dtype=torch_dtype)
+
+    launch = compile_iluvatar_silu_and_mul(
+        inter_dim=inter_dim,
+        topk=topk,
+        dtype=dtype,
+        apply_route_weight=True,
+    )
+    launch(
+        x,
+        out,
+        None,
+        sorted_ids,
+        num_valid_ids,
+        None,
+        None,
+        token_num,
+        rows,
+        sorted_weights=sorted_weights,
+    )
+    torch.cuda.synchronize()
+
+    gate = x[:, :inter_dim].float()
+    up = x[:, inter_dim:].float()
+    expected = (
+        torch.nn.functional.silu(gate)
+        * up
+        * route_by_row[:, None]
+    )
+    tol = 3e-2 if dtype == "f16" else 5e-2
+    torch.testing.assert_close(
+        out.float(), expected, rtol=tol, atol=tol
+    )
+
+
 def test_iluvatar_silu_and_mul_zero_rows(monkeypatch):
     _configure_iluvatar_env(monkeypatch)
 
@@ -229,6 +291,12 @@ def test_iluvatar_silu_and_mul_compile_time_guards():
             inter_dim=256,
             topk=2,
             quant_mode="fp4",
+        )
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        compile_iluvatar_silu_and_mul(
+            inter_dim=256,
+            topk=2,
+            dtype="f32",
         )
     with pytest.raises(ValueError, match="act must be one of"):
         compile_iluvatar_silu_and_mul(

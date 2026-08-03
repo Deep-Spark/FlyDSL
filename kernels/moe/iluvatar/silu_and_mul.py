@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar BF16-only gate-activation-and-multiply kernel.
+"""Iluvatar FP16/BF16 gate-activation-and-multiply kernel.
 
 This kernel is the nonlinear epilogue of a split-K MoE stage1 GEMM. Split-K
 first accumulates the two expert projections into ``x``:
@@ -26,7 +26,7 @@ a single GPU, with this kernel highlighted in its surrounding data flow:
                     |       G = sum_s(X_s @ W_gate_s.T)    |
                     |                                      +--> x = concat(G, U)
                     +--> Stage1 split-K up projection -----+    [token_num*topk,
-                            U = sum_s(X_s @ W_up_s.T)            2*inter_dim] BF16
+                            U = sum_s(X_s @ W_up_s.T)            2*inter_dim] b16
                                                                    |
                                                                    v
                     +----------------------------------------------+
@@ -36,7 +36,7 @@ a single GPU, with this kernel highlighted in its surrounding data flow:
                     |   3. load G/U from x[row]
                     |   4. optionally add expert-specific bias
                     |   5. compute H = SiLU(G) * U in FP32
-                    |   6. convert to BF16 and store out[row]
+                    |   6. optionally apply route weight and store out[row]
                     +----------------------------------------------+
                                                                    |
                                                                    v
@@ -51,8 +51,9 @@ a single GPU, with this kernel highlighted in its surrounding data flow:
 The sorting kernel groups token-slot pairs by expert for the grouped GEMMs.
 Consequently, CTAs walk rows in expert-sorted order, but decoded results are
 written back to their original ``token * topk + slot`` rows. This kernel does
-not perform the gate/up projections, down projection, routing-weighted
-reduction, or FP4/FP8 quantization.
+not perform the gate/up projections, down projection, Top-K reduction, or
+FP4/FP8 quantization. It can optionally apply the routing weight before
+Stage2.
 """
 
 from collections.abc import Callable
@@ -64,9 +65,12 @@ from flydsl.expr import const_expr, range_constexpr
 from kernels.gemm.iluvatar.common import WARP_SIZE
 
 BLOCK_THREADS = 4 * WARP_SIZE
-KERNEL_NAME = "iluvatar_silu_and_mul_bf16"
+KERNEL_NAME = "iluvatar_silu_and_mul_b16"
 SUPPORTED_ACTS = ("silu", "swiglu")
 SUPPORTED_QUANT_MODE = "none"
+SUPPORTED_DTYPES = ("f16", "bf16")
+_DTYPE_FX = {"f16": fx.Float16, "bf16": fx.BFloat16}
+_DTYPE_TORCH = {"f16": "torch.float16", "bf16": "torch.bfloat16"}
 
 
 def _tensors_overlap(a, b) -> bool:
@@ -89,7 +93,12 @@ def _tensors_overlap(a, b) -> bool:
 #     token-slot row mapping: row = token_id * topk + slot_id.
 #   quant_mode:
 #     Compatibility option shared with the generic implementation. This
-#     Iluvatar kernel accepts only "none" and writes BF16.
+#     Iluvatar kernel accepts only "none".
+#   dtype:
+#     Input/output type: "f16" or "bf16". Activation math remains FP32.
+#   apply_route_weight:
+#     Whether to multiply each token-slot row by its sorted FP32 routing
+#     weight before converting to dtype.
 #   gui_layout:
 #     Physical gate/up input layout. False means [gate_0:N | up_0:N]; True
 #     means 16-element interleaving:
@@ -117,6 +126,8 @@ def build_iluvatar_silu_and_mul_module(
     act: str = "silu",
     enable_bias: bool = False,
     swiglu_limit: float = 0.0,
+    dtype: str = "bf16",
+    apply_route_weight: bool = False,
 ) -> Callable:
     if inter_dim <= 0:
         raise ValueError(f"inter_dim must be positive, got {inter_dim}")
@@ -126,23 +137,31 @@ def build_iluvatar_silu_and_mul_module(
         raise ValueError(f"topk must be in [1, 255], got {topk}")
     if quant_mode != "none":
         raise ValueError(
-            f"Iluvatar BF16 silu_and_mul supports only quant_mode='none', got {quant_mode!r}"
+            f"Iluvatar b16 silu_and_mul supports only quant_mode='none', got {quant_mode!r}"
+        )
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(
+            f"dtype must be one of {SUPPORTED_DTYPES}, got {dtype!r}"
         )
     if act not in SUPPORTED_ACTS:
         raise ValueError(f"act must be one of {SUPPORTED_ACTS}, got {act!r}")
     if swiglu_limit < 0:
         raise ValueError(f"swiglu_limit must be non-negative, got {swiglu_limit}")
+    elem_dtype = _DTYPE_FX[dtype]
 
     # Device kernel parameters:
     #   x:
     #     Accumulated split-K stage1 result with logical shape
-    #     [token_num * topk, 2 * inter_dim], BF16.
+    #     [token_num * topk, 2 * inter_dim], FP16/BF16.
     #   out:
     #     Activated expert input for stage2 with logical shape
-    #     [token_num * topk, inter_dim], BF16.
+    #     [token_num * topk, inter_dim], same dtype as x.
     #   sorted_ids:
     #     Sorted-row -> original token-slot mapping. Low 24 bits encode
     #     token_id and high 8 bits encode the top-k slot.
+    #   sorted_weights:
+    #     FP32 routing weights aligned with sorted_ids. Read only when
+    #     apply_route_weight=True.
     #   num_valid_ids:
     #     Number of sorted rows in the routed/padded MoE region. Sentinel rows
     #     are rejected again by token_id/slot_id bounds checks.
@@ -159,6 +178,7 @@ def build_iluvatar_silu_and_mul_module(
         x: fx.Tensor,
         out: fx.Tensor,
         sorted_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
         num_valid_ids: fx.Tensor,
         topk_ids: fx.Tensor,
         bias: fx.Tensor,
@@ -195,6 +215,11 @@ def build_iluvatar_silu_and_mul_module(
             expert_id = fx.Int32(0)
             if const_expr(enable_bias):
                 expert_id = fx.Int32(topk_ids[token_id, slot_id])
+            route = (
+                fx.Float32(sorted_weights[bid])
+                if const_expr(apply_route_weight)
+                else fx.Float32(1.0)
+            )
 
             one = fx.Float32(1.0)
             alpha = fx.Float32(1.702)
@@ -274,9 +299,9 @@ def build_iluvatar_silu_and_mul_module(
                         sigmoid = one / (one + exp2_approx(-gate * log2e))
                         value = gate * sigmoid * up
 
-                    # Step 6 — Convert the FP32 result to BF16 and write it
-                    # back to the original token-slot row.
-                    out[row, col] = value.to(fx.BFloat16)
+                    # Step 6 — Apply the optional routing weight, convert to
+                    # the selected b16 dtype, and restore token-slot order.
+                    out[row, col] = (value * route).to(elem_dtype)
 
     @flyc.jit
     def _launch(
@@ -284,6 +309,7 @@ def build_iluvatar_silu_and_mul_module(
         x: fx.Tensor,
         out: fx.Tensor,
         sorted_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
         num_valid_ids: fx.Tensor,
         topk_ids: fx.Tensor,
         bias: fx.Tensor,
@@ -294,7 +320,14 @@ def build_iluvatar_silu_and_mul_module(
         # Grid X follows sorted rows, while each 256-thread CTA covers the
         # inter_dim columns of one decoded token-slot row.
         _kernel(
-            x, out, sorted_ids, num_valid_ids, topk_ids, bias, token_num
+            x,
+            out,
+            sorted_ids,
+            sorted_weights,
+            num_valid_ids,
+            topk_ids,
+            bias,
+            token_num,
         ).launch(
             grid=(num_sorted_rows, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
@@ -312,6 +345,7 @@ def build_iluvatar_silu_and_mul_module(
         token_num: int,
         num_sorted_rows: int,
         stream=None,
+        sorted_weights=None,
     ):
         if not isinstance(token_num, int) or token_num < 0:
             raise ValueError(f"token_num must be a non-negative int, got {token_num!r}")
@@ -328,10 +362,13 @@ def build_iluvatar_silu_and_mul_module(
             raise ValueError(
                 f"expected out shape ({rows},{inter_dim}), got {tuple(out.shape)}"
             )
-        if str(x.dtype) != "torch.bfloat16":
-            raise ValueError(f"x dtype must be torch.bfloat16, got {x.dtype}")
-        if str(out.dtype) != "torch.bfloat16":
-            raise ValueError(f"out dtype must be torch.bfloat16, got {out.dtype}")
+        expected_torch_dtype = _DTYPE_TORCH[dtype]
+        if str(x.dtype) != expected_torch_dtype:
+            raise ValueError(f"x dtype must be {expected_torch_dtype}, got {x.dtype}")
+        if str(out.dtype) != expected_torch_dtype:
+            raise ValueError(
+                f"out dtype must be {expected_torch_dtype}, got {out.dtype}"
+            )
         if not x.is_contiguous() or not out.is_contiguous():
             raise ValueError("x and out must be contiguous")
         if x.device != out.device:
@@ -346,6 +383,22 @@ def build_iluvatar_silu_and_mul_module(
             raise ValueError("sorted_ids dtype must be torch.int32")
         if int(num_valid_ids.numel()) < 1 or str(num_valid_ids.dtype) != "torch.int32":
             raise ValueError("num_valid_ids must contain at least one int32 element")
+        if apply_route_weight:
+            if sorted_weights is None:
+                raise ValueError(
+                    "sorted_weights is required when apply_route_weight=True"
+                )
+            if sorted_weights.dim() != 1 or int(sorted_weights.numel()) < num_sorted_rows:
+                raise ValueError(
+                    "sorted_weights must be 1D with at least "
+                    f"{num_sorted_rows} elements"
+                )
+            if str(sorted_weights.dtype) != "torch.float32":
+                raise ValueError("sorted_weights dtype must be torch.float32")
+            if not sorted_weights.is_contiguous():
+                raise ValueError("sorted_weights must be contiguous")
+        else:
+            sorted_weights = sorted_ids if sorted_weights is None else sorted_weights
 
         if enable_bias:
             if topk_ids is None or bias is None:
@@ -366,6 +419,7 @@ def build_iluvatar_silu_and_mul_module(
 
         for name, tensor in (
             ("sorted_ids", sorted_ids),
+            ("sorted_weights", sorted_weights),
             ("num_valid_ids", num_valid_ids),
             ("topk_ids", topk_ids),
             ("bias", bias),
@@ -381,6 +435,7 @@ def build_iluvatar_silu_and_mul_module(
             x,
             out,
             sorted_ids,
+            sorted_weights,
             num_valid_ids,
             topk_ids,
             bias,
@@ -390,7 +445,7 @@ def build_iluvatar_silu_and_mul_module(
         _launch(*args) if stream is None else _launch(*args, stream=stream)
         return out
 
-    launch.kernel_name = KERNEL_NAME
+    launch.kernel_name = f"{KERNEL_NAME}_{dtype}"
     launch.block_threads = BLOCK_THREADS
     return launch
 
@@ -404,6 +459,7 @@ __all__ = [
     "BLOCK_THREADS",
     "KERNEL_NAME",
     "SUPPORTED_ACTS",
+    "SUPPORTED_DTYPES",
     "SUPPORTED_QUANT_MODE",
     "build_iluvatar_silu_and_mul_module",
     "compile_iluvatar_silu_and_mul",
