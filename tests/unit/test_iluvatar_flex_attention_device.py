@@ -3,15 +3,11 @@
 
 """Iluvatar flex-attention device tests.
 
-PR-1a covers the ``Q @ K^T * sm_scale`` sub-step via ``_compile_iluvatar_qk_dot_dev``
-(kept as a dev-only bisection helper).
-
-PR-1b adds numerical tests for the full fused non-causal path
-(``compile_iluvatar_flex_attention(..., is_causal=False)``) — MMA1 -> online
-softmax -> P via SMEM -> MMA2 -> normalise -> gmem write.
-
-PR-1c adds ``is_causal=True`` numerical tests (in-kernel triangular mask
-applied after the ``(sm_scale * log2e)`` scale, before rowmax).
+Covers:
+* PR-1a: QK^T-only helper vs ``torch.matmul``.
+* PR-1b: non-causal fused forward vs ``F.scaled_dot_product_attention``.
+* PR-1c: causal fused forward vs SDPA ``is_causal=True``.
+* PR-2a: softcap / SWA (+ combinations) vs hand-written fp32 reference.
 """
 
 from __future__ import annotations
@@ -226,3 +222,129 @@ def test_iluvatar_flex_attention_rejects_negative_softcap():
     mod = _require_flex_attn_module()
     with pytest.raises(ValueError, match=r"softcap must be > 0"):
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", is_causal=True, softcap=-1.0)
+
+
+def test_iluvatar_flex_attention_rejects_nonpositive_window_size():
+    mod = _require_flex_attn_module()
+    with pytest.raises(ValueError, match=r"window_size must be > 0"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", is_causal=True, window_size=0)
+
+
+# --- PR-2a: softcap / SWA ----------------------------------------------------
+
+
+def _reference_flex_attention_fp32(
+    Q,
+    K,
+    V,
+    *,
+    sm_scale: float,
+    is_causal: bool = False,
+    window_size: int | None = None,
+    softcap: float | None = None,
+):
+    """Plan §3.1 hand-written fp32 reference for score mods."""
+    torch = _require_torch()
+    S = torch.matmul(Q.float(), K.float().transpose(-1, -2)) * sm_scale
+    if softcap is not None:
+        S = softcap * torch.tanh(S / softcap)
+    Sq = S.shape[-2]
+    Skv = S.shape[-1]
+    q_idx = torch.arange(Sq, device=S.device).view(Sq, 1)
+    kv_idx = torch.arange(Skv, device=S.device).view(1, Skv)
+    mask = torch.zeros((Sq, Skv), device=S.device, dtype=torch.bool)
+    if is_causal:
+        mask = mask | (kv_idx > q_idx)
+    if window_size is not None:
+        mask = mask | ((q_idx - kv_idx) > window_size)
+    S = S.masked_fill(mask, float("-inf"))
+    P = torch.softmax(S, dim=-1)
+    P = torch.nan_to_num(P, nan=0.0)
+    return torch.matmul(P, V.float())
+
+
+def _run_flex_attn(
+    monkeypatch,
+    *,
+    B,
+    H,
+    Sq,
+    Skv,
+    is_causal=False,
+    window_size=None,
+    softcap=None,
+    seed=0,
+):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    D = 128
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+
+    torch.manual_seed(seed)
+    Q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype)
+    K = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
+    V_natural = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
+    V_transposed = V_natural.transpose(-1, -2).contiguous()
+    O = torch.zeros(B, H, Sq, D, device="cuda", dtype=torch_dtype)  # noqa: E741
+
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype="bf16",
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+        sm_scale=sm_scale,
+    )
+    launch(Q, K, V_transposed, O)
+    torch.cuda.synchronize()
+
+    ref = _reference_flex_attention_fp32(
+        Q,
+        K,
+        V_natural,
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+    ).to(torch_dtype)
+    return O, ref
+
+
+@pytest.mark.parametrize(
+    "is_causal,window_size,softcap",
+    [
+        (False, 64, None),
+        (False, None, 30.0),
+        (True, 64, None),
+        (True, None, 30.0),
+        (True, 64, 30.0),
+        (False, 64, 30.0),
+    ],
+)
+def test_iluvatar_flex_attention_forward_pr2a_variants(monkeypatch, is_causal, window_size, softcap):
+    out, ref = _run_flex_attn(
+        monkeypatch,
+        B=2,
+        H=4,
+        Sq=128,
+        Skv=128,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_iluvatar_flex_attention_pr2a_softcap_none_matches_pr1b(monkeypatch):
+    """No softcap / no SWA must stay aligned with the fused-scale PR-1 path."""
+    torch = _require_torch()
+    out, ref = _run_flex_attn(monkeypatch, B=1, H=4, Sq=64, Skv=64, is_causal=False)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
