@@ -3,16 +3,12 @@
 
 """Iluvatar flex-attention forward kernel (V1).
 
-PR-1 lands the V1 scope incrementally via three internal sub-steps
-(see ``docs/iluvatar_flex_attention_v1_plan.md`` §5.4):
+This is a **variant subset** of PyTorch flex_attention (causal / SWA / softcap),
+not a general ``score_mod`` compiler. See ``docs/iluvatar_flex_attention_v1_plan.md``.
 
-* PR-1a: ``_compile_iluvatar_qk_dot_dev`` — QK^T-only dev helper, writes
-  ``S = Q @ K^T * sm_scale`` (fp32) to gmem. Kept as a bisection helper.
-* PR-1b: Full ``compile_iluvatar_flex_attention`` with online softmax + P via SMEM
-  + P@V, non-causal path.
-* PR-1c (this commit): Adds ``is_causal=True`` via an in-kernel triangular mask
-  applied after the ``(sm_scale * log2e)`` scale, before rowmax. Enforces
-  ``Sq == Skv`` (plan §2.2). MHA / D=128 / bf16 scope from PR-1b is unchanged.
+Landed:
+* PR-1a/1b/1c: fused forward, bf16 / D=128 / MHA / aligned self-attn, ``is_causal``.
+* PR-2a: ``softcap`` (Gemma-2) + ``window_size`` (SWA); independent of causal.
 """
 
 import math
@@ -22,6 +18,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
 from flydsl.expr import arith
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import Vector as Vec
 from kernels.gemm.iluvatar.common import GemmLayout
 from kernels.gemm.iluvatar.mr.common import (
@@ -95,7 +92,7 @@ def _validate_scope(
     if window_size is not None and window_size <= 0:
         raise ValueError(f"window_size must be > 0 when set, got {window_size}")
 
-    # --- PR-1 temporary subset (delete in PR-2) ---
+    # --- PR-1/PR-2a temporary subset (lift remaining rejects in PR-2b/2c) ---
     if dtype not in _PR1_SUPPORTED_DTYPES:
         raise NotImplementedError(f"PR-1 supports dtype {_PR1_SUPPORTED_DTYPES}; got {dtype!r}. f16 lands in PR-2.")
     if D not in _PR1_SUPPORTED_D:
@@ -106,10 +103,6 @@ def _validate_scope(
         raise NotImplementedError(
             f"PR-1 supports self-attention only (Sq=Skv); got Sq={Sq}, Skv={Skv}. " "Cross-attention lands in PR-2."
         )
-    if window_size is not None:
-        raise NotImplementedError("PR-1 does not support sliding_window; lands in PR-2.")
-    if softcap is not None:
-        raise NotImplementedError("PR-1 does not support softcap; lands in PR-2.")
     if Sq % BLOCK_M != 0:
         raise ValueError(
             f"PR-1 requires strict alignment: Sq ({Sq}) must be a multiple of BLOCK_M ({BLOCK_M}). "
@@ -380,9 +373,19 @@ def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: 
 
 
 def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cyclomatic score)
-    *, B: int, H: int, Sq: int, Skv: int, D: int, dtype: str, sm_scale_f32: float, is_causal: bool = False
+    *,
+    B: int,
+    H: int,
+    Sq: int,
+    Skv: int,
+    D: int,
+    dtype: str,
+    sm_scale_f32: float,
+    is_causal: bool = False,
+    window_size: int | None = None,
+    softcap: float | None = None,
 ) -> Callable:
-    """Compile the non-causal flex-attention forward launcher (PR-1b).
+    """Compile the flex-attention forward launcher (PR-1b + PR-1c + PR-2a).
 
     FA-1 chain: Q resident in SMEM; per-KV-tile MMA1 (Q @ K^T) -> online softmax
     with rowmax/rowsum cross-warp reduce -> P via SMEM (bf16, plain logical
@@ -392,6 +395,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     logical MN coordinates without a permutation) -> MMA2 (P @ V, host-side
     transposed V so both operands are k-major "tn") -> divide by rowsum ->
     write bf16 O back to gmem.
+
+    Score mods (plan §2.3), after MMA1:
+      * softcap set: ``S *= sm_scale`` → ``softcap * tanh(S/softcap)`` → ``S *= log2e``
+      * softcap None: fused ``S *= (sm_scale * log2e)`` (bit-exact with PR-1)
+      * then optional causal (``kv > q``) and SWA (``q - kv > window_size``) masks
+        in the log2 domain with ``NEG_LARGE_F``.
 
     Loop-carried state per lane: one ``(m_running, l_running)`` fp32 pair per
     ``mma_m`` (i.e. ``ROWS_PER_LANE = WARP_ATOMS_M = 2`` pairs = 4 scalars),
@@ -499,6 +508,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     LOG2E = 1.4426950408889634
     scale_log2e = float(sm_scale_f32) * LOG2E
     shuffle_steps = int(math.log2(TCU_LANE_COLS))
+    has_softcap = softcap is not None
+    has_swa = window_size is not None
+    softcap_f32 = float(softcap) if has_softcap else 0.0
+    window_size_i = int(window_size) if has_swa else 0
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def flex_attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor):  # noqa: E741
@@ -536,6 +549,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
         c_zero_f = fx.Float32(0.0)
         c_neg_large = fx.Float32(NEG_LARGE_F)
         c_scale_log2e = fx.Float32(scale_log2e)
+        c_sm_scale = fx.Float32(float(sm_scale_f32))
+        c_log2e = fx.Float32(LOG2E)
+        c_softcap = fx.Float32(softcap_f32)
+        c_window = fx.Int32(window_size_i)
 
         # 4D logical views (batch, head, seq, dim). V is host-transposed to
         # [B, H, D, Skv] so both MMA operands stay k-major "tn".
@@ -755,18 +772,42 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                             S_frags[mma_m][mma_n],
                         )
 
-            # ---- Scale S by (sm_scale * log2e) in-place -------------------
-            # Fuses the pre-softmax scaling and the exp2 log2-domain shift so
-            # the subsequent rowmax/exp2 chain stays in fp32.
-            for mma_m in fx.range_constexpr(WARP_ATOMS_M):
-                for mma_n in fx.range_constexpr(WARP_ATOMS_N):
-                    acc = S_frags[mma_m][mma_n]
-                    acc.store(Vec(acc.load()) * c_scale_log2e)
+            # ---- Scale / softcap / enter log2 domain ----------------------
+            # Plan §2.3: S *= sm_scale → optional softcap → masks → softmax.
+            # Softmax uses exp2, so we enter log2 domain with *log2e after
+            # softcap. When softcap is unset, keep the fused *(sm_scale*log2e)
+            # path bit-exact with PR-1.
+            if fx.const_expr(has_softcap):
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                        acc = S_frags[mma_m][mma_n]
+                        old = Vec(acc.load())
+                        acc.store(
+                            Vec.from_elements(
+                                [
+                                    c_log2e
+                                    * (
+                                        c_softcap
+                                        * fmath.tanh(
+                                            (old[ei] * c_sm_scale) / c_softcap,
+                                            fastmath=fm_fast,
+                                        )
+                                    )
+                                    for ei in range(4)
+                                ],
+                                fx.Float32,
+                            )
+                        )
+            else:
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                        acc = S_frags[mma_m][mma_n]
+                        acc.store(Vec(acc.load()) * c_scale_log2e)
 
             # ---- Causal mask (PR-1c) --------------------------------------
             # Set S[q, k] = NEG_LARGE_F where ``kv_global > q_global``. Applied
-            # AFTER the (sm_scale * log2e) scale above, so the sentinel lives
-            # in the same log2 domain as everything downstream and matches the
+            # AFTER entering the log2 domain above, so the sentinel lives in
+            # the same domain as everything downstream and matches the
             # m_running init: exp2(NEG_LARGE_F - m_new) ≈ 0 for any bounded
             # m_new. ``is_causal=True`` enforces ``Sq == Skv`` at compile
             # time, so q_global and kv_global share the same axis.
@@ -794,6 +835,30 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                                     (kv_g > q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row).select(
                                         c_neg_large, old[ei]
                                     )
+                                    for ei in range(4)
+                                ],
+                                fx.Float32,
+                            )
+                        )
+
+            # ---- Sliding-window mask (PR-2a) ------------------------------
+            # Plan §2.3: mask where ``q_global - kv_global > window_size``
+            # (distance == window_size remains visible). Independent of
+            # ``is_causal`` — callers wanting a causal window must set both.
+            if fx.const_expr(has_swa):
+                q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
+                kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                        acc = S_frags[mma_m][mma_n]
+                        old = Vec(acc.load())
+                        kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                        acc.store(
+                            Vec.from_elements(
+                                [
+                                    (
+                                        (q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row) - kv_g > c_window
+                                    ).select(c_neg_large, old[ei])
                                     for ei in range(4)
                                 ],
                                 fx.Float32,
@@ -1116,19 +1181,23 @@ def compile_iluvatar_flex_attention(
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
     See ``docs/iluvatar_flex_attention_v1_plan.md`` for the V1 decision record.
+    This is a variant subset (causal / SWA / softcap), not a general score_mod
+    compiler.
 
-    PR-1 supports the fused path with Q/K/V/O = bf16, D=128, MHA,
-    ``Sq == Skv``, both aligned to ``BLOCK_M/BLOCK_N``. ``is_causal`` can be
-    True (PR-1c) or False (PR-1b); no tile-level pruning for the fully-masked
-    causal tiles yet — that is a PR-2 perf optimisation.
+    Current scope (through PR-2a): Q/K/V/O = bf16, D=128, MHA, ``Sq == Skv``,
+    both aligned to ``BLOCK_M/BLOCK_N``. Supports ``is_causal``, ``window_size``,
+    and ``softcap`` (any combination). No tile-level pruning for fully-masked
+    causal tiles yet.
 
     Args:
         B, H, Sq, Skv, D: See plan §2.4. All compile-time constants.
-        Hkv: KV head count; ``None`` means MHA (Hkv = H). PR-1 requires Hkv == H.
-        dtype: ``"f16"`` or ``"bf16"``. PR-1 accepts only ``"bf16"``.
+        Hkv: KV head count; ``None`` means MHA (Hkv = H). Still requires Hkv == H.
+        dtype: ``"f16"`` or ``"bf16"``. Currently only ``"bf16"``.
         is_causal: Enable lower-triangular causal mask; requires ``Sq == Skv``.
-        window_size: Symmetric sliding-window radius; PR-1 must be ``None``.
-        softcap: Gemma-2 softcap constant; PR-1 must be ``None``.
+        window_size: Sliding-window radius; mask where ``q - kv > window_size``.
+            Independent of ``is_causal``.
+        softcap: Gemma-2 softcap; ``S = softcap * tanh(S / softcap)`` after
+            ``sm_scale``, before log2-domain entry.
         sm_scale: Query scale; ``None`` defaults to ``1 / sqrt(D)``.
 
     Returns:
@@ -1158,7 +1227,16 @@ def compile_iluvatar_flex_attention(
     sm_scale = float(sm_scale)
 
     return _build_flex_attention_launcher(
-        B=B, H=H, Sq=Sq, Skv=Skv, D=D, dtype=dtype, sm_scale_f32=sm_scale, is_causal=is_causal
+        B=B,
+        H=H,
+        Sq=Sq,
+        Skv=Skv,
+        D=D,
+        dtype=dtype,
+        sm_scale_f32=sm_scale,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
     )
 
 
