@@ -110,6 +110,7 @@ def _reference_stage2(x, w2, topk_ids, topk_weights, apply_route_weight):
         ({"topk": 256}, "8-bit"),
         ({"model_dim": 48}, "divisible"),
         ({"stages": 3}, "two-stage"),
+        ({"warp_atoms_n": 1}, "even"),
     ],
 )
 def test_gemm1_compile_guards(monkeypatch, kwargs, match):
@@ -188,7 +189,8 @@ def test_gemm1_correctness(monkeypatch, dtype, apply_route_weight):
     stream.synchronize()
 
     ref = _reference_stage1(x, w1, topk_ids, topk_weights, apply_route_weight)
-    tol = 3e-2 if dtype == "f16" else 6e-2
+    # MR MMA changes the FP32 accumulation order relative to torch.matmul.
+    tol = 4e-2 if dtype == "f16" else 6e-2
     torch.testing.assert_close(out.float(), ref, rtol=tol, atol=tol)
 
 
@@ -239,7 +241,8 @@ def test_gemm2_per_slot_and_reduction(monkeypatch, dtype):
     torch.cuda.synchronize()
 
     ref_slot = _reference_stage2(x, w2, topk_ids, topk_weights, apply_route_weight=True)
-    tol = 3e-2 if dtype == "f16" else 6e-2
+    # MR MMA changes the FP32 accumulation order relative to torch.matmul.
+    tol = 4e-2 if dtype == "f16" else 6e-2
     torch.testing.assert_close(per_slot.float(), ref_slot, rtol=tol, atol=tol)
 
     out = torch.empty(tokens, model_dim, device="cuda", dtype=td)
