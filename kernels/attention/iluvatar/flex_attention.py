@@ -10,6 +10,7 @@ Landed:
 * PR-1a/1b/1c: fused forward, bf16 / D=128 / MHA / aligned self-attn, ``is_causal``.
 * PR-2a: ``softcap`` (Gemma-2) + ``window_size`` (SWA); independent of causal.
 * PR-2b: ``dtype`` in {f16, bf16} and ``D`` in {64, 128}.
+* PR-2c: GQA, cross-attn (``Sq != Skv``), and arbitrary ``Sq``/``Skv`` via phys pad.
 """
 
 import math
@@ -57,10 +58,19 @@ assert BLOCK_N == ATOM_N * WARP_ATOMS_N * WARPS_N
 assert WARPS_N > 1, "PR-1b requires WARPS_N > 1 for the SMEM rowmax/rowsum reduce"
 
 
-# --- Supported variants (through PR-2b; GQA/cross/tail still PR-2c) ------------
+# --- Supported variants (V1 / PR-2c) ------------------------------------------
 _SUPPORTED_DTYPES = ("f16", "bf16")
 _SUPPORTED_D = (64, 128)
 _DTYPE_STR_TO_FX = {"f16": fx.Float16, "bf16": fx.BFloat16}
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _phys_seq(seq: int, block: int) -> int:
+    """Pad logical sequence length up to a multiple of ``block`` for G2S tiles."""
+    return _ceil_div(seq, block) * block
 
 
 def _validate_scope(
@@ -76,8 +86,7 @@ def _validate_scope(
     window_size: int | None,
     softcap: float | None,
 ) -> None:
-    """Validate compile-time inputs: V1 permanent envelope, then remaining gaps."""
-    # --- V1 permanent envelope (plan §2.4) ---
+    """Validate compile-time inputs against the V1 envelope (plan §2.4)."""
     if B <= 0 or H <= 0 or Hkv <= 0 or Sq <= 0 or Skv <= 0 or D <= 0:
         raise ValueError(f"all shape dims must be positive; got B={B} H={H} Hkv={Hkv} Sq={Sq} Skv={Skv} D={D}")
     if dtype not in _SUPPORTED_DTYPES:
@@ -93,17 +102,27 @@ def _validate_scope(
     if window_size is not None and window_size <= 0:
         raise ValueError(f"window_size must be > 0 when set, got {window_size}")
 
-    # --- Temporary subset remaining for PR-2c ---
+
+def _validate_qk_dot_subset(*, H: int, Hkv: int, Sq: int, Skv: int) -> None:
+    """Keep the PR-1a qk_dot helper on MHA + BLOCK-aligned self-attn only."""
     if H != Hkv:
-        raise NotImplementedError(f"MHA only for now (Hkv=H); got H={H}, Hkv={Hkv}. GQA lands in PR-2c.")
+        raise NotImplementedError(
+            f"qk_dot helper is MHA-only (Hkv=H); got H={H}, Hkv={Hkv}. " "Use compile_iluvatar_flex_attention for GQA."
+        )
     if Sq != Skv:
         raise NotImplementedError(
-            f"self-attention only for now (Sq=Skv); got Sq={Sq}, Skv={Skv}. " "Cross-attention lands in PR-2c."
+            f"qk_dot helper requires Sq == Skv; got Sq={Sq}, Skv={Skv}. "
+            "Use compile_iluvatar_flex_attention for cross-attention."
         )
-    if Sq % BLOCK_M != 0:
-        raise ValueError(f"Sq ({Sq}) must be a multiple of BLOCK_M ({BLOCK_M}). " "Tail masking lands in PR-2c.")
-    if Skv % BLOCK_N != 0:
-        raise ValueError(f"Skv ({Skv}) must be a multiple of BLOCK_N ({BLOCK_N}). " "Tail masking lands in PR-2c.")
+    if Sq % BLOCK_M != 0 or Skv % BLOCK_N != 0:
+        raise NotImplementedError(
+            f"qk_dot helper requires Sq/Skv aligned to BLOCK_M/N ({BLOCK_M}/{BLOCK_N}); "
+            f"got Sq={Sq}, Skv={Skv}. Use compile_iluvatar_flex_attention for tail."
+        )
+
+
+def _tensor_shape(t) -> tuple[int, ...]:
+    return tuple(int(x) for x in t.shape)
 
 
 def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: str, sm_scale_f32: float) -> Callable:
@@ -367,6 +386,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     *,
     B: int,
     H: int,
+    Hkv: int,
     Sq: int,
     Skv: int,
     D: int,
@@ -376,7 +396,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     window_size: int | None = None,
     softcap: float | None = None,
 ) -> Callable:
-    """Compile the flex-attention forward launcher (PR-1b + PR-1c + PR-2a).
+    """Compile the flex-attention forward launcher (PR-1 .. PR-2c).
 
     FA-1 chain: Q resident in SMEM; per-KV-tile MMA1 (Q @ K^T) -> online softmax
     with rowmax/rowsum cross-warp reduce -> P via SMEM (bf16, plain logical
@@ -392,6 +412,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
       * softcap None: fused ``S *= (sm_scale * log2e)`` (bit-exact with PR-1)
       * then optional causal (``kv > q``) and SWA (``q - kv > window_size``) masks
         in the log2 domain with ``NEG_LARGE_F``.
+      * PR-2c: when ``Skv`` is not a multiple of ``BLOCK_N``, also mask
+        ``kv_g >= Skv`` (folded with ``const_expr`` so aligned shapes stay
+        bit-exact). Callers must pass contiguous phys-padded Q/K/V/O.
 
     Loop-carried state per lane: one ``(m_running, l_running)`` fp32 pair per
     ``mma_m`` (i.e. ``ROWS_PER_LANE = WARP_ATOMS_M = 2`` pairs = 4 scalars),
@@ -426,8 +449,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
     )
 
     elem_dtype = _DTYPE_STR_TO_FX[dtype]
-    num_q_tiles = Sq // BLOCK_M
-    num_kv_tiles = Skv // BLOCK_N
+    Sq_phys = _phys_seq(Sq, BLOCK_M)
+    Skv_phys = _phys_seq(Skv, BLOCK_N)
+    num_q_tiles = Sq_phys // BLOCK_M
+    num_kv_tiles = Skv_phys // BLOCK_N
+    has_kv_tail = Skv < Skv_phys
+    group_size = H // Hkv
 
     bk_qk = D  # MMA1 inner K = head dim
     bk_pv = BLOCK_N  # MMA2 inner K = kv-tile size
@@ -475,17 +502,17 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
 
     q_row_stride = D
     k_row_stride = D
-    v_row_stride = Skv  # V host-transposed to [B, H, D, Skv]; Skv contiguous
+    v_row_stride = Skv_phys  # V host-transposed to [B, Hkv, D, Skv_phys]
     o_row_stride = D
 
-    q_batch_stride = H * Sq * D
-    q_head_stride = Sq * D
-    k_batch_stride = H * Skv * D
-    k_head_stride = Skv * D
-    v_batch_stride = H * D * Skv
-    v_head_stride = D * Skv
-    o_batch_stride = H * Sq * D
-    o_head_stride = Sq * D
+    q_batch_stride = H * Sq_phys * D
+    q_head_stride = Sq_phys * D
+    k_batch_stride = Hkv * Skv_phys * D
+    k_head_stride = Skv_phys * D
+    v_batch_stride = Hkv * D * Skv_phys
+    v_head_stride = D * Skv_phys
+    o_batch_stride = H * Sq_phys * D
+    o_head_stride = Sq_phys * D
 
     # ROWS_PER_LANE = WARP_ATOMS_M * 4: each lane owns 4 rows per warp-M atom
     # (row m = warp_m_id * 32 + mma_m * 16 + ei * 4 + lane_row). See TV
@@ -535,6 +562,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
         warp_n_id = warp_id % fx.Int32(WARPS_N)
         b_idx = bh_idx // fx.Int32(H)
         h_idx = bh_idx % fx.Int32(H)
+        hkv_idx = h_idx // fx.Int32(group_size)
 
         fm_fast = arith.FastMathFlags.fast
         c_zero_f = fx.Float32(0.0)
@@ -544,29 +572,30 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
         c_log2e = fx.Float32(LOG2E)
         c_softcap = fx.Float32(softcap_f32)
         c_window = fx.Int32(window_size_i)
+        c_skv_logical = fx.Int32(Skv)
 
-        # 4D logical views (batch, head, seq, dim). V is host-transposed to
-        # [B, H, D, Skv] so both MMA operands stay k-major "tn".
+        # Phys-padded 4D views. V is host-transposed to [B, Hkv, D, Skv_phys]
+        # so both MMA operands stay k-major "tn".
         Q_view = fx.make_view(
             fx.get_iter(Q),
-            fx.make_layout((B, H, Sq, D), (q_batch_stride, q_head_stride, q_row_stride, 1)),
+            fx.make_layout((B, H, Sq_phys, D), (q_batch_stride, q_head_stride, q_row_stride, 1)),
         )
         K_view = fx.make_view(
             fx.get_iter(K),
-            fx.make_layout((B, H, Skv, D), (k_batch_stride, k_head_stride, k_row_stride, 1)),
+            fx.make_layout((B, Hkv, Skv_phys, D), (k_batch_stride, k_head_stride, k_row_stride, 1)),
         )
         V_view = fx.make_view(
             fx.get_iter(V),
-            fx.make_layout((B, H, D, Skv), (v_batch_stride, v_head_stride, v_row_stride, 1)),
+            fx.make_layout((B, Hkv, D, Skv_phys), (v_batch_stride, v_head_stride, v_row_stride, 1)),
         )
         O_view = fx.make_view(
             fx.get_iter(O),
-            fx.make_layout((B, H, Sq, D), (o_batch_stride, o_head_stride, o_row_stride, 1)),
+            fx.make_layout((B, H, Sq_phys, D), (o_batch_stride, o_head_stride, o_row_stride, 1)),
         )
 
         Q_bh = fx.slice(Q_view, (b_idx, h_idx, None, None))
-        K_bh = fx.slice(K_view, (b_idx, h_idx, None, None))
-        V_bh = fx.slice(V_view, (b_idx, h_idx, None, None))
+        K_bh = fx.slice(K_view, (b_idx, hkv_idx, None, None))
+        V_bh = fx.slice(V_view, (b_idx, hkv_idx, None, None))
         O_bh = fx.slice(O_view, (b_idx, h_idx, None, None))
 
         gQ = fx.slice(fx.flat_divide(Q_bh, (BLOCK_M, bk_qk)), (None, None, q_tile_idx, 0))
@@ -856,6 +885,24 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
                             )
                         )
 
+            # ---- KV tail mask (PR-2c) -------------------------------------
+            # Phys pad runs full BLOCK_N G2S tiles; mask columns beyond the
+            # logical Skv so pad K/V never enter softmax. Folded away when
+            # Skv == Skv_phys (aligned path stays bit-exact with PR-2b).
+            if fx.const_expr(has_kv_tail):
+                kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                        acc = S_frags[mma_m][mma_n]
+                        old = Vec(acc.load())
+                        kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                        acc.store(
+                            Vec.from_elements(
+                                [(kv_g >= c_skv_logical).select(c_neg_large, old[ei]) for ei in range(4)],
+                                fx.Float32,
+                            )
+                        )
+
             # ---- Local rowmax (within this warp) --------------------------
             # C TV (version A): each of a lane's 4 fp32 elements sits in a
             # DIFFERENT row (m = mma_m * 16 + ei * 4 + lane_row) but the SAME
@@ -1107,7 +1154,27 @@ def _build_flex_attention_launcher(  # noqa: C901  (PR-1b: readability > cycloma
             stream=stream,
         )
 
-    return launch_flex_attn
+    def launch_flex_attn_checked(Q, K, V, O, stream=fx.Stream(None)):  # noqa: E741
+        """Host entry: enforce phys-pad / GQA shapes before the JIT launch."""
+        q_shape = _tensor_shape(Q)
+        k_shape = _tensor_shape(K)
+        v_shape = _tensor_shape(V)
+        o_shape = _tensor_shape(O)
+        expect_q = (B, H, Sq_phys, D)
+        expect_k = (B, Hkv, Skv_phys, D)
+        expect_v = (B, Hkv, D, Skv_phys)
+        expect_o = (B, H, Sq_phys, D)
+        if q_shape != expect_q:
+            raise ValueError(f"Q shape must be {expect_q} (Sq_phys-padded), got {q_shape}")
+        if k_shape != expect_k:
+            raise ValueError(f"K shape must be {expect_k} (Skv_phys-padded), got {k_shape}")
+        if v_shape != expect_v:
+            raise ValueError(f"V shape must be {expect_v} (host-transposed + Skv_phys-padded), got {v_shape}")
+        if o_shape != expect_o:
+            raise ValueError(f"O shape must be {expect_o} (Sq_phys-padded), got {o_shape}")
+        return launch_flex_attn(Q, K, V, O, stream=stream)
+
+    return launch_flex_attn_checked
 
 
 def _compile_iluvatar_qk_dot_dev(
@@ -1148,6 +1215,7 @@ def _compile_iluvatar_qk_dot_dev(
         window_size=None,
         softcap=None,
     )
+    _validate_qk_dot_subset(H=H, Hkv=H, Sq=Sq, Skv=Skv)
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
@@ -1176,14 +1244,24 @@ def compile_iluvatar_flex_attention(
     This is a variant subset (causal / SWA / softcap), not a general score_mod
     compiler.
 
-    Current scope (through PR-2b): Q/K/V/O = f16 or bf16, D in {64, 128}, MHA,
-    ``Sq == Skv``, both aligned to ``BLOCK_M/BLOCK_N``. Supports ``is_causal``,
-    ``window_size``, and ``softcap`` (any combination). No tile-level pruning
-    for fully-masked causal tiles yet.
+    V1 scope (through PR-2c): Q/K/V/O = f16 or bf16, D in {64, 128}, GQA
+    (``H % Hkv == 0``), arbitrary ``Sq``/``Skv`` (callers pass phys-padded
+    contiguous tensors; see below), ``is_causal`` / ``window_size`` / ``softcap``
+    in any combination (``is_causal`` requires ``Sq == Skv``).
+
+    Phys pad contract:
+        ``Sq_phys = ceil(Sq / 64) * 64``, ``Skv_phys = ceil(Skv / 64) * 64``.
+        Launch expects contiguous
+        ``Q,O: [B, H, Sq_phys, D]``, ``K: [B, Hkv, Skv_phys, D]``,
+        ``V: [B, Hkv, D, Skv_phys]`` (host transpose of natural K-major V).
+        Logical prefix ``[:Sq]`` / ``[:Skv]`` holds real data; pad rows/cols
+        may be anything. Score columns ``kv >= Skv`` are masked in-kernel.
 
     Args:
-        B, H, Sq, Skv, D: See plan §2.4. All compile-time constants.
-        Hkv: KV head count; ``None`` means MHA (Hkv = H). Still requires Hkv == H.
+        B, H, Sq, Skv, D: Logical shapes (compile-time constants). ``Sq``/``Skv``
+            are logical lengths used for masking; physical tensor ranks use
+            the padded sizes above.
+        Hkv: KV head count; ``None`` means MHA (``Hkv = H``).
         dtype: ``"f16"`` or ``"bf16"``.
         is_causal: Enable lower-triangular causal mask; requires ``Sq == Skv``.
         window_size: Sliding-window radius; mask where ``q - kv > window_size``.
@@ -1193,10 +1271,9 @@ def compile_iluvatar_flex_attention(
         sm_scale: Query scale; ``None`` defaults to ``1 / sqrt(D)``.
 
     Returns:
-        A launcher ``launch_fn(Q, K, V, O, stream=None)`` where V is the
-        host-side transposed KV cache with shape ``[B, H, D, Skv]``
-        (i.e. ``V.transpose(-1, -2).contiguous()`` of the natural ``[B, H, Skv, D]``
-        tensor); O has the natural ``[B, H, Sq, D]`` shape.
+        A launcher ``launch_fn(Q, K, V, O, stream=None)`` that validates phys
+        shapes then runs the kernel. Compare outputs on the logical ``O[..., :Sq, :]``
+        prefix.
     """
     if Hkv is None:
         Hkv = H
@@ -1221,6 +1298,7 @@ def compile_iluvatar_flex_attention(
     return _build_flex_attention_launcher(
         B=B,
         H=H,
+        Hkv=Hkv,
         Sq=Sq,
         Skv=Skv,
         D=D,
@@ -1232,4 +1310,4 @@ def compile_iluvatar_flex_attention(
     )
 
 
-__all__ = ["compile_iluvatar_flex_attention"]
+__all__ = ["compile_iluvatar_flex_attention", "BLOCK_M", "BLOCK_N"]
