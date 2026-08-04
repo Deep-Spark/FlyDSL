@@ -44,8 +44,8 @@ def _run_check(*, dtype: str, mma_tile: str) -> None:
     import torch
 
     import flydsl.expr as fx
-    from kernels.gemm.iluvatar.cq.hgemm import compile_iluvatar_cq_hgemm
     from kernels.gemm.iluvatar.cq.igemm import compile_iluvatar_cq_igemm
+    from kernels.gemm.iluvatar.cq.mma_frag import compile_iluvatar_cq_hgemm_mma_frag
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA-compatible Iluvatar device is not available")
@@ -68,7 +68,7 @@ def _run_check(*, dtype: str, mma_tile: str) -> None:
     else:
         elem = fx.BFloat16 if dtype == "bf16" else fx.Float16
         torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
-        launch = compile_iluvatar_cq_hgemm(
+        launch = compile_iluvatar_cq_hgemm_mma_frag(
             elem_dtype=elem, mma_tile=mma_tile, a_value=1.0, b_value=2.0
         )
         tile = launch.cq_mma_tile
