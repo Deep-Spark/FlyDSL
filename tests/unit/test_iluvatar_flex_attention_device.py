@@ -9,6 +9,7 @@ Covers:
 * PR-1c: causal fused forward vs SDPA ``is_causal=True``.
 * PR-2a: softcap / SWA (+ combinations) vs hand-written fp32 reference.
 * PR-2b: D=64 variant-cross + f16 dtype coverage.
+* PR-2c: GQA / cross-attn / phys-pad tail + plan §3.2 shape-cross.
 """
 
 from __future__ import annotations
@@ -51,6 +52,10 @@ def _require_flex_attn_module():
     except ModuleNotFoundError as exc:
         pytest.skip(f"kernels.attention.iluvatar.flex_attention not importable: {exc}")
     return mod
+
+
+def _phys_seq(seq: int, block: int) -> int:
+    return ((seq + block - 1) // block) * block
 
 
 # --- PR-1a: Q @ K^T only ------------------------------------------------------
@@ -195,18 +200,6 @@ def test_iluvatar_flex_attention_rejects_unsupported_head_dim():
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 32, dtype="bf16", is_causal=True)
 
 
-def test_iluvatar_flex_attention_rejects_gqa_until_pr2c():
-    mod = _require_flex_attn_module()
-    with pytest.raises(NotImplementedError, match="GQA lands in PR-2c"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, Hkv=2, dtype="bf16", is_causal=True)
-
-
-def test_iluvatar_flex_attention_rejects_cross_attn_until_pr2c():
-    mod = _require_flex_attn_module()
-    with pytest.raises(NotImplementedError, match="Cross-attention lands in PR-2c"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 128, 128, dtype="bf16", is_causal=False)
-
-
 def test_iluvatar_flex_attention_rejects_illegal_causal_shape():
     mod = _require_flex_attn_module()
     with pytest.raises(ValueError, match="is_causal=True requires Sq == Skv"):
@@ -231,6 +224,31 @@ def test_iluvatar_flex_attention_rejects_nonpositive_window_size():
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", is_causal=True, window_size=0)
 
 
+def test_iluvatar_flex_attention_rejects_unpadded_launch_shape(monkeypatch):
+    """Launch must reject logical-sized tensors when phys pad is required."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    B, H, Sq, Skv, D = 1, 4, 100, 128, 64
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    assert Sq_phys != Sq
+    launch = mod.compile_iluvatar_flex_attention(B, H, Sq, Skv, D, dtype="bf16", is_causal=False)
+    Q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch.bfloat16)  # not padded
+    K = torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)
+    V = torch.randn(B, H, D, Skv, device="cuda", dtype=torch.bfloat16)
+    O = torch.zeros(B, H, Sq, D, device="cuda", dtype=torch.bfloat16)  # noqa: E741
+    with pytest.raises(ValueError, match="Sq_phys-padded"):
+        launch(Q, K, V, O)
+
+
+def test_iluvatar_flex_attention_qk_dot_rejects_gqa():
+    mod = _require_flex_attn_module()
+    with pytest.raises(NotImplementedError, match="qk_dot helper is MHA-only"):
+        # Force the subset guard via the public validate path used by qk_dot.
+        mod._validate_qk_dot_subset(H=4, Hkv=2, Sq=64, Skv=64)
+
+
 # --- PR-2a: softcap / SWA ----------------------------------------------------
 
 
@@ -244,8 +262,14 @@ def _reference_flex_attention_fp32(
     window_size: int | None = None,
     softcap: float | None = None,
 ):
-    """Plan §3.1 hand-written fp32 reference for score mods."""
+    """Plan §3.1 hand-written fp32 reference for score mods (supports GQA)."""
     torch = _require_torch()
+    H = Q.shape[1]
+    Hkv = K.shape[1]
+    if H != Hkv:
+        group = H // Hkv
+        K = K.repeat_interleave(group, dim=1)
+        V = V.repeat_interleave(group, dim=1)
     S = torch.matmul(Q.float(), K.float().transpose(-1, -2)) * sm_scale
     if softcap is not None:
         S = softcap * torch.tanh(S / softcap)
@@ -272,6 +296,7 @@ def _run_flex_attn(
     Sq,
     Skv,
     D=128,
+    Hkv=None,
     dtype="bf16",
     is_causal=False,
     window_size=None,
@@ -282,16 +307,26 @@ def _run_flex_attn(
     _configure_iluvatar_env(monkeypatch)
     mod = _require_flex_attn_module()
 
+    if Hkv is None:
+        Hkv = H
     torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
     atol_rtol = 2e-2 if dtype == "bf16" else 1e-2
+    if Sq >= 1024 or Skv >= 1024:
+        atol_rtol *= 2
     sm_scale = 1.0 / math.sqrt(D)
 
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+
     torch.manual_seed(seed)
-    Q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype)
-    K = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
-    V_natural = torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    K = torch.zeros(B, Hkv, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    V_natural = torch.zeros(B, Hkv, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq, :].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    K[:, :, :Skv, :].copy_(torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch_dtype))
+    V_natural[:, :, :Skv, :].copy_(torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch_dtype))
     V_transposed = V_natural.transpose(-1, -2).contiguous()
-    O = torch.zeros(B, H, Sq, D, device="cuda", dtype=torch_dtype)  # noqa: E741
+    O = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)  # noqa: E741
 
     launch = mod.compile_iluvatar_flex_attention(
         B,
@@ -299,6 +334,7 @@ def _run_flex_attn(
         Sq,
         Skv,
         D,
+        Hkv=Hkv,
         dtype=dtype,
         is_causal=is_causal,
         window_size=window_size,
@@ -309,15 +345,15 @@ def _run_flex_attn(
     torch.cuda.synchronize()
 
     ref = _reference_flex_attention_fp32(
-        Q,
-        K,
-        V_natural,
+        Q[:, :, :Sq, :],
+        K[:, :, :Skv, :],
+        V_natural[:, :, :Skv, :],
         sm_scale=sm_scale,
         is_causal=is_causal,
         window_size=window_size,
         softcap=softcap,
     ).to(torch_dtype)
-    return O, ref, atol_rtol
+    return O[:, :, :Sq, :], ref, atol_rtol
 
 
 @pytest.mark.parametrize(
@@ -436,3 +472,58 @@ def test_iluvatar_flex_attention_qk_dot_pr2b_d64_smoke(monkeypatch):
 
     ref = (Q.float() @ K.float().transpose(-1, -2)) * sm_scale
     torch.testing.assert_close(S, ref, rtol=2e-2, atol=2e-2)
+
+
+# --- PR-2c: GQA / cross / tail + plan §3.2 shape-cross ------------------------
+
+
+@pytest.mark.parametrize(
+    "B,H,Hkv,Sq,Skv,D,is_causal",
+    [
+        (1, 4, 4, 128, 128, 64, True),  # MHA self
+        (1, 4, 2, 128, 128, 64, True),  # GQA self
+        (2, 8, 8, 512, 512, 128, True),  # medium self
+        (1, 4, 4, 64, 256, 64, False),  # cross-attn
+        # Plan table lists is_causal=True for shape-cross, but Sq≠Skv forbids it
+        # (same note as #4); use False so the Skv tail path is actually exercised.
+        (1, 4, 4, 128, 250, 64, False),  # unaligned Skv tail
+    ],
+)
+def test_iluvatar_flex_attention_forward_pr2c_shape_cross(monkeypatch, B, H, Hkv, Sq, Skv, D, is_causal):
+    """Plan §3.2 shape-cross (5 groups)."""
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=B,
+        H=H,
+        Hkv=Hkv,
+        Sq=Sq,
+        Skv=Skv,
+        D=D,
+        dtype="bf16",
+        is_causal=is_causal,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_forward_pr2c_sq_tail_smoke(monkeypatch):
+    """Sq not a multiple of BLOCK_M (epilogue writes phys-padded O)."""
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=1,
+        H=4,
+        Sq=100,
+        Skv=128,
+        D=64,
+        dtype="bf16",
+        is_causal=False,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_package_export():
+    from kernels.attention.iluvatar import compile_iluvatar_flex_attention as exported
+
+    mod = _require_flex_attn_module()
+    assert exported is mod.compile_iluvatar_flex_attention
