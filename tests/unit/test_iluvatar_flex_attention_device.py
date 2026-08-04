@@ -8,6 +8,7 @@ Covers:
 * PR-1b: non-causal fused forward vs ``F.scaled_dot_product_attention``.
 * PR-1c: causal fused forward vs SDPA ``is_causal=True``.
 * PR-2a: softcap / SWA (+ combinations) vs hand-written fp32 reference.
+* PR-2b: D=64 variant-cross + f16 dtype coverage.
 """
 
 from __future__ import annotations
@@ -184,25 +185,25 @@ def test_iluvatar_flex_attention_forward_pr1c_causal(monkeypatch, B, H, Sq):
 
 def test_iluvatar_flex_attention_rejects_unsupported_dtype():
     mod = _require_flex_attn_module()
-    with pytest.raises(NotImplementedError, match="f16 lands in PR-2"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="f16", is_causal=True)
+    with pytest.raises(ValueError, match=r"dtype must be one of"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="fp32", is_causal=True)
 
 
 def test_iluvatar_flex_attention_rejects_unsupported_head_dim():
     mod = _require_flex_attn_module()
-    with pytest.raises(NotImplementedError, match=r"D=64 lands in PR-2"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 64, dtype="bf16", is_causal=True)
+    with pytest.raises(ValueError, match=r"D must be one of"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 32, dtype="bf16", is_causal=True)
 
 
-def test_iluvatar_flex_attention_rejects_gqa_in_pr1():
+def test_iluvatar_flex_attention_rejects_gqa_until_pr2c():
     mod = _require_flex_attn_module()
-    with pytest.raises(NotImplementedError, match="GQA lands in PR-2"):
+    with pytest.raises(NotImplementedError, match="GQA lands in PR-2c"):
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, Hkv=2, dtype="bf16", is_causal=True)
 
 
-def test_iluvatar_flex_attention_rejects_cross_attn_in_pr1():
+def test_iluvatar_flex_attention_rejects_cross_attn_until_pr2c():
     mod = _require_flex_attn_module()
-    with pytest.raises(NotImplementedError, match="Cross-attention lands in PR-2"):
+    with pytest.raises(NotImplementedError, match="Cross-attention lands in PR-2c"):
         mod.compile_iluvatar_flex_attention(1, 4, 64, 128, 128, dtype="bf16", is_causal=False)
 
 
@@ -270,6 +271,8 @@ def _run_flex_attn(
     H,
     Sq,
     Skv,
+    D=128,
+    dtype="bf16",
     is_causal=False,
     window_size=None,
     softcap=None,
@@ -279,8 +282,8 @@ def _run_flex_attn(
     _configure_iluvatar_env(monkeypatch)
     mod = _require_flex_attn_module()
 
-    D = 128
-    torch_dtype = torch.bfloat16
+    torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
+    atol_rtol = 2e-2 if dtype == "bf16" else 1e-2
     sm_scale = 1.0 / math.sqrt(D)
 
     torch.manual_seed(seed)
@@ -296,7 +299,7 @@ def _run_flex_attn(
         Sq,
         Skv,
         D,
-        dtype="bf16",
+        dtype=dtype,
         is_causal=is_causal,
         window_size=window_size,
         softcap=softcap,
@@ -314,7 +317,7 @@ def _run_flex_attn(
         window_size=window_size,
         softcap=softcap,
     ).to(torch_dtype)
-    return O, ref
+    return O, ref, atol_rtol
 
 
 @pytest.mark.parametrize(
@@ -329,22 +332,107 @@ def _run_flex_attn(
     ],
 )
 def test_iluvatar_flex_attention_forward_pr2a_variants(monkeypatch, is_causal, window_size, softcap):
-    out, ref = _run_flex_attn(
+    out, ref, tol = _run_flex_attn(
         monkeypatch,
         B=2,
         H=4,
         Sq=128,
         Skv=128,
+        D=128,
+        dtype="bf16",
         is_causal=is_causal,
         window_size=window_size,
         softcap=softcap,
     )
     torch = _require_torch()
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
 
 
 def test_iluvatar_flex_attention_pr2a_softcap_none_matches_pr1b(monkeypatch):
     """No softcap / no SWA must stay aligned with the fused-scale PR-1 path."""
     torch = _require_torch()
-    out, ref = _run_flex_attn(monkeypatch, B=1, H=4, Sq=64, Skv=64, is_causal=False)
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    out, ref, tol = _run_flex_attn(monkeypatch, B=1, H=4, Sq=64, Skv=64, is_causal=False)
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+# --- PR-2b: f16 + D=64 -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "is_causal,window_size,softcap",
+    [
+        (False, None, None),
+        (True, None, None),
+        (False, 64, None),
+        (False, None, 30.0),
+        (True, 64, None),
+        (True, None, 30.0),
+    ],
+)
+def test_iluvatar_flex_attention_forward_pr2b_d64_variants(monkeypatch, is_causal, window_size, softcap):
+    """Plan §3.2 variant-cross base shape with D=64."""
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=2,
+        H=4,
+        Sq=256,
+        Skv=256,
+        D=64,
+        dtype="bf16",
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_forward_pr2b_f16_causal(monkeypatch):
+    """Plan §3.2 dtype-cross (smaller aligned shape for CI time)."""
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=2,
+        H=8,
+        Sq=128,
+        Skv=128,
+        D=128,
+        dtype="f16",
+        is_causal=True,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_forward_pr2b_f16_d64_smoke(monkeypatch):
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=1,
+        H=4,
+        Sq=64,
+        Skv=64,
+        D=64,
+        dtype="f16",
+        is_causal=True,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_qk_dot_pr2b_d64_smoke(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 64
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(0)
+    Q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch.bfloat16)
+    K = torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)
+    S = torch.zeros(B, H, Sq, Skv, device="cuda", dtype=torch.float32)
+
+    launch = mod._compile_iluvatar_qk_dot_dev(B, H, Sq, Skv, D, dtype="bf16", sm_scale=sm_scale)
+    launch(Q, K, S)
+    torch.cuda.synchronize()
+
+    ref = (Q.float() @ K.float().transpose(-1, -2)) * sm_scale
+    torch.testing.assert_close(S, ref, rtol=2e-2, atol=2e-2)
