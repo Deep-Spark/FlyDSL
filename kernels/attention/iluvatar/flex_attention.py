@@ -9,6 +9,7 @@ not a general ``score_mod`` compiler. See ``docs/iluvatar_flex_attention_v1_plan
 Landed:
 * PR-1a/1b/1c: fused forward, bf16 / D=128 / MHA / aligned self-attn, ``is_causal``.
 * PR-2a: ``softcap`` (Gemma-2) + ``window_size`` (SWA); independent of causal.
+* PR-2b: ``dtype`` in {f16, bf16} and ``D`` in {64, 128}.
 """
 
 import math
@@ -56,9 +57,9 @@ assert BLOCK_N == ATOM_N * WARP_ATOMS_N * WARPS_N
 assert WARPS_N > 1, "PR-1b requires WARPS_N > 1 for the SMEM rowmax/rowsum reduce"
 
 
-# --- Supported variants (PR-1 subset) -----------------------------------------
-_PR1_SUPPORTED_DTYPES = ("bf16",)
-_PR1_SUPPORTED_D = (128,)
+# --- Supported variants (through PR-2b; GQA/cross/tail still PR-2c) ------------
+_SUPPORTED_DTYPES = ("f16", "bf16")
+_SUPPORTED_D = (64, 128)
 _DTYPE_STR_TO_FX = {"f16": fx.Float16, "bf16": fx.BFloat16}
 
 
@@ -75,14 +76,14 @@ def _validate_scope(
     window_size: int | None,
     softcap: float | None,
 ) -> None:
-    """Validate compile-time inputs: V1 permanent envelope, then PR-1 subset."""
+    """Validate compile-time inputs: V1 permanent envelope, then remaining gaps."""
     # --- V1 permanent envelope (plan §2.4) ---
     if B <= 0 or H <= 0 or Hkv <= 0 or Sq <= 0 or Skv <= 0 or D <= 0:
         raise ValueError(f"all shape dims must be positive; got B={B} H={H} Hkv={Hkv} Sq={Sq} Skv={Skv} D={D}")
-    if dtype not in ("f16", "bf16"):
-        raise ValueError(f"dtype must be one of 'f16'/'bf16', got {dtype!r}")
-    if D not in (64, 128):
-        raise ValueError(f"D must be 64 or 128, got {D}")
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"dtype must be one of {_SUPPORTED_DTYPES}, got {dtype!r}")
+    if D not in _SUPPORTED_D:
+        raise ValueError(f"D must be one of {_SUPPORTED_D}, got {D}")
     if H % Hkv != 0:
         raise ValueError(f"H ({H}) must be divisible by Hkv ({Hkv})")
     if is_causal and Sq != Skv:
@@ -92,27 +93,17 @@ def _validate_scope(
     if window_size is not None and window_size <= 0:
         raise ValueError(f"window_size must be > 0 when set, got {window_size}")
 
-    # --- PR-1/PR-2a temporary subset (lift remaining rejects in PR-2b/2c) ---
-    if dtype not in _PR1_SUPPORTED_DTYPES:
-        raise NotImplementedError(f"PR-1 supports dtype {_PR1_SUPPORTED_DTYPES}; got {dtype!r}. f16 lands in PR-2.")
-    if D not in _PR1_SUPPORTED_D:
-        raise NotImplementedError(f"PR-1 supports D {_PR1_SUPPORTED_D}; got {D}. D=64 lands in PR-2.")
+    # --- Temporary subset remaining for PR-2c ---
     if H != Hkv:
-        raise NotImplementedError(f"PR-1 supports MHA only (Hkv=H); got H={H}, Hkv={Hkv}. GQA lands in PR-2.")
+        raise NotImplementedError(f"MHA only for now (Hkv=H); got H={H}, Hkv={Hkv}. GQA lands in PR-2c.")
     if Sq != Skv:
         raise NotImplementedError(
-            f"PR-1 supports self-attention only (Sq=Skv); got Sq={Sq}, Skv={Skv}. " "Cross-attention lands in PR-2."
+            f"self-attention only for now (Sq=Skv); got Sq={Sq}, Skv={Skv}. " "Cross-attention lands in PR-2c."
         )
     if Sq % BLOCK_M != 0:
-        raise ValueError(
-            f"PR-1 requires strict alignment: Sq ({Sq}) must be a multiple of BLOCK_M ({BLOCK_M}). "
-            "Tail masking lands in PR-2."
-        )
+        raise ValueError(f"Sq ({Sq}) must be a multiple of BLOCK_M ({BLOCK_M}). " "Tail masking lands in PR-2c.")
     if Skv % BLOCK_N != 0:
-        raise ValueError(
-            f"PR-1 requires strict alignment: Skv ({Skv}) must be a multiple of BLOCK_N ({BLOCK_N}). "
-            "Tail masking lands in PR-2."
-        )
+        raise ValueError(f"Skv ({Skv}) must be a multiple of BLOCK_N ({BLOCK_N}). " "Tail masking lands in PR-2c.")
 
 
 def _build_qk_dot_launcher(*, B: int, H: int, Sq: int, Skv: int, D: int, dtype: str, sm_scale_f32: float) -> Callable:
@@ -1136,9 +1127,10 @@ def _compile_iluvatar_qk_dot_dev(
     ``compile_iluvatar_flex_attention`` is fully implemented.
 
     Args:
-        B, H, Sq, Skv, D: See ``compile_iluvatar_flex_attention``. Same PR-1
-            envelope (D == 128, dtype == "bf16", MHA, Sq/Skv aligned to BLOCK).
-        dtype: ``"bf16"`` (PR-1 supports this only).
+        B, H, Sq, Skv, D: See ``compile_iluvatar_flex_attention``. Same
+            envelope as the fused path (D in {64, 128}, dtype in {f16, bf16},
+            MHA, Sq/Skv aligned to BLOCK).
+        dtype: ``"f16"`` or ``"bf16"``.
         sm_scale: Query scale; ``None`` -> ``1 / sqrt(D)``.
 
     Returns:
@@ -1184,15 +1176,15 @@ def compile_iluvatar_flex_attention(
     This is a variant subset (causal / SWA / softcap), not a general score_mod
     compiler.
 
-    Current scope (through PR-2a): Q/K/V/O = bf16, D=128, MHA, ``Sq == Skv``,
-    both aligned to ``BLOCK_M/BLOCK_N``. Supports ``is_causal``, ``window_size``,
-    and ``softcap`` (any combination). No tile-level pruning for fully-masked
-    causal tiles yet.
+    Current scope (through PR-2b): Q/K/V/O = f16 or bf16, D in {64, 128}, MHA,
+    ``Sq == Skv``, both aligned to ``BLOCK_M/BLOCK_N``. Supports ``is_causal``,
+    ``window_size``, and ``softcap`` (any combination). No tile-level pruning
+    for fully-masked causal tiles yet.
 
     Args:
         B, H, Sq, Skv, D: See plan §2.4. All compile-time constants.
         Hkv: KV head count; ``None`` means MHA (Hkv = H). Still requires Hkv == H.
-        dtype: ``"f16"`` or ``"bf16"``. Currently only ``"bf16"``.
+        dtype: ``"f16"`` or ``"bf16"``.
         is_causal: Enable lower-triangular causal mask; requires ``Sq == Skv``.
         window_size: Sliding-window radius; mask where ``q - kv > window_size``.
             Independent of ``is_causal``.
