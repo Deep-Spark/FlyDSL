@@ -61,27 +61,23 @@ Three unrelated "atom" sizes:
 from typing import NamedTuple
 
 import flydsl.expr as fx
-from kernels.gemm.iluvatar.common import GemmLayout
+from kernels.gemm.iluvatar.common import (
+    ATOM_K_B8,
+    ATOM_K_B16,
+    ATOM_K_B32,
+    ATOM_M,
+    ATOM_N,
+    SME_BITS_PER_ROW,
+    SMEM_B8_PER_ROW,
+    SMEM_B16_PER_ROW,
+    SMEM_B32_PER_ROW,
+    SMEM_ROWS,
+    TCU_LANE_COLS,
+    GemmLayout,
+)
 
 # Per-CTA dynamic shared memory cap on ivcore11 (BI-V150 / MR-50 / MR-100 class).
 DEFAULT_SMEM_CAP_BYTES = 131072
-
-# TCU MMA atom shape: M=N=16 for all dtypes; K per MRMma instruction depends on element width.
-ATOM_M = 16
-ATOM_N = 16
-ATOM_K_B8 = 32  # i8 MRMma K extent
-ATOM_K_B16 = 16  # f16/bf16 MRMma K extent (one mma_k slice in the f16 pipeline)
-ATOM_K_B32 = 16  # f32 MRMma K extent (one mma_k slice in the b32 pipeline)
-
-# TCU lane grid: 64 lanes -> 4 rows x 16 cols (same as ATOM_M / ATOM_N).
-TCU_LANE_COLS = 16
-
-# SME G2S chunk: 16 rows x 512 bits/row (= 32 f16 or 64 i8 per row).
-SME_BITS_PER_ROW = 512
-SMEM_ROWS = 16
-SMEM_B8_PER_ROW = SME_BITS_PER_ROW // 8
-SMEM_B16_PER_ROW = SME_BITS_PER_ROW // 16
-SMEM_B32_PER_ROW = SME_BITS_PER_ROW // 32
 
 
 class MrOperandGeom(NamedTuple):
