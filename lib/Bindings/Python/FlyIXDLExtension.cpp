@@ -54,6 +54,25 @@ struct PyMmaOpMRMmaType : PyConcreteType<PyMmaOpMRMmaType> {
   }
 };
 
+struct PyMmaOpCQMmaType : PyConcreteType<PyMmaOpCQMmaType> {
+  FLYDSL_REGISTER_TYPE_BINDING(MmaOpCQMmaType, "MmaOpCQMmaType");
+
+  static void bindDerived(ClassTy &c) {
+    c.def_static(
+        "get",
+        [](int32_t m, int32_t n, int32_t k, PyType &elemTyA, PyType &elemTyB, PyType &elemTyAcc,
+           DefaultingPyMlirContext context) {
+          return PyMmaOpCQMmaType(context->getRef(),
+                                  wrap(MmaOpCQMmaType::get(m, n, k, unwrap(elemTyA),
+                                                           unwrap(elemTyB), unwrap(elemTyAcc))));
+        },
+        "m"_a, "n"_a, "k"_a, "elem_ty_a"_a, "elem_ty_b"_a, "elem_ty_acc"_a, nb::kw_only(),
+        "context"_a = nb::none(),
+        "Create a MmaOpCQMmaType (Iluvatar CQ TCU MMA) with m, n, k dimensions and "
+        "(A, B) -> accumulator element types");
+  }
+};
+
 } // namespace fly_ixdl
 } // namespace MLIR_BINDINGS_PYTHON_DOMAIN
 } // namespace python
@@ -64,4 +83,5 @@ NB_MODULE(_mlirDialectsFlyIXDL, m) {
 
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpMRAsyncCpType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyMmaOpMRMmaType::bind(m);
+  ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyMmaOpCQMmaType::bind(m);
 }
