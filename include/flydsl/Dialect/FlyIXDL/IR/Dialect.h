@@ -4,6 +4,8 @@
 #ifndef FLYDSL_DIALECT_FLYIXDL_IR_DIALECT_H
 #define FLYDSL_DIALECT_FLYIXDL_IR_DIALECT_H
 
+#include <cstdint>
+
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/LLVMIR/IXDLDialect.h"
 #include "mlir/IR/Attributes.h"
@@ -22,6 +24,10 @@
 #define GET_ATTRDEF_CLASSES
 #include "flydsl/Dialect/FlyIXDL/IR/AttrDefs.h.inc"
 
-namespace mlir::fly_ixdl {} // namespace mlir::fly_ixdl
+namespace mlir::fly_ixdl {
+
+inline constexpr int64_t kWarpSize = 64;
+
+} // namespace mlir::fly_ixdl
 
 #endif // FLYDSL_DIALECT_FLYIXDL_IR_DIALECT_H

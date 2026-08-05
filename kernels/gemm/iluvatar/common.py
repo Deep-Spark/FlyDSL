@@ -8,6 +8,20 @@ from typing import NamedTuple
 # Warp width for Iluvatar devices.
 WARP_SIZE = 64
 
+# Common Iluvatar TCU and SME geometry. CQ long-mtx enlarges M/N while
+# preserving the dtype-specific K extent.
+ATOM_M = 16
+ATOM_N = 16
+ATOM_K_B8 = 32
+ATOM_K_B16 = 16
+ATOM_K_B32 = 16
+TCU_LANE_COLS = 16
+SME_BITS_PER_ROW = 512
+SMEM_ROWS = 16
+SMEM_B8_PER_ROW = SME_BITS_PER_ROW // 8
+SMEM_B16_PER_ROW = SME_BITS_PER_ROW // 16
+SMEM_B32_PER_ROW = SME_BITS_PER_ROW // 32
+
 # CUTLASS 3.x / CuTe BLAS layout tags for logical A(m,k) @ B(n,k).T (MxK * NxK).
 # SME/G2S index naming: kernels.gemm.iluvatar.mr.common (cta_*, mma_*, sme_row_*).
 # BLAS layout tags nn/nt/tn/tt -- opaque names on logical A(m,k)/B(n,k); not per-operand M/N/K major letters.
@@ -85,6 +99,11 @@ def remap_gemm_tensors(A, B, layout: GemmLayout | str):
 
 
 __all__ = [
+    "ATOM_K_B32",
+    "ATOM_K_B16",
+    "ATOM_K_B8",
+    "ATOM_M",
+    "ATOM_N",
     "DEFAULT_MAJOR_PATTERN",
     "GemmLayout",
     "MAJOR_PATTERN_CHOICES",
@@ -92,6 +111,12 @@ __all__ = [
     "MAJOR_PATTERN_TN",
     "MAJOR_PATTERN_NN",
     "MAJOR_PATTERN_TT",
+    "SME_BITS_PER_ROW",
+    "SMEM_B16_PER_ROW",
+    "SMEM_B32_PER_ROW",
+    "SMEM_B8_PER_ROW",
+    "SMEM_ROWS",
+    "TCU_LANE_COLS",
     "parse_major_pattern",
     "remap_gemm_tensors",
     "WARP_SIZE",
