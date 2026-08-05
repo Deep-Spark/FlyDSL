@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -19,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.l2_device]
+pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -36,11 +37,11 @@ def _require_torch():
     return torch
 
 
-def _configure_iluvatar_env(monkeypatch) -> None:
+def _configure_iluvatar_env(monkeypatch, *, enable_cache: bool = False) -> None:
     monkeypatch.setenv("FLYDSL_COMPILE_BACKEND", "iluvatar")
     monkeypatch.setenv("FLYDSL_RUNTIME_KIND", "iluvatar")
     monkeypatch.setenv("ARCH", os.environ.get("ARCH", "ivcore11"))
-    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "1" if enable_cache else "0")
     monkeypatch.delenv("COMPILE_ONLY", raising=False)
 
 
@@ -54,6 +55,35 @@ def _require_flex_attn_module():
 
 def _phys_seq(seq: int, block: int) -> int:
     return ((seq + block - 1) // block) * block
+
+
+def _require_perf_enabled() -> None:
+    if os.environ.get("FLYDSL_ILUVATAR_RUN_FLEX_ATTN_PERF", "").lower() not in {"1", "true", "yes", "on"}:
+        pytest.skip("set FLYDSL_ILUVATAR_RUN_FLEX_ATTN_PERF=1 to run Iluvatar flex-attention perf")
+
+
+def _bench_gpu_us(fn, *, warmup: int, iters: int) -> float:
+    torch = _require_torch()
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    end.synchronize()
+    return float(start.elapsed_time(end) * 1000.0 / iters)
+
+
+def _attention_tflops(*, B: int, H: int, Sq: int, Skv: int, D: int, latency_us: float) -> float:
+    """Rough forward FLOPs: QK^T + PV ~= 4 * B * H * Sq * Skv * D."""
+    if latency_us <= 0:
+        return 0.0
+    flops = 4.0 * B * H * Sq * Skv * D
+    return flops / (latency_us * 1.0e6)
 
 
 # --- Q @ K^T only -------------------------------------------------------------
@@ -524,3 +554,109 @@ def test_iluvatar_flex_attention_package_export():
 
     mod = _require_flex_attn_module()
     assert exported is mod.compile_iluvatar_flex_attention
+
+
+# --- Perf (opt-in; consumed by perf-daily-iluvatar) ----------------------------
+
+
+def test_iluvatar_flex_attention_perf(monkeypatch):
+    """Large-shape latency probe for daily trend (plan §3.3, six cases)."""
+    _require_perf_enabled()
+    torch = _require_torch()
+    # The kv loop is unrolled at trace time, so JIT compilation for these shapes
+    # costs minutes and grows linearly with Skv. Reuse the disk cache so a daily
+    # run pays it once instead of per invocation.
+    _configure_iluvatar_env(monkeypatch, enable_cache=True)
+    mod = _require_flex_attn_module()
+
+    # warmup must stay >= 1: the first launch triggers JIT compilation, which
+    # would otherwise dominate the reported latency.
+    warmup = max(1, int(os.environ.get("FLYDSL_ILUVATAR_FLEX_ATTN_PERF_WARMUP", "5")))
+    iters = int(os.environ.get("FLYDSL_ILUVATAR_FLEX_ATTN_PERF_ITERS", "10"))
+
+    B, H, Hkv, Sq, Skv, D = 2, 32, 8, 4096, 4096, 128
+    cases = (
+        ("causal", True, None, None, "bf16"),
+        ("causal", True, None, None, "f16"),
+        ("causal_swa1024", True, 1024, None, "bf16"),
+        ("causal_swa1024", True, 1024, None, "f16"),
+        ("causal_softcap30", True, None, 30.0, "bf16"),
+        ("causal_softcap30", True, None, 30.0, "f16"),
+    )
+
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+    assert Sq_phys == Sq and Skv_phys == Skv
+
+    metrics = {}
+    for case_name, is_causal, window_size, softcap, dtype_str in cases:
+        torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype_str]
+        sm_scale = 1.0 / math.sqrt(D)
+
+        torch.manual_seed(123)
+        Q = torch.randn(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype).contiguous()
+        K = torch.randn(B, Hkv, Skv_phys, D, device="cuda", dtype=torch_dtype).contiguous()
+        V_natural = torch.randn(B, Hkv, Skv_phys, D, device="cuda", dtype=torch_dtype).contiguous()
+        V_transposed = V_natural.transpose(-1, -2).contiguous()
+        O = torch.empty(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)  # noqa: E741
+
+        launch = mod.compile_iluvatar_flex_attention(
+            B,
+            H,
+            Sq,
+            Skv,
+            D,
+            Hkv=Hkv,
+            dtype=dtype_str,
+            is_causal=is_causal,
+            window_size=window_size,
+            softcap=softcap,
+            sm_scale=sm_scale,
+        )
+        stream = torch.cuda.current_stream()
+
+        def run_flydsl():
+            launch(Q, K, V_transposed, O, stream=stream)
+
+        flydsl_us = _bench_gpu_us(run_flydsl, warmup=warmup, iters=iters)
+        tflops = _attention_tflops(B=B, H=H, Sq=Sq, Skv=Skv, D=D, latency_us=flydsl_us)
+
+        point_metrics = {
+            "latency_us": float(flydsl_us),
+            "tflops": float(tflops),
+        }
+
+        compare_torch = window_size is None and softcap is None
+        torch_us = None
+        speedup = None
+        if compare_torch:
+            # SDPA expects natural V layout [B, Hkv, Skv, D]; expand GQA heads for torch.
+            group = H // Hkv
+            K_torch = K.repeat_interleave(group, dim=1)
+            V_torch = V_natural.repeat_interleave(group, dim=1)
+
+            def run_torch():
+                torch.nn.functional.scaled_dot_product_attention(
+                    Q,
+                    K_torch,
+                    V_torch,
+                    is_causal=True,
+                    scale=sm_scale,
+                )
+
+            torch_us = _bench_gpu_us(run_torch, warmup=warmup, iters=iters)
+            speedup = torch_us / flydsl_us if flydsl_us > 0 else 0.0
+            point_metrics["torch_latency_us"] = float(torch_us)
+            point_metrics["speedup_torch"] = float(speedup)
+
+        metric_key = f"{case_name}.{dtype_str}"
+        print(
+            f"[iluvatar-flex-attn-perf] key={metric_key} "
+            f"shape=B{B}_H{H}_Hkv{Hkv}_Sq{Sq}_Skv{Skv}_D{D} "
+            f"flydsl={flydsl_us:.1f}us tflops={tflops:.2f} "
+            f"torch={f'{torch_us:.1f}us' if torch_us is not None else 'N/A'} "
+            f"speedup_torch={f'{speedup:.3f}x' if speedup is not None else 'N/A'}"
+        )
+        metrics[metric_key] = point_metrics
+
+    print("PERF_CASE_JSON=" + json.dumps({"metrics": metrics}, sort_keys=True))
