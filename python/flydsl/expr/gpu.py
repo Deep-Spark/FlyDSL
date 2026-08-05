@@ -75,6 +75,31 @@ class _ScalarGPUIndex(Int32):
         return self._materialize().ir_value()
 
 
+class _ScalarGPUIndex(Int32):
+    """Lazy token for zero-argument GPU index ops, materialized via ``Int32(...)``."""
+
+    __slots__ = ("_dtype", "_factory")
+    _is_lazy_gpu_index = True
+
+    def __init__(self, factory, dtype=Int32):
+        self._factory = factory
+        self._dtype = dtype
+
+    def _materialize(self):
+        return self._dtype(self._factory())
+
+    @property
+    def value(self):
+        return self._materialize().value
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def ir_value(self):
+        return self._materialize().ir_value()
+
+
 @dsl_loc_tracing
 def thread_id(*args, **kwargs):
     return gpu.thread_id(*args, **kwargs)
