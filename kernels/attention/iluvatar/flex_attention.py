@@ -409,12 +409,13 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
       * when ``Skv`` is not a multiple of ``BLOCK_N``, also mask
         ``kv_g >= Skv``. Callers must pass contiguous phys-padded Q/K/V/O.
 
-    Loop-carried state per lane: one ``(m_running, l_running)`` fp32 pair per
-    ``mma_m`` (i.e. ``ROWS_PER_LANE = WARP_ATOMS_M = 2`` pairs = 4 scalars),
-    packed flat on the ``fx.range(init=...)`` boundary. ``m_running`` is
-    initialised to ``-1e30`` (not ``-inf``) so
+    Loop-carried state per lane: ``ROWS_PER_LANE = WARP_ATOMS_M * 4`` fp32
+    ``m_running`` values and the same count of ``l_running`` values, flat-packed
+    on the ``fx.range(init=...)`` / ``yield`` boundary. ``m_running`` is
+    initialised to ``NEG_LARGE_F`` so
     ``alpha = exp2(m_prev - m_new)`` stays finite under fastmath in the first
-    KV iteration.
+    KV iteration. Causal fully-masked KV tiles are skipped by shortening the
+    trip count to ``kv_end``; K/V SMEM is 2-stage double-buffered.
 
     MRMma C-fragment TV (from ``lib/Dialect/FlyIXDL/MR/MmaAtom.cpp``
     ``getThrValLayoutC = FxLayout(FxShape(FxThr(16, 4), FxVal(4)),
@@ -487,11 +488,15 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     b_per_warp_qk = b_atoms_qk // NUM_WARPS
     b_per_warp_pv = b_atoms_v // NUM_WARPS
 
-    # SMEM sizing (bf16 = 2 B): Q+K+V+P = 8+8+8+4 KiW = 56 KiB at D=128.
+    # SMEM sizing (bf16 = 2 B): Q+K+V+P = 16+16+16+8 KiB = 56 KiB at D=128
+    # for a single K/V bank; K/V are doubled for the 2-stage pipeline
+    # (Q/P/s_red stay single).
     q_smem_elems = BLOCK_M * bk_qk
     k_smem_elems = BLOCK_N * bk_qk
     v_smem_elems = D * bk_pv
     p_smem_elems = BLOCK_M * BLOCK_N
+    k_smem_elems_staged = k_smem_elems * 2
+    v_smem_elems_staged = v_smem_elems * 2
 
     q_row_stride = D
     k_row_stride = D
@@ -539,8 +544,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             s_red_max: fx.Array[fx.Float32, BLOCK_M * WARPS_N]
             s_red_sum: fx.Array[fx.Float32, BLOCK_M * WARPS_N]
             q: fx.Array[elem_dtype, q_smem_elems]
-            k: fx.Array[elem_dtype, k_smem_elems]
-            v: fx.Array[elem_dtype, v_smem_elems]
+            k: fx.Array[elem_dtype, k_smem_elems_staged]
+            v: fx.Array[elem_dtype, v_smem_elems_staged]
             p: fx.Array[elem_dtype, p_smem_elems]
 
         bh_idx = fx.block_idx.x
@@ -597,8 +602,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
         smem = fx.SharedAllocator(static=True).allocate(FlexAttnSmem).peek()
         q_smem = smem.q.ptr
-        k_smem = smem.k.ptr
-        v_smem = smem.v.ptr
+        k_smem_base = smem.k.ptr
+        v_smem_base = smem.v.ptr
         p_smem = smem.p.ptr
         # 2-D view over the flat 1-D fp32 arrays; row-major, WARPS_N-wide.
         s_red_max = smem.s_red_max.view(fx.make_layout((BLOCK_M, WARPS_N), (WARPS_N, 1)))
@@ -639,6 +644,48 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         )
         vpr = MR_GEMM_GEOM.values_per_sme_row
         tile_smem_row = fx.make_tile(SMEM_ROWS, vpr)
+
+        def _k_stage_ptr(stage):
+            return fx.add_offset(k_smem_base, fx.make_int_tuple(stage * fx.Int32(k_smem_elems)))
+
+        def _v_stage_ptr(stage):
+            return fx.add_offset(v_smem_base, fx.make_int_tuple(stage * fx.Int32(v_smem_elems)))
+
+        def _issue_k(kv_idx, stage):
+            gK = fx.slice(gK_all, (None, None, kv_idx, 0))
+            sme_K = ixdl.make_sme_gmem_tensor(gK, leading_stride=k_row_stride)
+            mr_gemm_g2s_issue_b_warp(
+                a_mn_major=False,
+                b_mn_major=False,
+                warp_id=warp_id,
+                b_per_warp=b_per_warp_qk,
+                b_cta_gmem_view=fx.zipped_divide(sme_K, tile_smem_row),
+                g2s_sme=g2s_sme,
+                smem_b=_k_stage_ptr(stage),
+                elem_dtype=elem_dtype,
+                bm=BLOCK_M,
+                bn=BLOCK_N,
+                bk=bk_qk,
+                geom=MR_GEMM_GEOM,
+            )
+
+        def _issue_v(kv_idx, stage):
+            gV = fx.slice(gV_all, (None, None, 0, kv_idx))
+            sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=v_row_stride)
+            mr_gemm_g2s_issue_b_warp(
+                a_mn_major=False,
+                b_mn_major=False,
+                warp_id=warp_id,
+                b_per_warp=b_per_warp_pv,
+                b_cta_gmem_view=fx.zipped_divide(sme_V, tile_smem_row),
+                g2s_sme=g2s_sme,
+                smem_b=_v_stage_ptr(stage),
+                elem_dtype=elem_dtype,
+                bm=BLOCK_M,
+                bn=D,
+                bk=bk_pv,
+                geom=MR_GEMM_GEOM,
+            )
 
         # ---- Fragment templates -------------------------------------------
         # O_acc: MMA2's (m, n) = (BLOCK_M, D). Template from gO warp view.
@@ -713,36 +760,39 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         ixdl.cp_async_wait_group(0)
         fx.gpu.barrier()
 
-        # ---- KV loop: unrolled at Python trace time (num_kv_tiles fixed) --
-        # range_constexpr lets m_running / l_running propagate as
-        # plain Python-scope lists of DSL scalars -- no scf.for loop-carried
-        # state chain is needed, and register-backed fragment side effects stay
-        # inside the same MLIR region.
-        m_prev = [c_neg_large for _ in range(ROWS_PER_LANE)]
-        l_prev = [c_zero_f for _ in range(ROWS_PER_LANE)]
-        for kv_idx_const in fx.range_constexpr(num_kv_tiles):
-            kv_idx = fx.Int32(kv_idx_const)
+        # ---- KV loop (runtime fx.range) -----------------------------------
+        # Causal fully-masked tiles are dropped by shortening the trip count:
+        # kv_end = min(num_kv_tiles, ceil(q_tile_end / BLOCK_N)). With
+        # BLOCK_M == BLOCK_N this is min(num_kv_tiles, q_tile_idx + 1).
+        # SWA empty-window tiles are NOT skipped here (element mask still applies).
+        #
+        # m_running / l_running are flat-packed across the scf.for boundary
+        # (ROWS_PER_LANE fp32 each). O_acc stays outside and is updated in place.
+        #
+        # Light 2-stage K/V pipeline: prologue loads K0; after QK issue K_{i+1}
+        # into the other bank; after P-write issue V_i; one wait drains both.
+        c_num_kv = fx.Int32(num_kv_tiles)
+        if fx.const_expr(is_causal):
+            kv_end_cand = q_tile_idx + fx.Int32(1)
+            kv_end = (kv_end_cand < c_num_kv).select(kv_end_cand, c_num_kv)
+        else:
+            kv_end = c_num_kv
 
-            # ---- G2S K tile ------------------------------------------------
-            gK = fx.slice(gK_all, (None, None, kv_idx, 0))
-            sme_K = ixdl.make_sme_gmem_tensor(gK, leading_stride=k_row_stride)
-            mr_gemm_g2s_issue_b_warp(
-                a_mn_major=False,
-                b_mn_major=False,
-                warp_id=warp_id,
-                b_per_warp=b_per_warp_qk,
-                b_cta_gmem_view=fx.zipped_divide(sme_K, tile_smem_row),
-                g2s_sme=g2s_sme,
-                smem_b=k_smem,
-                elem_dtype=elem_dtype,
-                bm=BLOCK_M,
-                bn=BLOCK_N,
-                bk=bk_qk,
-                geom=MR_GEMM_GEOM,
-            )
-            ixdl.cp_async_commit_group()
-            ixdl.cp_async_wait_group(0)
-            fx.gpu.barrier()
+        # Prologue: K0 into stage 0.
+        _issue_k(fx.Int32(0), fx.Int32(0))
+        ixdl.cp_async_commit_group()
+        ixdl.cp_async_wait_group(0)
+        fx.gpu.barrier()
+
+        init_state = [c_neg_large for _ in range(ROWS_PER_LANE)] + [c_zero_f for _ in range(ROWS_PER_LANE)]
+        loop_results = init_state
+        for kv_idx, state in fx.range(fx.Int32(0), kv_end, fx.Int32(1), init=init_state):
+            m_prev = [state[slot] for slot in range(ROWS_PER_LANE)]
+            l_prev = [state[ROWS_PER_LANE + slot] for slot in range(ROWS_PER_LANE)]
+            kv_i = fx.Int32(kv_idx)
+            comp_stage = kv_i % fx.Int32(2)
+            k_smem_cur = _k_stage_ptr(comp_stage)
+            v_smem_cur = _v_stage_ptr(comp_stage)
 
             # ---- MMA1: S = Q @ K^T ----------------------------------------
             for mma_m in fx.range_constexpr(WARP_ATOMS_M):
@@ -756,7 +806,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                     mma_k=mma_k,
                     g2s_sme=g2s_sme,
                     smem_a=q_smem,
-                    smem_b=k_smem,
+                    smem_b=k_smem_cur,
                     elem_dtype=elem_dtype,
                     warp_m_id=warp_m_id,
                     warp_n_id=warp_n_id,
@@ -781,6 +831,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                             b_frags[mma_n],
                             S_frags[mma_m][mma_n],
                         )
+
+            # Prefetch K_{i+1} into the other bank so G2S overlaps softmax / P.
+            next_kv = kv_i + fx.Int32(1)
+            if next_kv < kv_end:
+                _issue_k(next_kv, comp_stage ^ fx.Int32(1))
+                ixdl.cp_async_commit_group()
 
             # ---- Scale / softcap / enter log2 domain ----------------------
             # S *= sm_scale -> optional softcap -> masks -> softmax.
@@ -828,7 +884,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             #       + lane_col                -- ei-invariant
             if fx.const_expr(is_causal):
                 q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
-                kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
                 # Inner ``ei`` loop is a Python list comprehension (like the
                 # O_acc alpha-scale below): a bare ``for ei in range(4):`` is
                 # picked up by the AST rewriter as a dynamic for loop and
@@ -856,7 +912,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             # ``is_causal`` -- callers wanting a causal window must set both.
             if fx.const_expr(has_swa):
                 q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
-                kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                     for mma_n in fx.range_constexpr(WARP_ATOMS_N):
                         acc = S_frags[mma_m][mma_n]
@@ -879,7 +935,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             # logical Skv so pad K/V never enter softmax. Folded away when
             # Skv == Skv_phys.
             if fx.const_expr(has_kv_tail):
-                kv_block_base = kv_idx * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                     for mma_n in fx.range_constexpr(WARP_ATOMS_N):
                         acc = S_frags[mma_m][mma_n]
@@ -1023,25 +1079,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                     )
             fx.gpu.barrier()
 
-            # ---- G2S V tile -----------------------------------------------
-            # V is transposed to shape (D, Skv); kv_idx selects the (D, BLOCK_N)
-            # tile whose leading stride is Skv (contiguous BLOCK_N).
-            gV = fx.slice(gV_all, (None, None, 0, kv_idx))
-            sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=v_row_stride)
-            mr_gemm_g2s_issue_b_warp(
-                a_mn_major=False,
-                b_mn_major=False,
-                warp_id=warp_id,
-                b_per_warp=b_per_warp_pv,
-                b_cta_gmem_view=fx.zipped_divide(sme_V, tile_smem_row),
-                g2s_sme=g2s_sme,
-                smem_b=v_smem,
-                elem_dtype=elem_dtype,
-                bm=BLOCK_M,
-                bn=D,
-                bk=bk_pv,
-                geom=MR_GEMM_GEOM,
-            )
+            # ---- G2S V tile (current); wait also drains any K prefetch ----
+            _issue_v(kv_i, comp_stage)
             ixdl.cp_async_commit_group()
             ixdl.cp_async_wait_group(0)
             fx.gpu.barrier()
@@ -1070,7 +1109,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         mma_n=mma_n,
                         mma_k=mma_k,
                         g2s_sme=g2s_sme,
-                        smem_b=v_smem,
+                        smem_b=v_smem_cur,
                         elem_dtype=elem_dtype,
                         warp_n_id=warp_n_id,
                         warp_atoms_n=WARP_ATOMS_N_PV,
@@ -1097,17 +1136,17 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                             O_acc[mma_m][mma_n],
                         )
 
-            # ---- Barrier before next iter's G2S overwrites K / P ---------
-            fx.gpu.barrier()
 
-            m_prev = m_new
-            l_prev = l_new
+            # Barrier before next iter may overwrite P / consume prefetched K.
+            fx.gpu.barrier()
+            loop_results = yield m_new + l_new
+
+        l_final = [loop_results[ROWS_PER_LANE + slot] for slot in range(ROWS_PER_LANE)]
 
         # ---- Post-loop: normalise and write O -----------------------------
-        # ``l_prev`` holds l_final (the accumulated rowsum). Element ``ei`` of
-        # an (mma_m, mma_n_pv) fragment is at row ``mma_m * 16 + ei * 4 +
+        # ``l_final`` is the last yielded rowsum pack. Element ``ei`` of an
+        # (mma_m, mma_n_pv) fragment is at row ``mma_m * 16 + ei * 4 +
         # lane_row``, matching slot index ``mma_m * 4 + ei``.
-        l_final = list(l_prev)
         for mma_m in fx.range_constexpr(WARP_ATOMS_M):
             for mma_n in fx.range_constexpr(WARP_ATOMS_N_PV):
                 acc = O_acc[mma_m][mma_n]
