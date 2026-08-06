@@ -19,10 +19,11 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Tensor core MMA** | `MRMma` -- **16x16x16 f16** and **16x16x32 i8->i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` -- double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |
 | **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` -- int8xint8 -> i32/i8, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
+| **Flex-attention V1** | `kernels.attention.iluvatar.flex_attention` -- fused forward; causal / SWA / softcap; f16/bf16; D in {64,128}; GQA / cross-attn / tail; variant subset of PyTorch flex_attention (not a general score_mod compiler) |
 | **MoE GEMM V1** | `kernels.moe.iluvatar.mr` -- sorted grouped GEMM, `int8` / `int8smooth`, f16/bf16/f32 out (A gather + B SME) |
 | **GEMV V1** | `kernels.gemm.iluvatar.gemv` -- `F.linear`-aligned M=1, fp16/bf16, fp32 accum |
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |
-| **Unit / device tests** | `tests/kernels/test_iluvatar_*` (device kernels: G2S/S2R/MMA/epilogue/HGEMM stages, GEMV, RMSNorm, LayerNorm, atomic CAS, split-K) + `tests/unit/test_iluvatar_*` (backend, runtime, JIT launch/binary smokes); select via `-m iluvatar_lower`. IGEMM via example `--check` |
+| **Unit / device tests** | `tests/kernels/test_iluvatar_*` (device kernels: G2S/S2R/MMA/epilogue/HGEMM stages, GEMV, RMSNorm, LayerNorm, flex-attention, atomic CAS, split-K) + `tests/unit/test_iluvatar_*` (backend, runtime, JIT launch/binary smokes); select via `-m iluvatar_lower`. IGEMM via example `--check` |
 | **CI (optional)** | Iluvatar `ci-core` / `ci-device`, IX toolchain refresh, publish-image, perf-daily (see `.github/workflows/*iluvatar*`) |
 
 ### Kernel package layout
@@ -41,6 +42,9 @@ kernels/gemm/iluvatar/
 
 kernels/moe/iluvatar/mr/
   moe_gemm.py        # compile_iluvatar_mr_moe_gemm (int8 / int8smooth V1)
+
+kernels/attention/iluvatar/
+  flex_attention.py  # compile_iluvatar_flex_attention (V1 forward)
 ```
 
 ## Supported hardware
@@ -96,6 +100,7 @@ export LD_LIBRARY_PATH="${CUDAToolkit_ROOT}/lib64:${PWD}/build-fly/python_packag
 | `ARCH` | `ivcore11` | IXDL chip target (override per card generation) |
 | `COMPILE_ONLY` | `1` | Compile without device execution (CI / no GPU) |
 | `FLYDSL_RUNTIME_ENABLE_CACHE` | `0` | Disable disk cache while iterating on kernel or pass changes |
+| `FLYDSL_ILUVATAR_RUN_FLEX_ATTN_PERF` | `1` | Opt-in flex-attention large-shape perf probe (`tests/kernels/test_iluvatar_flex_attention_device.py`) |
 | `FLYDSL_ILUVATAR_SMOKE_BLOB_PATH` / `FLYDSL_ILUVATAR_SMOKE_KERNEL` | path / symbol | Blob + kernel name consumed by `tests/unit/test_iluvatar_runtime_smoke.py`; tests are skipped when unset |
 
 Iluvatar examples set the first three via `os.environ.setdefault(...)`.
@@ -411,7 +416,8 @@ MLIR FileCheck (needs `fly-opt` + `FileCheck` on `PATH`):
 | **Small-shape HGEMM perf** | Sub-peak / noisy | Below **~2048^3**, TFLOPS are far from 4k peak and sensitive to launch/JIT and `k_atoms`. Quote **Gate2 contract** medians; treat smaller shapes as indicative. |
 | **B8 / INT8 GEMM** | **Implemented (MR IGEMM)** | `kernels.gemm.iluvatar.mr.igemm` + example 03-igemm; i32 / i8 epilogues; four major patterns. Further quant-scale / fused epilogues still open. |
 | **GEMV** | V1 only | `kernels.gemm.iluvatar.gemv` -- M=1, strict N/K tile divisibility; not a general batched GEMV. |
-| **Other production kernels** | ROCm-only today | Main FlyDSL portfolio (FP8/INT4 preshuffle GEMM, MoE, attention, norms, all-reduce, ...) has **no Iluvatar port** yet beyond HGEMM / IGEMM / GEMV + teaching/unit coverage. |
+| **Flex-attention** | V1 (L1 subset) only | `kernels.attention.iluvatar.flex_attention` -- forward presets only; no user `score_mod`, no backward / varlen / paged KV. Relative to Torch SDPA still has a large gap on long sequences. |
+| **Other production kernels** | Mostly ROCm-only | Broader FlyDSL portfolio (FP8/INT4 preshuffle GEMM, CDNA flash-attn family, all-reduce, ...) still has **no** full Iluvatar port beyond HGEMM / IGEMM / GEMV / MoE GEMM / flex-attention V1 + teaching/unit coverage. |
 | **S2R register pressure** | Tuning item | Shared->register uses generic `UniversalCopy32b` tiling rather than a TCU-specialized load; SRF usage on large shapes is higher than ideal and may leave headroom on the table. |
 | **Multi-GPU** | Not supported | No Iluvatar multi-device runtime or collective kernels (e.g. custom all-reduce). |
 | **ivcore30+** | Bring-up incomplete | `ARCH=ivcore30` is accepted by the compile backend; device validation and kernel tuning on newer chips are ongoing. |
