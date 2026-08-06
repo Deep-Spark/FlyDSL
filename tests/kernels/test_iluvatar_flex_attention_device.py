@@ -8,6 +8,7 @@ Covers:
 * Non-causal and causal fused forward vs scaled dot-product attention.
 * Softcap and sliding-window combinations vs a hand-written fp32 reference.
 * f16/bf16, D=64/128, MHA/GQA, cross-attention, and physical-padding tails.
+* Packed varlen (``cu_seqlens``) self-attn vs per-seq dense concat.
 """
 
 from __future__ import annotations
@@ -660,3 +661,156 @@ def test_iluvatar_flex_attention_perf(monkeypatch):
         metrics[metric_key] = point_metrics
 
     print("PERF_CASE_JSON=" + json.dumps({"metrics": metrics}, sort_keys=True))
+
+
+# --- V2-1 packed varlen -------------------------------------------------------
+
+
+def _pack_varlen_qkv(seqlens, H, Hkv, D, torch_dtype, *, seed=0, align=32, pad_tokens=64):
+    """Pack varlen Q/K/V with 32-aligned sequence starts for SME G2S.
+
+    Returns physical ``cu_seqlens`` (addressing) and logical ``seq_lens`` (masking).
+    ``total_tokens`` is rounded up to a multiple of ``align``.
+    """
+    torch = _require_torch()
+    torch.manual_seed(seed)
+    align = int(align)
+    cu_phys = [0]
+    for s in seqlens:
+        # Pad each sequence so the next start stays ``align``-aligned.
+        phys = ((int(s) + align - 1) // align) * align
+        cu_phys.append(cu_phys[-1] + phys)
+    total = cu_phys[-1] + int(pad_tokens)
+    total = ((total + align - 1) // align) * align
+    Q = torch.zeros(total, H, D, device="cuda", dtype=torch_dtype)
+    K = torch.zeros(total, Hkv, D, device="cuda", dtype=torch_dtype)
+    V_nat = torch.zeros(total, Hkv, D, device="cuda", dtype=torch_dtype)
+    for i, s in enumerate(seqlens):
+        lo = cu_phys[i]
+        Q[lo : lo + s].copy_(torch.randn(s, H, D, device="cuda", dtype=torch_dtype))
+        K[lo : lo + s].copy_(torch.randn(s, Hkv, D, device="cuda", dtype=torch_dtype))
+        V_nat[lo : lo + s].copy_(torch.randn(s, Hkv, D, device="cuda", dtype=torch_dtype))
+    V = V_nat.permute(1, 2, 0).contiguous()  # [Hkv, D, total]
+    O = torch.zeros_like(Q)
+    cu_t = torch.tensor(cu_phys, dtype=torch.int32, device="cuda")
+    seq_lens_t = torch.tensor(list(seqlens), dtype=torch.int32, device="cuda")
+    return Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys
+
+
+def _run_varlen_flex_attn(
+    monkeypatch,
+    *,
+    seqlens,
+    H,
+    D=128,
+    Hkv=None,
+    dtype="bf16",
+    is_causal=False,
+    window_size=None,
+    softcap=None,
+    seed=0,
+):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    if Hkv is None:
+        Hkv = H
+    torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
+    atol_rtol = 2e-2 if dtype == "bf16" else 1e-2
+    max_seqlen = max(seqlens)
+    sm_scale = 1.0 / math.sqrt(D)
+    num_seqs = len(seqlens)
+
+    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(
+        seqlens, H, Hkv, D, torch_dtype, seed=seed
+    )
+
+    launch = mod.compile_iluvatar_flex_attention(
+        num_seqs,
+        H,
+        max_seqlen,
+        max_seqlen,
+        D,
+        Hkv=Hkv,
+        dtype=dtype,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+        sm_scale=sm_scale,
+        varlen=True,
+    )
+    launch(Q, K, V, O, cu_seqlens=cu_t, seq_lens=seq_lens_t)
+    torch.cuda.synchronize()
+
+    refs = []
+    for i, s in enumerate(seqlens):
+        lo = cu_phys[i]
+        q_i = Q[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        k_i = K[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        v_i = V_nat[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        ref_i = _reference_flex_attention_fp32(
+            q_i,
+            k_i,
+            v_i,
+            sm_scale=sm_scale,
+            is_causal=is_causal,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        refs.append(ref_i[0].transpose(0, 1).contiguous())
+    ref = torch.cat(refs, dim=0)
+
+    outs = []
+    for i, s in enumerate(seqlens):
+        lo = cu_phys[i]
+        outs.append(O[lo : lo + s].float())
+    out = torch.cat(outs, dim=0)
+    torch.testing.assert_close(out, ref, rtol=atol_rtol, atol=atol_rtol)
+
+
+@pytest.mark.parametrize(
+    "seqlens,H,Hkv,D,dtype,is_causal,window_size,softcap",
+    [
+        ([64, 64], 4, 4, 128, "bf16", True, None, None),  # aligned MHA causal
+        ([48, 80, 64], 4, 4, 128, "bf16", True, None, None),  # unaligned seqlens
+        ([96, 32], 4, 2, 64, "bf16", True, None, None),  # GQA + D64
+        ([64, 128], 4, 4, 128, "f16", True, None, None),  # f16 smoke
+        ([80, 80], 4, 4, 128, "bf16", True, 32, None),  # SWA
+        ([64, 64], 4, 4, 128, "bf16", True, None, 30.0),  # softcap
+    ],
+)
+def test_iluvatar_flex_attention_varlen_v21(
+    monkeypatch, seqlens, H, Hkv, D, dtype, is_causal, window_size, softcap
+):
+    """Packed varlen self-attn matches per-seq dense concat reference."""
+    _run_varlen_flex_attn(
+        monkeypatch,
+        seqlens=seqlens,
+        H=H,
+        Hkv=Hkv,
+        D=D,
+        dtype=dtype,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+    )
+
+
+def test_iluvatar_flex_attention_varlen_rejects_missing_cu(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    launch = mod.compile_iluvatar_flex_attention(2, 4, 64, 64, 128, dtype="bf16", varlen=True)
+    Q = torch.zeros(128, 4, 128, device="cuda", dtype=torch.bfloat16)
+    K = torch.zeros(128, 4, 128, device="cuda", dtype=torch.bfloat16)
+    V = torch.zeros(4, 128, 128, device="cuda", dtype=torch.bfloat16)
+    O = torch.zeros_like(Q)
+    with pytest.raises(ValueError, match="cu_seqlens"):
+        launch(Q, K, V, O)
+
+
+def test_iluvatar_flex_attention_varlen_rejects_cross_max(monkeypatch):
+    mod = _require_flex_attn_module()
+    with pytest.raises(ValueError, match="Sq == Skv"):
+        mod.compile_iluvatar_flex_attention(2, 4, 64, 128, 128, dtype="bf16", varlen=True)

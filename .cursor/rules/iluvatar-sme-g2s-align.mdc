@@ -1,0 +1,70 @@
+---
+description: Iluvatar SME G2S leading-stride and packed-base offsets must be multiples of 32
+alwaysApply: true
+---
+
+# Iluvatar SME G2S alignment (leading stride / packed base)
+
+**When issuing Iluvatar SME async G2S** (`ixdl.make_sme_gmem_tensor` /
+`mr_gemm_g2s_issue_*` with a `leading_stride`), **both the leading stride and
+any runtime base offset into that dimension must be multiples of 32.**
+
+This is an Iluvatar SME descriptor constraint. Violations do **not** reliably
+trap; they show up as silent numerical corruption (large maxdiff vs reference)
+that is easy to mis-attribute to masks, softmax, or store paths.
+
+## What must be 32-aligned
+
+| Quantity | Example (flex-attn varlen) | Rule |
+|---|---|---|
+| SME `leading_stride` | `total_tokens` for `V: [Hkv, D, total]` | `total % 32 == 0` |
+| Base offset along that dim | per-seq `tok_base` into packed Q/K/V | `tok_base % 32 == 0` |
+
+```python
+# ✅ GOOD — pack helper pads each seq so the next start stays aligned,
+# and rounds total up to a multiple of 32
+ALIGN = 32
+phys = ((logical_len + ALIGN - 1) // ALIGN) * ALIGN
+cu_phys.append(cu_phys[-1] + phys)
+total = ((cu_phys[-1] + pad + ALIGN - 1) // ALIGN) * ALIGN
+
+sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=total_tokens)  # total % 32 == 0
+# tok_base from cu_phys[seq] is also % 32 == 0
+
+# ❌ BAD — tight Flash-Attn pack with unaligned starts / odd total
+# seqlens [48, 80] -> starts 0, 48 (48 % 32 != 0)  OR  total=144 (144 % 32 != 0)
+# Symptom: wrong results only on some sequences / shapes; aligned cases may pass
+```
+
+## Host / API pattern
+
+When logical lengths are arbitrary:
+
+1. Store **physical** cumulative offsets (`cu_seqlens`) for addressing -- starts
+   32-aligned (pad between sequences as needed).
+2. Pass **logical** lengths (`seq_lens`) separately for masking / predicates.
+3. Validate at launch: `total % 32 == 0` (and ideally each `cu_seqlens[i] % 32 == 0`).
+
+Do not assume "Flash-Attn tight pack with only logical `cu_seqlens`" is safe on
+Iluvatar SME G2S without checking these alignments.
+
+## Debug fingerprint
+
+Suspect this rule when:
+
+- Dense / single-seq / `tok_base==0` matches reference, but multi-seq or
+  mid-buffer sequences diverge.
+- Failures correlate with `total % 32 != 0` (e.g. 144 bad, 128/160/192 good)
+  or with `tok_base % 32 != 0` (e.g. start 48 bad, 0/64/128 good).
+- Switching store path (tiled vs shfl) does not fix the gap.
+
+## Scope
+
+- **Iluvatar + SME G2S only.** ROCm buffer/TDM paths and non-SME copies are
+  out of scope.
+- **New Iluvatar kernels** that pass a runtime `leading_stride` or rebase into
+  a packed tensor: apply from the first line.
+- **Drive-by**: do not rewrite unrelated kernels; fold in when touching the
+  G2S / packing path.
+
+Do not restate this rule as a source comment (see `no-rule-echo-comments.mdc`).
