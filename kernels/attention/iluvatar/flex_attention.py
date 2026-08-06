@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar flex-attention forward kernel (V1).
+"""Iluvatar flex-attention forward kernel (V1 + V2-1 varlen).
 
 This is a variant subset of PyTorch flex_attention, not a general ``score_mod``
 compiler. It supports f16/bf16 inputs, head dimensions 64 and 128, MHA/GQA,
 self/cross-attention, physical sequence padding, causal masking, sliding-window
-attention, and Gemma-2 softcap.
+attention, Gemma-2 softcap, and packed varlen self-attention via ``cu_seqlens``.
 """
 
 import math
@@ -389,6 +389,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     is_causal: bool = False,
     window_size: int | None = None,
     softcap: float | None = None,
+    varlen: bool = False,
 ) -> Callable:
     """Compile the flex-attention forward launcher.
 
@@ -442,12 +443,16 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         mr_gemm_s2r_load_mma_k,
     )
 
+    if varlen and Sq != Skv:
+        raise ValueError(f"varlen self-attn requires Sq == Skv (max_seqlen); got Sq={Sq}, Skv={Skv}")
+
     elem_dtype = _DTYPE_STR_TO_FX[dtype]
     Sq_phys = _phys_seq(Sq, BLOCK_M)
     Skv_phys = _phys_seq(Skv, BLOCK_N)
     num_q_tiles = Sq_phys // BLOCK_M
     num_kv_tiles = Skv_phys // BLOCK_N
-    has_kv_tail = Skv < Skv_phys
+    # Varlen always applies a runtime kv>=seqlen mask; dense only when phys-padded.
+    has_kv_tail = bool(varlen) or (Skv < Skv_phys)
     group_size = H // Hkv
 
     bk_qk = D  # MMA1 inner K = head dim
@@ -498,19 +503,34 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     k_smem_elems_staged = k_smem_elems * 2
     v_smem_elems_staged = v_smem_elems * 2
 
-    q_row_stride = D
-    k_row_stride = D
-    v_row_stride = Skv_phys  # V host-transposed to [B, Hkv, D, Skv_phys]
-    o_row_stride = D
-
-    q_batch_stride = H * Sq_phys * D
-    q_head_stride = Sq_phys * D
-    k_batch_stride = Hkv * Skv_phys * D
-    k_head_stride = Skv_phys * D
-    v_batch_stride = Hkv * D * Skv_phys
-    v_head_stride = D * Skv_phys
-    o_batch_stride = H * Sq_phys * D
-    o_head_stride = Sq_phys * D
+    # Dense: BHSD phys-padded. Varlen packed: Q/K/O [total, H(or Hkv), D] with
+    # token stride H*D; V host-transposed to [Hkv, D, total] (total is runtime).
+    if varlen:
+        q_row_stride = H * D
+        k_row_stride = Hkv * D
+        o_row_stride = H * D
+        # v_row_stride filled at runtime from total_tokens.
+        q_batch_stride = 0
+        q_head_stride = D
+        k_batch_stride = 0
+        k_head_stride = D
+        v_batch_stride = 0
+        v_head_stride = 0
+        o_batch_stride = 0
+        o_head_stride = D
+    else:
+        q_row_stride = D
+        k_row_stride = D
+        v_row_stride = Skv_phys  # V host-transposed to [B, Hkv, D, Skv_phys]
+        o_row_stride = D
+        q_batch_stride = H * Sq_phys * D
+        q_head_stride = Sq_phys * D
+        k_batch_stride = Hkv * Skv_phys * D
+        k_head_stride = Skv_phys * D
+        v_batch_stride = Hkv * D * Skv_phys
+        v_head_stride = D * Skv_phys
+        o_batch_stride = H * Sq_phys * D
+        o_head_stride = Sq_phys * D
 
     # ROWS_PER_LANE = WARP_ATOMS_M * 4: each lane owns 4 rows per warp-M atom
     # (row m = warp_m_id * 32 + mma_m * 16 + ei * 4 + lane_row). See TV
@@ -530,7 +550,15 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     window_size_i = int(window_size) if has_swa else 0
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def flex_attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor):  # noqa: E741
+    def flex_attn_kernel(
+        Q: fx.Tensor,
+        K: fx.Tensor,
+        V: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        CuSeqLen: fx.Tensor,
+        SeqLens: fx.Tensor,
+        total_tokens: fx.Int32,
+    ):
         # Declared inside the kernel body so @fx.struct annotations resolve
         # against the local closure.
         # NB: fx.Array[T, size, align] -- the third param is ALIGNMENT (bytes),
@@ -569,31 +597,70 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         c_log2e = fx.Float32(LOG2E)
         c_softcap = fx.Float32(softcap_f32)
         c_window = fx.Int32(window_size_i)
-        c_skv_logical = fx.Int32(Skv)
+        c_block_n = fx.Int32(BLOCK_N)
+        q_start = q_tile_idx * fx.Int32(BLOCK_M)
 
-        # Phys-padded 4D views. V is host-transposed to [B, Hkv, D, Skv_phys]
-        # so both MMA operands stay k-major "tn".
-        Q_view = fx.make_view(
-            fx.get_iter(Q),
-            fx.make_layout((B, H, Sq_phys, D), (q_batch_stride, q_head_stride, q_row_stride, 1)),
-        )
-        K_view = fx.make_view(
-            fx.get_iter(K),
-            fx.make_layout((B, Hkv, Skv_phys, D), (k_batch_stride, k_head_stride, k_row_stride, 1)),
-        )
-        V_view = fx.make_view(
-            fx.get_iter(V),
-            fx.make_layout((B, Hkv, D, Skv_phys), (v_batch_stride, v_head_stride, v_row_stride, 1)),
-        )
-        O_view = fx.make_view(
-            fx.get_iter(O),
-            fx.make_layout((B, H, Sq_phys, D), (o_batch_stride, o_head_stride, o_row_stride, 1)),
-        )
-
-        Q_bh = fx.slice(Q_view, (b_idx, h_idx, None, None))
-        K_bh = fx.slice(K_view, (b_idx, hkv_idx, None, None))
-        V_bh = fx.slice(V_view, (b_idx, hkv_idx, None, None))
-        O_bh = fx.slice(O_view, (b_idx, h_idx, None, None))
+        # Dense: compile-time logical Skv. Varlen: per-seq length from cu_seqlens.
+        if fx.const_expr(varlen):
+            cu_view = fx.make_view(
+                fx.get_iter(CuSeqLen),
+                fx.make_layout((B + 1,), (1,)),
+            )
+            seqlens_view = fx.make_view(
+                fx.get_iter(SeqLens),
+                fx.make_layout((B,), (1,)),
+            )
+            tok_base = fx.memref_load(cu_view, b_idx)
+            seqlen = fx.memref_load(seqlens_view, b_idx)
+            c_skv_logical = seqlen
+            active = q_start < seqlen
+            v_row_stride_r = total_tokens
+            q_ptr = fx.add_offset(
+                fx.get_iter(Q),
+                fx.make_int_tuple(tok_base * fx.Int32(q_row_stride) + h_idx * fx.Int32(D)),
+            )
+            k_ptr = fx.add_offset(
+                fx.get_iter(K),
+                fx.make_int_tuple(tok_base * fx.Int32(k_row_stride) + hkv_idx * fx.Int32(D)),
+            )
+            o_ptr = fx.add_offset(
+                fx.get_iter(O),
+                fx.make_int_tuple(tok_base * fx.Int32(o_row_stride) + h_idx * fx.Int32(D)),
+            )
+            v_ptr = fx.add_offset(
+                fx.get_iter(V),
+                fx.make_int_tuple(hkv_idx * fx.Int32(D) * total_tokens + tok_base),
+            )
+            Q_bh = fx.make_view(q_ptr, fx.make_layout((Sq_phys, D), (q_row_stride, 1)))
+            K_bh = fx.make_view(k_ptr, fx.make_layout((Skv_phys, D), (k_row_stride, 1)))
+            O_bh = fx.make_view(o_ptr, fx.make_layout((Sq_phys, D), (o_row_stride, 1)))
+            V_bh = fx.make_view(v_ptr, fx.make_layout((D, Skv_phys), (v_row_stride_r, 1)))
+        else:
+            c_skv_logical = fx.Int32(Skv)
+            active = fx.Int32(1) != fx.Int32(0)
+            # Phys-padded 4D views. V is host-transposed to [B, Hkv, D, Skv_phys]
+            # so both MMA operands stay k-major "tn".
+            Q_view = fx.make_view(
+                fx.get_iter(Q),
+                fx.make_layout((B, H, Sq_phys, D), (q_batch_stride, q_head_stride, q_row_stride, 1)),
+            )
+            K_view = fx.make_view(
+                fx.get_iter(K),
+                fx.make_layout((B, Hkv, Skv_phys, D), (k_batch_stride, k_head_stride, k_row_stride, 1)),
+            )
+            V_view = fx.make_view(
+                fx.get_iter(V),
+                fx.make_layout((B, Hkv, D, Skv_phys), (v_batch_stride, v_head_stride, v_row_stride, 1)),
+            )
+            O_view = fx.make_view(
+                fx.get_iter(O),
+                fx.make_layout((B, H, Sq_phys, D), (o_batch_stride, o_head_stride, o_row_stride, 1)),
+            )
+            Q_bh = fx.slice(Q_view, (b_idx, h_idx, None, None))
+            K_bh = fx.slice(K_view, (b_idx, hkv_idx, None, None))
+            V_bh = fx.slice(V_view, (b_idx, hkv_idx, None, None))
+            O_bh = fx.slice(O_view, (b_idx, h_idx, None, None))
+            v_row_stride_r = fx.Int32(v_row_stride)
 
         gQ = fx.slice(fx.flat_divide(Q_bh, (BLOCK_M, bk_qk)), (None, None, q_tile_idx, 0))
         gK_all = fx.flat_divide(K_bh, (BLOCK_N, bk_qk))
@@ -671,7 +738,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
         def _issue_v(kv_idx, stage):
             gV = fx.slice(gV_all, (None, None, 0, kv_idx))
-            sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=v_row_stride)
+            sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=v_row_stride_r)
             mr_gemm_g2s_issue_b_warp(
                 a_mn_major=False,
                 b_mn_major=False,
@@ -777,12 +844,19 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             kv_end = (kv_end_cand < c_num_kv).select(kv_end_cand, c_num_kv)
         else:
             kv_end = c_num_kv
+        # Varlen: also drop tiles past this sequence's logical length.
+        if fx.const_expr(varlen):
+            kv_tiles_seq = (seqlen + c_block_n - fx.Int32(1)) // c_block_n
+            kv_end = (kv_end < kv_tiles_seq).select(kv_end, kv_tiles_seq)
+            # Inactive q-tiles (q_start >= seqlen): skip the KV loop entirely.
+            kv_end = active.select(kv_end, fx.Int32(0))
 
-        # Prologue: K0 into stage 0.
-        _issue_k(fx.Int32(0), fx.Int32(0))
-        ixdl.cp_async_commit_group()
-        ixdl.cp_async_wait_group(0)
-        fx.gpu.barrier()
+        # Prologue: K0 into stage 0 (skipped when kv_end == 0).
+        if kv_end > fx.Int32(0):
+            _issue_k(fx.Int32(0), fx.Int32(0))
+            ixdl.cp_async_commit_group()
+            ixdl.cp_async_wait_group(0)
+            fx.gpu.barrier()
 
         init_state = [c_neg_large for _ in range(ROWS_PER_LANE)] + [c_zero_f for _ in range(ROWS_PER_LANE)]
         loop_results = init_state
@@ -1147,26 +1221,83 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # ``l_final`` is the last yielded rowsum pack. Element ``ei`` of an
         # (mma_m, mma_n_pv) fragment is at row ``mma_m * 16 + ei * 4 +
         # lane_row``, matching slot index ``mma_m * 4 + ei``.
-        for mma_m in fx.range_constexpr(WARP_ATOMS_M):
-            for mma_n in fx.range_constexpr(WARP_ATOMS_N_PV):
-                acc = O_acc[mma_m][mma_n]
-                old = Vec(acc.load())
-                acc.store(
-                    Vec.from_elements(
-                        [old[ei] / l_final[mma_m * 4 + ei] for ei in range(4)],
-                        fx.Float32,
+        def _normalize_o():
+            for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                for mma_n in fx.range_constexpr(WARP_ATOMS_N_PV):
+                    acc = O_acc[mma_m][mma_n]
+                    old = Vec(acc.load())
+                    acc.store(
+                        Vec.from_elements(
+                            [old[ei] / l_final[mma_m * 4 + ei] for ei in range(4)],
+                            fx.Float32,
+                        )
                     )
-                )
 
-        mr_hgemm_epilogue_store_tiled(
-            lane_id=lane_id,
-            accs=O_acc,
-            gC_warp=gO_warp,
-            tiled_mma=tiled_mma,
-            warp_atoms_m=WARP_ATOMS_M,
-            warp_atoms_n=WARP_ATOMS_N_PV,
-            out_dtype=elem_dtype,
-        )
+        if fx.const_expr(varlen):
+            # Inactive CTAs skipped the KV loop (kv_end=0); do not divide by the
+            # zero rowsum init or write into a neighbor sequence's rows.
+            if active:
+                _normalize_o()
+                # Predicated shfl-style store (inlined so AST rewriter sees the
+                # ``if q_row < seqlen``). Row stride is packed ``H*D``, not D.
+                # ``total_tokens`` (V leading stride) must be a multiple of 32.
+                c_row = fx.Int32(o_row_stride)
+                c_warp_n = ATOM_N * WARP_ATOMS_N_PV
+                lane_voffset = lane_row * (c_row // fx.Int32(2)) + lane_col
+                lane_select0 = lane_row * fx.Int32(TCU_LANE_COLS) + (lane_col * fx.Int32(2)) % fx.Int32(
+                    TCU_LANE_COLS
+                )
+                lane_select1 = lane_select0 + fx.Int32(1)
+                lane_em = lane_col // fx.Int32(8)
+                width_i32 = fx.Int32(WARP_SIZE)
+                mask_lo = fx.Int32(0xFFFF)
+                mask_hi = fx.Int32(0xFFFF0000)
+                row_base = q_start + warp_m_id * fx.Int32(ATOM_M * WARP_ATOMS_M)
+                c_warp_ptr = fx.get_iter(gO_warp)
+                c_byte_ptr = fx.recast_iter(
+                    fx.PointerType.get(fx.Int8.ir_type, c_warp_ptr.memspace),
+                    c_warp_ptr,
+                )
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    phys_m = mma_m * TCU_LANE_COLS
+                    for ei in fx.range_constexpr(4):
+                        for phys_n in fx.range_constexpr(0, c_warp_n, TCU_LANE_COLS * 2):
+                            mma_n0 = phys_n // TCU_LANE_COLS
+                            mma_n1 = mma_n0 + 1
+                            tile_half_soffset = fx.Int32(phys_m + ei * 4) * c_row + fx.Int32(phys_n)
+                            f32_0 = Vec(O_acc[mma_m][mma_n0].load())[ei]
+                            f32_1 = Vec(O_acc[mma_m][mma_n1].load())[ei]
+                            h0 = f32_0.to(elem_dtype)
+                            h1 = f32_1.to(elem_dtype)
+                            hval_i32 = Vec(Vec.from_elements([h0, h1], elem_dtype)).bitcast(fx.Int32)[0]
+                            hvall = hval_i32.shuffle_idx(lane_select0, width_i32)
+                            hvalh = hval_i32.shuffle_idx(lane_select1, width_i32)
+                            val0 = (hvall & mask_lo) | (hvalh << fx.Int32(16))
+                            val1 = hvall.shrui(fx.Int32(16)) | (hvalh & mask_hi)
+                            val = fx.arith.select(
+                                fx.arith.cmpi(fx.arith.CmpIPredicate.ne, lane_em, fx.Int32(0)),
+                                val1,
+                                val0,
+                            )
+                            store_byte_off = lane_voffset * fx.Int32(4) + tile_half_soffset * fx.Int32(2)
+                            store_ptr = fx.recast_iter(
+                                fx.PointerType.get(fx.Int32.ir_type, c_warp_ptr.memspace),
+                                fx.add_offset(c_byte_ptr, fx.make_int_tuple(store_byte_off)),
+                            )
+                            q_row = row_base + fx.Int32(phys_m + ei * 4) + lane_row
+                            if q_row < seqlen:
+                                fx.ptr_store(val, store_ptr)
+        else:
+            _normalize_o()
+            mr_hgemm_epilogue_store_tiled(
+                lane_id=lane_id,
+                accs=O_acc,
+                gC_warp=gO_warp,
+                tiled_mma=tiled_mma,
+                warp_atoms_m=WARP_ATOMS_M,
+                warp_atoms_n=WARP_ATOMS_N_PV,
+                out_dtype=elem_dtype,
+            )
 
     @flyc.jit
     def launch_flex_attn(
@@ -1174,20 +1305,66 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         K: fx.Tensor,
         V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
+        CuSeqLen: fx.Tensor,
+        SeqLens: fx.Tensor,
+        total_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        flex_attn_kernel(Q, K, V, O).launch(
+        flex_attn_kernel(Q, K, V, O, CuSeqLen, SeqLens, total_tokens).launch(
             grid=(B * H, num_q_tiles, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
-    def launch_flex_attn_checked(Q, K, V, O, stream=fx.Stream(None)):  # noqa: E741
-        """Host entry: enforce phys-pad / GQA shapes before the JIT launch."""
+    def launch_flex_attn_checked(Q, K, V, O, cu_seqlens=None, seq_lens=None, stream=fx.Stream(None)):  # noqa: E741
+        """Host entry: enforce shapes before the JIT launch.
+
+        Dense (``varlen=False``): phys-padded BHSD tensors; cu/seq_lens ignored.
+        Varlen: packed ``Q/O [total, H, D]``, ``K [total, Hkv, D]``,
+        ``V [Hkv, D, total]`` (host-transposed), plus:
+          * ``cu_seqlens`` int32 ``[B+1]`` -- **physical** token offsets (each
+            start must be a multiple of 32 for SME G2S)
+          * ``seq_lens`` int32 ``[B]`` -- **logical** lengths used for masking
+        ``total`` must be a multiple of 32.
+        """
         q_shape = _tensor_shape(Q)
         k_shape = _tensor_shape(K)
         v_shape = _tensor_shape(V)
         o_shape = _tensor_shape(O)
+        if varlen:
+            if cu_seqlens is None or seq_lens is None:
+                raise ValueError("varlen launch requires cu_seqlens [B+1] and seq_lens [B] (int32)")
+            cu_shape = _tensor_shape(cu_seqlens)
+            sl_shape = _tensor_shape(seq_lens)
+            if len(cu_shape) != 1 or cu_shape[0] != B + 1:
+                raise ValueError(f"cu_seqlens shape must be ({B + 1},), got {cu_shape}")
+            if len(sl_shape) != 1 or sl_shape[0] != B:
+                raise ValueError(f"seq_lens shape must be ({B},), got {sl_shape}")
+            total = q_shape[0] if len(q_shape) == 3 else -1
+            expect_q = (total, H, D)
+            expect_k = (total, Hkv, D)
+            expect_v = (Hkv, D, total)
+            expect_o = (total, H, D)
+            if q_shape != expect_q:
+                raise ValueError(f"varlen Q shape must be [total, H, D]={expect_q}, got {q_shape}")
+            if k_shape != expect_k:
+                raise ValueError(f"varlen K shape must be [total, Hkv, D]={expect_k}, got {k_shape}")
+            if v_shape != expect_v:
+                raise ValueError(
+                    f"varlen V shape must be [Hkv, D, total]={expect_v} (host-transposed), got {v_shape}"
+                )
+            if o_shape != expect_o:
+                raise ValueError(f"varlen O shape must be [total, H, D]={expect_o}, got {o_shape}")
+            if total < 1:
+                raise ValueError(f"varlen total_tokens must be positive, got {total}")
+            if total % 32 != 0:
+                raise ValueError(
+                    f"varlen total_tokens (V leading dim) must be a multiple of 32 for SME G2S, got {total}"
+                )
+            return launch_flex_attn(
+                Q, K, V, O, cu_seqlens, seq_lens, fx.Int32(total), stream=stream
+            )
+
         expect_q = (B, H, Sq_phys, D)
         expect_k = (B, Hkv, Skv_phys, D)
         expect_v = (B, Hkv, D, Skv_phys)
@@ -1200,7 +1377,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             raise ValueError(f"V shape must be {expect_v} (host-transposed + Skv_phys-padded), got {v_shape}")
         if o_shape != expect_o:
             raise ValueError(f"O shape must be {expect_o} (Sq_phys-padded), got {o_shape}")
-        return launch_flex_attn(Q, K, V, O, stream=stream)
+        # Dense: CuSeqLen/SeqLens unused; pass O as a typed placeholder.
+        return launch_flex_attn(Q, K, V, O, O, O, fx.Int32(0), stream=stream)
 
     return launch_flex_attn_checked
 
@@ -1264,6 +1442,7 @@ def compile_iluvatar_flex_attention(
     window_size: int | None = None,
     softcap: float | None = None,
     sm_scale: float | None = None,
+    varlen: bool = False,
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
@@ -1275,7 +1454,7 @@ def compile_iluvatar_flex_attention(
     contiguous tensors; see below), ``is_causal`` / ``window_size`` / ``softcap``
     in any combination (``is_causal`` requires ``Sq == Skv``).
 
-    Phys pad contract:
+    Dense phys pad contract:
         ``Sq_phys = ceil(Sq / 64) * 64``, ``Skv_phys = ceil(Skv / 64) * 64``.
         Launch expects contiguous
         ``Q,O: [B, H, Sq_phys, D]``, ``K: [B, Hkv, Skv_phys, D]``,
@@ -1283,10 +1462,22 @@ def compile_iluvatar_flex_attention(
         Logical prefix ``[:Sq]`` / ``[:Skv]`` holds real data; pad rows/cols
         may be anything. Score columns ``kv >= Skv`` are masked in-kernel.
 
+    Varlen contract (``varlen=True``, self-attn only):
+        ``B`` is ``num_seqs``, ``Sq``/``Skv`` are the same ``max_seqlen``.
+        Launch expects packed ``Q,O: [total_tokens, H, D]``,
+        ``K: [total_tokens, Hkv, D]``, ``V: [Hkv, D, total_tokens]``
+        (host transpose of natural ``[total, Hkv, D]``), plus
+        ``cu_seqlens`` int32 ``[B+1]`` (**physical** token offsets; each start
+        and ``total_tokens`` must be multiples of 32 for SME G2S) and
+        ``seq_lens`` int32 ``[B]`` (**logical** lengths for masking).
+        Grid is ``(B * H, ceil(max_seqlen / BLOCK_M), 1)``. Between sequences,
+        pad so the next start is 32-aligned; trailing pad so ``total`` is
+        32-aligned and covers the last partial G2S tile.
+
     Args:
-        B, H, Sq, Skv, D: Logical shapes (compile-time constants). ``Sq``/``Skv``
-            are logical lengths used for masking; physical tensor ranks use
-            the padded sizes above.
+        B, H, Sq, Skv, D: Logical shapes (compile-time constants). Dense:
+            ``Sq``/``Skv`` are logical lengths used for masking. Varlen:
+            ``B=num_seqs``, ``Sq=Skv=max_seqlen``.
         Hkv: KV head count; ``None`` means MHA (``Hkv = H``).
         dtype: ``"f16"`` or ``"bf16"``.
         is_causal: Enable lower-triangular causal mask; requires ``Sq == Skv``.
@@ -1295,11 +1486,11 @@ def compile_iluvatar_flex_attention(
         softcap: Gemma-2 softcap; ``S = softcap * tanh(S / softcap)`` after
             ``sm_scale``, before log2-domain entry.
         sm_scale: Query scale; ``None`` defaults to ``1 / sqrt(D)``.
+        varlen: If True, compile the packed ``cu_seqlens`` self-attn path.
 
     Returns:
-        A launcher ``launch_fn(Q, K, V, O, stream=None)`` that validates phys
-        shapes then runs the kernel. Compare outputs on the logical ``O[..., :Sq, :]``
-        prefix.
+        Dense: ``launch_fn(Q, K, V, O, stream=None)``.
+        Varlen: ``launch_fn(Q, K, V, O, cu_seqlens=..., seq_lens=..., stream=None)``.
     """
     if Hkv is None:
         Hkv = H
@@ -1316,6 +1507,8 @@ def compile_iluvatar_flex_attention(
         window_size=window_size,
         softcap=softcap,
     )
+    if varlen and Sq != Skv:
+        raise ValueError(f"varlen self-attn requires Sq == Skv (max_seqlen); got Sq={Sq}, Skv={Skv}")
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
@@ -1333,6 +1526,7 @@ def compile_iluvatar_flex_attention(
         is_causal=is_causal,
         window_size=window_size,
         softcap=softcap,
+        varlen=varlen,
     )
 
 
