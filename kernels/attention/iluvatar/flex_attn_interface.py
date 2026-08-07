@@ -88,6 +88,8 @@ def _build_launcher(
     sm_scale: Optional[float],
     varlen: bool,
     paged: bool,
+    has_alibi: bool,
+    has_score_bias: bool,
 ):
     return compile_iluvatar_flex_attention(
         B,
@@ -103,6 +105,8 @@ def _build_launcher(
         sm_scale=sm_scale,
         varlen=varlen,
         paged=paged,
+        has_alibi=has_alibi,
+        has_score_bias=has_score_bias,
     )
 
 
@@ -164,6 +168,8 @@ def flydsl_flex_attn_func(
     causal: bool = False,
     window_size: Optional[int] = None,
     softcap: Optional[float] = None,
+    alibi_slopes=None,
+    score_bias=None,
     sm_scale: Optional[float] = None,
     out=None,
     # Varlen (packed): both required to select the varlen path.
@@ -217,6 +223,10 @@ def flydsl_flex_attn_func(
         if h % hkv != 0:
             raise ValueError(f"H ({h}) must be divisible by Hkv ({hkv})")
 
+        if alibi_slopes is not None and score_bias is not None:
+            raise ValueError("alibi_slopes and score_bias are mutually exclusive")
+        has_alibi = alibi_slopes is not None
+        has_score_bias = score_bias is not None
         launch = _build_launcher(
             b,
             h,
@@ -231,12 +241,43 @@ def flydsl_flex_attn_func(
             sm_scale,
             False,
             False,
+            has_alibi,
+            has_score_bias,
         )
         q_bhsd = _pad_bhsd(_bshd_to_bhsd(q), sq, BLOCK_M)
         k_bhsd = _pad_bhsd(_bshd_to_bhsd(k), skv, BLOCK_N)
         v_tn = _transpose_v_bhsd(_pad_bhsd(_bshd_to_bhsd(v), skv, BLOCK_N))
         o_bhsd = torch.zeros_like(q_bhsd)
-        launch(q_bhsd, k_bhsd, v_tn, o_bhsd, stream=fxs)
+        sb_phys = None
+        if has_score_bias:
+            # Accept BSHD logical [B,Sq,H,Skv] or BHSD [B,H,Sq,Skv]; pad to phys.
+            sb = score_bias
+            if sb.dim() != 4:
+                raise ValueError(f"score_bias must be 4D, got {tuple(sb.shape)}")
+            if sb.shape[1] == h and sb.shape[2] == sq:
+                sb_bhsd = sb
+            elif sb.shape[1] == sq and sb.shape[2] == h:
+                sb_bhsd = sb.permute(0, 2, 1, 3).contiguous()
+            else:
+                raise ValueError(f"score_bias shape {tuple(sb.shape)} incompatible with B={b} H={h} Sq={sq} Skv={skv}")
+            if sb_bhsd.shape[0] not in (1, b) or sb_bhsd.shape[3] != skv:
+                raise ValueError(f"score_bias shape {tuple(sb.shape)} incompatible with batch/Skv")
+            if sb_bhsd.shape[0] == 1 and b > 1:
+                sb_bhsd = sb_bhsd.expand(b, -1, -1, -1)
+            sq_phys = _phys_seq(sq, BLOCK_M)
+            skv_phys = _phys_seq(skv, BLOCK_N)
+            sb_phys = torch.zeros(b, h, sq_phys, skv_phys, device=sb.device, dtype=torch.float32)
+            sb_phys[:, :, :sq, :skv].copy_(sb_bhsd.float())
+        ali = alibi_slopes.float().contiguous() if has_alibi else None
+        launch(
+            q_bhsd,
+            k_bhsd,
+            v_tn,
+            o_bhsd,
+            alibi_slopes=ali,
+            score_bias=sb_phys,
+            stream=fxs,
+        )
         o_logic = _bhsd_to_bshd(o_bhsd[:, :, :sq, :])
         if out is not None:
             out.copy_(o_logic)
@@ -257,6 +298,8 @@ def flydsl_flex_attn_func(
             raise ValueError(f"varlen k shape {tuple(k.shape)} incompatible with q {tuple(q.shape)}")
         if h % hkv != 0:
             raise ValueError(f"H ({h}) must be divisible by Hkv ({hkv})")
+        if alibi_slopes is not None or score_bias is not None:
+            raise ValueError("alibi/score_bias are dense-only (not supported with varlen)")
 
         sl = seq_lens
         if sl.dtype != torch.int32:
@@ -288,6 +331,8 @@ def flydsl_flex_attn_func(
             sm_scale,
             True,
             False,
+            False,
+            False,
         )
         v_tn = v.permute(1, 2, 0).contiguous()  # [Hkv, D, total]
         o = torch.zeros_like(q) if out is None else out
@@ -318,6 +363,8 @@ def flydsl_flex_attn_func(
         )
     if seq_lens_kv.dtype != torch.int32:
         raise ValueError(f"seq_lens_kv must be int32, got {seq_lens_kv.dtype}")
+    if alibi_slopes is not None or score_bias is not None:
+        raise ValueError("alibi/score_bias are dense-only (not supported with paged)")
 
     skv = int(seq_lens_kv.max().item()) if max_seqlen_kv is None else int(max_seqlen_kv)
     sq_compile = int(max_seqlen_q) if max_seqlen_q is not None else sq
@@ -338,6 +385,8 @@ def flydsl_flex_attn_func(
         sm_scale,
         False,
         True,
+        False,
+        False,
     )
     q_bhsd = _pad_bhsd(_bshd_to_bhsd(q), sq, BLOCK_M)
     # If compile Sq > runtime Sq, pad Q rows to compile Sq_phys already handled

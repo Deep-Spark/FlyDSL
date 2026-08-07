@@ -7,7 +7,8 @@ This is a variant subset of PyTorch flex_attention, not a general ``score_mod``
 compiler. It supports f16/bf16 inputs, head dimensions 64 and 128, MHA/GQA,
 self/cross-attention, physical sequence padding, causal masking, sliding-window
 attention, Gemma-2 softcap, packed varlen self-attention via ``cu_seqlens``,
-and paged KV via ``block_table``.
+and paged KV via ``block_table``. Dense path also supports mutually exclusive
+``alibi_slopes`` / ``score_bias`` additive logits (V2-4).
 """
 
 import math
@@ -393,6 +394,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     softcap: float | None = None,
     varlen: bool = False,
     paged: bool = False,
+    has_alibi: bool = False,
+    has_score_bias: bool = False,
 ) -> Callable:
     """Compile the flex-attention forward launcher.
 
@@ -405,11 +408,13 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     transposed V so both operands are k-major "tn") -> divide by rowsum ->
     write bf16 O back to gmem.
 
-    Score modifications after MMA1:
-      * softcap set: ``S *= sm_scale`` -> ``softcap * tanh(S/softcap)`` -> ``S *= log2e``
-      * softcap None: fused ``S *= (sm_scale * log2e)``
-      * then optional causal (``kv > q``) and SWA (``q - kv > window_size``) masks
-        in the log2 domain with ``NEG_LARGE_F``.
+    Score modifications after MMA1 (linear domain then log2):
+      * ``S *= sm_scale``
+      * optional ``+ alibi`` or ``+ score_bias`` (dense only; mutually exclusive)
+      * optional softcap ``tanh``
+      * ``S *= log2e`` (when softcap/bias unset, fuse ``*(sm_scale*log2e)``)
+      * then optional causal / SWA / KV-tail masks in the log2 domain with
+        ``NEG_LARGE_F``.
       * when ``Skv`` is not a multiple of ``BLOCK_N``, also mask
         ``kv_g >= Skv``. Callers must pass contiguous phys-padded Q/K/V/O.
 
@@ -450,6 +455,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         raise ValueError("paged and varlen are mutually exclusive")
     if varlen and Sq != Skv:
         raise ValueError(f"varlen self-attn requires Sq == Skv (max_seqlen); got Sq={Sq}, Skv={Skv}")
+    if has_alibi and has_score_bias:
+        raise ValueError("alibi_slopes and score_bias are mutually exclusive")
+    if (has_alibi or has_score_bias) and (varlen or paged):
+        raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
 
     elem_dtype = _DTYPE_STR_TO_FX[dtype]
     Sq_phys = _phys_seq(Sq, BLOCK_M)
@@ -573,6 +582,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     shuffle_steps = int(math.log2(TCU_LANE_COLS))
     has_softcap = softcap is not None
     has_swa = window_size is not None
+    has_bias = bool(has_alibi) or bool(has_score_bias)
+    # Unfused scale path when softcap or additive bias is present.
+    use_unfused_scale = bool(has_softcap) or bool(has_bias)
     softcap_f32 = float(softcap) if has_softcap else 0.0
     window_size_i = int(window_size) if has_swa else 0
 
@@ -584,6 +596,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         O: fx.Tensor,  # noqa: E741
         CuSeqLen: fx.Tensor,
         SeqLens: fx.Tensor,
+        AlibiSlopes: fx.Tensor,
+        ScoreBias: fx.Tensor,
         total_tokens: fx.Int32,
     ):
         # Declared inside the kernel body so @fx.struct annotations resolve
@@ -626,6 +640,16 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         c_window = fx.Int32(window_size_i)
         c_block_n = fx.Int32(BLOCK_N)
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
+
+        # Dense additive bias (V2-4): load alibi slope once per head.
+        if fx.const_expr(has_alibi):
+            alibi_view = fx.make_view(
+                fx.get_iter(AlibiSlopes),
+                fx.make_layout((H,), (1,)),
+            )
+            alibi_slope = fx.memref_load(alibi_view, h_idx)
+        else:
+            alibi_slope = c_zero_f
 
         # Dense: compile-time logical Skv. Varlen: per-seq length from cu_seqlens.
         # Paged: seq_lens_kv from SeqLens; block_table in CuSeqLen slot.
@@ -787,9 +811,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 page_id = fx.memref_load(bt_view, (b_idx, kv_idx))
                 k_page_ptr = fx.add_offset(
                     fx.get_iter(K),
-                    fx.make_int_tuple(
-                        page_id * fx.Int32(page_elems_k) + hkv_idx * fx.Int32(D)
-                    ),
+                    fx.make_int_tuple(page_id * fx.Int32(page_elems_k) + hkv_idx * fx.Int32(D)),
                 )
                 gK = fx.make_view(
                     k_page_ptr,
@@ -819,9 +841,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 page_id = fx.memref_load(bt_view, (b_idx, kv_idx))
                 v_page_ptr = fx.add_offset(
                     fx.get_iter(V),
-                    fx.make_int_tuple(
-                        page_id * fx.Int32(page_elems_v) + hkv_idx * fx.Int32(D * PAGE_SIZE)
-                    ),
+                    fx.make_int_tuple(page_id * fx.Int32(page_elems_v) + hkv_idx * fx.Int32(D * PAGE_SIZE)),
                 )
                 gV = fx.make_view(
                     v_page_ptr,
@@ -1009,31 +1029,159 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 _issue_k(next_kv, comp_stage ^ fx.Int32(1))
                 ixdl.cp_async_commit_group()
 
-            # ---- Scale / softcap / enter log2 domain ----------------------
-            # S *= sm_scale -> optional softcap -> masks -> softmax.
-            # Softmax uses exp2, so we enter log2 domain with *log2e after
-            # softcap. When softcap is unset, fuse *(sm_scale*log2e).
-            if fx.const_expr(has_softcap):
-                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
-                    for mma_n in fx.range_constexpr(WARP_ATOMS_N):
-                        acc = S_frags[mma_m][mma_n]
-                        old = Vec(acc.load())
-                        acc.store(
-                            Vec.from_elements(
-                                [
-                                    c_log2e
-                                    * (
-                                        c_softcap
-                                        * fmath.tanh(
-                                            (old[ei] * c_sm_scale) / c_softcap,
-                                            fastmath=fm_fast,
-                                        )
+            # ---- Scale / bias / softcap / enter log2 domain ----------------
+            # Order: S *= sm_scale -> optional alibi|score_bias -> softcap
+            # -> *log2e. When neither softcap nor bias: fuse *(sm_scale*log2e).
+            if fx.const_expr(use_unfused_scale):
+                q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
+                kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                if fx.const_expr(has_alibi):
+                    for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                        for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                            acc = S_frags[mma_m][mma_n]
+                            old = Vec(acc.load())
+                            kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                            if fx.const_expr(has_softcap):
+                                acc.store(
+                                    Vec.from_elements(
+                                        [
+                                            c_log2e
+                                            * (
+                                                c_softcap
+                                                * fmath.tanh(
+                                                    (
+                                                        old[ei] * c_sm_scale
+                                                        + (
+                                                            c_zero_f
+                                                            - alibi_slope
+                                                            * (
+                                                                q_block_base
+                                                                + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                                                + lane_row
+                                                                - kv_g
+                                                            ).to(fx.Float32)
+                                                        )
+                                                    )
+                                                    / c_softcap,
+                                                    fastmath=fm_fast,
+                                                )
+                                            )
+                                            for ei in range(4)
+                                        ],
+                                        fx.Float32,
                                     )
-                                    for ei in range(4)
-                                ],
-                                fx.Float32,
+                                )
+                            else:
+                                acc.store(
+                                    Vec.from_elements(
+                                        [
+                                            (
+                                                old[ei] * c_sm_scale
+                                                + (
+                                                    c_zero_f
+                                                    - alibi_slope
+                                                    * (
+                                                        q_block_base
+                                                        + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                                        + lane_row
+                                                        - kv_g
+                                                    ).to(fx.Float32)
+                                                )
+                                            )
+                                            * c_log2e
+                                            for ei in range(4)
+                                        ],
+                                        fx.Float32,
+                                    )
+                                )
+                elif fx.const_expr(has_score_bias):
+                    score_bias_view = fx.make_view(
+                        fx.get_iter(ScoreBias),
+                        fx.make_layout(
+                            (B, H, Sq_phys, Skv_phys),
+                            (H * Sq_phys * Skv_phys, Sq_phys * Skv_phys, Skv_phys, 1),
+                        ),
+                    )
+                    for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                        for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                            acc = S_frags[mma_m][mma_n]
+                            old = Vec(acc.load())
+                            kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                            if fx.const_expr(has_softcap):
+                                acc.store(
+                                    Vec.from_elements(
+                                        [
+                                            c_log2e
+                                            * (
+                                                c_softcap
+                                                * fmath.tanh(
+                                                    (
+                                                        old[ei] * c_sm_scale
+                                                        + fx.memref_load(
+                                                            score_bias_view,
+                                                            (
+                                                                b_idx,
+                                                                h_idx,
+                                                                q_block_base
+                                                                + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                                                + lane_row,
+                                                                kv_g,
+                                                            ),
+                                                        )
+                                                    )
+                                                    / c_softcap,
+                                                    fastmath=fm_fast,
+                                                )
+                                            )
+                                            for ei in range(4)
+                                        ],
+                                        fx.Float32,
+                                    )
+                                )
+                            else:
+                                acc.store(
+                                    Vec.from_elements(
+                                        [
+                                            (
+                                                old[ei] * c_sm_scale
+                                                + fx.memref_load(
+                                                    score_bias_view,
+                                                    (
+                                                        b_idx,
+                                                        h_idx,
+                                                        q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row,
+                                                        kv_g,
+                                                    ),
+                                                )
+                                            )
+                                            * c_log2e
+                                            for ei in range(4)
+                                        ],
+                                        fx.Float32,
+                                    )
+                                )
+                else:
+                    # softcap only (no additive bias)
+                    for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                        for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                            acc = S_frags[mma_m][mma_n]
+                            old = Vec(acc.load())
+                            acc.store(
+                                Vec.from_elements(
+                                    [
+                                        c_log2e
+                                        * (
+                                            c_softcap
+                                            * fmath.tanh(
+                                                (old[ei] * c_sm_scale) / c_softcap,
+                                                fastmath=fm_fast,
+                                            )
+                                        )
+                                        for ei in range(4)
+                                    ],
+                                    fx.Float32,
+                                )
                             )
-                        )
             else:
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                     for mma_n in fx.range_constexpr(WARP_ATOMS_N):
@@ -1070,10 +1218,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                                 [
                                     (
                                         kv_g
-                                        > q_block_base
-                                        + fx.Int32(mma_m * ATOM_M + ei * 4)
-                                        + lane_row
-                                        + c_causal_delta
+                                        > q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row + c_causal_delta
                                     ).select(c_neg_large, old[ei])
                                     for ei in range(4)
                                 ],
@@ -1311,7 +1456,6 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                             O_acc[mma_m][mma_n],
                         )
 
-
             # Barrier before next iter may overwrite P / consume prefetched K.
             fx.gpu.barrier()
             loop_results = yield m_new + l_new
@@ -1345,9 +1489,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 c_row = fx.Int32(o_row_stride)
                 c_warp_n = ATOM_N * WARP_ATOMS_N_PV
                 lane_voffset = lane_row * (c_row // fx.Int32(2)) + lane_col
-                lane_select0 = lane_row * fx.Int32(TCU_LANE_COLS) + (lane_col * fx.Int32(2)) % fx.Int32(
-                    TCU_LANE_COLS
-                )
+                lane_select0 = lane_row * fx.Int32(TCU_LANE_COLS) + (lane_col * fx.Int32(2)) % fx.Int32(TCU_LANE_COLS)
                 lane_select1 = lane_select0 + fx.Int32(1)
                 lane_em = lane_col // fx.Int32(8)
                 width_i32 = fx.Int32(WARP_SIZE)
@@ -1408,10 +1550,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         O: fx.Tensor,  # noqa: E741
         CuSeqLen: fx.Tensor,
         SeqLens: fx.Tensor,
+        AlibiSlopes: fx.Tensor,
+        ScoreBias: fx.Tensor,
         total_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        flex_attn_kernel(Q, K, V, O, CuSeqLen, SeqLens, total_tokens).launch(
+        flex_attn_kernel(Q, K, V, O, CuSeqLen, SeqLens, AlibiSlopes, ScoreBias, total_tokens).launch(
             grid=(B * H, num_q_tiles, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -1426,29 +1570,31 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         seq_lens=None,
         block_table=None,
         seq_lens_kv=None,
+        alibi_slopes=None,
+        score_bias=None,
         stream=fx.Stream(None),
     ):
         """Host entry: enforce shapes before the JIT launch.
 
-        Dense (``varlen=False``, ``paged=False``): phys-padded BHSD tensors;
-        cu/seq_lens / block_table ignored.
-        Varlen: packed ``Q/O [total, H, D]``, ``K [total, Hkv, D]``,
-        ``V [Hkv, D, total]`` (host-transposed), plus:
-          * ``cu_seqlens`` int32 ``[B+1]`` -- **physical** token offsets (each
-            start must be a multiple of 32 for SME G2S)
-          * ``seq_lens`` int32 ``[B]`` -- **logical** lengths used for masking
-        ``total`` must be a multiple of 32.
-        Paged: dense Q/O; ``K [NumBlocks, 64, Hkv, D]``;
-        ``V [NumBlocks, Hkv, D, 64]`` (per-page host transpose for MMA2);
-        ``block_table`` int32 ``[B, max_num_pages]``; ``seq_lens_kv`` int32 ``[B]``.
+        Dense: phys-padded BHSD; optional dense-only ``alibi_slopes`` ``[H]`` fp32
+        or phys-padded ``score_bias`` ``[B,H,Sq_phys,Skv_phys]`` (mutually exclusive).
+        Varlen / paged contracts unchanged; alibi/score_bias rejected there.
         """
         q_shape = _tensor_shape(Q)
         k_shape = _tensor_shape(K)
         v_shape = _tensor_shape(V)
         o_shape = _tensor_shape(O)
+
+        def _bias_placeholders():
+            ali = alibi_slopes if alibi_slopes is not None else O
+            sb = score_bias if score_bias is not None else O
+            return ali, sb
+
         if varlen:
             if cu_seqlens is None or seq_lens is None:
                 raise ValueError("varlen launch requires cu_seqlens [B+1] and seq_lens [B] (int32)")
+            if alibi_slopes is not None or score_bias is not None:
+                raise ValueError("alibi/score_bias are dense-only (not supported with varlen)")
             cu_shape = _tensor_shape(cu_seqlens)
             sl_shape = _tensor_shape(seq_lens)
             if len(cu_shape) != 1 or cu_shape[0] != B + 1:
@@ -1465,9 +1611,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             if k_shape != expect_k:
                 raise ValueError(f"varlen K shape must be [total, Hkv, D]={expect_k}, got {k_shape}")
             if v_shape != expect_v:
-                raise ValueError(
-                    f"varlen V shape must be [Hkv, D, total]={expect_v} (host-transposed), got {v_shape}"
-                )
+                raise ValueError(f"varlen V shape must be [Hkv, D, total]={expect_v} (host-transposed), got {v_shape}")
             if o_shape != expect_o:
                 raise ValueError(f"varlen O shape must be [total, H, D]={expect_o}, got {o_shape}")
             if total < 1:
@@ -1476,46 +1620,37 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 raise ValueError(
                     f"varlen total_tokens (V leading dim) must be a multiple of 32 for SME G2S, got {total}"
                 )
-            return launch_flex_attn(
-                Q, K, V, O, cu_seqlens, seq_lens, fx.Int32(total), stream=stream
-            )
+            ali, sb = _bias_placeholders()
+            return launch_flex_attn(Q, K, V, O, cu_seqlens, seq_lens, ali, sb, fx.Int32(total), stream=stream)
 
         if paged:
             if block_table is None or seq_lens_kv is None:
-                raise ValueError(
-                    "paged launch requires block_table [B, max_num_pages] and seq_lens_kv [B] (int32)"
-                )
+                raise ValueError("paged launch requires block_table [B, max_num_pages] and seq_lens_kv [B] (int32)")
+            if alibi_slopes is not None or score_bias is not None:
+                raise ValueError("alibi/score_bias are dense-only (not supported with paged)")
             bt_shape = _tensor_shape(block_table)
             sl_shape = _tensor_shape(seq_lens_kv)
             if len(bt_shape) != 2 or bt_shape[0] != B or bt_shape[1] != max_num_pages:
-                raise ValueError(
-                    f"block_table shape must be ({B}, {max_num_pages}), got {bt_shape}"
-                )
+                raise ValueError(f"block_table shape must be ({B}, {max_num_pages}), got {bt_shape}")
             if len(sl_shape) != 1 or sl_shape[0] != B:
                 raise ValueError(f"seq_lens_kv shape must be ({B},), got {sl_shape}")
             expect_q = (B, H, Sq_phys, D)
             expect_o = (B, H, Sq_phys, D)
-            # NumBlocks is runtime; only check trailing dims.
             if q_shape != expect_q:
                 raise ValueError(f"paged Q shape must be {expect_q} (Sq_phys-padded), got {q_shape}")
             if o_shape != expect_o:
                 raise ValueError(f"paged O shape must be {expect_o} (Sq_phys-padded), got {o_shape}")
             if len(k_shape) != 4 or k_shape[1:] != (PAGE_SIZE, Hkv, D):
-                raise ValueError(
-                    f"paged K shape must be [NumBlocks, {PAGE_SIZE}, {Hkv}, {D}], got {k_shape}"
-                )
+                raise ValueError(f"paged K shape must be [NumBlocks, {PAGE_SIZE}, {Hkv}, {D}], got {k_shape}")
             if len(v_shape) != 4 or v_shape[1:] != (Hkv, D, PAGE_SIZE):
                 raise ValueError(
                     f"paged V shape must be [NumBlocks, {Hkv}, {D}, {PAGE_SIZE}] "
                     f"(per-page host-transposed), got {v_shape}"
                 )
             if k_shape[0] != v_shape[0]:
-                raise ValueError(
-                    f"paged K/V NumBlocks mismatch: K={k_shape[0]}, V={v_shape[0]}"
-                )
-            return launch_flex_attn(
-                Q, K, V, O, block_table, seq_lens_kv, fx.Int32(0), stream=stream
-            )
+                raise ValueError(f"paged K/V NumBlocks mismatch: K={k_shape[0]}, V={v_shape[0]}")
+            ali, sb = _bias_placeholders()
+            return launch_flex_attn(Q, K, V, O, block_table, seq_lens_kv, ali, sb, fx.Int32(0), stream=stream)
 
         expect_q = (B, H, Sq_phys, D)
         expect_k = (B, Hkv, Skv_phys, D)
@@ -1529,8 +1664,32 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             raise ValueError(f"V shape must be {expect_v} (host-transposed + Skv_phys-padded), got {v_shape}")
         if o_shape != expect_o:
             raise ValueError(f"O shape must be {expect_o} (Sq_phys-padded), got {o_shape}")
-        # Dense: CuSeqLen/SeqLens unused; pass O as a typed placeholder.
-        return launch_flex_attn(Q, K, V, O, O, O, fx.Int32(0), stream=stream)
+
+        if alibi_slopes is not None and score_bias is not None:
+            raise ValueError("alibi_slopes and score_bias are mutually exclusive")
+        if has_alibi:
+            if alibi_slopes is None:
+                raise ValueError("compiled with has_alibi=True requires alibi_slopes [H]")
+            as_shape = _tensor_shape(alibi_slopes)
+            if len(as_shape) != 1 or as_shape[0] != H:
+                raise ValueError(f"alibi_slopes shape must be ({H},), got {as_shape}")
+        elif alibi_slopes is not None:
+            raise ValueError("alibi_slopes passed but kernel compiled without has_alibi=True")
+        if has_score_bias:
+            if score_bias is None:
+                raise ValueError(
+                    "compiled with has_score_bias=True requires score_bias "
+                    f"[B, H, Sq_phys, Skv_phys]=[{B}, {H}, {Sq_phys}, {Skv_phys}]"
+                )
+            sb_shape = _tensor_shape(score_bias)
+            expect_sb = (B, H, Sq_phys, Skv_phys)
+            if sb_shape != expect_sb:
+                raise ValueError(f"score_bias shape must be {expect_sb} (phys-padded), got {sb_shape}")
+        elif score_bias is not None:
+            raise ValueError("score_bias passed but kernel compiled without has_score_bias=True")
+
+        ali, sb = _bias_placeholders()
+        return launch_flex_attn(Q, K, V, O, O, O, ali, sb, fx.Int32(0), stream=stream)
 
     return launch_flex_attn_checked
 
@@ -1596,6 +1755,8 @@ def compile_iluvatar_flex_attention(
     sm_scale: float | None = None,
     varlen: bool = False,
     paged: bool = False,
+    has_alibi: bool = False,
+    has_score_bias: bool = False,
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
@@ -1652,9 +1813,12 @@ def compile_iluvatar_flex_attention(
         sm_scale: Query scale; ``None`` defaults to ``1 / sqrt(D)``.
         varlen: If True, compile the packed ``cu_seqlens`` self-attn path.
         paged: If True, compile the ``block_table`` paged-KV path.
+        has_alibi: Dense-only; enable ``alibi_slopes [H]`` additive bias.
+        has_score_bias: Dense-only; enable phys-padded ``score_bias`` tensor.
+            Mutually exclusive with ``has_alibi``; not supported with varlen/paged.
 
     Returns:
-        Dense: ``launch_fn(Q, K, V, O, stream=None)``.
+        Dense: ``launch_fn(Q, K, V, O, stream=None, alibi_slopes=..., score_bias=...)``.
         Varlen: ``launch_fn(Q, K, V, O, cu_seqlens=..., seq_lens=..., stream=None)``.
         Paged: ``launch_fn(Q, K, V, O, block_table=..., seq_lens_kv=..., stream=None)``.
     """
@@ -1663,6 +1827,10 @@ def compile_iluvatar_flex_attention(
 
     if varlen and paged:
         raise ValueError("paged and varlen are mutually exclusive")
+    if has_alibi and has_score_bias:
+        raise ValueError("alibi_slopes and score_bias are mutually exclusive")
+    if (has_alibi or has_score_bias) and (varlen or paged):
+        raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
 
     _validate_scope(
         B=B,
@@ -1698,6 +1866,8 @@ def compile_iluvatar_flex_attention(
         softcap=softcap,
         varlen=varlen,
         paged=paged,
+        has_alibi=has_alibi,
+        has_score_bias=has_score_bias,
     )
 
 

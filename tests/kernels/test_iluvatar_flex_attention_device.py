@@ -291,6 +291,8 @@ def _reference_flex_attention_fp32(
     is_causal: bool = False,
     window_size: int | None = None,
     softcap: float | None = None,
+    alibi_slopes=None,
+    score_bias=None,
 ):
     """Hand-written fp32 reference for score modifications, including GQA."""
     torch = _require_torch()
@@ -301,12 +303,23 @@ def _reference_flex_attention_fp32(
         K = K.repeat_interleave(group, dim=1)
         V = V.repeat_interleave(group, dim=1)
     S = torch.matmul(Q.float(), K.float().transpose(-1, -2)) * sm_scale
-    if softcap is not None:
-        S = softcap * torch.tanh(S / softcap)
     Sq = S.shape[-2]
     Skv = S.shape[-1]
     q_idx = torch.arange(Sq, device=S.device).view(Sq, 1)
     kv_idx = torch.arange(Skv, device=S.device).view(1, Skv)
+    if alibi_slopes is not None and score_bias is not None:
+        raise ValueError("alibi_slopes and score_bias are mutually exclusive")
+    if alibi_slopes is not None:
+        # slopes [H]; bias = -slope * (q - kv)
+        slopes = alibi_slopes.float().view(1, H, 1, 1)
+        S = S + (-slopes * (q_idx.float() - kv_idx.float()))
+    if score_bias is not None:
+        sb = score_bias.float()
+        if sb.shape[1] == Sq and sb.dim() == 4 and sb.shape[2] == H:
+            sb = sb.permute(0, 2, 1, 3)
+        S = S + sb
+    if softcap is not None:
+        S = softcap * torch.tanh(S / softcap)
     mask = torch.zeros((Sq, Skv), device=S.device, dtype=torch.bool)
     if is_causal:
         # Align q=0 with kv=(Skv-Sq) so decode (Sq=1) and cross-length prefill
@@ -1083,9 +1096,7 @@ def test_iluvatar_flex_attn_func_varlen_matches_compile(monkeypatch):
     seqlens = [64, 64]
     H, Hkv, D = 4, 4, 128
     sm_scale = 1.0 / math.sqrt(D)
-    Q, K, V_tn, V_nat, _O_unused, cu_t, seq_lens_t, _ = _pack_varlen_qkv(
-        seqlens, H, Hkv, D, torch.bfloat16, seed=1
-    )
+    Q, K, V_tn, V_nat, _O_unused, cu_t, seq_lens_t, _ = _pack_varlen_qkv(seqlens, H, Hkv, D, torch.bfloat16, seed=1)
     out = iface.flydsl_flex_attn_func(
         Q,
         K,
@@ -1192,3 +1203,136 @@ def test_iluvatar_flex_attn_func_rejects_partial_paged(monkeypatch):
     bt = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="block_table"):
         iface.flydsl_flex_attn_func(q, k, v, block_table=bt)
+
+
+# --- V2-4 alibi / score_bias (dense) ------------------------------------------
+
+
+def _run_dense_alibi_or_bias(
+    monkeypatch,
+    *,
+    mode: str,
+    is_causal=True,
+    window_size=None,
+    softcap=None,
+    B=1,
+    H=4,
+    Sq=64,
+    Skv=64,
+    D=128,
+    dtype="bf16",
+):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
+    atol_rtol = 2e-2 if dtype == "bf16" else 1e-2
+    sm_scale = 1.0 / math.sqrt(D)
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+
+    torch.manual_seed(7)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    K = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Vn = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    K[:, :, :Skv].copy_(torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype))
+    Vn[:, :, :Skv].copy_(torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype))
+    Vt = Vn.transpose(-1, -2).contiguous()
+    O = torch.zeros_like(Q)  # noqa: E741
+
+    alibi = None
+    sb = None
+    has_alibi = mode == "alibi"
+    has_score_bias = mode == "score_bias"
+    if has_alibi:
+        alibi = torch.rand(H, device="cuda", dtype=torch.float32) * 0.5 + 0.1
+    if has_score_bias:
+        sb = torch.zeros(B, H, Sq_phys, Skv_phys, device="cuda", dtype=torch.float32)
+        sb[:, :, :Sq, :Skv].copy_(torch.randn(B, H, Sq, Skv, device="cuda", dtype=torch.float32) * 0.1)
+
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+        sm_scale=sm_scale,
+        has_alibi=has_alibi,
+        has_score_bias=has_score_bias,
+    )
+    launch(Q, K, Vt, O, alibi_slopes=alibi, score_bias=sb)
+    torch.cuda.synchronize()
+
+    ref = _reference_flex_attention_fp32(
+        Q[:, :, :Sq],
+        K[:, :, :Skv],
+        Vn[:, :, :Skv],
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi,
+        score_bias=None if sb is None else sb[:, :, :Sq, :Skv],
+    )
+    torch.testing.assert_close(O[:, :, :Sq].float(), ref, rtol=atol_rtol, atol=atol_rtol)
+
+
+@pytest.mark.parametrize(
+    "mode,is_causal,window_size,softcap",
+    [
+        ("alibi", True, None, None),
+        ("alibi", True, 32, None),
+        ("alibi", True, None, 30.0),
+        ("score_bias", True, None, None),
+        ("score_bias", False, None, None),
+    ],
+)
+def test_iluvatar_flex_attention_alibi_score_bias_v24(monkeypatch, mode, is_causal, window_size, softcap):
+    _run_dense_alibi_or_bias(
+        monkeypatch,
+        mode=mode,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+    )
+
+
+def test_iluvatar_flex_attention_rejects_alibi_and_bias(monkeypatch):
+    mod = _require_flex_attn_module()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", has_alibi=True, has_score_bias=True)
+
+
+def test_iluvatar_flex_attention_rejects_alibi_with_varlen(monkeypatch):
+    mod = _require_flex_attn_module()
+    with pytest.raises(ValueError, match="dense-only"):
+        mod.compile_iluvatar_flex_attention(2, 4, 64, 64, 128, dtype="bf16", varlen=True, has_alibi=True)
+
+
+def test_iluvatar_flex_attn_func_alibi_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(11)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    slopes = torch.rand(H, device="cuda", dtype=torch.float32) * 0.4 + 0.05
+    out = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, alibi_slopes=slopes)
+    torch.cuda.synchronize()
+    ref = _reference_flex_attention_fp32(
+        q.permute(0, 2, 1, 3).contiguous(),
+        k.permute(0, 2, 1, 3).contiguous(),
+        v.permute(0, 2, 1, 3).contiguous(),
+        sm_scale=sm_scale,
+        is_causal=True,
+        alibi_slopes=slopes,
+    )
+    torch.testing.assert_close(out.permute(0, 2, 1, 3).float(), ref, rtol=2e-2, atol=2e-2)
