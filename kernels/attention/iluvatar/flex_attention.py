@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar flex-attention forward kernel (V1 + V2-1 varlen).
+"""Iluvatar flex-attention forward kernel (V1 + V2-1 varlen + V2-2 paged).
 
 This is a variant subset of PyTorch flex_attention, not a general ``score_mod``
 compiler. It supports f16/bf16 inputs, head dimensions 64 and 128, MHA/GQA,
 self/cross-attention, physical sequence padding, causal masking, sliding-window
-attention, Gemma-2 softcap, and packed varlen self-attention via ``cu_seqlens``.
+attention, Gemma-2 softcap, packed varlen self-attention via ``cu_seqlens``,
+and paged KV via ``block_table``.
 """
 
 import math
@@ -80,8 +81,9 @@ def _validate_scope(
     is_causal: bool,
     window_size: int | None,
     softcap: float | None,
+    allow_causal_cross_len: bool = False,
 ) -> None:
-    """Validate compile-time inputs against the supported V1 envelope."""
+    """Validate compile-time inputs against the supported V1/V2 envelope."""
     if B <= 0 or H <= 0 or Hkv <= 0 or Sq <= 0 or Skv <= 0 or D <= 0:
         raise ValueError(f"all shape dims must be positive; got B={B} H={H} Hkv={Hkv} Sq={Sq} Skv={Skv} D={D}")
     if dtype not in _SUPPORTED_DTYPES:
@@ -90,7 +92,7 @@ def _validate_scope(
         raise ValueError(f"D must be one of {_SUPPORTED_D}, got {D}")
     if H % Hkv != 0:
         raise ValueError(f"H ({H}) must be divisible by Hkv ({Hkv})")
-    if is_causal and Sq != Skv:
+    if is_causal and Sq != Skv and not allow_causal_cross_len:
         raise ValueError(f"is_causal=True requires Sq == Skv (self-attention); got Sq={Sq}, Skv={Skv}")
     if softcap is not None and softcap <= 0:
         raise ValueError(f"softcap must be > 0 when set, got {softcap}")
@@ -390,6 +392,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     window_size: int | None = None,
     softcap: float | None = None,
     varlen: bool = False,
+    paged: bool = False,
 ) -> Callable:
     """Compile the flex-attention forward launcher.
 
@@ -443,6 +446,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         mr_gemm_s2r_load_mma_k,
     )
 
+    if varlen and paged:
+        raise ValueError("paged and varlen are mutually exclusive")
     if varlen and Sq != Skv:
         raise ValueError(f"varlen self-attn requires Sq == Skv (max_seqlen); got Sq={Sq}, Skv={Skv}")
 
@@ -451,9 +456,16 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     Skv_phys = _phys_seq(Skv, BLOCK_N)
     num_q_tiles = Sq_phys // BLOCK_M
     num_kv_tiles = Skv_phys // BLOCK_N
-    # Varlen always applies a runtime kv>=seqlen mask; dense only when phys-padded.
-    has_kv_tail = bool(varlen) or (Skv < Skv_phys)
+    max_num_pages = num_kv_tiles  # page_size == BLOCK_N
+    # Varlen/paged always apply a runtime kv>=seqlen mask; dense only when phys-padded.
+    has_kv_tail = bool(varlen) or bool(paged) or (Skv < Skv_phys)
     group_size = H // Hkv
+    PAGE_SIZE = BLOCK_N
+    # K cache [NumBlocks, PAGE_SIZE, Hkv, D]; V kernel-facing [NumBlocks, Hkv, D, PAGE_SIZE].
+    page_elems_k = PAGE_SIZE * Hkv * D
+    page_elems_v = Hkv * D * PAGE_SIZE
+    k_page_token_stride = Hkv * D
+    v_page_leading = PAGE_SIZE  # (D, PAGE_SIZE):(PAGE_SIZE, 1)
 
     bk_qk = D  # MMA1 inner K = head dim
     bk_pv = BLOCK_N  # MMA2 inner K = kv-tile size
@@ -505,6 +517,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
     # Dense: BHSD phys-padded. Varlen packed: Q/K/O [total, H(or Hkv), D] with
     # token stride H*D; V host-transposed to [Hkv, D, total] (total is runtime).
+    # Paged: Q/O dense BHSD; K pages [NumBlocks, PAGE, Hkv, D]; V pages
+    # host-transposed per page to [NumBlocks, Hkv, D, PAGE] for MMA2 "tn".
     if varlen:
         q_row_stride = H * D
         k_row_stride = Hkv * D
@@ -518,6 +532,19 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         v_head_stride = 0
         o_batch_stride = 0
         o_head_stride = D
+    elif paged:
+        q_row_stride = D
+        k_row_stride = k_page_token_stride  # within a page: (PAGE, D):(Hkv*D, 1)
+        v_row_stride = v_page_leading  # within a page: (D, PAGE):(PAGE, 1)
+        o_row_stride = D
+        q_batch_stride = H * Sq_phys * D
+        q_head_stride = Sq_phys * D
+        k_batch_stride = 0
+        k_head_stride = D
+        v_batch_stride = 0
+        v_head_stride = D * PAGE_SIZE
+        o_batch_stride = H * Sq_phys * D
+        o_head_stride = Sq_phys * D
     else:
         q_row_stride = D
         k_row_stride = D
@@ -601,6 +628,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
 
         # Dense: compile-time logical Skv. Varlen: per-seq length from cu_seqlens.
+        # Paged: seq_lens_kv from SeqLens; block_table in CuSeqLen slot.
         if fx.const_expr(varlen):
             cu_view = fx.make_view(
                 fx.get_iter(CuSeqLen),
@@ -613,6 +641,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             tok_base = fx.memref_load(cu_view, b_idx)
             seqlen = fx.memref_load(seqlens_view, b_idx)
             c_skv_logical = seqlen
+            c_causal_delta = fx.Int32(0)
             active = q_start < seqlen
             v_row_stride_r = total_tokens
             q_ptr = fx.add_offset(
@@ -635,9 +664,40 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             K_bh = fx.make_view(k_ptr, fx.make_layout((Skv_phys, D), (k_row_stride, 1)))
             O_bh = fx.make_view(o_ptr, fx.make_layout((Sq_phys, D), (o_row_stride, 1)))
             V_bh = fx.make_view(v_ptr, fx.make_layout((D, Skv_phys), (v_row_stride_r, 1)))
+        elif fx.const_expr(paged):
+            bt_view = fx.make_view(
+                fx.get_iter(CuSeqLen),
+                fx.make_layout((B, max_num_pages), (max_num_pages, 1)),
+            )
+            seqlens_kv_view = fx.make_view(
+                fx.get_iter(SeqLens),
+                fx.make_layout((B,), (1,)),
+            )
+            seqlen_kv = fx.memref_load(seqlens_kv_view, b_idx)
+            c_skv_logical = seqlen_kv
+            # Cross-length causal: mask kv > q + (seqlen_kv - Sq).
+            c_causal_delta = seqlen_kv - fx.Int32(Sq)
+            active = fx.Int32(1) != fx.Int32(0)
+            seqlen = fx.Int32(Sq)  # Q rows are dense phys-padded; store mask uses Sq
+            Q_view = fx.make_view(
+                fx.get_iter(Q),
+                fx.make_layout((B, H, Sq_phys, D), (q_batch_stride, q_head_stride, q_row_stride, 1)),
+            )
+            O_view = fx.make_view(
+                fx.get_iter(O),
+                fx.make_layout((B, H, Sq_phys, D), (o_batch_stride, o_head_stride, o_row_stride, 1)),
+            )
+            Q_bh = fx.slice(Q_view, (b_idx, h_idx, None, None))
+            O_bh = fx.slice(O_view, (b_idx, h_idx, None, None))
+            # K/V pages are gathered in _issue_k / _issue_v; placeholders unused.
+            K_bh = Q_bh
+            V_bh = Q_bh
+            v_row_stride_r = fx.Int32(v_row_stride)
         else:
             c_skv_logical = fx.Int32(Skv)
+            c_causal_delta = fx.Int32(0)
             active = fx.Int32(1) != fx.Int32(0)
+            seqlen = fx.Int32(Sq)
             # Phys-padded 4D views. V is host-transposed to [B, Hkv, D, Skv_phys]
             # so both MMA operands stay k-major "tn".
             Q_view = fx.make_view(
@@ -663,8 +723,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             v_row_stride_r = fx.Int32(v_row_stride)
 
         gQ = fx.slice(fx.flat_divide(Q_bh, (BLOCK_M, bk_qk)), (None, None, q_tile_idx, 0))
-        gK_all = fx.flat_divide(K_bh, (BLOCK_N, bk_qk))
-        gV_all = fx.flat_divide(V_bh, (D, bk_pv))
+        if fx.const_expr(paged):
+            gK_all = gQ  # unused; page gather uses K/V base + block_table
+            gV_all = gQ
+        else:
+            gK_all = fx.flat_divide(K_bh, (BLOCK_N, bk_qk))
+            gV_all = fx.flat_divide(V_bh, (D, bk_pv))
         gO = fx.slice(fx.flat_divide(O_bh, (BLOCK_M, D)), (None, None, q_tile_idx, 0))
 
         smem = fx.SharedAllocator(static=True).allocate(FlexAttnSmem).peek()
@@ -719,8 +783,22 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             return fx.add_offset(v_smem_base, fx.make_int_tuple(stage * fx.Int32(v_smem_elems)))
 
         def _issue_k(kv_idx, stage):
-            gK = fx.slice(gK_all, (None, None, kv_idx, 0))
-            sme_K = ixdl.make_sme_gmem_tensor(gK, leading_stride=k_row_stride)
+            if fx.const_expr(paged):
+                page_id = fx.memref_load(bt_view, (b_idx, kv_idx))
+                k_page_ptr = fx.add_offset(
+                    fx.get_iter(K),
+                    fx.make_int_tuple(
+                        page_id * fx.Int32(page_elems_k) + hkv_idx * fx.Int32(D)
+                    ),
+                )
+                gK = fx.make_view(
+                    k_page_ptr,
+                    fx.make_layout((BLOCK_N, D), (k_page_token_stride, 1)),
+                )
+                sme_K = ixdl.make_sme_gmem_tensor(gK, leading_stride=k_page_token_stride)
+            else:
+                gK = fx.slice(gK_all, (None, None, kv_idx, 0))
+                sme_K = ixdl.make_sme_gmem_tensor(gK, leading_stride=k_row_stride)
             mr_gemm_g2s_issue_b_warp(
                 a_mn_major=False,
                 b_mn_major=False,
@@ -737,8 +815,22 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             )
 
         def _issue_v(kv_idx, stage):
-            gV = fx.slice(gV_all, (None, None, 0, kv_idx))
-            sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=v_row_stride_r)
+            if fx.const_expr(paged):
+                page_id = fx.memref_load(bt_view, (b_idx, kv_idx))
+                v_page_ptr = fx.add_offset(
+                    fx.get_iter(V),
+                    fx.make_int_tuple(
+                        page_id * fx.Int32(page_elems_v) + hkv_idx * fx.Int32(D * PAGE_SIZE)
+                    ),
+                )
+                gV = fx.make_view(
+                    v_page_ptr,
+                    fx.make_layout((D, BLOCK_N), (PAGE_SIZE, 1)),
+                )
+                sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=PAGE_SIZE)
+            else:
+                gV = fx.slice(gV_all, (None, None, 0, kv_idx))
+                sme_V = ixdl.make_sme_gmem_tensor(gV, leading_stride=v_row_stride_r)
             mr_gemm_g2s_issue_b_warp(
                 a_mn_major=False,
                 b_mn_major=False,
@@ -840,14 +932,19 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # into the other bank; after P-write issue V_i; one wait drains both.
         c_num_kv = fx.Int32(num_kv_tiles)
         if fx.const_expr(is_causal):
-            kv_end_cand = q_tile_idx + fx.Int32(1)
+            # Self (delta=0): kv_end = q_tile + 1. Cross-length paged: allow
+            # kv up through q_tile_end + causal_delta.
+            q_tile_end = q_start + fx.Int32(BLOCK_M)
+            kv_end_cand = (q_tile_end + c_causal_delta + c_block_n - fx.Int32(1)) // c_block_n
             kv_end = (kv_end_cand < c_num_kv).select(kv_end_cand, c_num_kv)
+            kv_end = (kv_end > fx.Int32(0)).select(kv_end, fx.Int32(0))
         else:
             kv_end = c_num_kv
-        # Varlen: also drop tiles past this sequence's logical length.
-        if fx.const_expr(varlen):
-            kv_tiles_seq = (seqlen + c_block_n - fx.Int32(1)) // c_block_n
+        # Varlen / paged: also drop tiles past this sequence's logical KV length.
+        if fx.const_expr(varlen or paged):
+            kv_tiles_seq = (c_skv_logical + c_block_n - fx.Int32(1)) // c_block_n
             kv_end = (kv_end < kv_tiles_seq).select(kv_end, kv_tiles_seq)
+        if fx.const_expr(varlen):
             # Inactive q-tiles (q_start >= seqlen): skip the KV loop entirely.
             kv_end = active.select(kv_end, fx.Int32(0))
 
@@ -948,8 +1045,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             # AFTER entering the log2 domain above, so the sentinel lives in
             # the same domain as everything downstream and matches the
             # m_running init: exp2(NEG_LARGE_F - m_new) ~= 0 for any bounded
-            # m_new. ``is_causal=True`` enforces ``Sq == Skv`` at compile
-            # time, so q_global and kv_global share the same axis.
+            # m_new. Dense causal requires Sq == Skv (delta=0). Paged causal
+            # allows Sq != Skv via c_causal_delta = seqlen_kv - Sq.
             #
             # Fragment coord recap (col-major C-TV, see docstring above):
             #   m = warp_m_id * (WARP_ATOMS_M * ATOM_M) + mma_m * ATOM_M
@@ -971,9 +1068,13 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         acc.store(
                             Vec.from_elements(
                                 [
-                                    (kv_g > q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row).select(
-                                        c_neg_large, old[ei]
-                                    )
+                                    (
+                                        kv_g
+                                        > q_block_base
+                                        + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                        + lane_row
+                                        + c_causal_delta
+                                    ).select(c_neg_large, old[ei])
                                     for ei in range(4)
                                 ],
                                 fx.Float32,
@@ -1316,16 +1417,30 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             stream=stream,
         )
 
-    def launch_flex_attn_checked(Q, K, V, O, cu_seqlens=None, seq_lens=None, stream=fx.Stream(None)):  # noqa: E741
+    def launch_flex_attn_checked(
+        Q,
+        K,
+        V,
+        O,  # noqa: E741
+        cu_seqlens=None,
+        seq_lens=None,
+        block_table=None,
+        seq_lens_kv=None,
+        stream=fx.Stream(None),
+    ):
         """Host entry: enforce shapes before the JIT launch.
 
-        Dense (``varlen=False``): phys-padded BHSD tensors; cu/seq_lens ignored.
+        Dense (``varlen=False``, ``paged=False``): phys-padded BHSD tensors;
+        cu/seq_lens / block_table ignored.
         Varlen: packed ``Q/O [total, H, D]``, ``K [total, Hkv, D]``,
         ``V [Hkv, D, total]`` (host-transposed), plus:
           * ``cu_seqlens`` int32 ``[B+1]`` -- **physical** token offsets (each
             start must be a multiple of 32 for SME G2S)
           * ``seq_lens`` int32 ``[B]`` -- **logical** lengths used for masking
         ``total`` must be a multiple of 32.
+        Paged: dense Q/O; ``K [NumBlocks, 64, Hkv, D]``;
+        ``V [NumBlocks, Hkv, D, 64]`` (per-page host transpose for MMA2);
+        ``block_table`` int32 ``[B, max_num_pages]``; ``seq_lens_kv`` int32 ``[B]``.
         """
         q_shape = _tensor_shape(Q)
         k_shape = _tensor_shape(K)
@@ -1363,6 +1478,43 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 )
             return launch_flex_attn(
                 Q, K, V, O, cu_seqlens, seq_lens, fx.Int32(total), stream=stream
+            )
+
+        if paged:
+            if block_table is None or seq_lens_kv is None:
+                raise ValueError(
+                    "paged launch requires block_table [B, max_num_pages] and seq_lens_kv [B] (int32)"
+                )
+            bt_shape = _tensor_shape(block_table)
+            sl_shape = _tensor_shape(seq_lens_kv)
+            if len(bt_shape) != 2 or bt_shape[0] != B or bt_shape[1] != max_num_pages:
+                raise ValueError(
+                    f"block_table shape must be ({B}, {max_num_pages}), got {bt_shape}"
+                )
+            if len(sl_shape) != 1 or sl_shape[0] != B:
+                raise ValueError(f"seq_lens_kv shape must be ({B},), got {sl_shape}")
+            expect_q = (B, H, Sq_phys, D)
+            expect_o = (B, H, Sq_phys, D)
+            # NumBlocks is runtime; only check trailing dims.
+            if q_shape != expect_q:
+                raise ValueError(f"paged Q shape must be {expect_q} (Sq_phys-padded), got {q_shape}")
+            if o_shape != expect_o:
+                raise ValueError(f"paged O shape must be {expect_o} (Sq_phys-padded), got {o_shape}")
+            if len(k_shape) != 4 or k_shape[1:] != (PAGE_SIZE, Hkv, D):
+                raise ValueError(
+                    f"paged K shape must be [NumBlocks, {PAGE_SIZE}, {Hkv}, {D}], got {k_shape}"
+                )
+            if len(v_shape) != 4 or v_shape[1:] != (Hkv, D, PAGE_SIZE):
+                raise ValueError(
+                    f"paged V shape must be [NumBlocks, {Hkv}, {D}, {PAGE_SIZE}] "
+                    f"(per-page host-transposed), got {v_shape}"
+                )
+            if k_shape[0] != v_shape[0]:
+                raise ValueError(
+                    f"paged K/V NumBlocks mismatch: K={k_shape[0]}, V={v_shape[0]}"
+                )
+            return launch_flex_attn(
+                Q, K, V, O, block_table, seq_lens_kv, fx.Int32(0), stream=stream
             )
 
         expect_q = (B, H, Sq_phys, D)
@@ -1443,6 +1595,7 @@ def compile_iluvatar_flex_attention(
     softcap: float | None = None,
     sm_scale: float | None = None,
     varlen: bool = False,
+    paged: bool = False,
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
@@ -1452,7 +1605,8 @@ def compile_iluvatar_flex_attention(
     Supported scope: Q/K/V/O = f16 or bf16, D in {64, 128}, GQA
     (``H % Hkv == 0``), arbitrary ``Sq``/``Skv`` (callers pass phys-padded
     contiguous tensors; see below), ``is_causal`` / ``window_size`` / ``softcap``
-    in any combination (``is_causal`` requires ``Sq == Skv``).
+    in any combination. Dense ``is_causal`` requires ``Sq == Skv``; paged
+    causal allows ``Sq != Skv`` (cross-length via ``seq_lens_kv - Sq``).
 
     Dense phys pad contract:
         ``Sq_phys = ceil(Sq / 64) * 64``, ``Skv_phys = ceil(Skv / 64) * 64``.
@@ -1474,26 +1628,41 @@ def compile_iluvatar_flex_attention(
         pad so the next start is 32-aligned; trailing pad so ``total`` is
         32-aligned and covers the last partial G2S tile.
 
+    Paged contract (``paged=True``; mutually exclusive with ``varlen``):
+        ``Sq``/``Skv`` are ``max_seqlen_q`` / ``max_seqlen_kv``. Q/O stay dense
+        phys-padded. KV is linear paged with ``page_size == BLOCK_N == 64``:
+        ``K: [NumBlocks, 64, Hkv, D]``,
+        ``V: [NumBlocks, Hkv, D, 64]`` (per-page host transpose for MMA2,
+        mirroring dense V), plus ``block_table`` int32 ``[B, max_num_pages]``
+        and ``seq_lens_kv`` int32 ``[B]``. Kernel gathers pages per KV tile
+        (not gather-to-dense). Causal uses ``delta = seq_lens_kv[b] - Sq``.
+
     Args:
         B, H, Sq, Skv, D: Logical shapes (compile-time constants). Dense:
             ``Sq``/``Skv`` are logical lengths used for masking. Varlen:
-            ``B=num_seqs``, ``Sq=Skv=max_seqlen``.
+            ``B=num_seqs``, ``Sq=Skv=max_seqlen``. Paged: ``Sq``/``Skv`` are
+            max sequence lengths for Q and KV.
         Hkv: KV head count; ``None`` means MHA (``Hkv = H``).
         dtype: ``"f16"`` or ``"bf16"``.
-        is_causal: Enable lower-triangular causal mask; requires ``Sq == Skv``.
+        is_causal: Enable causal mask; dense requires ``Sq == Skv``.
         window_size: Sliding-window radius; mask where ``q - kv > window_size``.
             Independent of ``is_causal``.
         softcap: Gemma-2 softcap; ``S = softcap * tanh(S / softcap)`` after
             ``sm_scale``, before log2-domain entry.
         sm_scale: Query scale; ``None`` defaults to ``1 / sqrt(D)``.
         varlen: If True, compile the packed ``cu_seqlens`` self-attn path.
+        paged: If True, compile the ``block_table`` paged-KV path.
 
     Returns:
         Dense: ``launch_fn(Q, K, V, O, stream=None)``.
         Varlen: ``launch_fn(Q, K, V, O, cu_seqlens=..., seq_lens=..., stream=None)``.
+        Paged: ``launch_fn(Q, K, V, O, block_table=..., seq_lens_kv=..., stream=None)``.
     """
     if Hkv is None:
         Hkv = H
+
+    if varlen and paged:
+        raise ValueError("paged and varlen are mutually exclusive")
 
     _validate_scope(
         B=B,
@@ -1506,6 +1675,7 @@ def compile_iluvatar_flex_attention(
         is_causal=is_causal,
         window_size=window_size,
         softcap=softcap,
+        allow_causal_cross_len=bool(paged),
     )
     if varlen and Sq != Skv:
         raise ValueError(f"varlen self-attn requires Sq == Skv (max_seqlen); got Sq={Sq}, Skv={Skv}")
@@ -1527,6 +1697,7 @@ def compile_iluvatar_flex_attention(
         window_size=window_size,
         softcap=softcap,
         varlen=varlen,
+        paged=paged,
     )
 
 

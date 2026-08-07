@@ -9,6 +9,7 @@ Covers:
 * Softcap and sliding-window combinations vs a hand-written fp32 reference.
 * f16/bf16, D=64/128, MHA/GQA, cross-attention, and physical-padding tails.
 * Packed varlen (``cu_seqlens``) self-attn vs per-seq dense concat.
+* Paged KV (``block_table``) vs gather-to-dense flex reference.
 """
 
 from __future__ import annotations
@@ -308,7 +309,10 @@ def _reference_flex_attention_fp32(
     kv_idx = torch.arange(Skv, device=S.device).view(1, Skv)
     mask = torch.zeros((Sq, Skv), device=S.device, dtype=torch.bool)
     if is_causal:
-        mask = mask | (kv_idx > q_idx)
+        # Align q=0 with kv=(Skv-Sq) so decode (Sq=1) and cross-length prefill
+        # match the paged kernel's delta = seqlen_kv - Sq.
+        delta = Skv - Sq
+        mask = mask | (kv_idx > q_idx + delta)
     if window_size is not None:
         mask = mask | ((q_idx - kv_idx) > window_size)
     S = S.masked_fill(mask, float("-inf"))
@@ -814,3 +818,218 @@ def test_iluvatar_flex_attention_varlen_rejects_cross_max(monkeypatch):
     mod = _require_flex_attn_module()
     with pytest.raises(ValueError, match="Sq == Skv"):
         mod.compile_iluvatar_flex_attention(2, 4, 64, 128, 128, dtype="bf16", varlen=True)
+
+
+# --- V2-2 paged KV ------------------------------------------------------------
+
+
+def _build_paged_kv(
+    *,
+    B: int,
+    Hkv: int,
+    D: int,
+    seq_lens_kv,
+    torch_dtype,
+    seed: int = 0,
+    page_size: int = 64,
+):
+    """Build linear K/V pages + block_table; return natural and V-transposed.
+
+    Logical cache layout for both K and V is ``[NumBlocks, page_size, Hkv, D]``.
+    Kernel-facing V is per-page transposed to ``[NumBlocks, Hkv, D, page_size]``.
+    """
+    torch = _require_torch()
+    torch.manual_seed(seed)
+    seq_lens_kv = [int(s) for s in seq_lens_kv]
+    assert len(seq_lens_kv) == B
+    max_pages = max((s + page_size - 1) // page_size for s in seq_lens_kv)
+    # Allocate enough pages for all sequences (no sharing).
+    pages_per_seq = [((s + page_size - 1) // page_size) for s in seq_lens_kv]
+    num_blocks = sum(pages_per_seq)
+    K_pages = torch.zeros(num_blocks, page_size, Hkv, D, device="cuda", dtype=torch_dtype)
+    V_pages_nat = torch.zeros_like(K_pages)
+    block_table = torch.full((B, max_pages), -1, device="cuda", dtype=torch.int32)
+    cursor = 0
+    dense_k = []
+    dense_v = []
+    for b, slen in enumerate(seq_lens_kv):
+        npages = pages_per_seq[b]
+        ids = list(range(cursor, cursor + npages))
+        cursor += npages
+        for i, pid in enumerate(ids):
+            block_table[b, i] = pid
+            lo = i * page_size
+            hi = min(lo + page_size, slen)
+            n = hi - lo
+            K_pages[pid, :n].copy_(torch.randn(n, Hkv, D, device="cuda", dtype=torch_dtype))
+            V_pages_nat[pid, :n].copy_(torch.randn(n, Hkv, D, device="cuda", dtype=torch_dtype))
+        # Gather dense [Hkv, Skv, D] then to [B,Hkv,Skv,D] style for ref.
+        k_rows = []
+        v_rows = []
+        for i, pid in enumerate(ids):
+            lo = i * page_size
+            hi = min(lo + page_size, slen)
+            n = hi - lo
+            k_rows.append(K_pages[pid, :n])  # [n, Hkv, D]
+            v_rows.append(V_pages_nat[pid, :n])
+        k_cat = torch.cat(k_rows, dim=0)  # [slen, Hkv, D]
+        v_cat = torch.cat(v_rows, dim=0)
+        dense_k.append(k_cat.permute(1, 0, 2).contiguous())  # [Hkv, slen, D]
+        dense_v.append(v_cat.permute(1, 0, 2).contiguous())
+    V_pages = V_pages_nat.permute(0, 2, 3, 1).contiguous()  # [NumBlocks, Hkv, D, page]
+    seq_lens_t = torch.tensor(seq_lens_kv, dtype=torch.int32, device="cuda")
+    return K_pages, V_pages, V_pages_nat, block_table, seq_lens_t, dense_k, dense_v, max_pages
+
+
+def _run_paged_flex_attn(
+    monkeypatch,
+    *,
+    B: int,
+    H: int,
+    Sq: int,
+    seq_lens_kv,
+    D: int = 128,
+    Hkv: int | None = None,
+    dtype: str = "bf16",
+    is_causal: bool = False,
+    window_size: int | None = None,
+    softcap: float | None = None,
+    seed: int = 0,
+):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    if Hkv is None:
+        Hkv = H
+    torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
+    atol_rtol = 2e-2 if dtype == "bf16" else 1e-2
+    Skv = max(seq_lens_kv)
+    sm_scale = 1.0 / math.sqrt(D)
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, max_pages = _build_paged_kv(
+        B=B,
+        Hkv=Hkv,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=seed,
+        page_size=mod.BLOCK_N,
+    )
+    assert max_pages == _phys_seq(Skv, mod.BLOCK_N) // mod.BLOCK_N
+
+    torch.manual_seed(seed + 1)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O = torch.zeros_like(Q)  # noqa: E741
+
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        Hkv=Hkv,
+        dtype=dtype,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+        sm_scale=sm_scale,
+        paged=True,
+    )
+    launch(Q, K_pages, V_pages, O, block_table=block_table, seq_lens_kv=seq_lens_t)
+    torch.cuda.synchronize()
+
+    refs = []
+    for b in range(B):
+        slen = seq_lens_kv[b]
+        q_b = Q[b : b + 1, :, :Sq, :].contiguous()
+        k_b = dense_k[b].unsqueeze(0)[:, :, :slen, :].contiguous()  # [1,Hkv,slen,D]
+        v_b = dense_v[b].unsqueeze(0)[:, :, :slen, :].contiguous()
+        ref_b = _reference_flex_attention_fp32(
+            q_b,
+            k_b,
+            v_b,
+            sm_scale=sm_scale,
+            is_causal=is_causal,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        refs.append(ref_b)
+    ref = torch.cat(refs, dim=0)
+    out = O[:, :, :Sq, :].float()
+    torch.testing.assert_close(out, ref, rtol=atol_rtol, atol=atol_rtol)
+
+
+@pytest.mark.parametrize(
+    "B,H,Hkv,Sq,seq_lens_kv,D,dtype,is_causal,window_size,softcap",
+    [
+        # Decode Sq=1 over 128 KV tokens
+        (1, 4, 4, 1, [128], 128, "bf16", True, None, None),
+        # Short causal prefill, equal lengths
+        (2, 4, 4, 64, [64, 64], 128, "bf16", True, None, None),
+        # Cross-length: Sq=64 over Skv=128
+        (1, 4, 4, 64, [128], 128, "bf16", True, None, None),
+        # Variable seq_lens_kv within batch
+        (2, 4, 4, 64, [80, 128], 128, "bf16", True, None, None),
+        # GQA + D64
+        (1, 4, 2, 64, [64], 64, "bf16", True, None, None),
+        # f16 smoke
+        (1, 4, 4, 64, [64], 128, "f16", True, None, None),
+        # SWA
+        (1, 4, 4, 64, [64], 128, "bf16", True, 32, None),
+        # softcap
+        (1, 4, 4, 64, [64], 128, "bf16", True, None, 30.0),
+        # Non-causal
+        (1, 4, 4, 64, [96], 128, "bf16", False, None, None),
+    ],
+)
+def test_iluvatar_flex_attention_paged_v22(
+    monkeypatch, B, H, Hkv, Sq, seq_lens_kv, D, dtype, is_causal, window_size, softcap
+):
+    """Paged KV gather matches dense flex reference on gathered K/V."""
+    _run_paged_flex_attn(
+        monkeypatch,
+        B=B,
+        H=H,
+        Hkv=Hkv,
+        Sq=Sq,
+        seq_lens_kv=seq_lens_kv,
+        D=D,
+        dtype=dtype,
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+    )
+
+
+def test_iluvatar_flex_attention_paged_rejects_varlen_combo():
+    mod = _require_flex_attn_module()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", varlen=True, paged=True
+        )
+
+
+def test_iluvatar_flex_attention_paged_allows_causal_cross_len():
+    mod = _require_flex_attn_module()
+    # Should not raise (unlike dense causal).
+    mod.compile_iluvatar_flex_attention(
+        1, 4, 1, 128, 128, dtype="bf16", is_causal=True, paged=True
+    )
+
+
+def test_iluvatar_flex_attention_paged_rejects_missing_table(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    launch = mod.compile_iluvatar_flex_attention(
+        1, 4, 64, 64, 128, dtype="bf16", is_causal=True, paged=True
+    )
+    Q = torch.zeros(1, 4, 64, 128, device="cuda", dtype=torch.bfloat16)
+    K = torch.zeros(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    V = torch.zeros(1, 4, 128, 64, device="cuda", dtype=torch.bfloat16)
+    O = torch.zeros_like(Q)
+    with pytest.raises(ValueError, match="block_table"):
+        launch(Q, K, V, O)
