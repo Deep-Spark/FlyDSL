@@ -4,6 +4,11 @@
 """Iluvatar-specific attention kernels."""
 
 from .flex_attention import compile_iluvatar_flex_attention
+from .flex_attn_interface import flydsl_flex_attn_func
 from .fused_rope_cache_kernel import build_fused_rope_cache_module
 
-__all__ = ["build_fused_rope_cache_module", "compile_iluvatar_flex_attention"]
+__all__ = [
+    "build_fused_rope_cache_module",
+    "compile_iluvatar_flex_attention",
+    "flydsl_flex_attn_func",
+]
