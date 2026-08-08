@@ -16,6 +16,7 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Layout algebra** | Same Fly layout API as ROCm (`logical_divide`, `copy_atom_call`, `make_tiled_copy_*`, ...) |
 | **SME async copy** | `MRAsyncCpRow8b` / `Row16b` / `Col`, `make_sme_gmem_tensor`, `make_sme_shared_layout` / `make_sme_shared_layout_k_spanning`, `cp_async_commit_group` / `cp_async_wait_group` (`python/flydsl/expr/ixdl/`) |
 | **CQ SMEX G2S** | `CQSmexCp` (mtx/plain); `row_mask` / `col_mask` are arbitrary bit prefixes; SME gmem global row stride must be **16B-aligned** (`make_sme_gmem_tensor` fail-fasts; hardware otherwise silently truncates the low 4 bits) |
+| **CQ SMEX matrix copy** | `CQSmexCp(layout="mtx")` G2S + `CQMtxLoadn` S2R for 8/16-bit CQ MMA A/B fragments |
 | **Pipeline sync** | `sl_waitmem`, `sl_pipebar_arrive`, `sl_pipebar_wait` for software-pipelined kernels |
 | **Tensor core MMA** | `MRMma` -- **16x16x16 f16** and **16x16x32 i8->i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` -- double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |
@@ -26,6 +27,25 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |
 | **Unit / device tests** | `tests/kernels/test_iluvatar_*` (device kernels: G2S/S2R/MMA/epilogue/HGEMM stages, GEMV, RMSNorm, LayerNorm, flex-attention, atomic CAS, split-K) + `tests/unit/test_iluvatar_*` (backend, runtime, JIT launch/binary smokes); select via `-m iluvatar_lower`. IGEMM via example `--check` |
 | **CI (optional)** | Iluvatar `ci-core` / `ci-device`, IX toolchain refresh, publish-image, perf-daily (see `.github/workflows/*iluvatar*`) |
+
+### CQ shared-memory access paths
+
+CQ has two incompatible shared-buffer contracts:
+
+- `SmexMtx`: `CQSmexCp(layout="mtx")` writes the CQ matrix format and
+  `CQMtxLoadn` reads it with `ixdl.mtx_loadn_*x2`. `loadn16` / `loadn64`
+  only pair with the 16-row / 64-row G2S tile height -- both emit the same
+  x2 load (64 bits/lane); a 64-row footprint needs multiple atom calls with
+  different EmPart / slot bases. Row gather produces the CQ MMA A fragment;
+  column gather produces B.
+- `LegacySme`: MR-style SME copies and scalar/legacy S2R use the historical
+  byte-swizzled shared layout.
+
+A shared buffer must use one contract for both G2S and S2R. Do not write with
+one path and read with the other. "Swizzle bypass" on `SmexMtx` means the
+legacy byte-swizzle transform leaves shared indices unchanged; it does not mean
+the data is unswizzled. SMEX writes the matrix-format mtx-index XOR mapping, and
+the matrix-load instruction consumes that mapping in hardware.
 
 ### Kernel package layout
 

@@ -1,7 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-from .cq import CQMma, CQSmexCp, SMEX_LAYOUT_MTX, SMEX_LAYOUT_PLAIN
+from .cq import (
+    MTX_GATHER_COL,
+    MTX_GATHER_ROW,
+    MTX_LOAD_PATTERN_LOADN16,
+    MTX_LOAD_PATTERN_LOADN64,
+    SMEX_LAYOUT_MTX,
+    SMEX_LAYOUT_PLAIN,
+    CQMma,
+    CQMtxLoadn,
+    CQSmexCp,
+)
 from .mr import (
     MRAsyncCp,
     MRAsyncCpCol,
@@ -47,9 +57,14 @@ __all__ = [
     "MRAsyncCpRow16b",
     "MRMma",
     "CQMma",
+    "CQMtxLoadn",
     "CQSmexCp",
     "SMEX_LAYOUT_MTX",
     "SMEX_LAYOUT_PLAIN",
+    "MTX_LOAD_PATTERN_LOADN16",
+    "MTX_LOAD_PATTERN_LOADN64",
+    "MTX_GATHER_ROW",
+    "MTX_GATHER_COL",
     "SMEMajor",
     "make_sme_shared_layout",
     "make_sme_shared_layout_k_spanning",

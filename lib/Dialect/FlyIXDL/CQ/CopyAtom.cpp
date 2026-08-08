@@ -3,6 +3,8 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
@@ -341,6 +343,176 @@ FailureOr<Value> CopyOpCQSmexCpType::emitAtomCallSSA(OpBuilder &builder, Locatio
                           dst, pred)))
     return failure();
   return Value{};
+}
+
+//===----------------------------------------------------------------------===//
+// CopyOpCQMtxLoadnType -- CQ SmexMtx S2R via ixdl.mtx_loadn_*x2.
+//
+// loadn16 / loadn64 on the atom type only document which SmexMtx G2S tile
+// height the call is paired with. Emission always uses the x2 IXDL ops below
+// (64 bits/lane); pattern does not change the opcode.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+int64_t packedBitWidth(Type type) {
+  if (auto vectorTy = dyn_cast<VectorType>(type))
+    return vectorTy.getNumElements() * vectorTy.getElementTypeBitWidth();
+  if (type.isIntOrFloat())
+    return type.getIntOrFloatBitWidth();
+  return 0;
+}
+
+FailureOr<Value> emitMtxLoadn(OpBuilder &builder, Location loc, MtxGatherDirection direction,
+                              int32_t elemBits, Type resultTy, Value src) {
+  auto srcPtrTy = dyn_cast<LLVM::LLVMPointerType>(src.getType());
+  if (!srcPtrTy || srcPtrTy.getAddressSpace() != 3)
+    return mlir::emitError(loc) << "CQMtxLoadn src must lower to !llvm.ptr<3>, got "
+                                << src.getType();
+  if (!resultTy || packedBitWidth(resultTy) != 64)
+    return mlir::emitError(loc) << "CQMtxLoadn x2 requires a 64-bit register result, got "
+                                << resultTy;
+
+  Type intrinsicTy = VectorType::get({2}, builder.getI32Type());
+  Value loaded;
+  if (direction == MtxGatherDirection::Col) {
+    loaded = IXDL::MtxLoadnColx2Op::create(builder, loc, intrinsicTy, src);
+  } else if (elemBits == 8) {
+    loaded = IXDL::MtxLoadnB8Rowx2Op::create(builder, loc, intrinsicTy, src);
+  } else {
+    loaded = IXDL::MtxLoadnB16Rowx2Op::create(builder, loc, intrinsicTy, src);
+  }
+
+  if (loaded.getType() != resultTy)
+    loaded = LLVM::BitcastOp::create(builder, loc, resultTy, loaded);
+  return loaded;
+}
+
+LogicalResult verifyMtxLoadnCall(Location loc, Type copyAtomTyArg, Type srcMemTyArg,
+                                 Type dstMemTyArg) {
+  auto copyAtomTy = dyn_cast<fly::CopyAtomType>(copyAtomTyArg);
+  auto srcMemTy = dyn_cast<fly::MemRefType>(srcMemTyArg);
+  auto dstMemTy = dyn_cast<fly::MemRefType>(dstMemTyArg);
+  if (!copyAtomTy || !srcMemTy || !dstMemTy)
+    return failure();
+
+  auto copyOp = dyn_cast<CopyOpCQMtxLoadnType>(copyAtomTy.getCopyOp());
+  if (!copyOp || copyAtomTy.getValBits() != copyOp.getElemBits())
+    return mlir::emitError(loc) << "CQMtxLoadn elemBits must match copy atom valBits";
+  if (!isGenericAddressSpace<fly::AddressSpace::Shared>(srcMemTy.getAddressSpace()) ||
+      !isGenericAddressSpace<fly::AddressSpace::Register>(dstMemTy.getAddressSpace()))
+    return mlir::emitError(loc) << "CQMtxLoadn requires shared-to-register operands";
+  return success();
+}
+
+} // namespace
+
+LogicalResult CopyOpCQMtxLoadnType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                           MtxLoadPattern pattern, MtxGatherDirection direction,
+                                           int32_t elemBits) {
+  if (pattern != MtxLoadPattern::Loadn16 && pattern != MtxLoadPattern::Loadn64)
+    return emitError() << "unsupported CQMtxLoadn pattern";
+  if (direction != MtxGatherDirection::Row && direction != MtxGatherDirection::Col)
+    return emitError() << "unsupported CQMtxLoadn gather direction";
+  if (elemBits != 8 && elemBits != 16)
+    return emitError() << "CQMtxLoadn elemBits must be 8 or 16, got " << elemBits;
+  return success();
+}
+
+bool CopyOpCQMtxLoadnType::isStatic() const { return true; }
+
+Value CopyOpCQMtxLoadnType::rebuildStaticValue(OpBuilder &, Location, Value) const {
+  return nullptr;
+}
+
+Attribute CopyOpCQMtxLoadnType::getThrLayout() const { return FxLayout(FxC(kWarpSize), FxC(1)); }
+
+Attribute CopyOpCQMtxLoadnType::getThrBitLayoutSrc() const {
+  // All lanes pass the same SmexMtx tile-base + EmPart pointer. The matrix-load
+  // hardware distributes one 64-bit x2 result per lane.
+  return FxLayout(FxShape(FxThr(kWarpSize), FxVal(64)), FxStride(FxThr(0), FxVal(1)));
+}
+
+Attribute CopyOpCQMtxLoadnType::getThrBitLayoutDst() const {
+  // These bit layouts recast exactly to the base CQ MMA A (row gather) or B
+  // (column gather) fragment layouts. Larger CQ MMA shapes tile this base atom.
+  if (getElemBits() == 16) {
+    if (getDirection() == MtxGatherDirection::Row)
+      return FxLayout(FxShape(FxThr(16, 4), FxVal(2, 2, 16)),
+                      FxStride(FxThr(256, 32), FxVal(16, 128, 1)));
+    return FxLayout(FxShape(FxThr(16, 4), FxVal(2, 2, 16)),
+                    FxStride(FxThr(16, 512), FxVal(256, 2048, 1)));
+  }
+
+  if (getDirection() == MtxGatherDirection::Row)
+    return FxLayout(FxShape(FxThr(16, 4), FxVal(4, 2, 8)),
+                    FxStride(FxThr(128, 32), FxVal(8, 2048, 1)));
+  return FxLayout(FxShape(FxThr(16, 4), FxVal(4, 2, 8)),
+                  FxStride(FxThr(8, 512), FxVal(128, 2048, 1)));
+}
+
+Attribute CopyOpCQMtxLoadnType::getThrBitLayoutRef() const { return getThrBitLayoutDst(); }
+
+FailureOr<Value> CopyOpCQMtxLoadnType::emitAtomCallSSA(OpBuilder &builder, Location loc,
+                                                       Type resultTy, Type copyAtomTyArg,
+                                                       Type srcTyArg, Type dstTyArg, Value,
+                                                       Value src, Value) const {
+  if (auto copyAtomTy = dyn_cast<fly::CopyAtomType>(copyAtomTyArg);
+      !copyAtomTy || copyAtomTy.getValBits() != getElemBits())
+    return mlir::emitError(loc) << "CQMtxLoadn elemBits must match copy atom valBits";
+  return emitMtxLoadn(builder, loc, getDirection(), getElemBits(), resultTy, src);
+}
+
+FailureOr<Value> CopyOpCQMtxLoadnType::emitAtomCallSSA(OpBuilder &builder, Location loc,
+                                                       Type resultTy, Type copyAtomTyArg,
+                                                       Type srcTyArg, Type dstTyArg, Type,
+                                                       Value atomVal, Value src, Value dst,
+                                                       Value pred) const {
+  if (!resultTy || !dst)
+    return failure();
+  OpBuilder::InsertionGuard guard(builder);
+  auto ifOp = scf::IfOp::create(builder, loc, resultTy, pred, /*withElseRegion=*/true);
+  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  auto loaded =
+      emitAtomCallSSA(builder, loc, resultTy, copyAtomTyArg, srcTyArg, dstTyArg, atomVal, src, dst);
+  if (failed(loaded))
+    return failure();
+  scf::YieldOp::create(builder, loc, *loaded);
+  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+  scf::YieldOp::create(builder, loc, dst);
+  return ifOp.getResult(0);
+}
+
+LogicalResult CopyOpCQMtxLoadnType::emitAtomCall(OpBuilder &builder, Location loc,
+                                                 Type copyAtomTyArg, Type srcMemTyArg,
+                                                 Type dstMemTyArg, Value atomVal, Value src,
+                                                 Value dst) const {
+  if (failed(verifyMtxLoadnCall(loc, copyAtomTyArg, srcMemTyArg, dstMemTyArg)))
+    return failure();
+  Type resultTy = fly::RegMem2SSAType(cast<fly::MemRefType>(dstMemTyArg), true);
+  auto loaded = emitAtomCallSSA(builder, loc, resultTy, copyAtomTyArg, srcMemTyArg, dstMemTyArg,
+                                atomVal, src, Value{});
+  if (failed(loaded))
+    return failure();
+  LLVM::StoreOp::create(builder, loc, *loaded, dst);
+  return success();
+}
+
+LogicalResult CopyOpCQMtxLoadnType::emitAtomCall(OpBuilder &builder, Location loc,
+                                                 Type copyAtomTyArg, Type srcMemTyArg,
+                                                 Type dstMemTyArg, Type predMemTyArg, Value atomVal,
+                                                 Value src, Value dst, Value pred) const {
+  if (failed(verifyMtxLoadnCall(loc, copyAtomTyArg, srcMemTyArg, dstMemTyArg)))
+    return failure();
+  auto predMemTy = dyn_cast<fly::MemRefType>(predMemTyArg);
+  if (!predMemTy || !predMemTy.getElemTy().isInteger(1))
+    return failure();
+
+  OpBuilder::InsertionGuard guard(builder);
+  Value predValue = LLVM::LoadOp::create(builder, loc, predMemTy.getElemTy(), pred);
+  auto ifOp = scf::IfOp::create(builder, loc, TypeRange{}, predValue, /*withElseRegion=*/false);
+  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  return emitAtomCall(builder, loc, copyAtomTyArg, srcMemTyArg, dstMemTyArg, atomVal, src, dst);
 }
 
 } // namespace mlir::fly_ixdl
