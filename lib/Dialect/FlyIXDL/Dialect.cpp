@@ -11,6 +11,7 @@ using namespace mlir::fly;
 using namespace mlir::fly_ixdl;
 
 #include "flydsl/Dialect/FlyIXDL/IR/Dialect.cpp.inc"
+#include "flydsl/Dialect/FlyIXDL/IR/FlyIXDLEnums.cpp.inc"
 
 #define GET_TYPEDEF_CLASSES
 #include "flydsl/Dialect/FlyIXDL/IR/CopyAtom.cpp.inc"

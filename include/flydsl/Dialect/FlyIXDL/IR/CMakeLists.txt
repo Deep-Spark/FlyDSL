@@ -6,6 +6,8 @@ mlir_tablegen(Dialect.cpp.inc -gen-dialect-defs)
 add_public_tablegen_target(MLIRFlyIXDLIncGen)
 
 set(LLVM_TARGET_DEFINITIONS AttrDefs.td)
+mlir_tablegen(FlyIXDLEnums.h.inc -gen-enum-decls)
+mlir_tablegen(FlyIXDLEnums.cpp.inc -gen-enum-defs)
 mlir_tablegen(AttrDefs.h.inc -gen-attrdef-decls -attrdefs-dialect=fly_ixdl)
 mlir_tablegen(AttrDefs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=fly_ixdl)
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-from .cq import CQMma
+from .cq import CQMma, CQSmexCp, SMEX_LAYOUT_MTX, SMEX_LAYOUT_PLAIN
 from .mr import (
     MRAsyncCp,
     MRAsyncCpCol,
@@ -46,6 +46,9 @@ __all__ = [
     "MRAsyncCpRow16b",
     "MRMma",
     "CQMma",
+    "CQSmexCp",
+    "SMEX_LAYOUT_MTX",
+    "SMEX_LAYOUT_PLAIN",
     "SMEMajor",
     "make_sme_shared_layout",
     "make_sme_shared_layout_k_spanning",

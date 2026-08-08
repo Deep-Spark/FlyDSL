@@ -18,11 +18,12 @@
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
 
 #include "flydsl/Dialect/FlyIXDL/IR/Dialect.h.inc"
+#include "flydsl/Dialect/FlyIXDL/IR/FlyIXDLEnums.h.inc"
 
-#define GET_TYPEDEF_CLASSES
-#include "flydsl/Dialect/FlyIXDL/IR/CopyAtom.h.inc"
 #define GET_ATTRDEF_CLASSES
 #include "flydsl/Dialect/FlyIXDL/IR/AttrDefs.h.inc"
+#define GET_TYPEDEF_CLASSES
+#include "flydsl/Dialect/FlyIXDL/IR/CopyAtom.h.inc"
 
 namespace mlir::fly_ixdl {
 
