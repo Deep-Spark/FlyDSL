@@ -11,6 +11,8 @@ from .cq import (
     CQMma,
     CQMtxLoadn,
     CQSmexCp,
+    CQSmexCpMtx,
+    CQSmexCpPlain,
 )
 from .mr import (
     MRAsyncCp,
@@ -62,6 +64,8 @@ __all__ = [
     "CQMma",
     "CQMtxLoadn",
     "CQSmexCp",
+    "CQSmexCpMtx",
+    "CQSmexCpPlain",
     "SMEX_LAYOUT_MTX",
     "SMEX_LAYOUT_PLAIN",
     "MTX_LOAD_PATTERN_LOADN16",

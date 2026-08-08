@@ -14,8 +14,8 @@ CQ named barriers in the same kernel (and do not emit pipebar on CQ paths).
   (ivcore11 / MR). CQ has no pipebar -- keep these for MR kernels only.
 
 * Scheme C (CQ named barrier): :func:`nbarrier_reach` / :func:`nbarrier_wait` /
-  :func:`nbarrier_sync`. Requires ``named-bar`` (QS/CQ/BZ);
-  :func:`nbarrier_sync` additionally requires ``named-bar-sync`` (CQ/BZ).
+  :func:`nbarrier_sync`. Requires ``named-bar`` (CQ);
+  :func:`nbarrier_sync` additionally requires ``named-bar-sync`` (CQ).
   Use these for CQ multi-stage / double-buffer pipelines that would use
   pipebar on MR.
 
@@ -132,7 +132,7 @@ def nbarrier_reach(tag_id, warp_num):
     """Arrive at a named barrier without stalling (``llvm.bi.nbarrier.reach``).
 
     ``tag_id`` is the barrier tag; ``warp_num`` is the expected participant warp
-    count. Requires ``named-bar`` (QS/CQ/BZ). On CQ double-buffer pipelines this
+    count. Requires ``named-bar`` (CQ). On CQ double-buffer pipelines this
     is the arrive half of the MR ``sl_pipebar_arrive`` / ``sl_pipebar_wait`` pair.
     """
     return _llvm.call_intrinsic(
@@ -148,7 +148,7 @@ def nbarrier_wait(tag_id, warp_num):
     """Wait on a named barrier (``llvm.bi.nbarrier.wait``).
 
     Blocks until ``warp_num`` participants have reached barrier ``tag_id``.
-    Requires ``named-bar`` (QS/CQ/BZ). Pair with :func:`nbarrier_reach`, or use
+    Requires ``named-bar`` (CQ). Pair with :func:`nbarrier_reach`, or use
     :func:`nbarrier_sync` for a combined arrive+wait on CQ.
     """
     return _llvm.call_intrinsic(
@@ -163,7 +163,7 @@ def nbarrier_wait(tag_id, warp_num):
 def nbarrier_sync(tag_id, warp_num):
     """Combined arrive+wait on a named barrier (``llvm.bi.nbarrier.sync``).
 
-    Requires ``named-bar-sync`` (CQ/BZ). Prefer this when a single sync point is
+    Requires ``named-bar-sync`` (CQ). Prefer this when a single sync point is
     enough; use :func:`nbarrier_reach` + :func:`nbarrier_wait` when arrive and
     wait must be separated around other work (CQ analogue of pipebar split).
     """
