@@ -18,4 +18,20 @@ def FlyIXDL_SmexLayout
           "SmexLayout",
           "CQ SMEX shared-memory layout", [FlyIXDL_SmexLayoutPlain, FlyIXDL_SmexLayoutMtx]>;
 
+// loadn16 / loadn64: G2S consume pairing only (16-row vs 64-row SmexMtx tile).
+// Not x1 vs x2 and not a distinct mtx_loadn ISA; both patterns emit the same
+// *x2 load. Keep the enum description string stable -- it appears in parse
+// diagnostics matched by FileCheck.
+def FlyIXDL_MtxLoadPatternLoadn16 : I32EnumAttrCase<"Loadn16", 0, "loadn16">;
+def FlyIXDL_MtxLoadPatternLoadn64 : I32EnumAttrCase<"Loadn64", 1, "loadn64">;
+def FlyIXDL_MtxLoadPattern
+    : FlyIXDL_I32EnumAttr<"MtxLoadPattern", "CQ SMEX matrix-load pattern",
+                          [FlyIXDL_MtxLoadPatternLoadn16, FlyIXDL_MtxLoadPatternLoadn64]>;
+
+def FlyIXDL_MtxGatherDirectionRow : I32EnumAttrCase<"Row", 0, "row">;
+def FlyIXDL_MtxGatherDirectionCol : I32EnumAttrCase<"Col", 1, "col">;
+def FlyIXDL_MtxGatherDirection
+    : FlyIXDL_I32EnumAttr<"MtxGatherDirection", "CQ matrix-load gather direction",
+                          [FlyIXDL_MtxGatherDirectionRow, FlyIXDL_MtxGatherDirectionCol]>;
+
 #endif // FLYIXDL_ATTR_DEFS

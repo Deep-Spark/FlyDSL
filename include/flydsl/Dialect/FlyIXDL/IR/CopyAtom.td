@@ -26,4 +26,20 @@ def FlyIXDL_CopyOpCQSmexCp : FlyIXDL_StatefulCopyOp<"CopyOpCQSmexCp", "cq.smex_c
   let genVerifyDecl = 1;
 }
 
+// CQ SMEX matrix shared-to-register load. This atom consumes the SmexMtx
+// format written by cq.smex_cp<..., layout = mtx>; it must not consume a
+// LegacySme byte-swizzled buffer. The shared pointer is warp-uniform and
+// already contains the tile-base and EmPart selection.
+//
+// $pattern (loadn16 / loadn64) only records which G2S SmexMtx tile height this
+// atom is meant to consume. Both patterns lower to the same ixdl.mtx_loadn_*x2
+// op (64 bits/lane). A 64-row shared footprint is covered by multiple atom
+// calls with different EmPart / slot bases, not a different ISA opcode.
+def FlyIXDL_CopyOpCQMtxLoadn : FlyIXDL_CopyOp<"CopyOpCQMtxLoadn", "cq.mtx_loadn"> {
+  let parameters = (ins "MtxLoadPattern":$pattern, "MtxGatherDirection":$direction,
+      "int32_t":$elemBits);
+  let assemblyFormat = "`<` $pattern `,` $direction `,` $elemBits `>`";
+  let genVerifyDecl = 1;
+}
+
 #endif // FLYIXDL_COPYATOM
