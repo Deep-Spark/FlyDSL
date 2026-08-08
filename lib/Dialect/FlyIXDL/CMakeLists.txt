@@ -1,5 +1,6 @@
 add_mlir_dialect_library(MLIRFlyIXDLDialect
   Dialect.cpp
+  CQ/CopyAtom.cpp
   CQ/MmaAtom.cpp
   MR/CopyAtom.cpp
   MR/MmaAtom.cpp

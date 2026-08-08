@@ -15,6 +15,7 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Dialect & lowering** | `FlyIXDL` dialect, `convert-fly-to-ixdl`, `gpu-to-ixdl`, `ixdl-attach-target` pipeline (`python/flydsl/compiler/backends/iluvatar.py`) |
 | **Layout algebra** | Same Fly layout API as ROCm (`logical_divide`, `copy_atom_call`, `make_tiled_copy_*`, ...) |
 | **SME async copy** | `MRAsyncCpRow8b` / `Row16b` / `Col`, `make_sme_gmem_tensor`, `make_sme_shared_layout` / `make_sme_shared_layout_k_spanning`, `cp_async_commit_group` / `cp_async_wait_group` (`python/flydsl/expr/ixdl/`) |
+| **CQ SMEX G2S** | `CQSmexCp` (mtx/plain); `row_mask` / `col_mask` are arbitrary bit prefixes; SME gmem global row stride must be **16B-aligned** (`make_sme_gmem_tensor` fail-fasts; hardware otherwise silently truncates the low 4 bits) |
 | **Pipeline sync** | `sl_waitmem`, `sl_pipebar_arrive`, `sl_pipebar_wait` for software-pipelined kernels |
 | **Tensor core MMA** | `MRMma` -- **16x16x16 f16** and **16x16x32 i8->i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` -- double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |

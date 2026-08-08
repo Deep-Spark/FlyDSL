@@ -244,6 +244,34 @@ def make_sme_shared_layout_k_spanning(sme_swizzle, elem_type, *, major=SMEMajor.
     return recast_layout(byte_layout, 8, elem_bits)
 
 
+def _sme_gmem_elem_bytes(elem_ty) -> int:
+    """Element size in bytes for SME gmem stride scaling (matches FlyToIXDL)."""
+    width = getattr(elem_ty, "width", None)
+    if width is None:
+        raise TypeError(f"SME gmem element type has no bit width: {elem_ty!r}")
+    return 1 if width < 8 else (width + 7) // 8
+
+
+def _check_sme_gmem_leading_stride_align(leading_stride, elem_ty) -> None:
+    """Fail fast when a foldable leading stride is not 16B-aligned.
+
+    CQ SMEX G2S descriptors quantize global row stride to 16B (low 4 bits
+    dropped silently). Dynamic / non-foldable strides are skipped here; the CQ
+    SMEX lowering may still diagnose a constant stride_byte later.
+    """
+    if isinstance(leading_stride, bool) or not isinstance(leading_stride, int):
+        return
+    elem_bytes = _sme_gmem_elem_bytes(elem_ty)
+    stride_bytes = int(leading_stride) * elem_bytes
+    if stride_bytes % 16 != 0:
+        raise ValueError(
+            "SME gmem leading_stride must be 16B-aligned "
+            "(CQ SMEX hardware silently truncates the low 4 bits of global row "
+            f"stride); got leading_stride={leading_stride} ({stride_bytes}B), "
+            "need a multiple of 16B"
+        )
+
+
 def make_sme_gmem_tensor(tensor: Tensor, *, leading_stride=None) -> Tensor:
     """Wrap ``tensor`` in an SME global-memory view (``#fly_ixdl.sme_gmem``).
 
@@ -251,6 +279,10 @@ def make_sme_gmem_tensor(tensor: Tensor, *, leading_stride=None) -> Tensor:
     ``make_ptr`` stores ``leading_stride * elem_bytes`` into the fat pointer's
     ``stride_byte`` field. By default the leading stride is taken from the
     tensor layout's first stride leaf; pass ``leading_stride`` to override.
+
+    When ``leading_stride`` folds to a Python int, ``leading_stride * elem_bytes``
+    must be a multiple of 16B. CQ SMEX G2S hardware silently drops the low 4
+    bits of the global row stride; this factory does not round or pad.
 
     Mirrors :func:`flydsl.expr.rocdl.universal.make_buffer_tensor`.
     """
@@ -262,6 +294,8 @@ def make_sme_gmem_tensor(tensor: Tensor, *, leading_stride=None) -> Tensor:
     if leading_stride is None:
         # The leading (outermost) stride leaf, in element units.
         leading_stride = get_leaves(get_stride(layout))[0]
+
+    _check_sme_gmem_leading_stride_align(leading_stride, elem_ty)
 
     sme_ptr_ty = PointerType.get(
         elem_ty=elem_ty.ir_type,
