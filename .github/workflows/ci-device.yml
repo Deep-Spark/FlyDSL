@@ -291,6 +291,9 @@ jobs:
           if [ -f logs/corex-version-summary.md ]; then
             cat logs/corex-version-summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
+          if [ -f logs/device-cuda-preflight.md ]; then
+            cat logs/device-cuda-preflight.md >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload JUnit reports
         if: always()
@@ -314,6 +317,7 @@ jobs:
             logs/device-must-pass.log
             logs/device-must-pass-summary.md
             logs/corex-version-summary.md
+            logs/device-cuda-preflight.md
             logs/mlir-filecheck.log
             logs/device-container-env.txt
             logs/device-env.txt
