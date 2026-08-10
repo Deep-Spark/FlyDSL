@@ -21,7 +21,7 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Tensor core MMA** | `MRMma` -- **16x16x16 f16** and **16x16x32 i8->i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` -- double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |
 | **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` -- int8xint8 -> i32/i8, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
-| **Flex-attention V2** | `compile_iluvatar_flex_attention` (dense / varlen / paged) + Torch entry `flydsl_flex_attn_func` in `kernels.attention.iluvatar`; causal / SWA / softcap; f16/bf16; D in {64,128}; GQA; variant subset of PyTorch flex_attention (not a general score_mod compiler) |
+| **Flex-attention V2** | `compile_iluvatar_flex_attention` (dense / varlen / paged) + Torch entry `flydsl_flex_attn_func` in `kernels.attention.iluvatar`; causal / SWA / softcap; f16/bf16; D in {64,128,256}; GQA; dense alibi/score_bias; variant subset of PyTorch flex_attention (not a general score_mod compiler) |
 | **MoE GEMM V1** | `kernels.moe.iluvatar.mr` -- sorted grouped GEMM, `int8` / `int8smooth`, f16/bf16/f32 out (A gather + B SME) |
 | **GEMV V1** | `kernels.gemm.iluvatar.gemv` -- `F.linear`-aligned M=1, fp16/bf16, fp32 accum |
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |

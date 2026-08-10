@@ -7,9 +7,10 @@ Covers:
 * QK^T-only helper vs ``torch.matmul``.
 * Non-causal and causal fused forward vs scaled dot-product attention.
 * Softcap and sliding-window combinations vs a hand-written fp32 reference.
-* f16/bf16, D=64/128, MHA/GQA, cross-attention, and physical-padding tails.
+* f16/bf16, D=64/128/256, MHA/GQA, cross-attention, and physical-padding tails.
 * Packed varlen (``cu_seqlens``) self-attn vs per-seq dense concat.
 * Paged KV (``block_table``) vs gather-to-dense flex reference.
+* Dense alibi / score_bias and the ``flydsl_flex_attn_func`` dispatcher.
 """
 
 from __future__ import annotations
@@ -228,6 +229,10 @@ def test_iluvatar_flex_attention_rejects_unsupported_head_dim():
     mod = _require_flex_attn_module()
     with pytest.raises(ValueError, match=r"D must be one of"):
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 32, dtype="bf16", is_causal=True)
+    with pytest.raises(ValueError, match=r"D must be one of"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 96, dtype="bf16", is_causal=True)
+    with pytest.raises(ValueError, match=r"D must be one of"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 192, dtype="bf16", is_causal=True)
 
 
 def test_iluvatar_flex_attention_rejects_illegal_causal_shape():
@@ -713,7 +718,7 @@ def _pack_varlen_qkv(seqlens, H, Hkv, D, torch_dtype, *, seed=0, align=32, pad_t
         K[lo : lo + s].copy_(torch.randn(s, Hkv, D, device="cuda", dtype=torch_dtype))
         V_nat[lo : lo + s].copy_(torch.randn(s, Hkv, D, device="cuda", dtype=torch_dtype))
     V = V_nat.permute(1, 2, 0).contiguous()  # [Hkv, D, total]
-    O = torch.zeros_like(Q)
+    O = torch.zeros_like(Q)  # noqa: E741
     cu_t = torch.tensor(cu_phys, dtype=torch.int32, device="cuda")
     seq_lens_t = torch.tensor(list(seqlens), dtype=torch.int32, device="cuda")
     return Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys
@@ -744,7 +749,9 @@ def _run_varlen_flex_attn(
     sm_scale = 1.0 / math.sqrt(D)
     num_seqs = len(seqlens)
 
-    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(seqlens, H, Hkv, D, torch_dtype, seed=seed)
+    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(  # noqa: E741
+        seqlens, H, Hkv, D, torch_dtype, seed=seed
+    )
 
     launch = mod.compile_iluvatar_flex_attention(
         num_seqs,
@@ -823,7 +830,7 @@ def test_iluvatar_flex_attention_varlen_rejects_missing_cu(monkeypatch):
     Q = torch.zeros(128, 4, 128, device="cuda", dtype=torch.bfloat16)
     K = torch.zeros(128, 4, 128, device="cuda", dtype=torch.bfloat16)
     V = torch.zeros(4, 128, 128, device="cuda", dtype=torch.bfloat16)
-    O = torch.zeros_like(Q)
+    O = torch.zeros_like(Q)  # noqa: E741
     with pytest.raises(ValueError, match="cu_seqlens"):
         launch(Q, K, V, O)
 
@@ -1038,7 +1045,7 @@ def test_iluvatar_flex_attention_paged_rejects_missing_table(monkeypatch):
     Q = torch.zeros(1, 4, 64, 128, device="cuda", dtype=torch.bfloat16)
     K = torch.zeros(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
     V = torch.zeros(1, 4, 128, 64, device="cuda", dtype=torch.bfloat16)
-    O = torch.zeros_like(Q)
+    O = torch.zeros_like(Q)  # noqa: E741
     with pytest.raises(ValueError, match="block_table"):
         launch(Q, K, V, O)
 
@@ -1336,3 +1343,133 @@ def test_iluvatar_flex_attn_func_alibi_matches_compile(monkeypatch):
         alibi_slopes=slopes,
     )
     torch.testing.assert_close(out.permute(0, 2, 1, 3).float(), ref, rtol=2e-2, atol=2e-2)
+
+
+# --- V2-5 larger head dim (D=256) ---------------------------------------------
+
+
+def test_iluvatar_flex_attention_kv_stages_smem_choice():
+    """Host-only: D=256 must drop to 1-stage; D=64/128 keep 2-stage."""
+    from kernels.gemm.iluvatar.mr.common import DEFAULT_SMEM_CAP_BYTES
+
+    mod = _require_flex_attn_module()
+    assert mod._choose_kv_stages(64) == 2
+    assert mod._choose_kv_stages(128) == 2
+    assert mod._choose_kv_stages(256) == 1
+    assert mod._flex_attn_smem_bytes(256, 2) > DEFAULT_SMEM_CAP_BYTES
+    assert mod._flex_attn_smem_bytes(256, 1) <= DEFAULT_SMEM_CAP_BYTES
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "f16"])
+def test_iluvatar_flex_attention_d256_dense_causal(monkeypatch, dtype):
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=1,
+        H=4,
+        Sq=128,
+        Skv=128,
+        D=256,
+        dtype=dtype,
+        is_causal=True,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize(
+    "is_causal,window_size,softcap,Hkv,mode",
+    [
+        (True, 32, None, 4, None),  # SWA
+        (True, None, 30.0, 4, None),  # softcap
+        (True, None, None, 2, None),  # GQA
+        (True, None, None, 4, "alibi"),
+    ],
+)
+def test_iluvatar_flex_attention_d256_dense_variant_smoke(monkeypatch, is_causal, window_size, softcap, Hkv, mode):
+    if mode == "alibi":
+        _run_dense_alibi_or_bias(
+            monkeypatch,
+            mode="alibi",
+            is_causal=is_causal,
+            window_size=window_size,
+            softcap=softcap,
+            B=1,
+            H=4,
+            Sq=64,
+            Skv=64,
+            D=256,
+            dtype="bf16",
+        )
+        return
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=1,
+        H=4,
+        Hkv=Hkv,
+        Sq=64,
+        Skv=64,
+        D=256,
+        dtype="bf16",
+        is_causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_d256_varlen_smoke(monkeypatch):
+    _run_varlen_flex_attn(
+        monkeypatch,
+        seqlens=[64, 96],
+        H=4,
+        D=256,
+        dtype="bf16",
+        is_causal=True,
+    )
+
+
+def test_iluvatar_flex_attention_d256_paged_smoke(monkeypatch):
+    _run_paged_flex_attn(
+        monkeypatch,
+        B=1,
+        H=4,
+        Sq=64,
+        seq_lens_kv=[128],
+        D=256,
+        dtype="bf16",
+        is_causal=True,
+    )
+
+
+def test_iluvatar_flex_attn_func_d256_dense_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 256
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(3)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    out = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch.bfloat16)
+    K = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    Vn = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    Q[:, :, :Sq].copy_(q.permute(0, 2, 1, 3))
+    K[:, :, :Skv].copy_(k.permute(0, 2, 1, 3))
+    Vn[:, :, :Skv].copy_(v.permute(0, 2, 1, 3))
+    Vt = Vn.transpose(-1, -2).contiguous()
+    O = torch.zeros_like(Q)  # noqa: E741
+    launch = mod.compile_iluvatar_flex_attention(B, H, Sq, Skv, D, dtype="bf16", is_causal=True, sm_scale=sm_scale)
+    launch(Q, K, Vt, O)
+    torch.cuda.synchronize()
+    ref = O[:, :, :Sq].permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
