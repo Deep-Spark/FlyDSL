@@ -55,6 +55,25 @@ def byte_permute(a, b, sel: int):
     return Int32(result)
 
 
+def readfirstlane(val):
+    """Broadcast lane 0's value across the warp (``llvm.bi.readfirstlane``).
+
+    Mirrors ROCm ``rocdl.readfirstlane`` for Iluvatar: turn a potentially
+    divergent VGPR into a warp-uniform value that can live in an SGPR (addresses,
+    sequence lengths, block-table entries). Supports ``i32`` and ``i64``.
+    """
+    from ..._mlir.ir import IntegerType
+    from ..numeric import Int32, Int64
+
+    raw = _arith.unwrap(val)
+    width = IntegerType(raw.type).width
+    if width == 32:
+        return Int32(_llvm.call_intrinsic(T.i32, "llvm.bi.readfirstlane", [raw], [], []))
+    if width == 64:
+        return Int64(_llvm.call_intrinsic(T.i64, "llvm.bi.readfirstlane.i64", [raw], [], []))
+    raise TypeError(f"readfirstlane supports i32/i64, got width={width}")
+
+
 def _llvm_ptr(ptr, *, addrspace: int | None = 1):
     """Materialize ``!fly.ptr`` as ``!llvm.ptr`` / ``!llvm.ptr<AS>`` via ptrtoint/inttoptr.
 
