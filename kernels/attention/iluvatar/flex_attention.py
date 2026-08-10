@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar flex-attention forward kernel (V1 + V2-1 varlen + V2-2 paged).
+"""Iluvatar flex-attention forward kernel (V1 + V2 dense/varlen/paged).
 
 This is a variant subset of PyTorch flex_attention, not a general ``score_mod``
-compiler. It supports f16/bf16 inputs, head dimensions 64 and 128, MHA/GQA,
+compiler. It supports f16/bf16 inputs, head dimensions 64/128/256, MHA/GQA,
 self/cross-attention, physical sequence padding, causal masking, sliding-window
 attention, Gemma-2 softcap, packed varlen self-attention via ``cu_seqlens``,
 and paged KV via ``block_table``. Dense path also supports mutually exclusive
@@ -25,6 +25,7 @@ from kernels.gemm.iluvatar.mr.common import (
     ATOM_K_B16,
     ATOM_M,
     ATOM_N,
+    DEFAULT_SMEM_CAP_BYTES,
     MR_GEMM_GEOM,
     SMEM_ROWS,
     TCU_LANE_COLS,
@@ -57,8 +58,9 @@ assert WARPS_N > 1, "WARPS_N must be > 1 for the SMEM rowmax/rowsum reduce"
 
 # --- Supported variants -------------------------------------------------------
 _SUPPORTED_DTYPES = ("f16", "bf16")
-_SUPPORTED_D = (64, 128)
+_SUPPORTED_D = (64, 128, 256)
 _DTYPE_STR_TO_FX = {"f16": fx.Float16, "bf16": fx.BFloat16}
+_ELEM_BYTES_B16 = 2
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -68,6 +70,25 @@ def _ceil_div(a: int, b: int) -> int:
 def _phys_seq(seq: int, block: int) -> int:
     """Pad logical sequence length up to a multiple of ``block`` for G2S tiles."""
     return _ceil_div(seq, block) * block
+
+
+def _flex_attn_smem_bytes(D: int, kv_stages: int, *, elem_bytes: int = _ELEM_BYTES_B16) -> int:
+    """Bytes for Q + staged K/V + P + s_red under the current tile geometry."""
+    q = BLOCK_M * D * elem_bytes
+    k = kv_stages * BLOCK_N * D * elem_bytes
+    v = kv_stages * D * BLOCK_N * elem_bytes
+    p = BLOCK_M * BLOCK_N * elem_bytes
+    s_red = 2 * BLOCK_M * WARPS_N * 4  # fp32 rowmax/rowsum scratch
+    return q + k + v + p + s_red
+
+
+def _choose_kv_stages(D: int, *, elem_bytes: int = _ELEM_BYTES_B16) -> int:
+    """Pick the largest ``kv_stages`` in {2, 1} that fits the CTA SMEM cap."""
+    for stages in (2, 1):
+        if _flex_attn_smem_bytes(D, stages, elem_bytes=elem_bytes) <= DEFAULT_SMEM_CAP_BYTES:
+            return stages
+    need = _flex_attn_smem_bytes(D, 1, elem_bytes=elem_bytes)
+    raise ValueError(f"flex-attention SMEM {need} B for D={D} exceeds CTA cap {DEFAULT_SMEM_CAP_BYTES} B")
 
 
 def _validate_scope(
@@ -424,7 +445,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     initialised to ``NEG_LARGE_F`` so
     ``alpha = exp2(m_prev - m_new)`` stays finite under fastmath in the first
     KV iteration. Causal fully-masked KV tiles are skipped by shortening the
-    trip count to ``kv_end``; K/V SMEM is 2-stage double-buffered.
+    trip count to ``kv_end``; K/V SMEM uses ``kv_stages`` in {1,2} chosen to fit
+    the CTA shared-memory cap (2-stage when possible; 1-stage for large D).
 
     MRMma C-fragment TV (from ``lib/Dialect/FlyIXDL/MR/MmaAtom.cpp``
     ``getThrValLayoutC = FxLayout(FxShape(FxThr(16, 4), FxVal(4)),
@@ -484,11 +506,13 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     # Warp partition:
     #   MMA1 (S = Q @ K^T): S extent per CTA = (BLOCK_M, BLOCK_N) = (64, 64);
     #     WARPS_M x WARPS_N warp grid; warp tile = (32, 32); warp_atoms = (2, 2).
-    #   MMA2 (O += P @ V):  O extent per CTA = (BLOCK_M, D) = (64, 128);
+    #   MMA2 (O += P @ V):  O extent per CTA = (BLOCK_M, D);
     #     same warp grid; warp_m_id still splits M into halves (32 rows/warp),
-    #     but warp_n_id now splits D=128 (not BLOCK_N=64), so each warp owns
-    #     32 x (D / WARPS_N) = 32 x 64 of O -> warp_atoms_n_pv = 4.
+    #     but warp_n_id splits D (not BLOCK_N), so each warp owns
+    #     32 x (D / WARPS_N) of O -> warp_atoms_n_pv = D / (ATOM_N * WARPS_N)
+    #     (4 at D=128, 8 at D=256).
     WARP_ATOMS_N_PV = D // (ATOM_N * WARPS_N)
+    assert D % (ATOM_N * WARPS_N) == 0, f"D={D} must be divisible by ATOM_N*WARPS_N={ATOM_N * WARPS_N}"
     assert BLOCK_M * D == BLOCK_M * (ATOM_N * WARP_ATOMS_N_PV * WARPS_N)
 
     # G2S chunk counts
@@ -514,15 +538,19 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     b_per_warp_qk = b_atoms_qk // NUM_WARPS
     b_per_warp_pv = b_atoms_v // NUM_WARPS
 
-    # SMEM sizing (bf16 = 2 B): Q+K+V+P = 16+16+16+8 KiB = 56 KiB at D=128
-    # for a single K/V bank; K/V are doubled for the 2-stage pipeline
-    # (Q/P/s_red stay single).
+    # SMEM: pick largest kv_stages in {2,1} under the CTA cap. At D=128 with
+    # 2-stage K/V this is ~56-90 KiB; at D=256 only stages=1 fits (~105 KiB).
+    KV_STAGES = _choose_kv_stages(D, elem_bytes=_ELEM_BYTES_B16)
     q_smem_elems = BLOCK_M * bk_qk
     k_smem_elems = BLOCK_N * bk_qk
     v_smem_elems = D * bk_pv
     p_smem_elems = BLOCK_M * BLOCK_N
-    k_smem_elems_staged = k_smem_elems * 2
-    v_smem_elems_staged = v_smem_elems * 2
+    k_smem_elems_staged = k_smem_elems * KV_STAGES
+    v_smem_elems_staged = v_smem_elems * KV_STAGES
+    smem_bytes = _flex_attn_smem_bytes(D, KV_STAGES, elem_bytes=_ELEM_BYTES_B16)
+    assert smem_bytes <= DEFAULT_SMEM_CAP_BYTES, (
+        f"flex-attention SMEM {smem_bytes} B exceeds cap {DEFAULT_SMEM_CAP_BYTES} B " f"(D={D}, kv_stages={KV_STAGES})"
+    )
 
     # Dense: BHSD phys-padded. Varlen packed: Q/K/O [total, H(or Hkv), D] with
     # token stride H*D; V host-transposed to [Hkv, D, total] (total is runtime).
@@ -948,8 +976,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # m_running / l_running are flat-packed across the scf.for boundary
         # (ROWS_PER_LANE fp32 each). O_acc stays outside and is updated in place.
         #
-        # Light 2-stage K/V pipeline: prologue loads K0; after QK issue K_{i+1}
-        # into the other bank; after P-write issue V_i; one wait drains both.
+        # Light K/V pipeline: with kv_stages=2, prologue loads K0; after QK
+        # issue K_{i+1} into the other bank; after P-write issue V_i; one wait
+        # drains both. With kv_stages=1 (large D), both banks collapse to stage
+        # 0 -- K_{i+1} may still prefetch into the same K bank after MMA1.
         c_num_kv = fx.Int32(num_kv_tiles)
         if fx.const_expr(is_causal):
             # Self (delta=0): kv_end = q_tile + 1. Cross-length paged: allow
@@ -981,7 +1011,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             m_prev = [state[slot] for slot in range(ROWS_PER_LANE)]
             l_prev = [state[ROWS_PER_LANE + slot] for slot in range(ROWS_PER_LANE)]
             kv_i = fx.Int32(kv_idx)
-            comp_stage = kv_i % fx.Int32(2)
+            if fx.const_expr(KV_STAGES == 2):
+                comp_stage = kv_i % fx.Int32(2)
+                prefetch_stage = comp_stage ^ fx.Int32(1)
+            else:
+                comp_stage = fx.Int32(0)
+                prefetch_stage = fx.Int32(0)
             k_smem_cur = _k_stage_ptr(comp_stage)
             v_smem_cur = _v_stage_ptr(comp_stage)
 
@@ -1023,10 +1058,11 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                             S_frags[mma_m][mma_n],
                         )
 
-            # Prefetch K_{i+1} into the other bank so G2S overlaps softmax / P.
+            # Prefetch K_{i+1} so G2S overlaps softmax / P (other bank when
+            # kv_stages=2; same bank when kv_stages=1 after MMA1 is done).
             next_kv = kv_i + fx.Int32(1)
             if next_kv < kv_end:
-                _issue_k(next_kv, comp_stage ^ fx.Int32(1))
+                _issue_k(next_kv, prefetch_stage)
                 ixdl.cp_async_commit_group()
 
             # ---- Scale / bias / softcap / enter log2 domain ----------------
