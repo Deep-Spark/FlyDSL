@@ -255,6 +255,11 @@ import torch
 print(f"torch visible in Run C venv: {torch.__version__}")
 PY
 
+    # Fail fast before the CMake build when host kmod and COREX userspace disagree.
+    # A mismatched pair often surfaces later as torch.cuda segfaults that hide the
+    # real cuDevicePrimaryCtxRetain / DRIVER_MISMATCH error.
+    python3 /workspace/.github/scripts/ci_device_cuda_preflight.py
+
     cmake -S . -B build-fly -G Ninja \
       -DFLYDSL_BACKENDS=iluvatar \
       -DMLIR_DIR="${MLIR_DIR}" \
