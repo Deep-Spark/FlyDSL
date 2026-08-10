@@ -11,6 +11,7 @@ Covers:
 * Packed varlen (``cu_seqlens``) self-attn vs per-seq dense concat.
 * Paged KV (``block_table``) vs gather-to-dense flex reference.
 * Dense alibi / score_bias and the ``flydsl_flex_attn_func`` dispatcher.
+* Optional ``tile_config`` whitelist and dense ``autotune_iluvatar_flex_attention_tile``.
 """
 
 from __future__ import annotations
@@ -353,6 +354,7 @@ def _run_flex_attn(
     window_size=None,
     softcap=None,
     seed=0,
+    tile_config=None,
 ):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
@@ -366,8 +368,9 @@ def _run_flex_attn(
         atol_rtol *= 2
     sm_scale = 1.0 / math.sqrt(D)
 
-    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
-    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+    block_m, block_n = mod._normalize_tile_config(tile_config)
+    Sq_phys = _phys_seq(Sq, block_m)
+    Skv_phys = _phys_seq(Skv, block_n)
 
     torch.manual_seed(seed)
     Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
@@ -391,6 +394,7 @@ def _run_flex_attn(
         window_size=window_size,
         softcap=softcap,
         sm_scale=sm_scale,
+        tile_config=tile_config,
     )
     launch(Q, K, V_transposed, O)
     torch.cuda.synchronize()
@@ -573,6 +577,7 @@ def test_iluvatar_flex_attention_forward_pr2c_sq_tail_smoke(monkeypatch):
 
 
 def test_iluvatar_flex_attention_package_export():
+    from kernels.attention.iluvatar import autotune_iluvatar_flex_attention_tile as exported_tune
     from kernels.attention.iluvatar import compile_iluvatar_flex_attention as exported
     from kernels.attention.iluvatar import flydsl_flex_attn_func as exported_func
 
@@ -582,6 +587,7 @@ def test_iluvatar_flex_attention_package_export():
     from kernels.attention.iluvatar import flex_attn_interface as iface
 
     assert exported_func is iface.flydsl_flex_attn_func
+    assert exported_tune is iface.autotune_iluvatar_flex_attention_tile
 
 
 # --- Perf (opt-in; consumed by perf-daily-iluvatar) ----------------------------
@@ -1473,3 +1479,135 @@ def test_iluvatar_flex_attn_func_d256_dense_matches_compile(monkeypatch):
     torch.cuda.synchronize()
     ref = O[:, :, :Sq].permute(0, 2, 1, 3).contiguous()
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+# --- V2-6 optional tile_config / dense autotune helper ------------------------
+
+
+def test_iluvatar_flex_attention_rejects_invalid_tile_config():
+    mod = _require_flex_attn_module()
+    with pytest.raises(ValueError, match=r"block_m/block_n must be in"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", tile_config={"block_m": 48})
+    with pytest.raises(ValueError, match=r"unexpected keys"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", tile_config={"block_m": 64, "foo": 1})
+    with pytest.raises(ValueError, match=r"paged path requires block_n"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", paged=True, tile_config={"block_m": 32, "block_n": 32}
+        )
+
+
+@pytest.mark.parametrize(
+    "block_m,block_n",
+    [
+        (32, 32),
+        (32, 64),
+        (64, 32),
+        (64, 64),
+    ],
+)
+def test_iluvatar_flex_attention_tile_config_dense_smoke(monkeypatch, block_m, block_n):
+    """Whitelist tiles vs fp32 reference (default 64x64 included)."""
+    out, ref, tol = _run_flex_attn(
+        monkeypatch,
+        B=1,
+        H=4,
+        Sq=64,
+        Skv=64,
+        D=128,
+        dtype="bf16",
+        is_causal=True,
+        tile_config={"block_m": block_m, "block_n": block_n},
+        seed=block_m * 100 + block_n,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attn_func_tile_config_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 128
+    tile = {"block_m": 32, "block_n": 32}
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(11)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    out = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, tile_config=tile)
+    torch.cuda.synchronize()
+
+    block_m, block_n = tile["block_m"], tile["block_n"]
+    Sq_phys = _phys_seq(Sq, block_m)
+    Skv_phys = _phys_seq(Skv, block_n)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch.bfloat16)
+    K = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    Vn = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    Q[:, :, :Sq].copy_(q.permute(0, 2, 1, 3))
+    K[:, :, :Skv].copy_(k.permute(0, 2, 1, 3))
+    Vn[:, :, :Skv].copy_(v.permute(0, 2, 1, 3))
+    Vt = Vn.transpose(-1, -2).contiguous()
+    O = torch.zeros_like(Q)  # noqa: E741
+    launch = mod.compile_iluvatar_flex_attention(
+        B, H, Sq, Skv, D, dtype="bf16", is_causal=True, sm_scale=sm_scale, tile_config=tile
+    )
+    launch(Q, K, Vt, O)
+    torch.cuda.synchronize()
+    ref = O[:, :, :Sq].permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attention_autotune_tile_helper(monkeypatch):
+    """Opt-in helper returns a whitelist config; best is not worse than baseline."""
+    torch = _require_torch()
+    # Keep disk cache off: CI runners may have an unusable HOME (e.g. "/"), and
+    # enabling FLYDSL_RUNTIME_ENABLE_CACHE then tries to mkdir "/.flydsl".
+    _configure_iluvatar_env(monkeypatch, enable_cache=False)
+    iface = _require_flex_attn_interface()
+    from flydsl.autotune import do_bench
+
+    B, H, Sq, Skv, D = 1, 4, 128, 128, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(21)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    configs = [
+        {"block_m": 32, "block_n": 32},
+        {"block_m": 64, "block_n": 64},
+    ]
+    best = iface.autotune_iluvatar_flex_attention_tile(
+        q,
+        k,
+        v,
+        causal=True,
+        sm_scale=sm_scale,
+        configs=configs,
+        warmup=2,
+        rep=5,
+    )
+    assert best["block_m"] in (32, 64) and best["block_n"] in (32, 64)
+
+    # Re-measure baseline vs best; by construction best_ms <= baseline_ms.
+    def _bench(cfg):
+        def run():
+            iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, tile_config=cfg)
+
+        run()
+        torch.cuda.synchronize()
+        return float(do_bench(run, warmup=1, rep=5))
+
+    baseline_ms = _bench({"block_m": 64, "block_n": 64})
+    best_ms = _bench(best)
+    assert best_ms <= baseline_ms * 1.05 + 1e-6
+
+    out = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, tile_config=best)
+    ref = iface.flydsl_flex_attn_func(
+        q, k, v, causal=True, sm_scale=sm_scale, tile_config={"block_m": 64, "block_n": 64}
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)

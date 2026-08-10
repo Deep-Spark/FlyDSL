@@ -8,11 +8,12 @@ compiler. It supports f16/bf16 inputs, head dimensions 64/128/256, MHA/GQA,
 self/cross-attention, physical sequence padding, causal masking, sliding-window
 attention, Gemma-2 softcap, packed varlen self-attention via ``cu_seqlens``,
 and paged KV via ``block_table``. Dense path also supports mutually exclusive
-``alibi_slopes`` / ``score_bias`` additive logits (V2-4).
+``alibi_slopes`` / ``score_bias`` additive logits (V2-4). Optional
+``tile_config`` selects ``block_m``/``block_n`` in ``{32,64}`` (default 64x64).
 """
 
 import math
-from typing import Callable
+from typing import Callable, Mapping
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -39,7 +40,7 @@ from kernels.gemm.iluvatar.mr.common import (
 
 WARP_SIZE = 64
 
-# --- Fixed tile parameters ----------------------------------------------------
+# --- Default tile parameters (overridable via tile_config) --------------------
 BLOCK_M = 64
 BLOCK_N = 64
 WARPS_M = 2
@@ -59,6 +60,7 @@ assert WARPS_N > 1, "WARPS_N must be > 1 for the SMEM rowmax/rowsum reduce"
 # --- Supported variants -------------------------------------------------------
 _SUPPORTED_DTYPES = ("f16", "bf16")
 _SUPPORTED_D = (64, 128, 256)
+_SUPPORTED_BLOCK = (32, 64)
 _DTYPE_STR_TO_FX = {"f16": fx.Float16, "bf16": fx.BFloat16}
 _ELEM_BYTES_B16 = 2
 
@@ -72,23 +74,77 @@ def _phys_seq(seq: int, block: int) -> int:
     return _ceil_div(seq, block) * block
 
 
-def _flex_attn_smem_bytes(D: int, kv_stages: int, *, elem_bytes: int = _ELEM_BYTES_B16) -> int:
-    """Bytes for Q + staged K/V + P + s_red under the current tile geometry."""
-    q = BLOCK_M * D * elem_bytes
-    k = kv_stages * BLOCK_N * D * elem_bytes
-    v = kv_stages * D * BLOCK_N * elem_bytes
-    p = BLOCK_M * BLOCK_N * elem_bytes
-    s_red = 2 * BLOCK_M * WARPS_N * 4  # fp32 rowmax/rowsum scratch
+def _normalize_tile_config(
+    tile_config: Mapping[str, int] | None,
+    *,
+    paged: bool = False,
+) -> tuple[int, int]:
+    """Validate optional ``tile_config`` and return ``(block_m, block_n)``.
+
+    Whitelist is ``{32,64} x {32,64}``. Paged KV requires ``block_n == 64``
+    because ``page_size`` equals the KV tile. ``WARPS_M/N`` stay fixed at 2;
+    ``WARP_ATOMS_*`` are derived as ``block // (ATOM_* * WARPS_*)``.
+    """
+    if tile_config is None:
+        return BLOCK_M, BLOCK_N
+    if not isinstance(tile_config, Mapping):
+        raise ValueError(f"tile_config must be a mapping, got {type(tile_config)!r}")
+    extra = set(tile_config) - {"block_m", "block_n"}
+    if extra:
+        raise ValueError(f"tile_config only allows block_m/block_n; unexpected keys {sorted(extra)}")
+    block_m = int(tile_config.get("block_m", BLOCK_M))
+    block_n = int(tile_config.get("block_n", BLOCK_N))
+    if block_m not in _SUPPORTED_BLOCK or block_n not in _SUPPORTED_BLOCK:
+        raise ValueError(
+            f"tile_config block_m/block_n must be in {_SUPPORTED_BLOCK}; " f"got block_m={block_m}, block_n={block_n}"
+        )
+    if paged and block_n != BLOCK_N:
+        raise ValueError(f"paged path requires block_n={BLOCK_N} (page_size), got {block_n}")
+    warp_atoms_m = block_m // (ATOM_M * WARPS_M)
+    warp_atoms_n = block_n // (ATOM_N * WARPS_N)
+    if warp_atoms_m < 1 or block_m != ATOM_M * warp_atoms_m * WARPS_M:
+        raise ValueError(f"block_m={block_m} is not compatible with ATOM_M={ATOM_M}, WARPS_M={WARPS_M}")
+    if warp_atoms_n < 1 or block_n != ATOM_N * warp_atoms_n * WARPS_N:
+        raise ValueError(f"block_n={block_n} is not compatible with ATOM_N={ATOM_N}, WARPS_N={WARPS_N}")
+    return block_m, block_n
+
+
+def _flex_attn_smem_bytes(
+    D: int,
+    kv_stages: int,
+    *,
+    block_m: int = BLOCK_M,
+    block_n: int = BLOCK_N,
+    elem_bytes: int = _ELEM_BYTES_B16,
+) -> int:
+    """Bytes for Q + staged K/V + P + s_red under the given tile geometry."""
+    q = block_m * D * elem_bytes
+    k = kv_stages * block_n * D * elem_bytes
+    v = kv_stages * D * block_n * elem_bytes
+    p = block_m * block_n * elem_bytes
+    s_red = 2 * block_m * WARPS_N * 4  # fp32 rowmax/rowsum scratch
     return q + k + v + p + s_red
 
 
-def _choose_kv_stages(D: int, *, elem_bytes: int = _ELEM_BYTES_B16) -> int:
+def _choose_kv_stages(
+    D: int,
+    *,
+    block_m: int = BLOCK_M,
+    block_n: int = BLOCK_N,
+    elem_bytes: int = _ELEM_BYTES_B16,
+) -> int:
     """Pick the largest ``kv_stages`` in {2, 1} that fits the CTA SMEM cap."""
     for stages in (2, 1):
-        if _flex_attn_smem_bytes(D, stages, elem_bytes=elem_bytes) <= DEFAULT_SMEM_CAP_BYTES:
+        if (
+            _flex_attn_smem_bytes(D, stages, block_m=block_m, block_n=block_n, elem_bytes=elem_bytes)
+            <= DEFAULT_SMEM_CAP_BYTES
+        ):
             return stages
-    need = _flex_attn_smem_bytes(D, 1, elem_bytes=elem_bytes)
-    raise ValueError(f"flex-attention SMEM {need} B for D={D} exceeds CTA cap {DEFAULT_SMEM_CAP_BYTES} B")
+    need = _flex_attn_smem_bytes(D, 1, block_m=block_m, block_n=block_n, elem_bytes=elem_bytes)
+    raise ValueError(
+        f"flex-attention SMEM {need} B for D={D} tile=({block_m},{block_n}) "
+        f"exceeds CTA cap {DEFAULT_SMEM_CAP_BYTES} B"
+    )
 
 
 def _validate_scope(
@@ -417,6 +473,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     paged: bool = False,
     has_alibi: bool = False,
     has_score_bias: bool = False,
+    block_m: int = BLOCK_M,
+    block_n: int = BLOCK_N,
 ) -> Callable:
     """Compile the flex-attention forward launcher.
 
@@ -482,6 +540,14 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     if (has_alibi or has_score_bias) and (varlen or paged):
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
 
+    # Shadow module defaults so the nested kernel closure binds these ints.
+    BLOCK_M = int(block_m)
+    BLOCK_N = int(block_n)
+    WARP_ATOMS_M = BLOCK_M // (ATOM_M * WARPS_M)
+    WARP_ATOMS_N = BLOCK_N // (ATOM_N * WARPS_N)
+    assert BLOCK_M == ATOM_M * WARP_ATOMS_M * WARPS_M
+    assert BLOCK_N == ATOM_N * WARP_ATOMS_N * WARPS_N
+
     elem_dtype = _DTYPE_STR_TO_FX[dtype]
     Sq_phys = _phys_seq(Sq, BLOCK_M)
     Skv_phys = _phys_seq(Skv, BLOCK_N)
@@ -504,12 +570,13 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     k_atoms_pv = bk_pv // ATOM_K_B16
 
     # Warp partition:
-    #   MMA1 (S = Q @ K^T): S extent per CTA = (BLOCK_M, BLOCK_N) = (64, 64);
-    #     WARPS_M x WARPS_N warp grid; warp tile = (32, 32); warp_atoms = (2, 2).
+    #   MMA1 (S = Q @ K^T): S extent per CTA = (BLOCK_M, BLOCK_N);
+    #     WARPS_M x WARPS_N warp grid; warp_atoms derived from block size.
     #   MMA2 (O += P @ V):  O extent per CTA = (BLOCK_M, D);
-    #     same warp grid; warp_m_id still splits M into halves (32 rows/warp),
+    #     same warp grid; warp_m_id still splits M,
     #     but warp_n_id splits D (not BLOCK_N), so each warp owns
-    #     32 x (D / WARPS_N) of O -> warp_atoms_n_pv = D / (ATOM_N * WARPS_N)
+    #     (BLOCK_M/WARPS_M) x (D / WARPS_N) of O ->
+    #     warp_atoms_n_pv = D / (ATOM_N * WARPS_N)
     #     (4 at D=128, 8 at D=256).
     WARP_ATOMS_N_PV = D // (ATOM_N * WARPS_N)
     assert D % (ATOM_N * WARPS_N) == 0, f"D={D} must be divisible by ATOM_N*WARPS_N={ATOM_N * WARPS_N}"
@@ -538,18 +605,18 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     b_per_warp_qk = b_atoms_qk // NUM_WARPS
     b_per_warp_pv = b_atoms_v // NUM_WARPS
 
-    # SMEM: pick largest kv_stages in {2,1} under the CTA cap. At D=128 with
-    # 2-stage K/V this is ~56-90 KiB; at D=256 only stages=1 fits (~105 KiB).
-    KV_STAGES = _choose_kv_stages(D, elem_bytes=_ELEM_BYTES_B16)
+    # SMEM: pick largest kv_stages in {2,1} under the CTA cap for this tile x D.
+    KV_STAGES = _choose_kv_stages(D, block_m=BLOCK_M, block_n=BLOCK_N, elem_bytes=_ELEM_BYTES_B16)
     q_smem_elems = BLOCK_M * bk_qk
     k_smem_elems = BLOCK_N * bk_qk
     v_smem_elems = D * bk_pv
     p_smem_elems = BLOCK_M * BLOCK_N
     k_smem_elems_staged = k_smem_elems * KV_STAGES
     v_smem_elems_staged = v_smem_elems * KV_STAGES
-    smem_bytes = _flex_attn_smem_bytes(D, KV_STAGES, elem_bytes=_ELEM_BYTES_B16)
+    smem_bytes = _flex_attn_smem_bytes(D, KV_STAGES, block_m=BLOCK_M, block_n=BLOCK_N, elem_bytes=_ELEM_BYTES_B16)
     assert smem_bytes <= DEFAULT_SMEM_CAP_BYTES, (
-        f"flex-attention SMEM {smem_bytes} B exceeds cap {DEFAULT_SMEM_CAP_BYTES} B " f"(D={D}, kv_stages={KV_STAGES})"
+        f"flex-attention SMEM {smem_bytes} B exceeds cap {DEFAULT_SMEM_CAP_BYTES} B "
+        f"(D={D}, tile=({BLOCK_M},{BLOCK_N}), kv_stages={KV_STAGES})"
     )
 
     # Dense: BHSD phys-padded. Varlen packed: Q/K/O [total, H(or Hkv), D] with
@@ -597,8 +664,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         o_head_stride = Sq_phys * D
 
     # ROWS_PER_LANE = WARP_ATOMS_M * 4: each lane owns 4 rows per warp-M atom
-    # (row m = warp_m_id * 32 + mma_m * 16 + ei * 4 + lane_row). See TV
-    # analysis in the docstring above.
+    # (row m = warp_m_id * (WARP_ATOMS_M * ATOM_M) + mma_m * ATOM_M + ei * 4 +
+    # lane_row). See TV analysis in the docstring above.
     ROWS_PER_LANE = WARP_ATOMS_M * 4
     # ``m_running`` init: log2-domain "very negative". Value chosen so
     # ``exp2(NEG_LARGE_F - m_new) = 0`` in fp32 for any bounded ``m_new``, but
@@ -1793,20 +1860,22 @@ def compile_iluvatar_flex_attention(
     paged: bool = False,
     has_alibi: bool = False,
     has_score_bias: bool = False,
+    tile_config: Mapping[str, int] | None = None,
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
     This is a variant subset (causal / SWA / softcap), not a general score_mod
     compiler.
 
-    Supported scope: Q/K/V/O = f16 or bf16, D in {64, 128}, GQA
+    Supported scope: Q/K/V/O = f16 or bf16, D in {64, 128, 256}, GQA
     (``H % Hkv == 0``), arbitrary ``Sq``/``Skv`` (callers pass phys-padded
     contiguous tensors; see below), ``is_causal`` / ``window_size`` / ``softcap``
     in any combination. Dense ``is_causal`` requires ``Sq == Skv``; paged
     causal allows ``Sq != Skv`` (cross-length via ``seq_lens_kv - Sq``).
 
     Dense phys pad contract:
-        ``Sq_phys = ceil(Sq / 64) * 64``, ``Skv_phys = ceil(Skv / 64) * 64``.
+        ``Sq_phys = ceil(Sq / BLOCK_M) * BLOCK_M``,
+        ``Skv_phys = ceil(Skv / BLOCK_N) * BLOCK_N`` (default tile 64x64).
         Launch expects contiguous
         ``Q,O: [B, H, Sq_phys, D]``, ``K: [B, Hkv, Skv_phys, D]``,
         ``V: [B, Hkv, D, Skv_phys]`` (host transpose of natural K-major V).
@@ -1827,7 +1896,8 @@ def compile_iluvatar_flex_attention(
 
     Paged contract (``paged=True``; mutually exclusive with ``varlen``):
         ``Sq``/``Skv`` are ``max_seqlen_q`` / ``max_seqlen_kv``. Q/O stay dense
-        phys-padded. KV is linear paged with ``page_size == BLOCK_N == 64``:
+        phys-padded. KV is linear paged with ``page_size == BLOCK_N``
+        (must stay 64):
         ``K: [NumBlocks, 64, Hkv, D]``,
         ``V: [NumBlocks, Hkv, D, 64]`` (per-page host transpose for MMA2,
         mirroring dense V), plus ``block_table`` int32 ``[B, max_num_pages]``
@@ -1852,6 +1922,8 @@ def compile_iluvatar_flex_attention(
         has_alibi: Dense-only; enable ``alibi_slopes [H]`` additive bias.
         has_score_bias: Dense-only; enable phys-padded ``score_bias`` tensor.
             Mutually exclusive with ``has_alibi``; not supported with varlen/paged.
+        tile_config: Optional ``{"block_m": int, "block_n": int}`` with values
+            in ``{32, 64}``. Default is ``64x64``. Paged requires ``block_n=64``.
 
     Returns:
         Dense: ``launch_fn(Q, K, V, O, stream=None, alibi_slopes=..., score_bias=...)``.
@@ -1867,6 +1939,8 @@ def compile_iluvatar_flex_attention(
         raise ValueError("alibi_slopes and score_bias are mutually exclusive")
     if (has_alibi or has_score_bias) and (varlen or paged):
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
+
+    block_m, block_n = _normalize_tile_config(tile_config, paged=bool(paged))
 
     _validate_scope(
         B=B,
@@ -1904,7 +1978,15 @@ def compile_iluvatar_flex_attention(
         paged=paged,
         has_alibi=has_alibi,
         has_score_bias=has_score_bias,
+        block_m=block_m,
+        block_n=block_n,
     )
 
 
-__all__ = ["compile_iluvatar_flex_attention", "BLOCK_M", "BLOCK_N"]
+__all__ = [
+    "compile_iluvatar_flex_attention",
+    "BLOCK_M",
+    "BLOCK_N",
+    "_SUPPORTED_BLOCK",
+    "_normalize_tile_config",
+]
