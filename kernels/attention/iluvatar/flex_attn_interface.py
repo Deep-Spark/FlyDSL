@@ -10,21 +10,24 @@ Wraps ``compile_iluvatar_flex_attention`` behind a single Torch entry:
 Selects dense / varlen / paged from optional metadata, caches compiled
 launchers with ``lru_cache``, and owns dense/paged phys-pad + V transpose so
 callers can pass logical BSHD (or packed varlen / natural paged pages).
+
+Also exposes ``autotune_iluvatar_flex_attention_tile`` for opt-in dense-only
+tile search (returns a ``tile_config`` dict; does not alter the default path).
 """
 
 from __future__ import annotations
 
 import functools
-from typing import Optional
+from typing import Mapping, Optional, Sequence
 
 import flydsl.expr as fx
 from kernels.attention.iluvatar.flex_attention import (
-    BLOCK_M,
-    BLOCK_N,
+    _SUPPORTED_BLOCK,
+    _normalize_tile_config,
     compile_iluvatar_flex_attention,
 )
 
-__all__ = ["flydsl_flex_attn_func"]
+__all__ = ["flydsl_flex_attn_func", "autotune_iluvatar_flex_attention_tile"]
 
 
 def _torch():
@@ -73,6 +76,10 @@ def _resolve_mode(*, cu_seqlens, seq_lens, block_table, seq_lens_kv) -> str:
     return "dense"
 
 
+def _default_tile_configs() -> list[dict[str, int]]:
+    return [{"block_m": bm, "block_n": bn} for bm in _SUPPORTED_BLOCK for bn in _SUPPORTED_BLOCK]
+
+
 @functools.lru_cache(maxsize=256)
 def _build_launcher(
     B: int,
@@ -90,6 +97,8 @@ def _build_launcher(
     paged: bool,
     has_alibi: bool,
     has_score_bias: bool,
+    block_m: int,
+    block_n: int,
 ):
     return compile_iluvatar_flex_attention(
         B,
@@ -107,6 +116,7 @@ def _build_launcher(
         paged=paged,
         has_alibi=has_alibi,
         has_score_bias=has_score_bias,
+        tile_config={"block_m": block_m, "block_n": block_n},
     )
 
 
@@ -181,6 +191,7 @@ def flydsl_flex_attn_func(
     # Optional compile-time upper bounds for varlen/paged (defaults: current max).
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
+    tile_config: Mapping[str, int] | None = None,
     stream=None,
 ):
     """Run Iluvatar flex-attention (dense / varlen / paged).
@@ -197,6 +208,9 @@ def flydsl_flex_attn_func(
         ``v: [total, Hkv, D]`` (natural; transposed inside). Physical
         ``cu_seqlens`` must already be 32-aligned (no re-pack).
 
+    ``tile_config`` is optional ``{"block_m", "block_n"}`` with values in
+    ``{32, 64}`` (default 64x64). Paged requires ``block_n=64``.
+
     Returns:
         Output in the same layout as ``q`` (logical lengths; no phys pad).
     """
@@ -209,6 +223,7 @@ def flydsl_flex_attn_func(
     )
     dtype = _dtype_str(q)
     fxs = _as_fx_stream(stream)
+    block_m, block_n = _normalize_tile_config(tile_config, paged=(mode == "paged"))
 
     if mode == "dense":
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
@@ -243,10 +258,12 @@ def flydsl_flex_attn_func(
             False,
             has_alibi,
             has_score_bias,
+            block_m,
+            block_n,
         )
-        q_bhsd = _pad_bhsd(_bshd_to_bhsd(q), sq, BLOCK_M)
-        k_bhsd = _pad_bhsd(_bshd_to_bhsd(k), skv, BLOCK_N)
-        v_tn = _transpose_v_bhsd(_pad_bhsd(_bshd_to_bhsd(v), skv, BLOCK_N))
+        q_bhsd = _pad_bhsd(_bshd_to_bhsd(q), sq, block_m)
+        k_bhsd = _pad_bhsd(_bshd_to_bhsd(k), skv, block_n)
+        v_tn = _transpose_v_bhsd(_pad_bhsd(_bshd_to_bhsd(v), skv, block_n))
         o_bhsd = torch.zeros_like(q_bhsd)
         sb_phys = None
         if has_score_bias:
@@ -264,8 +281,8 @@ def flydsl_flex_attn_func(
                 raise ValueError(f"score_bias shape {tuple(sb.shape)} incompatible with batch/Skv")
             if sb_bhsd.shape[0] == 1 and b > 1:
                 sb_bhsd = sb_bhsd.expand(b, -1, -1, -1)
-            sq_phys = _phys_seq(sq, BLOCK_M)
-            skv_phys = _phys_seq(skv, BLOCK_N)
+            sq_phys = _phys_seq(sq, block_m)
+            skv_phys = _phys_seq(skv, block_n)
             sb_phys = torch.zeros(b, h, sq_phys, skv_phys, device=sb.device, dtype=torch.float32)
             sb_phys[:, :, :sq, :skv].copy_(sb_bhsd.float())
         ali = alibi_slopes.float().contiguous() if has_alibi else None
@@ -333,6 +350,8 @@ def flydsl_flex_attn_func(
             False,
             False,
             False,
+            block_m,
+            block_n,
         )
         v_tn = v.permute(1, 2, 0).contiguous()  # [Hkv, D, total]
         o = torch.zeros_like(q) if out is None else out
@@ -350,9 +369,9 @@ def flydsl_flex_attn_func(
         )
     b, sq, h, d = q.shape
     num_blocks, page, hkv, d_k = k.shape
-    if page != BLOCK_N or d_k != d or v.shape != k.shape:
+    if page != block_n or d_k != d or v.shape != k.shape:
         raise ValueError(
-            f"paged K/V must be same-shaped [NumBlocks, {BLOCK_N}, Hkv, D]; " f"got k{tuple(k.shape)} v{tuple(v.shape)}"
+            f"paged K/V must be same-shaped [NumBlocks, {block_n}, Hkv, D]; " f"got k{tuple(k.shape)} v{tuple(v.shape)}"
         )
     if h % hkv != 0:
         raise ValueError(f"H ({h}) must be divisible by Hkv ({hkv})")
@@ -387,12 +406,14 @@ def flydsl_flex_attn_func(
         True,
         False,
         False,
+        block_m,
+        block_n,
     )
-    q_bhsd = _pad_bhsd(_bshd_to_bhsd(q), sq, BLOCK_M)
+    q_bhsd = _pad_bhsd(_bshd_to_bhsd(q), sq, block_m)
     # If compile Sq > runtime Sq, pad Q rows to compile Sq_phys already handled
-    # by pad to BLOCK_M from logical sq; kernel masks via causal delta / seq_lens_kv.
+    # by pad to block_m from logical sq; kernel masks via causal delta / seq_lens_kv.
     # When max_seqlen_q > sq, need pad to compile Sq_phys for launch shape check.
-    sq_phys_compile = _phys_seq(sq_compile, BLOCK_M)
+    sq_phys_compile = _phys_seq(sq_compile, block_m)
     if q_bhsd.size(2) != sq_phys_compile:
         q_pad = torch.zeros(b, h, sq_phys_compile, d, device=q.device, dtype=q.dtype)
         q_pad[:, :, : q_bhsd.size(2)].copy_(q_bhsd)
@@ -413,3 +434,71 @@ def flydsl_flex_attn_func(
         out.copy_(o_logic)
         return out
     return o_logic
+
+
+def autotune_iluvatar_flex_attention_tile(
+    q,
+    k,
+    v,
+    *,
+    causal: bool = False,
+    window_size: Optional[int] = None,
+    softcap: Optional[float] = None,
+    sm_scale: Optional[float] = None,
+    configs: Sequence[Mapping[str, int]] | None = None,
+    warmup: int = 5,
+    rep: int = 25,
+    stream=None,
+) -> dict[str, int]:
+    """Opt-in dense-only tile search; returns the fastest ``tile_config``.
+
+    Sweeps ``configs`` (default: all ``{32,64} x {32,64}``) via ``do_bench``,
+    then returns ``{"block_m", "block_n"}`` for the median-fastest config.
+    Does not write a disk artifact. Caller should pass the result back into
+    ``flydsl_flex_attn_func(..., tile_config=...)``.
+    """
+    torch = _torch()
+    from flydsl.autotune import do_bench
+
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError(
+            "autotune_iluvatar_flex_attention_tile is dense-only; "
+            f"expected BSHD q/k/v ndim=4, got q{tuple(q.shape)} k{tuple(k.shape)} v{tuple(v.shape)}"
+        )
+
+    tile_list = list(configs) if configs is not None else _default_tile_configs()
+    if not tile_list:
+        raise ValueError("configs must be a non-empty sequence of tile_config dicts")
+
+    best_cfg: dict[str, int] | None = None
+    best_ms = float("inf")
+    fxs = _as_fx_stream(stream)
+
+    for raw in tile_list:
+        block_m, block_n = _normalize_tile_config(raw, paged=False)
+        cfg = {"block_m": block_m, "block_n": block_n}
+
+        # Allocate pads / out once per config (phys shape depends on tile).
+        def _run(cfg=cfg):
+            flydsl_flex_attn_func(
+                q,
+                k,
+                v,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                sm_scale=sm_scale,
+                tile_config=cfg,
+                stream=fxs,
+            )
+
+        # Force one compile/warmup launch before timing so JIT cost is excluded.
+        _run()
+        torch.cuda.synchronize()
+        ms = float(do_bench(_run, warmup=max(0, int(warmup) - 1), rep=int(rep)))
+        if ms < best_ms:
+            best_ms = ms
+            best_cfg = cfg
+
+    assert best_cfg is not None
+    return dict(best_cfg)
