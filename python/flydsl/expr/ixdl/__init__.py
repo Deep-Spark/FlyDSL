@@ -18,6 +18,7 @@ from .mr import (
 from .ops import (
     atomic_cas,
     byte_permute,
+    readfirstlane,
     stp_vs_b8,
     stp_vs_b16,
     stp_vs_b32,
@@ -59,6 +60,7 @@ __all__ = [
     "sl_pipebar_arrive",
     "sl_pipebar_wait",
     "byte_permute",
+    "readfirstlane",
     "atomic_cas",
     "stp_vs_b8",
     "stp_vs_b16",
