@@ -140,6 +140,9 @@ def run_external_binary_codegen(
         tmp_dir_obj = tempfile.TemporaryDirectory(prefix="flydsl_external_llvm_")
         work_dir = Path(tmp_dir_obj.name)
     else:
+        from ..utils.release_guard import assert_ir_dump_allowed
+
+        assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR (external LLVM dump)")
         work_dir.mkdir(parents=True, exist_ok=True)
 
     llvm_cli_args = _format_llvm_cli_options(llvm_options) if llvm_options else []

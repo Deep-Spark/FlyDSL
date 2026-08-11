@@ -901,6 +901,7 @@ class MlirCompiler:
                     next_stage += 1
 
                 if llir is not None:
+                    assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR (LLVM IR dump)")
                     ll_name = f"{next_stage:02d}_llvm_ir"
                     (dump_dir / f"{ll_name}.ll").write_text(llir, encoding="utf-8")
                     print(f"[flydsl.compile] dump {ll_name} -> {dump_dir / f'{ll_name}.ll'}")

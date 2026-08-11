@@ -92,3 +92,17 @@ def test_ir_dump_allowed_for_editable_install(monkeypatch):
 def test_ir_dump_allowed_from_source_tree(monkeypatch):
     monkeypatch.delenv("FLYDSL_ALLOW_IR_DUMP", raising=False)
     assert ir_dump_allowed() is True
+
+
+def test_official_dump_write_sites_share_packaged_guard(monkeypatch):
+    """Official dump writers all call assert_ir_dump_allowed before writing."""
+    monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: False)
+    monkeypatch.setattr("importlib.metadata.distribution", lambda name: _fake_packaged_dist())
+    for feature in (
+        "FLYDSL_DUMP_IR",
+        "FLYDSL_DUMP_IR (ISA dump)",
+        "FLYDSL_DUMP_IR (LLVM IR dump)",
+        "FLYDSL_DUMP_IR (external LLVM dump)",
+    ):
+        with pytest.raises(RuntimeError, match="disabled for packaged FlyDSL installs"):
+            assert_ir_dump_allowed(feature=feature)
