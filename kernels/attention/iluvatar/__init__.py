@@ -13,6 +13,9 @@ from .block_mask import (
     pack_block_masks_paged,
     pack_block_masks_varlen,
 )
+from .block_mask import FlexBlockMask, create_block_mask
+from .flash_attn_kvcache import flash_attn_with_kvcache
+from .flash_attn_varlen import flash_attn_varlen_func
 from .flex_attention import compile_iluvatar_flex_attention
 from .flex_attention_bwd import compile_iluvatar_flex_attention_bwd
 from .flex_attn_interface import autotune_iluvatar_flex_attention_tile, flydsl_flex_attn_func
@@ -31,5 +34,7 @@ __all__ = [
     "PackedVarlenBlockMask",
     "PackedPagedBlockMask",
     "flydsl_flex_attn_func",
+    "flash_attn_varlen_func",
+    "flash_attn_with_kvcache",
     "autotune_iluvatar_flex_attention_tile",
 ]
