@@ -21,7 +21,7 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Tensor core MMA** | `MRMma` -- **16x16x16 f16** and **16x16x32 i8->i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` -- double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |
 | **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` -- int8xint8 -> i32/i8, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
-| **Flex-attention V2** | `compile_iluvatar_flex_attention` (dense / varlen / paged) + Torch entry `flydsl_flex_attn_func` in `kernels.attention.iluvatar`; optional `tile_config` (`{32,64}x{32,64}`, default 64x64) + dense-only `autotune_iluvatar_flex_attention_tile`; causal / SWA / softcap; f16/bf16; D in {64,128,256}; GQA; dense alibi/score_bias; variant subset of PyTorch flex_attention (not a general score_mod compiler) |
+| **Flex-attention V2** | `compile_iluvatar_flex_attention` (dense / varlen / paged) + Torch entry `flydsl_flex_attn_func` in `kernels.attention.iluvatar`; optional `tile_config` (`{32,64}x{32,64}`, default 64x64) + dense-only `autotune_iluvatar_flex_attention_tile`; causal / SWA / softcap; f16/bf16; D in {64,128,256}; GQA; dense alibi/score_bias; dense `return_lse` + `compile_iluvatar_flex_attention_bwd` (MHA, D in {64,128}, correctness-first); variant subset of PyTorch flex_attention (not a general score_mod compiler) |
 | **MoE GEMM V1** | `kernels.moe.iluvatar.mr` -- sorted grouped GEMM, `int8` / `int8smooth`, f16/bf16/f32 out (A gather + B SME) |
 | **GEMV V1** | `kernels.gemm.iluvatar.gemv` -- `F.linear`-aligned M=1, fp16/bf16, fp32 accum |
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |
@@ -65,7 +65,8 @@ kernels/moe/iluvatar/mr/
   moe_gemm.py        # compile_iluvatar_mr_moe_gemm (int8 / int8smooth V1)
 
 kernels/attention/iluvatar/
-  flex_attention.py       # compile_iluvatar_flex_attention (dense / varlen / paged)
+  flex_attention.py       # compile_iluvatar_flex_attention (dense / varlen / paged; optional return_lse)
+  flex_attention_bwd.py   # compile_iluvatar_flex_attention_bwd (dense MHA)
   flex_attn_interface.py  # flydsl_flex_attn_func + autotune_*_tile
 ```
 
@@ -438,7 +439,7 @@ MLIR FileCheck (needs `fly-opt` + `FileCheck` on `PATH`):
 | **Small-shape HGEMM perf** | Sub-peak / noisy | Below **~2048^3**, TFLOPS are far from 4k peak and sensitive to launch/JIT and `k_atoms`. Quote **Gate2 contract** medians; treat smaller shapes as indicative. |
 | **B8 / INT8 GEMM** | **Implemented (MR IGEMM)** | `kernels.gemm.iluvatar.mr.igemm` + example 03-igemm; i32 / i8 epilogues; four major patterns. Further quant-scale / fused epilogues still open. |
 | **GEMV** | V1 only | `kernels.gemm.iluvatar.gemv` -- M=1, strict N/K tile divisibility; not a general batched GEMV. |
-| **Flex-attention** | V2 forward (dense / varlen / paged) via `compile_*` + `flydsl_flex_attn_func`; optional `tile_config` / dense `autotune_*_tile` | No user `score_mod`, no backward. Relative to Torch SDPA still has a gap on long sequences. |
+| **Flex-attention** | V2 forward (dense / varlen / paged) via `compile_*` + `flydsl_flex_attn_func`; optional `tile_config` / dense `autotune_*_tile`; dense `return_lse` + `compile_*_bwd` (MHA bring-up) | No user `score_mod`. Bwd is dense-MHA correctness-first (not MMA-opt). Relative to Torch SDPA still has a gap on long sequences. |
 | **Other production kernels** | Mostly ROCm-only | Broader FlyDSL portfolio (FP8/INT4 preshuffle GEMM, CDNA flash-attn family, all-reduce, ...) still has **no** full Iluvatar port beyond HGEMM / IGEMM / GEMV / MoE GEMM / flex-attention V1 + teaching/unit coverage. |
 | **S2R register pressure** | Tuning item | Shared->register uses generic `UniversalCopy32b` tiling rather than a TCU-specialized load; SRF usage on large shapes is higher than ideal and may leave headroom on the table. |
 | **Multi-GPU** | Not supported | No Iluvatar multi-device runtime or collective kernels (e.g. custom all-reduce). |
