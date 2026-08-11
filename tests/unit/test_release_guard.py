@@ -17,10 +17,12 @@ for _name in list(sys.modules):
     if _name == "flydsl" or _name.startswith("flydsl."):
         del sys.modules[_name]
 
+from flydsl.utils.env import DebugEnvManager  # noqa: E402
 from flydsl.utils.release_guard import (  # noqa: E402
     assert_ir_dump_allowed,
     clear_ir_dump_allowed_cache,
     ir_dump_allowed,
+    is_packaged_install,
 )
 
 pytestmark = [pytest.mark.l0_backend_agnostic]
@@ -33,29 +35,45 @@ def _clear_guard_cache():
     clear_ir_dump_allowed_cache()
 
 
-def test_ir_dump_allowed_with_explicit_override(monkeypatch):
+def _fake_packaged_dist():
+    class _FakeDist:
+        def read_text(self, name):
+            raise FileNotFoundError(name)
+
+    return _FakeDist()
+
+
+def test_ir_dump_denied_even_with_allow_env(monkeypatch):
     monkeypatch.setenv("FLYDSL_ALLOW_IR_DUMP", "1")
     monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: False)
-    assert ir_dump_allowed() is True
-    assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR")
+    monkeypatch.setattr("importlib.metadata.distribution", lambda name: _fake_packaged_dist())
+    assert is_packaged_install() is True
+    assert ir_dump_allowed() is False
+    with pytest.raises(RuntimeError, match="disabled for packaged FlyDSL installs"):
+        assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR")
 
 
 def test_ir_dump_denied_for_packaged_wheel_install(monkeypatch):
     monkeypatch.delenv("FLYDSL_ALLOW_IR_DUMP", raising=False)
     monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: False)
-
-    class _FakeDist:
-        def read_text(self, name):
-            raise FileNotFoundError(name)
-
-    def _fake_distribution(name):
-        assert name == "flydsl"
-        return _FakeDist()
-
-    monkeypatch.setattr("importlib.metadata.distribution", _fake_distribution)
+    monkeypatch.setattr("importlib.metadata.distribution", lambda name: _fake_packaged_dist())
     assert ir_dump_allowed() is False
     with pytest.raises(RuntimeError, match="disabled for packaged FlyDSL installs"):
         assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR")
+
+
+def test_packaged_debug_env_forced_false(monkeypatch):
+    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
+    monkeypatch.setenv("FLYDSL_DEBUG_DUMP_ASM", "1")
+    monkeypatch.setenv("FLYDSL_DEBUG_PRINT_ORIGIN_IR", "1")
+    monkeypatch.setenv("FLYDSL_DEBUG_PRINT_AFTER_ALL", "1")
+    monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: False)
+    monkeypatch.setattr("importlib.metadata.distribution", lambda name: _fake_packaged_dist())
+    dbg = DebugEnvManager()
+    assert dbg.dump_ir is False
+    assert dbg.dump_asm is False
+    assert dbg.print_origin_ir is False
+    assert dbg.print_after_all is False
 
 
 def test_ir_dump_allowed_for_editable_install(monkeypatch):

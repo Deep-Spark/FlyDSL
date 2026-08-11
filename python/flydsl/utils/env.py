@@ -62,6 +62,17 @@ class EnvOption(Generic[T]):
         return value
 
 
+# Dump / IR-print knobs that packaged wheels must ignore even when the env is set.
+_PACKAGED_DENIED_DEBUG_OPTIONS = frozenset(
+    {
+        "dump_asm",
+        "dump_ir",
+        "print_origin_ir",
+        "print_after_all",
+    }
+)
+
+
 class OptBool(EnvOption[bool]):
     """Boolean environment option (truthy: ``1``, ``true``, ``yes``, ``on``)."""
 
@@ -244,6 +255,15 @@ class DebugEnvManager(EnvManager):
     """Debug and diagnostics options (``FLYDSL_DEBUG_*`` / ``FLYDSL_DUMP_*``)."""
 
     env_prefix = "DEBUG"
+
+    def __getattribute__(self, name: str):
+        value = super().__getattribute__(name)
+        if name in _PACKAGED_DENIED_DEBUG_OPTIONS:
+            from .release_guard import is_packaged_install
+
+            if is_packaged_install():
+                return False
+        return value
 
     dump_asm = OptBool(False, description="Dump ASM to file")
     dump_ir = OptBool(False, env_var="FLYDSL_DUMP_IR", description="Dump IR to file")
