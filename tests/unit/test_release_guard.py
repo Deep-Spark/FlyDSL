@@ -20,6 +20,9 @@ for _name in list(sys.modules):
 from flydsl.utils.env import DebugEnvManager  # noqa: E402
 from flydsl.utils.release_guard import (  # noqa: E402
     assert_ir_dump_allowed,
+    assert_isa_format_allowed,
+    assert_passmanager_parse_allowed,
+    authorize_pass_pipeline,
     clear_ir_dump_allowed_cache,
     ir_dump_allowed,
     is_packaged_install,
@@ -115,3 +118,25 @@ def test_official_dump_write_sites_share_packaged_guard(monkeypatch):
     ):
         with pytest.raises(RuntimeError, match="disabled for packaged FlyDSL installs"):
             assert_ir_dump_allowed(feature=feature)
+
+
+def test_passmanager_parse_denied_without_authorization(monkeypatch):
+    monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: False)
+    monkeypatch.setattr("importlib.metadata.distribution", lambda name: _fake_packaged_dist())
+    with pytest.raises(RuntimeError, match="PassManager.parse is disabled"):
+        assert_passmanager_parse_allowed()
+    with authorize_pass_pipeline():
+        assert_passmanager_parse_allowed()
+
+
+def test_format_isa_denied_for_packaged_or_stripped(monkeypatch):
+    monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: False)
+    monkeypatch.setattr("importlib.metadata.distribution", lambda name: _fake_packaged_dist())
+    with pytest.raises(RuntimeError, match="format=isa"):
+        assert_isa_format_allowed()
+
+    clear_ir_dump_allowed_cache()
+    monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: True)
+    monkeypatch.setattr("flydsl.utils.dump_support.DUMP_SUPPORT", False)
+    with pytest.raises(RuntimeError, match="format=isa"):
+        assert_isa_format_allowed()

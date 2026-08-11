@@ -10,8 +10,13 @@ installs keep the full dump path for developers. Packaged installs ignore
 """
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
+
+_pass_pipeline_authorized: ContextVar[bool] = ContextVar("flydsl_pass_pipeline_authorized", default=False)
+_passmanager_guard_installed = False
 
 
 def _distribution_is_editable(dist) -> bool:
@@ -90,3 +95,56 @@ def clear_ir_dump_allowed_cache() -> None:
     """Reset the cached allow decision (tests only)."""
     is_packaged_install.cache_clear()
     ir_dump_allowed.cache_clear()
+
+
+@contextmanager
+def authorize_pass_pipeline():
+    """Allow PassManager.parse for the official compiler pipeline only."""
+    token = _pass_pipeline_authorized.set(True)
+    try:
+        yield
+    finally:
+        _pass_pipeline_authorized.reset(token)
+
+
+def assert_passmanager_parse_allowed() -> None:
+    """Raise if a packaged install tries to parse a pass pipeline without authorization."""
+    if is_packaged_install() and not _pass_pipeline_authorized.get():
+        raise RuntimeError(
+            "PassManager.parse is disabled for packaged FlyDSL installs. "
+            "Use @flyc.jit / @flyc.kernel compilation rather than constructing "
+            "backend pass pipelines directly."
+        )
+
+
+def assert_isa_format_allowed() -> None:
+    """Raise if a packaged or stripped build tries to emit format=isa."""
+    from .dump_support import DUMP_SUPPORT
+
+    if is_packaged_install() or not DUMP_SUPPORT:
+        raise RuntimeError("gpu-module-to-binary{format=isa} is disabled for packaged FlyDSL installs.")
+
+
+def install_passmanager_guard() -> None:
+    """Wrap flydsl._mlir.passmanager.PassManager.parse on packaged installs."""
+    global _passmanager_guard_installed
+    if _passmanager_guard_installed:
+        return
+    if not is_packaged_install():
+        return
+    try:
+        from flydsl._mlir.passmanager import PassManager
+    except ImportError:  # pragma: no cover
+        return
+    original = PassManager.parse
+    if getattr(original, "_flydsl_passmanager_guarded", False):
+        _passmanager_guard_installed = True
+        return
+
+    def parse(pipeline, *args, **kwargs):
+        assert_passmanager_parse_allowed()
+        return original(pipeline, *args, **kwargs)
+
+    parse._flydsl_passmanager_guarded = True
+    PassManager.parse = parse
+    _passmanager_guard_installed = True

@@ -84,7 +84,12 @@ def _verify_one_wheel(wheel_path: Path) -> tuple[list[str], dict]:
 
             if member == "flydsl/utils/release_guard.py":
                 text = zf.read(member).decode("utf-8", errors="replace")
-                if "def ir_dump_allowed" not in text or "def is_packaged_install" not in text:
+                if (
+                    "def ir_dump_allowed" not in text
+                    or "def is_packaged_install" not in text
+                    or "def authorize_pass_pipeline" not in text
+                    or "def assert_isa_format_allowed" not in text
+                ):
                     violations.append(
                         f"{wheel_path.name}: `{member}` is present but missing IR dump guard symbols"
                     )

@@ -25,9 +25,14 @@ from ..expr.meta import tracing_context
 from ..expr.typing import Constexpr, Stream
 from ..expr.utils.arith import fastmath as fastmath_ctx
 from ..utils import env, log
-from ..utils.file import atomic_write
 from ..utils.dump_support import require_dump_support
-from ..utils.release_guard import assert_ir_dump_allowed
+from ..utils.file import atomic_write
+from ..utils.release_guard import (
+    assert_ir_dump_allowed,
+    assert_isa_format_allowed,
+    authorize_pass_pipeline,
+    install_passmanager_guard,
+)
 from .ast_rewriter import ASTRewriter
 from .backends import compile_backend_name, get_backend
 from .diagnostics import (
@@ -57,6 +62,8 @@ from .protocol import (
     construct_from_ir_values,
     get_ir_types,
 )
+
+install_passmanager_guard()
 
 EXTRA_SOURCE_DIRS: List[str] = []
 
@@ -682,15 +689,17 @@ def _dump_isa(*, dump_dir: Path, ctx: ir.Context, asm: str, verify: bool, stage_
     """
     require_dump_support(feature="FLYDSL_DUMP_IR (ISA dump)")
     assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR (ISA dump)")
+    assert_isa_format_allowed()
     try:
         mod = ir.Module.parse(asm, context=ctx)
         di_pass = (
             "ensure-debug-info-scope-on-llvm-func{emission-kind=LineTablesOnly}," if env.debug.enable_debug_info else ""
         )
-        pm = PassManager.parse(
-            f'builtin.module({di_pass}gpu-module-to-binary{{format=isa opts="{"-g" if env.debug.enable_debug_info else ""}" section= toolkit=}})',
-            context=ctx,
-        )
+        with authorize_pass_pipeline():
+            pm = PassManager.parse(
+                f'builtin.module({di_pass}gpu-module-to-binary{{format=isa opts="{"-g" if env.debug.enable_debug_info else ""}" section= toolkit=}})',
+                context=ctx,
+            )
         pm.enable_verifier(bool(verify))
         pm.run(mod.operation)
 
@@ -780,7 +789,8 @@ def _pipeline_fragments_for_mode(backend, *, compile_hints: dict) -> PipelineCon
 def _run_pipeline(module: ir.Module, fragments: list, *, verifier: bool, print_after_all: bool) -> None:
     """Parse and run a comma-joined pass pipeline on *module*."""
     pipeline = f"builtin.module({','.join(fragments)})"
-    pm = PassManager.parse(pipeline)
+    with authorize_pass_pipeline():
+        pm = PassManager.parse(pipeline)
     pm.enable_verifier(verifier)
     pm.enable_ir_printing(print_after_all=print_after_all)
     with dsl_ir_diagnostics(module.context) as diags:
@@ -866,7 +876,8 @@ class MlirCompiler:
 
                     stage_num = stage_num_base + idx
                     stage_name = f"{stage_num:02d}_{_stage_label_from_fragment(frag)}"
-                    pm = PassManager.parse(f"builtin.module({frag})")
+                    with authorize_pass_pipeline():
+                        pm = PassManager.parse(f"builtin.module({frag})")
                     pm.enable_verifier(env.debug.enable_verifier)
                     with dsl_ir_diagnostics(module.context) as diags:
                         try:
