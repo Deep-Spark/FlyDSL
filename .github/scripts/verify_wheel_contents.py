@@ -21,6 +21,11 @@ _FORBIDDEN_PATH_PATTERNS = (
     "*/docs/*",
     "*/.github/*",
 )
+# Packaged wheels must include the IR/ISA dump guard used to deny FLYDSL_DUMP_IR
+# for external installs.
+_REQUIRED_MEMBERS = (
+    "flydsl/utils/release_guard.py",
+)
 
 
 def _resolve_wheels(patterns: list[str]) -> list[Path]:
@@ -60,7 +65,12 @@ def _verify_one_wheel(wheel_path: Path) -> tuple[list[str], dict]:
 
     with zipfile.ZipFile(wheel_path) as zf:
         members = [m for m in zf.namelist() if m and not m.endswith("/")]
+        member_set = set(members)
         summary["file_count"] = len(members)
+
+        for required in _REQUIRED_MEMBERS:
+            if required not in member_set:
+                violations.append(f"{wheel_path.name}: missing required release member `{required}`")
 
         for member in members:
             top = member.split("/", 1)[0]
@@ -71,6 +81,13 @@ def _verify_one_wheel(wheel_path: Path) -> tuple[list[str], dict]:
             if _is_forbidden_member(member):
                 violations.append(f"{wheel_path.name}: forbidden release path `{member}`")
 
+            if member == "flydsl/utils/release_guard.py":
+                text = zf.read(member).decode("utf-8", errors="replace")
+                if "def ir_dump_allowed" not in text or "FLYDSL_ALLOW_IR_DUMP" not in text:
+                    violations.append(
+                        f"{wheel_path.name}: `{member}` is present but missing IR dump guard symbols"
+                    )
+
     return violations, summary
 
 
@@ -78,7 +95,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Validate wheel payload stays minimal: only flydsl + dist-info top-level entries, "
-            "and no tests/examples/docs payload."
+            "no tests/examples/docs payload, and the IR/ISA dump release guard is present."
         )
     )
     parser.add_argument("wheels", nargs="+", help="Wheel files or glob patterns (e.g. dist/*.whl)")

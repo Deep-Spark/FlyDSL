@@ -26,6 +26,7 @@ from ..expr.typing import Constexpr, Stream
 from ..expr.utils.arith import fastmath as fastmath_ctx
 from ..utils import env, log
 from ..utils.file import atomic_write
+from ..utils.release_guard import assert_ir_dump_allowed
 from .ast_rewriter import ASTRewriter
 from .backends import compile_backend_name, get_backend
 from .diagnostics import (
@@ -616,6 +617,7 @@ def _stage_label_from_fragment(fragment: str) -> str:
 
 def _dump_ir(stage: str, *, dump_dir: Path, asm: str) -> Path:
     """Write one compilation stage's MLIR assembly to a .mlir file."""
+    assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR")
     dump_dir.mkdir(parents=True, exist_ok=True)
     out = dump_dir / f"{stage}.mlir"
     out.write_text(asm, encoding="utf-8")
@@ -676,6 +678,7 @@ def _dump_isa(*, dump_dir: Path, ctx: ir.Context, asm: str, verify: bool, stage_
     main compilation is not affected.  The raw ISA text is extracted from the
     MLIR ``assembly = "..."`` attribute and written as a clean ``.s`` file.
     """
+    assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR (ISA dump)")
     try:
         mod = ir.Module.parse(asm, context=ctx)
         di_pass = (
@@ -821,6 +824,17 @@ class MlirCompiler:
         from .llvm_options import llvm_options as _llvm_options
 
         _llvm_ctx = _llvm_options(llvm_opts) if llvm_opts else nullcontext()
+
+        if env.debug.dump_ir or env.debug.dump_asm or env.debug.print_origin_ir or env.debug.print_after_all:
+            # Packaged wheels must not expose backend IR / ISA dump surfaces.
+            feature = "FLYDSL_DUMP_IR"
+            if env.debug.dump_asm and not env.debug.dump_ir:
+                feature = "FLYDSL_DEBUG_DUMP_ASM"
+            elif env.debug.print_origin_ir and not env.debug.dump_ir:
+                feature = "FLYDSL_DEBUG_PRINT_ORIGIN_IR"
+            elif env.debug.print_after_all and not env.debug.dump_ir:
+                feature = "FLYDSL_DEBUG_PRINT_AFTER_ALL"
+            assert_ir_dump_allowed(feature=feature)
 
         if env.debug.print_origin_ir:
             log().info(f"Origin IR: \n{module}")
@@ -1251,6 +1265,8 @@ class JitFunction:
         self.manager_key = _jit_function_cache_key(self.func, owner_cls=owner_cls)
 
         run_only = env.runtime.run_only
+        if env.debug.dump_ir:
+            assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR")
         if run_only and env.debug.dump_ir:
             raise ValueError(
                 "FLYDSL_RUNTIME_RUN_ONLY=1 is incompatible with FLYDSL_DUMP_IR=1: "
