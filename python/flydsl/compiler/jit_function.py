@@ -36,7 +36,12 @@ from .diagnostics import (
     warn_annotation_value_mismatch,
     warn_invalid_annotations,
 )
-from .jit_argument import convert_to_jit_arguments, is_type_param_annotation, resolve_signature
+from .jit_argument import (
+    TorchTensorJitArg,
+    convert_to_jit_arguments,
+    is_type_param_annotation,
+    resolve_signature,
+)
 from .jit_executor import CallState, CompiledArtifact
 from .kernel_function import (
     CompilationContext,
@@ -1093,6 +1098,10 @@ def _resolve_jit_arg_type(arg, annotation):
     return constructor
 
 
+def _fill_raw_torch_tensor_ptr(arg, storage):
+    storage.value = arg.data_ptr()
+
+
 def _build_call_state(sig, args_tuple, func_exe):
     """Build a CallState for fast repeated dispatch.
 
@@ -1126,7 +1135,11 @@ def _build_call_state(sig, args_tuple, func_exe):
             )
 
         inst = arg if isinstance(arg, jit_arg_type) else jit_arg_type(arg)
-        for ctype, fill in c_abi_spec(inst):
+        abi_slots = list(c_abi_spec(inst))
+        if jit_arg_type is TorchTensorJitArg and not isinstance(arg, JitArgument):
+            ctype, _fill = abi_slots[0]
+            abi_slots[0] = (ctype, _fill_raw_torch_tensor_ptr)
+        for ctype, fill in abi_slots:
             slot_specs.append((i, ctype, fill))
 
     # Auto-stream: NULL ptr selects HIP default stream when no user stream arg.
