@@ -64,7 +64,63 @@
         "extra_args": [
           "-k",
           "test_iluvatar_flex_attention_perf"
-        ]
+        ],
+        "perf_config": {
+          "shape": {
+            "B": 2,
+            "H": 32,
+            "Hkv": 8,
+            "Sq": 4096,
+            "Skv": 4096,
+            "D": 128
+          },
+          "warmup": 5,
+          "iters": 10,
+          "cases": [
+            {
+              "name": "causal",
+              "is_causal": true,
+              "window_size": null,
+              "softcap": null,
+              "dtype": "bf16"
+            },
+            {
+              "name": "causal",
+              "is_causal": true,
+              "window_size": null,
+              "softcap": null,
+              "dtype": "f16"
+            },
+            {
+              "name": "causal_swa1024",
+              "is_causal": true,
+              "window_size": 1024,
+              "softcap": null,
+              "dtype": "bf16"
+            },
+            {
+              "name": "causal_swa1024",
+              "is_causal": true,
+              "window_size": 1024,
+              "softcap": null,
+              "dtype": "f16"
+            },
+            {
+              "name": "causal_softcap30",
+              "is_causal": true,
+              "window_size": null,
+              "softcap": 30.0,
+              "dtype": "bf16"
+            },
+            {
+              "name": "causal_softcap30",
+              "is_causal": true,
+              "window_size": null,
+              "softcap": 30.0,
+              "dtype": "f16"
+            }
+          ]
+        }
       },
       "gate": {
         "compare": "delta_vs_prev",
