@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""CQ GEMM package: shared tile helpers + CQMma fragment smoke.
+"""CQ GEMM package: SmexMtx pipeline HGEMM helpers."""
 
-Full pipelined ``hgemm`` / ``igemm`` are not here yet (need async copy / load-matrix).
-"""
-
-from .common import MMA_TILE_BASE, MMA_TILE_PRESETS, CqMmaTile, parse_mma_tile
-from .mma_fragment_smoke import (
-    compile_cq_mma_fragment_smoke_f16,
-    compile_cq_mma_fragment_smoke_s8,
+from .common import (
+    CQ_GEMM_GEOM,
+    MMA_TILE_BASE,
+    MMA_TILE_PRESETS,
+    CqMmaTile,
+    CqOperandGeom,
+    parse_mma_tile,
 )
+from .hgemm import compile_iluvatar_cq_hgemm, select_swizzle_cta
 
 __all__ = [
     "MMA_TILE_BASE",
     "MMA_TILE_PRESETS",
+    "CQ_GEMM_GEOM",
     "CqMmaTile",
+    "CqOperandGeom",
     "parse_mma_tile",
-    "compile_cq_mma_fragment_smoke_f16",
-    "compile_cq_mma_fragment_smoke_s8",
+    "compile_iluvatar_cq_hgemm",
+    "select_swizzle_cta",
 ]
