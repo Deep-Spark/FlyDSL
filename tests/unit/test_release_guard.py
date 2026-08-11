@@ -94,6 +94,15 @@ def test_ir_dump_allowed_from_source_tree(monkeypatch):
     assert ir_dump_allowed() is True
 
 
+def test_dump_support_false_blocks_even_when_guard_allows(monkeypatch):
+    from flydsl.utils.dump_support import require_dump_support
+
+    monkeypatch.setattr("flydsl.utils.dump_support.DUMP_SUPPORT", False)
+    monkeypatch.setattr("flydsl.utils.release_guard.ir_dump_allowed", lambda: True)
+    with pytest.raises(RuntimeError, match="DUMP_SUPPORT=False"):
+        require_dump_support(feature="FLYDSL_DUMP_IR")
+
+
 def test_official_dump_write_sites_share_packaged_guard(monkeypatch):
     """Official dump writers all call assert_ir_dump_allowed before writing."""
     monkeypatch.setattr("flydsl.utils.release_guard._running_from_source_tree", lambda: False)

@@ -25,6 +25,7 @@ _FORBIDDEN_PATH_PATTERNS = (
 # for external installs.
 _REQUIRED_MEMBERS = (
     "flydsl/utils/release_guard.py",
+    "flydsl/utils/dump_support.py",
 )
 
 
@@ -90,6 +91,13 @@ def _verify_one_wheel(wheel_path: Path) -> tuple[list[str], dict]:
                 if "_env_truthy(\"FLYDSL_ALLOW_IR_DUMP\")" in text or "_env_truthy('FLYDSL_ALLOW_IR_DUMP')" in text:
                     violations.append(
                         f"{wheel_path.name}: `{member}` still treats FLYDSL_ALLOW_IR_DUMP as an override"
+                    )
+
+            if member == "flydsl/utils/dump_support.py":
+                text = zf.read(member).decode("utf-8", errors="replace")
+                if "DUMP_SUPPORT = False" not in text or "def require_dump_support" not in text:
+                    violations.append(
+                        f"{wheel_path.name}: `{member}` must bake DUMP_SUPPORT = False for release wheels"
                     )
 
     return violations, summary

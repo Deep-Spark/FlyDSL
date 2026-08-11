@@ -26,6 +26,7 @@ from ..expr.typing import Constexpr, Stream
 from ..expr.utils.arith import fastmath as fastmath_ctx
 from ..utils import env, log
 from ..utils.file import atomic_write
+from ..utils.dump_support import require_dump_support
 from ..utils.release_guard import assert_ir_dump_allowed
 from .ast_rewriter import ASTRewriter
 from .backends import compile_backend_name, get_backend
@@ -617,6 +618,7 @@ def _stage_label_from_fragment(fragment: str) -> str:
 
 def _dump_ir(stage: str, *, dump_dir: Path, asm: str) -> Path:
     """Write one compilation stage's MLIR assembly to a .mlir file."""
+    require_dump_support(feature="FLYDSL_DUMP_IR")
     assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR")
     dump_dir.mkdir(parents=True, exist_ok=True)
     out = dump_dir / f"{stage}.mlir"
@@ -678,6 +680,7 @@ def _dump_isa(*, dump_dir: Path, ctx: ir.Context, asm: str, verify: bool, stage_
     main compilation is not affected.  The raw ISA text is extracted from the
     MLIR ``assembly = "..."`` attribute and written as a clean ``.s`` file.
     """
+    require_dump_support(feature="FLYDSL_DUMP_IR (ISA dump)")
     assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR (ISA dump)")
     try:
         mod = ir.Module.parse(asm, context=ctx)
@@ -901,6 +904,7 @@ class MlirCompiler:
                     next_stage += 1
 
                 if llir is not None:
+                    require_dump_support(feature="FLYDSL_DUMP_IR (LLVM IR dump)")
                     assert_ir_dump_allowed(feature="FLYDSL_DUMP_IR (LLVM IR dump)")
                     ll_name = f"{next_stage:02d}_llvm_ir"
                     (dump_dir / f"{ll_name}.ll").write_text(llir, encoding="utf-8")

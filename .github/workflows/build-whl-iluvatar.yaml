@@ -97,6 +97,7 @@ jobs:
                   FLY_REBUILD=0 \
                   FLY_BUILD_DIR="${build_dir}" \
                   MLIR_PATH="${MLIR_PREFIX}" \
+                  FLYDSL_RELEASE_STRIP_DUMP=1 \
                   python setup.py bdist_wheel
                 deactivate
               done
