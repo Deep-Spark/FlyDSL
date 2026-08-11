@@ -10,6 +10,7 @@ attention, Gemma-2 softcap, packed varlen self-attention via ``cu_seqlens``,
 and paged KV via ``block_table``. Dense path also supports mutually exclusive
 ``alibi_slopes`` / ``score_bias`` additive logits (V2-4). Optional
 ``tile_config`` selects ``block_m``/``block_n`` in ``{32,64}`` (default 64x64).
+Optional ``return_lse`` writes natural-log row LSE for backward (dense-only).
 """
 
 import math
@@ -475,6 +476,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     has_score_bias: bool = False,
     block_m: int = BLOCK_M,
     block_n: int = BLOCK_N,
+    return_lse: bool = False,
 ) -> Callable:
     """Compile the flex-attention forward launcher.
 
@@ -673,6 +675,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     # NaN under ``fastmath=fast`` (NInf/AFN).
     NEG_LARGE_F = -60.0
     LOG2E = 1.4426950408889634
+    LN2 = math.log(2.0)
+    NEG_INF_F = float("-inf")
     scale_log2e = float(sm_scale_f32) * LOG2E
     shuffle_steps = int(math.log2(TCU_LANE_COLS))
     has_softcap = softcap is not None
@@ -682,6 +686,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     use_unfused_scale = bool(has_softcap) or bool(has_bias)
     softcap_f32 = float(softcap) if has_softcap else 0.0
     window_size_i = int(window_size) if has_swa else 0
+    do_return_lse = bool(return_lse)
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def flex_attn_kernel(
@@ -689,6 +694,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         K: fx.Tensor,
         V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
+        LSE: fx.Tensor,
         CuSeqLen: fx.Tensor,
         SeqLens: fx.Tensor,
         AlibiSlopes: fx.Tensor,
@@ -783,6 +789,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             K_bh = fx.make_view(k_ptr, fx.make_layout((Skv_phys, D), (k_row_stride, 1)))
             O_bh = fx.make_view(o_ptr, fx.make_layout((Sq_phys, D), (o_row_stride, 1)))
             V_bh = fx.make_view(v_ptr, fx.make_layout((D, Skv_phys), (v_row_stride_r, 1)))
+            # return_lse is dense-only; placeholder keeps SSA defined.
+            LSE_bh = fx.make_view(fx.get_iter(LSE), fx.make_layout((1,), (1,)))
         elif fx.const_expr(paged):
             bt_view = fx.make_view(
                 fx.get_iter(CuSeqLen),
@@ -812,6 +820,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             K_bh = Q_bh
             V_bh = Q_bh
             v_row_stride_r = fx.Int32(v_row_stride)
+            LSE_bh = fx.make_view(fx.get_iter(LSE), fx.make_layout((1,), (1,)))
         else:
             c_skv_logical = fx.Int32(Skv)
             c_causal_delta = fx.Int32(0)
@@ -840,6 +849,14 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             V_bh = fx.slice(V_view, (b_idx, hkv_idx, None, None))
             O_bh = fx.slice(O_view, (b_idx, h_idx, None, None))
             v_row_stride_r = fx.Int32(v_row_stride)
+            if fx.const_expr(do_return_lse):
+                LSE_view = fx.make_view(
+                    fx.get_iter(LSE),
+                    fx.make_layout((B, H, Sq_phys), (H * Sq_phys, Sq_phys, 1)),
+                )
+                LSE_bh = fx.slice(LSE_view, (b_idx, h_idx, None))
+            else:
+                LSE_bh = fx.make_view(fx.get_iter(LSE), fx.make_layout((1,), (1,)))
 
         gQ = fx.slice(fx.flat_divide(Q_bh, (BLOCK_M, bk_qk)), (None, None, q_tile_idx, 0))
         if fx.const_expr(paged):
@@ -1563,7 +1580,34 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             fx.gpu.barrier()
             loop_results = yield m_new + l_new
 
+        c_ln2 = fx.Float32(LN2)
+        c_neg_inf = fx.Float32(NEG_INF_F)
+
         l_final = [loop_results[ROWS_PER_LANE + slot] for slot in range(ROWS_PER_LANE)]
+        m_final = [loop_results[slot] for slot in range(ROWS_PER_LANE)]
+
+        # Optional natural-log LSE: LSE = m_log2 * ln2 + ln(l). Dense-only.
+        if fx.const_expr(do_return_lse):
+            if active:
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    for ei in fx.range_constexpr(4):
+                        slot = mma_m * 4 + ei
+                        row = (
+                            warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
+                            + fx.Int32(mma_m * ATOM_M + ei * 4)
+                            + lane_row
+                        )
+                        q_row = q_start + row
+                        l_val = l_final[slot]
+                        m_val = m_final[slot]
+                        # Empty / fully-masked row -> -inf.
+                        lse_val = (l_val > c_zero_f).select(
+                            m_val * c_ln2 + fmath.log(l_val, fastmath=fm_fast),
+                            c_neg_inf,
+                        )
+                        if lane_col == fx.Int32(0):
+                            if q_row < fx.Int32(Sq_phys):
+                                fx.memref_store(lse_val, LSE_bh, q_row)
 
         # ---- Post-loop: normalise and write O -----------------------------
         # ``l_final`` is the last yielded rowsum pack. Element ``ei`` of an
@@ -1651,6 +1695,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         K: fx.Tensor,
         V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
+        LSE: fx.Tensor,
         CuSeqLen: fx.Tensor,
         SeqLens: fx.Tensor,
         AlibiSlopes: fx.Tensor,
@@ -1658,7 +1703,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         total_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        flex_attn_kernel(Q, K, V, O, CuSeqLen, SeqLens, AlibiSlopes, ScoreBias, total_tokens).launch(
+        flex_attn_kernel(Q, K, V, O, LSE, CuSeqLen, SeqLens, AlibiSlopes, ScoreBias, total_tokens).launch(
             grid=(B * H, num_q_tiles, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -1675,13 +1720,16 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         seq_lens_kv=None,
         alibi_slopes=None,
         score_bias=None,
+        lse=None,
         stream=fx.Stream(None),
     ):
         """Host entry: enforce shapes before the JIT launch.
 
         Dense: phys-padded BHSD; optional dense-only ``alibi_slopes`` ``[H]`` fp32
         or phys-padded ``score_bias`` ``[B,H,Sq_phys,Skv_phys]`` (mutually exclusive).
-        Varlen / paged contracts unchanged; alibi/score_bias rejected there.
+        When compiled with ``return_lse=True``, pass or allocate fp32
+        ``lse [B,H,Sq_phys]``; the launch returns that tensor. Varlen / paged
+        contracts unchanged; alibi/score_bias / return_lse rejected there.
         """
         q_shape = _tensor_shape(Q)
         k_shape = _tensor_shape(K)
@@ -1693,7 +1741,13 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             sb = score_bias if score_bias is not None else O
             return ali, sb
 
+        def _lse_placeholder():
+            # Unused when return_lse=False (kernel builds a 1-element view).
+            return O if lse is None else lse
+
         if varlen:
+            if do_return_lse:
+                raise ValueError("return_lse is dense-only (not supported with varlen)")
             if cu_seqlens is None or seq_lens is None:
                 raise ValueError("varlen launch requires cu_seqlens [B+1] and seq_lens [B] (int32)")
             if alibi_slopes is not None or score_bias is not None:
@@ -1724,9 +1778,14 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                     f"varlen total_tokens (V leading dim) must be a multiple of 32 for SME G2S, got {total}"
                 )
             ali, sb = _bias_placeholders()
-            return launch_flex_attn(Q, K, V, O, cu_seqlens, seq_lens, ali, sb, fx.Int32(total), stream=stream)
+            launch_flex_attn(
+                Q, K, V, O, _lse_placeholder(), cu_seqlens, seq_lens, ali, sb, fx.Int32(total), stream=stream
+            )
+            return None
 
         if paged:
+            if do_return_lse:
+                raise ValueError("return_lse is dense-only (not supported with paged)")
             if block_table is None or seq_lens_kv is None:
                 raise ValueError("paged launch requires block_table [B, max_num_pages] and seq_lens_kv [B] (int32)")
             if alibi_slopes is not None or score_bias is not None:
@@ -1753,7 +1812,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             if k_shape[0] != v_shape[0]:
                 raise ValueError(f"paged K/V NumBlocks mismatch: K={k_shape[0]}, V={v_shape[0]}")
             ali, sb = _bias_placeholders()
-            return launch_flex_attn(Q, K, V, O, block_table, seq_lens_kv, ali, sb, fx.Int32(0), stream=stream)
+            launch_flex_attn(
+                Q, K, V, O, _lse_placeholder(), block_table, seq_lens_kv, ali, sb, fx.Int32(0), stream=stream
+            )
+            return None
 
         expect_q = (B, H, Sq_phys, D)
         expect_k = (B, Hkv, Skv_phys, D)
@@ -1792,7 +1854,21 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             raise ValueError("score_bias passed but kernel compiled without has_score_bias=True")
 
         ali, sb = _bias_placeholders()
-        return launch_flex_attn(Q, K, V, O, O, O, ali, sb, fx.Int32(0), stream=stream)
+        if do_return_lse:
+            if lse is None:
+                import torch
+
+                lse_tensor = torch.empty(B, H, Sq_phys, device=Q.device, dtype=torch.float32)
+            else:
+                lse_shape = _tensor_shape(lse)
+                expect_lse = (B, H, Sq_phys)
+                if lse_shape != expect_lse:
+                    raise ValueError(f"lse shape must be {expect_lse}, got {lse_shape}")
+                lse_tensor = lse
+        else:
+            lse_tensor = _lse_placeholder()
+        launch_flex_attn(Q, K, V, O, lse_tensor, O, O, ali, sb, fx.Int32(0), stream=stream)
+        return lse_tensor if do_return_lse else None
 
     return launch_flex_attn_checked
 
@@ -1861,6 +1937,7 @@ def compile_iluvatar_flex_attention(
     has_alibi: bool = False,
     has_score_bias: bool = False,
     tile_config: Mapping[str, int] | None = None,
+    return_lse: bool = False,
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
@@ -1924,9 +2001,13 @@ def compile_iluvatar_flex_attention(
             Mutually exclusive with ``has_alibi``; not supported with varlen/paged.
         tile_config: Optional ``{"block_m": int, "block_n": int}`` with values
             in ``{32, 64}``. Default is ``64x64``. Paged requires ``block_n=64``.
+        return_lse: Dense-only. If True, launch writes fp32 ``LSE [B,H,Sq_phys]``
+            in natural log (``m_log2 * ln2 + ln(l)``) and returns that tensor.
 
     Returns:
-        Dense: ``launch_fn(Q, K, V, O, stream=None, alibi_slopes=..., score_bias=...)``.
+        Dense: ``launch_fn(Q, K, V, O, stream=None, alibi_slopes=..., score_bias=...,
+        lse=...)``. When ``return_lse=True``, returns the LSE tensor (allocates
+        if ``lse`` omitted); otherwise returns ``None``.
         Varlen: ``launch_fn(Q, K, V, O, cu_seqlens=..., seq_lens=..., stream=None)``.
         Paged: ``launch_fn(Q, K, V, O, block_table=..., seq_lens_kv=..., stream=None)``.
     """
@@ -1939,6 +2020,8 @@ def compile_iluvatar_flex_attention(
         raise ValueError("alibi_slopes and score_bias are mutually exclusive")
     if (has_alibi or has_score_bias) and (varlen or paged):
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
+    if return_lse and (varlen or paged):
+        raise ValueError("return_lse is dense-only (not supported with varlen/paged)")
 
     block_m, block_n = _normalize_tile_config(tile_config, paged=bool(paged))
 
@@ -1980,6 +2063,7 @@ def compile_iluvatar_flex_attention(
         has_score_bias=has_score_bias,
         block_m=block_m,
         block_n=block_n,
+        return_lse=return_lse,
     )
 
 
