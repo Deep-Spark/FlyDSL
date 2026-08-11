@@ -13,6 +13,9 @@ gpucore.*
 # IR dumps
 my_ir_dumps*/
 
+# Perf-daily materialised suite configs (FLYDSL_PERF_CONFIG_PATH)
+.perf/
+
 # git 
 *.log
 *.diff

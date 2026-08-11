@@ -592,9 +592,102 @@ def test_iluvatar_flex_attention_package_export():
 
 # --- Perf (opt-in; consumed by perf-daily-iluvatar) ----------------------------
 
+# Fallback when FLYDSL_PERF_CONFIG_PATH is unset. Keep in sync with
+# ``iluvatar_flex_attention.params.perf_config`` in
+# ``.github/perf-kernels-iluvatar.json`` so daily trend keys stay stable.
+_DEFAULT_FLEX_ATTN_PERF_CONFIG = {
+    "shape": {"B": 2, "H": 32, "Hkv": 8, "Sq": 4096, "Skv": 4096, "D": 128},
+    "warmup": 5,
+    "iters": 10,
+    "cases": [
+        {"name": "causal", "is_causal": True, "window_size": None, "softcap": None, "dtype": "bf16"},
+        {"name": "causal", "is_causal": True, "window_size": None, "softcap": None, "dtype": "f16"},
+        {
+            "name": "causal_swa1024",
+            "is_causal": True,
+            "window_size": 1024,
+            "softcap": None,
+            "dtype": "bf16",
+        },
+        {
+            "name": "causal_swa1024",
+            "is_causal": True,
+            "window_size": 1024,
+            "softcap": None,
+            "dtype": "f16",
+        },
+        {
+            "name": "causal_softcap30",
+            "is_causal": True,
+            "window_size": None,
+            "softcap": 30.0,
+            "dtype": "bf16",
+        },
+        {
+            "name": "causal_softcap30",
+            "is_causal": True,
+            "window_size": None,
+            "softcap": 30.0,
+            "dtype": "f16",
+        },
+    ],
+}
+
+_FLEX_ATTN_PERF_CONFIG_ENV = "FLYDSL_PERF_CONFIG_PATH"
+
+
+def _load_flex_attn_perf_config() -> dict:
+    """Load suite ``perf_config`` from env path, else the hardcoded §3.3 six cases."""
+    path = os.environ.get(_FLEX_ATTN_PERF_CONFIG_ENV, "").strip()
+    if not path:
+        return dict(_DEFAULT_FLEX_ATTN_PERF_CONFIG)
+    cfg_path = Path(path)
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"{_FLEX_ATTN_PERF_CONFIG_ENV} does not exist: {path}")
+    with cfg_path.open(encoding="utf-8") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{_FLEX_ATTN_PERF_CONFIG_ENV} must point to a JSON object, got {type(cfg)}")
+    return cfg
+
+
+def _parse_flex_attn_perf_cases(cfg: dict):
+    shape = cfg.get("shape") or {}
+    if not isinstance(shape, dict):
+        raise ValueError("perf_config.shape must be an object")
+    required = ("B", "H", "Hkv", "Sq", "Skv", "D")
+    missing = [k for k in required if k not in shape]
+    if missing:
+        raise ValueError(f"perf_config.shape missing keys: {missing}")
+    B = int(shape["B"])
+    H = int(shape["H"])
+    Hkv = int(shape["Hkv"])
+    Sq = int(shape["Sq"])
+    Skv = int(shape["Skv"])
+    D = int(shape["D"])
+
+    raw_cases = cfg.get("cases")
+    if not isinstance(raw_cases, list) or not raw_cases:
+        raise ValueError("perf_config.cases must be a non-empty list")
+    cases = []
+    for i, case in enumerate(raw_cases):
+        if not isinstance(case, dict):
+            raise ValueError(f"perf_config.cases[{i}] must be an object")
+        name = str(case["name"])
+        is_causal = bool(case.get("is_causal", False))
+        window_size = case.get("window_size", None)
+        if window_size is not None:
+            window_size = int(window_size)
+        softcap = case.get("softcap", None)
+        if softcap is not None:
+            softcap = float(softcap)
+        dtype_str = str(case["dtype"])
+        cases.append((name, is_causal, window_size, softcap, dtype_str))
+    return B, H, Hkv, Sq, Skv, D, cases
+
 
 def test_iluvatar_flex_attention_perf(monkeypatch):
-    """Large-shape latency probe for daily trend (plan §3.3, six cases)."""
+    """Large-shape latency probe for daily trend (six cases by default)."""
     _require_perf_enabled()
     torch = _require_torch()
     # The kv loop is unrolled at trace time, so JIT compilation for these shapes
@@ -603,20 +696,15 @@ def test_iluvatar_flex_attention_perf(monkeypatch):
     _configure_iluvatar_env(monkeypatch, enable_cache=True)
     mod = _require_flex_attn_module()
 
-    # warmup must stay >= 1: the first launch triggers JIT compilation, which
-    # would otherwise dominate the reported latency.
-    warmup = max(1, int(os.environ.get("FLYDSL_ILUVATAR_FLEX_ATTN_PERF_WARMUP", "5")))
-    iters = int(os.environ.get("FLYDSL_ILUVATAR_FLEX_ATTN_PERF_ITERS", "10"))
+    cfg = _load_flex_attn_perf_config()
+    B, H, Hkv, Sq, Skv, D, cases = _parse_flex_attn_perf_cases(cfg)
 
-    B, H, Hkv, Sq, Skv, D = 2, 32, 8, 4096, 4096, 128
-    cases = (
-        ("causal", True, None, None, "bf16"),
-        ("causal", True, None, None, "f16"),
-        ("causal_swa1024", True, 1024, None, "bf16"),
-        ("causal_swa1024", True, 1024, None, "f16"),
-        ("causal_softcap30", True, None, 30.0, "bf16"),
-        ("causal_softcap30", True, None, 30.0, "f16"),
-    )
+    # warmup must stay >= 1: the first launch triggers JIT compilation, which
+    # would otherwise dominate the reported latency. Env overrides win over json.
+    warmup_default = int(cfg.get("warmup", 5))
+    iters_default = int(cfg.get("iters", 10))
+    warmup = max(1, int(os.environ.get("FLYDSL_ILUVATAR_FLEX_ATTN_PERF_WARMUP", str(warmup_default))))
+    iters = int(os.environ.get("FLYDSL_ILUVATAR_FLEX_ATTN_PERF_ITERS", str(iters_default)))
 
     Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
     Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
