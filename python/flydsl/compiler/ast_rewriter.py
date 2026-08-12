@@ -153,6 +153,38 @@ def _pack_states(slots, exemplar):
     return construct_from_ir_values(type(exemplar), exemplar, list(slots))
 
 
+def _clone_mutable_state(value, memo=None):
+    """Clone mutable container structure while preserving DSL/IR leaves."""
+    if memo is None:
+        memo = {}
+
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+
+    if isinstance(value, list):
+        result = []
+        memo[value_id] = result
+        result.extend(_clone_mutable_state(item, memo) for item in value)
+        return result
+    if isinstance(value, dict):
+        result = {}
+        memo[value_id] = result
+        result.update((key, _clone_mutable_state(item, memo)) for key, item in value.items())
+        return result
+    if isinstance(value, types.SimpleNamespace):
+        result = types.SimpleNamespace()
+        memo[value_id] = result
+        for key, item in vars(value).items():
+            setattr(result, key, _clone_mutable_state(item, memo))
+        return result
+    if isinstance(value, tuple):
+        result = tuple(_clone_mutable_state(item, memo) for item in value)
+        memo[value_id] = result
+        return result
+    return value
+
+
 def _collect_assigned_vars(body_stmts, active_symbols, orelse_stmts=None, test_expr=None):
     write_args = []
     invoked_args = []
@@ -738,9 +770,11 @@ class ReplaceIfWithDispatch(Transformer):
 
         def _emit_branch(fn, block, label):
             with ir.InsertionPoint(block):
-                branch_result = ReplaceIfWithDispatch._call_branch(fn, result_names, result_values)
+                branch_inputs = _clone_mutable_state(result_values)
+                branch_result = ReplaceIfWithDispatch._call_branch(fn, result_names, branch_inputs)
+                branch_map = dict(zip(result_names, branch_inputs))
                 branch_values = ReplaceIfWithDispatch._normalize_branch_result(
-                    branch_result, result_names, result_map, label
+                    branch_result, result_names, branch_map, label
                 )
                 scf.YieldOp(
                     _unpack_branch_outputs(result_names, branch_values, exemplar, label),
