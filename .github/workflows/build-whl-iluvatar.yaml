@@ -38,7 +38,10 @@ jobs:
       wheel_names: ${{ steps.collect.outputs.wheel_names }}
     env:
       COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
-      IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
+      # Release wheels must link against the dump-hardened IXCC install (patched
+      # disable-dump-ir-asm tree), not the daily working toolchain used by
+      # ci-device / perf.
+      IXCC_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -52,6 +55,26 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Preflight release IXCC toolchain
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake" ]]; then
+            echo "::error::Release IXCC MLIR missing at ${IXCC_MLIR_CMAKE}."
+            echo "::error::Build sdk/ixcc-release (disable-dump-ir-asm) first, or set vars.IXCC_RELEASE_MLIR_CMAKE."
+            echo "::error::Helper: bash .github/scripts/prepare_ix_toolchain_release.sh"
+            exit 1
+          fi
+          IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
+          echo "IXCC_RELEASE_MLIR_CMAKE=${IXCC_MLIR_CMAKE}"
+          echo "IXCC_RELEASE_ROOT=${IXCC_ROOT}"
+          if [[ -d "${IXCC_ROOT}/.git" || -e "${IXCC_ROOT}/.git" ]]; then
+            echo "IXCC_RELEASE_COMMIT=$(git -C "${IXCC_ROOT}" rev-parse --short HEAD)"
+            git -C "${IXCC_ROOT}" log -1 --oneline || true
+          fi
+          if [[ -f "${IXCC_ROOT}/.flydsl_ixcc_build_commit" ]]; then
+            echo "IXCC_RELEASE_STAMP=$(tr '\n' ' ' < "${IXCC_ROOT}/.flydsl_ixcc_build_commit")"
+          fi
 
       - name: Build A-track wheels in container
         env:
