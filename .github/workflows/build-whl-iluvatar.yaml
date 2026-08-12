@@ -66,6 +66,11 @@ jobs:
             exit 1
           fi
           IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
+          if [[ ! -d "${IXCC_ROOT}/build/tools/mlir/python_packages/mlir_core" ]]; then
+            echo "::error::Release IXCC was built without MLIR Python bindings."
+            echo "::error::Rebuild with -DMLIR_ENABLE_BINDINGS_PYTHON=ON (see prepare_ix_toolchain_release.sh)."
+            exit 1
+          fi
           echo "IXCC_RELEASE_MLIR_CMAKE=${IXCC_MLIR_CMAKE}"
           echo "IXCC_RELEASE_ROOT=${IXCC_ROOT}"
           if [[ -d "${IXCC_ROOT}/.git" || -e "${IXCC_ROOT}/.git" ]]; then

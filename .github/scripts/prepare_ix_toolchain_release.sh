@@ -43,6 +43,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 MARKER="${IXCC_RELEASE_ROOT}/build/lib/cmake/mlir/MLIRConfig.cmake"
+PYTHON_MARKER="${IXCC_RELEASE_ROOT}/build/tools/mlir/python_packages/mlir_core"
 STAMP="${IXCC_RELEASE_ROOT}/.flydsl_ixcc_build_commit"
 
 if [[ ! -d "${IXCC_WORKING_ROOT}/.git" ]]; then
@@ -67,6 +68,9 @@ need_build=0
 if [[ "${FORCE_REBUILD}" == "1" ]]; then
   need_build=1
 elif [[ ! -f "${MARKER}" ]]; then
+  need_build=1
+elif [[ ! -d "${PYTHON_MARKER}" ]]; then
+  echo "[ixcc-release] MLIR Python bindings package missing; rebuilding"
   need_build=1
 elif [[ -f "${STAMP}" ]]; then
   stamped="$(head -n1 "${STAMP}" | tr -d '[:space:]')"
@@ -102,7 +106,9 @@ cmake -S "${IXCC_RELEASE_ROOT}/llvm" \
   -DCMAKE_CXX_STANDARD=17 \
   -DLLVM_INCLUDE_TESTS=OFF \
   -DCLANG_INCLUDE_TESTS=OFF \
-  -DMLIR_INCLUDE_TESTS=OFF
+  -DMLIR_INCLUDE_TESTS=OFF \
+  -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+  -DPython3_EXECUTABLE="$(command -v python3)"
 
 cmake --build "${IXCC_RELEASE_ROOT}/build" -j"$(nproc)"
 
@@ -114,6 +120,11 @@ short="$(git -C "${IXCC_RELEASE_ROOT}" rev-parse --short HEAD)"
 
 if [[ ! -f "${MARKER}" ]]; then
   echo "::error::build finished but marker missing: ${MARKER}"
+  exit 1
+fi
+if [[ ! -d "${PYTHON_MARKER}" ]]; then
+  echo "::error::build finished but MLIR Python package missing: ${PYTHON_MARKER}"
+  echo "::error::Ensure -DMLIR_ENABLE_BINDINGS_PYTHON=ON and Python3 Development.Module are available."
   exit 1
 fi
 
