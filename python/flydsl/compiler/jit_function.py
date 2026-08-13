@@ -5,6 +5,7 @@ import ctypes
 import fcntl
 import hashlib
 import inspect
+import io
 import os
 import pickle
 import pkgutil
@@ -797,7 +798,13 @@ class MlirCompiler:
         backend = get_backend(arch=arch)
 
         compile_hints = CompilationContext.get_compile_hints()
-        module = ir.Module.parse(module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info))
+        # Re-parse the traced module so the pipeline mutates a private tree.
+        # A bytecode round-trip keeps the normal compile path off the MLIR text
+        # printer/parser; unlike the previous text round-trip it preserves
+        # locations even when env.debug.enable_debug_info is off.
+        _bytecode_buf = io.BytesIO()
+        module.operation.write_bytecode(_bytecode_buf)
+        module = ir.Module.parse(_bytecode_buf.getvalue())
         backend.lower_compile_hints(module, compile_hints=compile_hints)
         cfg = _pipeline_fragments_for_mode(backend, compile_hints=compile_hints)
         fragments = cfg.fragments
@@ -1533,7 +1540,11 @@ class JitFunction:
                                         self.func(**named_args)
                                 func.ReturnOp([])
 
-                    original_ir = module.operation.get_asm(enable_debug_info=True)
+                    # Capture lazily: compile() never mutates the traced module
+                    # (it re-parses its own copy first), so only pay the text
+                    # printing cost when source_ir is actually inspected or the
+                    # artifact is pickled to the disk cache.
+                    original_ir = lambda: module.operation.get_asm(enable_debug_info=True)
 
                     # Extern-symbol integration is carried entirely via
                     # CompilationContext: each ExternFunction populates

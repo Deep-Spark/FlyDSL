@@ -3,11 +3,12 @@
 
 import ctypes
 import importlib
+import io
 import pickle
 import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from .._mlir import ir
 from .._mlir.execution_engine import ExecutionEngine
@@ -219,12 +220,18 @@ class CompiledArtifact:
         self,
         compiled_module: ir.Module,
         func_name: str,
-        source_ir: Optional[str] = None,
+        source_ir: Optional[Union[str, Callable[[], str]]] = None,
         post_load_processors: Optional[List[Callable]] = None,
         link_libs: Optional[List[str]] = None,
         uses_explicit_module: bool = False,
     ):
-        self._ir_text = str(compiled_module)
+        # Store the compiled module as MLIR bytecode rather than printed text:
+        # cheaper to produce, and ir.Module.parse() transparently detects the
+        # bytecode magic on load. Legacy disk-cache entries may still hand us
+        # printed text (str) via __setstate__; both forms are accepted.
+        buf = io.BytesIO()
+        compiled_module.operation.write_bytecode(buf)
+        self._ir_blob = buf.getvalue()
         self._entry = func_name
         self._source_ir = source_ir
         self._post_load_processors = post_load_processors or []
@@ -272,16 +279,17 @@ class CompiledArtifact:
                 "path for it."
             )
         return {
-            "ir_text": self._ir_text,
+            "ir_text": self._ir_blob,
             "entry": self._entry,
-            "source_ir": self._source_ir,
+            "source_ir": self._resolve_source_ir(),
             "processor_refs": refs,
             "link_libs": self._link_libs,
             "uses_explicit_module": self._uses_explicit_module,
         }
 
     def __setstate__(self, state):
-        self._ir_text = state["ir_text"]
+        # str = legacy printed-text cache entry; bytes = MLIR bytecode.
+        self._ir_blob = state["ir_text"]
         self._entry = state["entry"]
         self._source_ir = state["source_ir"]
         self._link_libs = state.get("link_libs", [])
@@ -316,7 +324,7 @@ class CompiledArtifact:
 
             ctx = _create_mlir_context()
             with ctx:
-                module = ir.Module.parse(self._ir_text)
+                module = ir.Module.parse(self._ir_blob)
                 engine = ExecutionEngine(
                     module,
                     opt_level=3,
@@ -368,20 +376,40 @@ class CompiledArtifact:
             print("=" * 60)
             print("Compiled MLIR IR:")
             print("=" * 60)
-            print(self._ir_text)
+            print(self.ir)
         else:
-            if self._source_ir is None:
+            source_ir = self._resolve_source_ir()
+            if source_ir is None:
                 print("Original IR not available")
             else:
                 print("=" * 60)
                 print("Original MLIR IR:")
                 print("=" * 60)
-                print(self._source_ir)
+                print(source_ir)
+
+    def _ir_as_text(self) -> str:
+        """Decode the compiled module to printed text (debug/inspection only)."""
+        if isinstance(self._ir_blob, str):
+            return self._ir_blob
+        from .jit_function import _create_mlir_context
+
+        ctx = _create_mlir_context()
+        with ctx:
+            return str(ir.Module.parse(self._ir_blob, context=ctx))
+
+    def _resolve_source_ir(self) -> Optional[str]:
+        """Materialise a lazily-captured source IR snapshot, caching the result."""
+        if callable(self._source_ir):
+            try:
+                self._source_ir = self._source_ir()
+            except Exception:
+                self._source_ir = None
+        return self._source_ir
 
     @property
     def ir(self) -> str:
-        return self._ir_text
+        return self._ir_as_text()
 
     @property
     def source_ir(self) -> str:
-        return self._source_ir
+        return self._resolve_source_ir()
