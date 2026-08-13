@@ -945,6 +945,10 @@ class ComposedLayout(BuiltinDslType):
 
 @ir.register_value_caster(PointerType.static_typeid, replace=True)
 class Pointer(BuiltinDslType):
+    # Element stores mutate referenced storage; control-flow lowering may share
+    # this handle when the Python name itself is not rebound.
+    __flydsl_reference_semantics__ = True
+
     @property
     def element_type(self):
         return Numeric.from_ir_type(self.type.element_type)
@@ -1011,6 +1015,9 @@ class Pointer(BuiltinDslType):
 @ir.register_value_caster(MemRefType.static_typeid, replace=True)
 @ir.register_value_caster(CoordTensorType.static_typeid, replace=True)
 class Tensor(BuiltinDslType):
+    # See Pointer.__flydsl_reference_semantics__.
+    __flydsl_reference_semantics__ = True
+
     @property
     def element_type(self):
         if isinstance(self.type, CoordTensorType):
@@ -2069,6 +2076,8 @@ class Array:
     _cache: dict[tuple, type] = {}
 
     class _Base:
+        __flydsl_reference_semantics__ = True
+
         dtype = None
         size = None
         align = None

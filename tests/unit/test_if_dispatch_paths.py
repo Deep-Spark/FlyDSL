@@ -29,6 +29,21 @@ d += 1
     assert assigned == ["a", "b", "c", "d"]
 
 
+def test_collect_assigned_vars_distinguishes_mutation_from_rebinding():
+    code = """
+tensor[index] = value
+sink.store(value)
+other = replacement
+mixed[index] = value
+mixed = replacement
+"""
+    stmts = ast.parse(code).body
+    active_symbols = [{"tensor", "sink", "index", "value", "other", "replacement", "mixed"}]
+    assigned, rebound = _collect_assigned_vars(stmts, active_symbols, return_rebound=True)
+    assert assigned == ["tensor", "other", "mixed", "sink"]
+    assert rebound == ["other", "mixed"]
+
+
 def test_collect_assigned_vars_supports_annassign_walrus_with_except_for():
     code = """
 x: int = 1

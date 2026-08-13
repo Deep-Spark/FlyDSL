@@ -185,9 +185,82 @@ def _clone_mutable_state(value, memo=None):
     return value
 
 
-def _collect_assigned_vars(body_stmts, active_symbols, orelse_stmts=None, test_expr=None):
+def _is_storage_ref(value):
+    """True when ``value`` is a shared storage handle, not SSA-carried state.
+
+    Types opt in with ``__flydsl_reference_semantics__`` (``Tensor``, ``Pointer``,
+    ``Array``). Element stores such as ``x[i] = v`` mutate referenced storage and
+    must not become scf results / iter_args unless the Python name is rebound.
+    This check is name-level; storage refs nested in list/dict/namespace are not
+    filtered. Python value containers still need SSA carry + branch clones.
+    """
+    return bool(getattr(type(value), "__flydsl_reference_semantics__", False))
+
+
+def _as_name_tuple(names):
+    if not names:
+        return ()
+    if isinstance(names, str):
+        return (names,)
+    return tuple(names)
+
+
+def _split_storage_and_carried(result_names, result_values, rebound_names=()):
+    """Partition control-flow state into SSA-carried values vs shared storage refs."""
+    rebound_names = frozenset(_as_name_tuple(rebound_names))
+    carried_names = []
+    carried_values = []
+    storage_map = {}
+    for name, value in zip(result_names, result_values):
+        # A storage handle is shared only for mutation-only uses (x[i] = v,
+        # x.store(v), ...). A real name assignment (x = other) must still be
+        # represented as SSA state even when the entry value is a storage ref.
+        if name not in rebound_names and _is_storage_ref(value):
+            storage_map[name] = value
+        else:
+            carried_names.append(name)
+            carried_values.append(value)
+    return tuple(carried_names), tuple(carried_values), storage_map
+
+
+def _merge_storage_and_carried(result_names, carried_names, carried_values, storage_map):
+    """Rebuild the full name order, splicing shared storage refs back in."""
+    carried_map = dict(zip(carried_names, carried_values))
+    return [storage_map[name] if name in storage_map else carried_map[name] for name in result_names]
+
+
+def _select_named_values(selected_names, all_names, all_values):
+    value_map = dict(zip(all_names, all_values))
+    return [value_map[name] for name in selected_names]
+
+
+def _check_storage_not_rebound(result_names, branch_values, storage_map, label):
+    """Reject a branch that rebinds a name the dispatcher kept as shared storage.
+
+    The rewriter derives ``rebound_names`` from the source, but the dispatchers
+    are also called directly. Without this check an omitted ``rebound_names``
+    would drop the new binding silently instead of failing.
+    """
+    for name, value in zip(result_names, branch_values):
+        if name in storage_map and value is not storage_map[name]:
+            raise TypeError(
+                f"{label} rebinds '{name}', but the dispatcher was told '{name}' is only "
+                f"mutated in place and may stay shared across regions. Pass "
+                f"rebound_names including '{name}' so it is carried as scf state."
+            )
+
+
+def _collect_assigned_vars(
+    body_stmts,
+    active_symbols,
+    orelse_stmts=None,
+    test_expr=None,
+    *,
+    return_rebound=False,
+):
     write_args = []
     invoked_args = []
+    rebound_args = []
 
     def add_unique(items, name):
         if isinstance(name, str) and name not in items:
@@ -209,7 +282,10 @@ def _collect_assigned_vars(body_stmts, active_symbols, orelse_stmts=None, test_e
             return None
 
         def visit_Name(self, node):
-            if isinstance(node.ctx, ast.Store) or self.force_store:
+            if isinstance(node.ctx, ast.Store):
+                add_unique(write_args, node.id)
+                add_unique(rebound_args, node.id)
+            elif self.force_store:
                 add_unique(write_args, node.id)
 
         def visit_Subscript(self, node):
@@ -222,6 +298,12 @@ def _collect_assigned_vars(body_stmts, active_symbols, orelse_stmts=None, test_e
                 self.generic_visit(node)
 
         def visit_Assign(self, node):
+            if getattr(node, _ASTREWRITE_MARKER, None) is not None:
+                # A nested control-flow rewrite assigns dispatch results back to
+                # every analyzed name. That assignment is compiler plumbing, not
+                # evidence that the user's source rebound a mutation-only handle.
+                self.visit(node.value)
+                return
             self.force_store = True
             for target in node.targets:
                 self.visit(target)
@@ -251,7 +333,11 @@ def _collect_assigned_vars(body_stmts, active_symbols, orelse_stmts=None, test_e
     invoked_args = [name for name in invoked_args if name not in write_args]
     write_args = [name for name in write_args if in_active_symbols(name)]
     invoked_args = [name for name in invoked_args if in_active_symbols(name)]
-    return write_args + invoked_args
+    result_names = write_args + invoked_args
+    rebound_args = [name for name in rebound_args if name in result_names]
+    if return_rebound:
+        return result_names, rebound_args
+    return result_names
 
 
 def _check_local_var(name, local_vars):
@@ -706,6 +792,7 @@ class ReplaceIfWithDispatch(Transformer):
         *,
         result_names=(),
         result_values=(),
+        rebound_names=(),
         state_names=(),
         state_values=(),
         auto_else=False,
@@ -736,7 +823,11 @@ class ReplaceIfWithDispatch(Transformer):
         if not isinstance(cond_i1, ir.Value):
             raise TypeError(f"dynamic if condition must lower to ir.Value, got {type(cond_i1).__name__}")
 
-        none_vars = [name for name, value in zip(result_names, result_values) if as_ir_value(value) is None]
+        carried_names, carried_values, storage_map = _split_storage_and_carried(
+            result_names, result_values, rebound_names
+        )
+
+        none_vars = [name for name, value in zip(carried_names, carried_values) if as_ir_value(value) is None]
         if none_vars:
             raise TypeError(
                 f"Variable(s) {none_vars} initialized as None before a dynamic "
@@ -747,25 +838,34 @@ class ReplaceIfWithDispatch(Transformer):
                 f"const_expr() if it is a compile-time constant."
             )
 
-        if not result_names:
+        if not carried_names:
             has_else = else_fn is not None
+            entry_map = dict(zip(result_names, result_values))
+
+            def _emit_storage_only_branch(fn, label):
+                branch_result = ReplaceIfWithDispatch._call_branch(fn, result_names, result_values)
+                branch_values = ReplaceIfWithDispatch._normalize_branch_result(
+                    branch_result, result_names, entry_map, label
+                )
+                _check_storage_not_rebound(result_names, branch_values, storage_map, label)
+                scf.YieldOp([], loc=capture_user_location())
+
             if_op = scf.IfOp(cond_i1, [], has_else=has_else, loc=capture_user_location())
             with ir.InsertionPoint(if_op.regions[0].blocks[0]):
-                ReplaceIfWithDispatch._call_branch(then_fn, result_names, result_values)
-                scf.YieldOp([], loc=capture_user_location())
+                _emit_storage_only_branch(then_fn, "then-branch")
             if has_else:
                 if len(if_op.regions[1].blocks) == 0:
                     if_op.regions[1].blocks.append(*[])
                 with ir.InsertionPoint(if_op.regions[1].blocks[0]):
-                    ReplaceIfWithDispatch._call_branch(else_fn, result_names, result_values)
-                    scf.YieldOp([], loc=capture_user_location())
+                    _emit_storage_only_branch(else_fn, "else-branch")
             return ReplaceIfWithDispatch._pack_named_values(result_names, result_values)
 
         if else_fn is None:
             else_fn = lambda *args: {}
 
         # Unpack carried states to flat scf.if results; `exemplar` re-packs on exit.
-        exemplar, state_raw, result_types = _unpack_states(result_values)
+        # Storage refs stay shared across branches and are not scf results.
+        exemplar, state_raw, result_types = _unpack_states(carried_values)
         if_op = scf.IfOp(cond_i1, result_types, has_else=True, loc=capture_user_location())
 
         def _emit_branch(fn, block, label):
@@ -776,8 +876,10 @@ class ReplaceIfWithDispatch(Transformer):
                 branch_values = ReplaceIfWithDispatch._normalize_branch_result(
                     branch_result, result_names, branch_map, label
                 )
+                _check_storage_not_rebound(result_names, branch_values, storage_map, label)
+                carried_branch_values = _select_named_values(carried_names, result_names, branch_values)
                 scf.YieldOp(
-                    _unpack_branch_outputs(result_names, branch_values, exemplar, label),
+                    _unpack_branch_outputs(carried_names, carried_branch_values, exemplar, label),
                     loc=capture_user_location(),
                 )
 
@@ -786,7 +888,8 @@ class ReplaceIfWithDispatch(Transformer):
             if_op.regions[1].blocks.append(*[])
         _emit_branch(else_fn, if_op.regions[1].blocks[0], "else-branch")
 
-        final_values = _pack_states(if_op.results, exemplar)
+        final_carried = _pack_states(if_op.results, exemplar)
+        final_values = _merge_storage_and_carried(result_names, carried_names, final_carried, storage_map)
         return ReplaceIfWithDispatch._pack_named_values(result_names, final_values)
 
     @classmethod
@@ -818,7 +921,12 @@ class ReplaceIfWithDispatch(Transformer):
             ReplaceIfWithDispatch._counter += 1
 
             then_name = f"__then_{uid}"
-            result_names = _collect_assigned_vars(node.body, active_symbols_before_if, node.orelse)
+            result_names, rebound_names = _collect_assigned_vars(
+                node.body,
+                active_symbols_before_if,
+                node.orelse,
+                return_rebound=True,
+            )
 
             fn_args = [ast.arg(arg="__ret_names", annotation=None)] + [
                 ast.arg(arg=v, annotation=None) for v in result_names
@@ -862,6 +970,10 @@ class ReplaceIfWithDispatch(Transformer):
                                 elts=[_state_value_expr(v) for v in result_names],
                                 ctx=ast.Load(),
                             ),
+                        ),
+                        ast.keyword(
+                            arg="rebound_names",
+                            value=ast.Tuple(elts=[ast.Constant(value=v) for v in rebound_names], ctx=ast.Load()),
                         ),
                     ]
                 )
@@ -931,6 +1043,7 @@ class ReplaceIfWithDispatch(Transformer):
                 dispatch_stmt = ast.Expr(value=dispatch_value)
             dispatch_stmt = ast.copy_location(dispatch_stmt, node)
             dispatch_stmt = ast.fix_missing_locations(dispatch_stmt)
+            setattr(dispatch_stmt, _ASTREWRITE_MARKER, type(self).__name__)
             result.append(dispatch_stmt)
 
             return result
@@ -1035,7 +1148,16 @@ class InsertEmptyYieldForSCFFor(Transformer):
                 yield for_op.induction_variable
 
     @staticmethod
-    def scf_for_dispatch(start, stop, step, body_fn, *, result_names=(), result_values=()):
+    def scf_for_dispatch(
+        start,
+        stop,
+        step,
+        body_fn,
+        *,
+        result_names=(),
+        result_values=(),
+        rebound_names=(),
+    ):
         start_val = as_ir_value(start)
         stop_val = as_ir_value(stop)
         step_val = as_ir_value(step)
@@ -1056,8 +1178,11 @@ class InsertEmptyYieldForSCFFor(Transformer):
         result_names = tuple(result_names)
         result_values = tuple(result_values)
         result_map = {name: value for name, value in zip(result_names, result_values)}
+        carried_names, carried_values, storage_map = _split_storage_and_carried(
+            result_names, result_values, rebound_names
+        )
 
-        none_vars = [name for name, value in zip(result_names, result_values) if as_ir_value(value) is None]
+        none_vars = [name for name, value in zip(carried_names, carried_values) if as_ir_value(value) is None]
         if none_vars:
             raise TypeError(
                 f"Variable(s) {none_vars} initialized as None before a dynamic "
@@ -1067,20 +1192,27 @@ class InsertEmptyYieldForSCFFor(Transformer):
                 f"(e.g. fx.Int32(0), fx.Float32(0.0))."
             )
 
-        if not result_names:
+        if not carried_names:
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
-                body_fn(iv, result_names)
+                if result_names:
+                    body_result = body_fn(iv, result_names, *result_values)
+                    body_values = ReplaceIfWithDispatch._normalize_branch_result(
+                        body_result, result_names, result_map, "for-body"
+                    )
+                    _check_storage_not_rebound(result_names, body_values, storage_map, "for-body")
+                else:
+                    body_fn(iv, result_names)
                 scf.YieldOp([], loc=capture_user_location())
             return ReplaceIfWithDispatch._pack_named_values(result_names, result_values)
 
         # Unpack carried states to flat iter_args; `exemplar` re-packs body +
         # results. scf.for infers its result types from iter_args, so the flat
-        # types are unused here.
-        exemplar, state_raw, _ = _unpack_states(result_values)
+        # types are unused here. Storage refs are shared, not iter_args.
+        exemplar, state_raw, _ = _unpack_states(carried_values)
 
         loc = capture_user_location()
         for_op = scf.ForOp(start_val, stop_val, step_val, state_raw, loc=loc)
@@ -1089,19 +1221,23 @@ class InsertEmptyYieldForSCFFor(Transformer):
         with ir.InsertionPoint(for_op.body):
             iv = for_op.induction_variable
             # pack the flat inner_iter_args back into each name's container shape
-            inner_args = _pack_states(for_op.inner_iter_args, exemplar)
+            inner_carried = _pack_states(for_op.inner_iter_args, exemplar)
+            inner_args = _merge_storage_and_carried(result_names, carried_names, inner_carried, storage_map)
 
             body_result = body_fn(iv, result_names, *inner_args)
 
             body_values = ReplaceIfWithDispatch._normalize_branch_result(
                 body_result, result_names, result_map, "for-body"
             )
+            _check_storage_not_rebound(result_names, body_values, storage_map, "for-body")
+            carried_body_values = _select_named_values(carried_names, result_names, body_values)
             scf.YieldOp(
-                _unpack_branch_outputs(result_names, body_values, exemplar, "for-body"),
+                _unpack_branch_outputs(carried_names, carried_body_values, exemplar, "for-body"),
                 loc=capture_user_location(),
             )
 
-        final_values = _pack_states(for_op.results, exemplar)
+        final_carried = _pack_states(for_op.results, exemplar)
+        final_values = _merge_storage_and_carried(result_names, carried_names, final_carried, storage_map)
         return ReplaceIfWithDispatch._pack_named_values(result_names, final_values)
 
     @classmethod
@@ -1187,8 +1323,13 @@ class InsertEmptyYieldForSCFFor(Transformer):
             )
             active_symbols_before_for = list(active_symbols_before_for) + [{loop_carried_var_name}]
 
-        result_names = _collect_assigned_vars(node.body, active_symbols_before_for)
+        result_names, rebound_names = _collect_assigned_vars(
+            node.body,
+            active_symbols_before_for,
+            return_rebound=True,
+        )
         result_names = [n for n in result_names if n != iv_name]
+        rebound_names = [n for n in rebound_names if n != iv_name]
 
         body_name = f"__for_body_{uid}"
         fn_args = (
@@ -1247,6 +1388,10 @@ class InsertEmptyYieldForSCFFor(Transformer):
                             ctx=ast.Load(),
                         ),
                     ),
+                    ast.keyword(
+                        arg="rebound_names",
+                        value=ast.Tuple(elts=[ast.Constant(value=v) for v in rebound_names], ctx=ast.Load()),
+                    ),
                 ]
             )
 
@@ -1270,6 +1415,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
 
         dispatch_stmt = ast.copy_location(dispatch_stmt, node)
         dispatch_stmt = ast.fix_missing_locations(dispatch_stmt)
+        setattr(dispatch_stmt, _ASTREWRITE_MARKER, type(self).__name__)
 
         pre_stmts = []
         post_stmts = []
@@ -1374,13 +1520,23 @@ class CanonicalizeWhile(Transformer):
     _counter = 0
 
     @staticmethod
-    def scf_while_dispatch(before_fn, after_fn, *, result_names=(), result_values=()):
+    def scf_while_dispatch(
+        before_fn,
+        after_fn,
+        *,
+        result_names=(),
+        result_values=(),
+        rebound_names=(),
+    ):
         result_names, result_values = ReplaceIfWithDispatch._normalize_named_values(
             result_names, result_values, "result_names", "result_values"
         )
         result_map = {name: value for name, value in zip(result_names, result_values)}
+        carried_names, carried_values, storage_map = _split_storage_and_carried(
+            result_names, result_values, rebound_names
+        )
 
-        none_vars = [name for name, value in zip(result_names, result_values) if as_ir_value(value) is None]
+        none_vars = [name for name, value in zip(carried_names, carried_values) if as_ir_value(value) is None]
         if none_vars:
             raise TypeError(
                 f"Variable(s) {none_vars} initialized as None before a dynamic "
@@ -1391,10 +1547,31 @@ class CanonicalizeWhile(Transformer):
                 f"const_expr() if it is a compile-time constant."
             )
 
-        # Unpack carried states to the flat state before/after blocks carry;
-        # `exemplar` re-packs per block.
-        exemplar, state_raw, result_types = _unpack_states(result_values)
         loc = capture_user_location()
+        if not carried_names:
+            # Storage refs are shared across before/after; there is no loop-carried
+            # SSA state, matching the empty-result scf.if / scf.for paths.
+            while_op = scf.WhileOp([], [], loc=loc)
+            while_op.regions[0].blocks.append()
+            while_op.regions[1].blocks.append()
+            with ir.InsertionPoint(while_op.regions[0].blocks[0]):
+                before_cond = ReplaceIfWithDispatch._call_branch(before_fn, result_names, result_values)
+                cond_i1 = ReplaceIfWithDispatch._to_i1(before_cond)
+                if not isinstance(cond_i1, ir.Value):
+                    raise TypeError(f"dynamic while condition must lower to ir.Value, got {type(cond_i1).__name__}")
+                scf.ConditionOp(cond_i1, [], loc=capture_user_location())
+            with ir.InsertionPoint(while_op.regions[1].blocks[0]):
+                body_result = ReplaceIfWithDispatch._call_branch(after_fn, result_names, result_values)
+                body_values = ReplaceIfWithDispatch._normalize_branch_result(
+                    body_result, result_names, result_map, "while-body"
+                )
+                _check_storage_not_rebound(result_names, body_values, storage_map, "while-body")
+                scf.YieldOp([], loc=capture_user_location())
+            return ReplaceIfWithDispatch._pack_named_values(result_names, result_values)
+
+        # Unpack carried states to the flat state before/after blocks carry;
+        # `exemplar` re-packs per block. Storage refs are shared, not loop state.
+        exemplar, state_raw, result_types = _unpack_states(carried_values)
         while_op = scf.WhileOp(result_types, state_raw, loc=loc)
         # Give the loop-carried block arguments the user location.
         arg_locs = [loc] * len(result_types)
@@ -1403,7 +1580,8 @@ class CanonicalizeWhile(Transformer):
 
         with ir.InsertionPoint(while_op.regions[0].blocks[0]):
             before_args = list(while_op.regions[0].blocks[0].arguments)
-            wrapped_before = _pack_states(before_args, exemplar) if result_names else []
+            wrapped_carried = _pack_states(before_args, exemplar)
+            wrapped_before = _merge_storage_and_carried(result_names, carried_names, wrapped_carried, storage_map)
             before_cond = ReplaceIfWithDispatch._call_branch(before_fn, result_names, wrapped_before)
             cond_i1 = ReplaceIfWithDispatch._to_i1(before_cond)
             if not isinstance(cond_i1, ir.Value):
@@ -1412,23 +1590,21 @@ class CanonicalizeWhile(Transformer):
 
         with ir.InsertionPoint(while_op.regions[1].blocks[0]):
             after_args = list(while_op.regions[1].blocks[0].arguments)
-            wrapped_after = _pack_states(after_args, exemplar) if result_names else []
+            wrapped_carried = _pack_states(after_args, exemplar)
+            wrapped_after = _merge_storage_and_carried(result_names, carried_names, wrapped_carried, storage_map)
             body_result = ReplaceIfWithDispatch._call_branch(after_fn, result_names, wrapped_after)
-            if result_names:
-                body_values = ReplaceIfWithDispatch._normalize_branch_result(
-                    body_result, result_names, result_map, "while-body"
-                )
-                scf.YieldOp(
-                    _unpack_branch_outputs(result_names, body_values, exemplar, "while-body"),
-                    loc=capture_user_location(),
-                )
-            else:
-                scf.YieldOp([], loc=capture_user_location())
+            body_values = ReplaceIfWithDispatch._normalize_branch_result(
+                body_result, result_names, result_map, "while-body"
+            )
+            _check_storage_not_rebound(result_names, body_values, storage_map, "while-body")
+            carried_body_values = _select_named_values(carried_names, result_names, body_values)
+            scf.YieldOp(
+                _unpack_branch_outputs(carried_names, carried_body_values, exemplar, "while-body"),
+                loc=capture_user_location(),
+            )
 
-        if not result_names:
-            return ReplaceIfWithDispatch._pack_named_values(result_names, result_values)
-
-        final_values = _pack_states(while_op.results, exemplar)
+        final_carried = _pack_states(while_op.results, exemplar)
+        final_values = _merge_storage_and_carried(result_names, carried_names, final_carried, storage_map)
         return ReplaceIfWithDispatch._pack_named_values(result_names, final_values)
 
     @classmethod
@@ -1457,7 +1633,12 @@ class CanonicalizeWhile(Transformer):
             uid = CanonicalizeWhile._counter
             CanonicalizeWhile._counter += 1
 
-            result_names = _collect_assigned_vars(node.body, active_symbols_before_while, test_expr=node.test)
+            result_names, rebound_names = _collect_assigned_vars(
+                node.body,
+                active_symbols_before_while,
+                test_expr=node.test,
+                return_rebound=True,
+            )
 
             fn_args = [ast.arg(arg="__ret_names", annotation=None)] + [
                 ast.arg(arg=v, annotation=None) for v in result_names
@@ -1519,6 +1700,10 @@ class CanonicalizeWhile(Transformer):
                                 ctx=ast.Load(),
                             ),
                         ),
+                        ast.keyword(
+                            arg="rebound_names",
+                            value=ast.Tuple(elts=[ast.Constant(value=v) for v in rebound_names], ctx=ast.Load()),
+                        ),
                     ]
                 )
 
@@ -1541,6 +1726,7 @@ class CanonicalizeWhile(Transformer):
                 dispatch_stmt = ast.Expr(value=dispatch_value)
             dispatch_stmt = ast.copy_location(dispatch_stmt, node)
             dispatch_stmt = ast.fix_missing_locations(dispatch_stmt)
+            setattr(dispatch_stmt, _ASTREWRITE_MARKER, type(self).__name__)
 
             return [before_func, after_func, dispatch_stmt]
 
