@@ -38,7 +38,9 @@ jobs:
       wheel_names: ${{ steps.collect.outputs.wheel_names }}
     env:
       COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
-      IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
+      # Release wheels use sdk/ixcc-release (xiang.zhang/ixcc-flydsl-release).
+      # Dev CI (ci-device / perf) continues to use sdk/ixcc.
+      IXCC_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -52,6 +54,31 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Preflight release IXCC toolchain
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake" ]]; then
+            echo "::error::Release IXCC MLIR missing at ${IXCC_MLIR_CMAKE}."
+            echo "::error::Build sdk/ixcc-release first, or set vars.IXCC_RELEASE_MLIR_CMAKE."
+            echo "::error::Helper: bash .github/scripts/prepare_ix_toolchain_release.sh"
+            exit 1
+          fi
+          IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
+          if [[ ! -d "${IXCC_ROOT}/build/tools/mlir/python_packages/mlir_core" ]]; then
+            echo "::error::Release IXCC was built without MLIR Python bindings."
+            echo "::error::Rebuild with -DMLIR_ENABLE_BINDINGS_PYTHON=ON (see prepare_ix_toolchain_release.sh)."
+            exit 1
+          fi
+          echo "IXCC_RELEASE_MLIR_CMAKE=${IXCC_MLIR_CMAKE}"
+          echo "IXCC_RELEASE_ROOT=${IXCC_ROOT}"
+          if [[ -d "${IXCC_ROOT}/.git" || -e "${IXCC_ROOT}/.git" ]]; then
+            echo "IXCC_RELEASE_COMMIT=$(git -C "${IXCC_ROOT}" rev-parse --short HEAD)"
+            git -C "${IXCC_ROOT}" log -1 --oneline || true
+          fi
+          if [[ -f "${IXCC_ROOT}/.flydsl_ixcc_build_commit" ]]; then
+            echo "IXCC_RELEASE_STAMP=$(tr '\n' ' ' < "${IXCC_ROOT}/.flydsl_ixcc_build_commit")"
+          fi
 
       - name: Build A-track wheels in container
         env:

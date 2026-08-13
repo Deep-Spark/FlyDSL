@@ -1,8 +1,7 @@
 name: FlyDSL CI Wheels (Iluvatar A-track)
 
+# Manual-only: do not schedule nightlies. Dispatch when a release wheel is needed.
 on:
-  schedule:
-    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       skip_tests:
