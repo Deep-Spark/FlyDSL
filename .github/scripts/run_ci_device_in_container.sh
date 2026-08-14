@@ -55,6 +55,15 @@ fi
 
 mkdir -p "${WORKSPACE}/logs" "${WORKSPACE}/reports"
 
+# Restrict device jobs to the CI GPU allow-list: pick the idle-most card.
+SELECT_GPU_SCRIPT="${WORKSPACE}/.github/scripts/select_iluvatar_ci_gpu.sh"
+if [[ -f "${SELECT_GPU_SCRIPT}" ]]; then
+  selected_gpu="$(bash "${SELECT_GPU_SCRIPT}")"
+  export CUDA_VISIBLE_DEVICES="${selected_gpu}"
+else
+  echo "::warning::select_iluvatar_ci_gpu.sh missing; leaving CUDA_VISIBLE_DEVICES unset"
+fi
+
 corex_git_commit=""
 corex_version_file=""
 corex_lld_version=""
@@ -99,6 +108,7 @@ COREX_ROOT=${COREX_ROOT}
 IXCC_MLIR_CMAKE=${IXCC_MLIR_CMAKE}
 IXCC_ROOT=${IXCC_ROOT}
 ARCH=${ARCH}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
 DEVICE_PYTEST_ARGS_JSON=${DEVICE_PYTEST_ARGS_JSON}
 DEVICE_MUST_PASS_TESTS_JSON=${DEVICE_MUST_PASS_TESTS_JSON}
 FLYDSL_ILUVATAR_SMOKE_BLOB_PATH=${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH}
@@ -164,6 +174,7 @@ docker_args=(
   -e MLIR_DIR="${IXCC_MLIR_CMAKE}"
   -e HOST_MPI_LIB_DIR="${host_mpi_lib_dir}"
   -e PYTHONUNBUFFERED=1
+  -e CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 )
 
 if [[ -n "${host_mpi_lib_dir}" ]]; then
