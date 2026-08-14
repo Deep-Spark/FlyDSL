@@ -11,6 +11,7 @@ Covers:
 * Packed varlen (``cu_seqlens``) self-attn vs per-seq dense concat.
 * Paged KV (``block_table``) vs gather-to-dense flex reference.
 * Dense alibi / score_bias and the ``flydsl_flex_attn_func`` dispatcher.
+* Dense ``score_mod=TracedScoreMod`` (V3-2) vs host ``eval_host`` reference.
 * Optional ``tile_config`` whitelist and dense ``autotune_iluvatar_flex_attention_tile``.
 """
 
@@ -22,6 +23,7 @@ import os
 import sys
 from pathlib import Path
 
+import flydsl.expr as fx
 import pytest
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
@@ -299,6 +301,7 @@ def _reference_flex_attention_fp32(
     softcap: float | None = None,
     alibi_slopes=None,
     score_bias=None,
+    score_mod=None,
 ):
     """Hand-written fp32 reference for score modifications, including GQA."""
     torch = _require_torch()
@@ -311,6 +314,7 @@ def _reference_flex_attention_fp32(
     S = torch.matmul(Q.float(), K.float().transpose(-1, -2)) * sm_scale
     Sq = S.shape[-2]
     Skv = S.shape[-1]
+    B = S.shape[0]
     q_idx = torch.arange(Sq, device=S.device).view(Sq, 1)
     kv_idx = torch.arange(Skv, device=S.device).view(1, Skv)
     if alibi_slopes is not None and score_bias is not None:
@@ -326,6 +330,18 @@ def _reference_flex_attention_fp32(
         S = S + sb
     if softcap is not None:
         S = softcap * torch.tanh(S / softcap)
+    if score_mod is not None:
+        # Dense logical prefix; matches kernel phys indices when Sq/Skv unpadded
+        # or when only the logical region is compared.
+        Sout = S.clone()
+        for b in range(B):
+            for h in range(H):
+                for qi in range(Sq):
+                    for ki in range(Skv):
+                        Sout[b, h, qi, ki] = float(
+                            score_mod.eval_host(float(S[b, h, qi, ki]), b, h, qi, ki)
+                        )
+        S = Sout
     mask = torch.zeros((Sq, Skv), device=S.device, dtype=torch.bool)
     if is_causal:
         # Align q=0 with kv=(Skv-Sq) so decode (Sq=1) and cross-length prefill
@@ -1699,3 +1715,134 @@ def test_iluvatar_flex_attention_autotune_tile_helper(monkeypatch):
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+# --- V3-2 dense score_mod -----------------------------------------------------
+
+
+def test_iluvatar_flex_attention_rejects_raw_score_mod_callable():
+    mod = _require_flex_attn_module()
+
+    def raw(score, batch, head, q_idx, kv_idx):
+        return score
+
+    with pytest.raises(ValueError, match=r"TracedScoreMod"):
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", score_mod=raw)
+
+
+def test_iluvatar_flex_attention_rejects_score_mod_varlen_paged():
+    mod = _require_flex_attn_module()
+
+    @fx.trace_score_mod
+    def identity(score, batch, head, q_idx, kv_idx):
+        return score
+
+    with pytest.raises(ValueError, match=r"dense-only"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", varlen=True, score_mod=identity
+        )
+    with pytest.raises(ValueError, match=r"dense-only"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", paged=True, score_mod=identity
+        )
+
+
+def test_iluvatar_flex_attention_dispatcher_rejects_score_mod(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_score_mod
+    def identity(score, batch, head, q_idx, kv_idx):
+        return score
+
+    q = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"score_mod"):
+        iface.flydsl_flex_attn_func(q, k, v, score_mod=identity)
+
+
+def _run_flex_attn_score_mod(monkeypatch, *, score_mod, softcap=None, is_causal=True, dtype="bf16"):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 128
+    torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
+    tol = 2e-2 if dtype == "bf16" else 1e-2
+    sm_scale = 1.0 / math.sqrt(D)
+    Sq_phys = _phys_seq(Sq, 64)
+    Skv_phys = _phys_seq(Skv, 64)
+
+    torch.manual_seed(0)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    K = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    V_natural = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq, :].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    K[:, :, :Skv, :].copy_(torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype))
+    V_natural[:, :, :Skv, :].copy_(torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype))
+    V_transposed = V_natural.transpose(-1, -2).contiguous()
+    O = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)  # noqa: E741
+
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=is_causal,
+        softcap=softcap,
+        sm_scale=sm_scale,
+        score_mod=score_mod,
+    )
+    launch(Q, K, V_transposed, O)
+    torch.cuda.synchronize()
+
+    ref = _reference_flex_attention_fp32(
+        Q[:, :, :Sq, :],
+        K[:, :, :Skv, :],
+        V_natural[:, :, :Skv, :],
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+        softcap=softcap,
+        score_mod=score_mod,
+    ).to(torch_dtype)
+    return O[:, :, :Sq, :], ref, tol
+
+
+def test_iluvatar_flex_attention_score_mod_alibi_like(monkeypatch):
+    slope = 0.25
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score - slope * (q_idx - kv_idx)
+
+    out, ref, tol = _run_flex_attn_score_mod(monkeypatch, score_mod=alibi_like)
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_score_mod_where_relu(monkeypatch):
+    @fx.trace_score_mod
+    def relu_scores(score, batch, head, q_idx, kv_idx):
+        return fx.where(score > 0.0, score, 0.0)
+
+    out, ref, tol = _run_flex_attn_score_mod(monkeypatch, score_mod=relu_scores, is_causal=False)
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_score_mod_with_softcap(monkeypatch):
+    slope = 0.1
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score - slope * (q_idx - kv_idx)
+
+    out, ref, tol = _run_flex_attn_score_mod(
+        monkeypatch, score_mod=alibi_like, softcap=30.0, is_causal=True
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)

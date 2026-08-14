@@ -1,26 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar flex-attention forward kernel (V1 + V2 dense/varlen/paged).
+"""Iluvatar flex-attention forward kernel (V1 + V2 dense/varlen/paged + V3-2).
 
 This is a variant subset of PyTorch flex_attention, not a general ``score_mod``
 compiler. It supports f16/bf16 inputs, head dimensions 64/128/256, MHA/GQA,
 self/cross-attention, physical sequence padding, causal masking, sliding-window
 attention, Gemma-2 softcap, packed varlen self-attention via ``cu_seqlens``,
 and paged KV via ``block_table``. Dense path also supports mutually exclusive
-``alibi_slopes`` / ``score_bias`` additive logits (V2-4). Optional
-``tile_config`` selects ``block_m``/``block_n`` in ``{32,64}`` (default 64x64).
-Optional ``return_lse`` writes natural-log row LSE for backward (dense-only).
+``alibi_slopes`` / ``score_bias`` additive logits (V2-4) and optional dense
+``score_mod=TracedScoreMod`` (V3-2). Optional ``tile_config`` selects
+``block_m``/``block_n`` in ``{32,64}`` (default 64x64). Optional ``return_lse``
+writes natural-log row LSE for backward (dense-only).
 """
 
 import math
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
 from flydsl.expr import arith
 from flydsl.expr import math as fmath
+from flydsl.expr.trace_mod import TracedScoreMod
 from flydsl.expr.typing import Vector as Vec
 from kernels.gemm.iluvatar.common import GemmLayout
 from kernels.gemm.iluvatar.mr.common import (
@@ -474,6 +476,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     paged: bool = False,
     has_alibi: bool = False,
     has_score_bias: bool = False,
+    score_mod: Optional[TracedScoreMod] = None,
     block_m: int = BLOCK_M,
     block_n: int = BLOCK_N,
     return_lse: bool = False,
@@ -493,7 +496,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
       * ``S *= sm_scale``
       * optional ``+ alibi`` or ``+ score_bias`` (dense only; mutually exclusive)
       * optional softcap ``tanh``
-      * ``S *= log2e`` (when softcap/bias unset, fuse ``*(sm_scale*log2e)``)
+      * optional dense ``score_mod.apply`` (V3-2; after softcap)
+      * ``S *= log2e`` (when softcap/bias/score_mod unset, fuse ``*(sm_scale*log2e)``)
       * then optional causal / SWA / KV-tail masks in the log2 domain with
         ``NEG_LARGE_F``.
       * when ``Skv`` is not a multiple of ``BLOCK_N``, also mask
@@ -541,6 +545,15 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         raise ValueError("alibi_slopes and score_bias are mutually exclusive")
     if (has_alibi or has_score_bias) and (varlen or paged):
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
+    if score_mod is not None and not isinstance(score_mod, TracedScoreMod):
+        raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
+    if score_mod is not None and (varlen or paged):
+        raise ValueError("score_mod is dense-only (not supported with varlen/paged)")
+
+    has_score_mod = score_mod is not None
+    # Captured into the nested kernel closure for JIT cache keying (forbid id(fn)).
+    score_mod_fingerprint = score_mod.fingerprint if has_score_mod else ""
+    score_mod_obj = score_mod
 
     # Shadow module defaults so the nested kernel closure binds these ints.
     BLOCK_M = int(block_m)
@@ -682,8 +695,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     has_softcap = softcap is not None
     has_swa = window_size is not None
     has_bias = bool(has_alibi) or bool(has_score_bias)
-    # Unfused scale path when softcap or additive bias is present.
-    use_unfused_scale = bool(has_softcap) or bool(has_bias)
+    # Unfused scale path when softcap, additive bias, or score_mod is present.
+    use_unfused_scale = bool(has_softcap) or bool(has_bias) or bool(has_score_mod)
     softcap_f32 = float(softcap) if has_softcap else 0.0
     window_size_i = int(window_size) if has_swa else 0
     do_return_lse = bool(return_lse)
@@ -1149,13 +1162,180 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 _issue_k(next_kv, prefetch_stage)
                 ixdl.cp_async_commit_group()
 
-            # ---- Scale / bias / softcap / enter log2 domain ----------------
+            # ---- Scale / bias / softcap / score_mod / enter log2 domain ----
             # Order: S *= sm_scale -> optional alibi|score_bias -> softcap
-            # -> *log2e. When neither softcap nor bias: fuse *(sm_scale*log2e).
+            # -> optional score_mod -> *log2e. When none of softcap/bias/score_mod:
+            # fuse *(sm_scale*log2e). score_mod=None keeps the legacy unfused
+            # branches below bit-identical.
             if fx.const_expr(use_unfused_scale):
                 q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
                 kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
-                if fx.const_expr(has_alibi):
+                # Touch fingerprint so it stays in the kernel closure (JIT key).
+                _score_mod_fp = score_mod_fingerprint
+                if fx.const_expr(has_score_mod):
+                    # Linear-domain mods first, then score_mod.apply, then *log2e.
+                    if fx.const_expr(has_alibi):
+                        for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                            for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                                acc = S_frags[mma_m][mma_n]
+                                old = Vec(acc.load())
+                                kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                                if fx.const_expr(has_softcap):
+                                    acc.store(
+                                        Vec.from_elements(
+                                            [
+                                                c_softcap
+                                                * fmath.tanh(
+                                                    (
+                                                        old[ei] * c_sm_scale
+                                                        + (
+                                                            c_zero_f
+                                                            - alibi_slope
+                                                            * (
+                                                                q_block_base
+                                                                + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                                                + lane_row
+                                                                - kv_g
+                                                            ).to(fx.Float32)
+                                                        )
+                                                    )
+                                                    / c_softcap,
+                                                    fastmath=fm_fast,
+                                                )
+                                                for ei in range(4)
+                                            ],
+                                            fx.Float32,
+                                        )
+                                    )
+                                else:
+                                    acc.store(
+                                        Vec.from_elements(
+                                            [
+                                                old[ei] * c_sm_scale
+                                                + (
+                                                    c_zero_f
+                                                    - alibi_slope
+                                                    * (
+                                                        q_block_base
+                                                        + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                                        + lane_row
+                                                        - kv_g
+                                                    ).to(fx.Float32)
+                                                )
+                                                for ei in range(4)
+                                            ],
+                                            fx.Float32,
+                                        )
+                                    )
+                    elif fx.const_expr(has_score_bias):
+                        score_bias_view = fx.make_view(
+                            fx.get_iter(ScoreBias),
+                            fx.make_layout(
+                                (B, H, Sq_phys, Skv_phys),
+                                (H * Sq_phys * Skv_phys, Sq_phys * Skv_phys, Skv_phys, 1),
+                            ),
+                        )
+                        for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                            for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                                acc = S_frags[mma_m][mma_n]
+                                old = Vec(acc.load())
+                                kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                                if fx.const_expr(has_softcap):
+                                    acc.store(
+                                        Vec.from_elements(
+                                            [
+                                                c_softcap
+                                                * fmath.tanh(
+                                                    (
+                                                        old[ei] * c_sm_scale
+                                                        + fx.memref_load(
+                                                            score_bias_view,
+                                                            (
+                                                                b_idx,
+                                                                h_idx,
+                                                                q_block_base
+                                                                + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                                                + lane_row,
+                                                                kv_g,
+                                                            ),
+                                                        )
+                                                    )
+                                                    / c_softcap,
+                                                    fastmath=fm_fast,
+                                                )
+                                                for ei in range(4)
+                                            ],
+                                            fx.Float32,
+                                        )
+                                    )
+                                else:
+                                    acc.store(
+                                        Vec.from_elements(
+                                            [
+                                                old[ei] * c_sm_scale
+                                                + fx.memref_load(
+                                                    score_bias_view,
+                                                    (
+                                                        b_idx,
+                                                        h_idx,
+                                                        q_block_base
+                                                        + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                                        + lane_row,
+                                                        kv_g,
+                                                    ),
+                                                )
+                                                for ei in range(4)
+                                            ],
+                                            fx.Float32,
+                                        )
+                                    )
+                    elif fx.const_expr(has_softcap):
+                        for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                            for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                                acc = S_frags[mma_m][mma_n]
+                                old = Vec(acc.load())
+                                acc.store(
+                                    Vec.from_elements(
+                                        [
+                                            c_softcap
+                                            * fmath.tanh(
+                                                (old[ei] * c_sm_scale) / c_softcap,
+                                                fastmath=fm_fast,
+                                            )
+                                            for ei in range(4)
+                                        ],
+                                        fx.Float32,
+                                    )
+                                )
+                    else:
+                        # score_mod only: S *= sm_scale
+                        for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                            for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                                acc = S_frags[mma_m][mma_n]
+                                acc.store(Vec(acc.load()) * c_sm_scale)
+                    # score_mod.apply then enter log2 domain
+                    for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                        for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                            acc = S_frags[mma_m][mma_n]
+                            old = Vec(acc.load())
+                            kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                            acc.store(
+                                Vec.from_elements(
+                                    [
+                                        c_log2e
+                                        * score_mod_obj.apply(
+                                            old[ei],
+                                            b_idx,
+                                            h_idx,
+                                            q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row,
+                                            kv_g,
+                                        )
+                                        for ei in range(4)
+                                    ],
+                                    fx.Float32,
+                                )
+                            )
+                elif fx.const_expr(has_alibi):
                     for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                         for mma_n in fx.range_constexpr(WARP_ATOMS_N):
                             acc = S_frags[mma_m][mma_n]
@@ -1281,7 +1461,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                                     )
                                 )
                 else:
-                    # softcap only (no additive bias)
+                    # softcap only (no additive bias, no score_mod)
                     for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                         for mma_n in fx.range_constexpr(WARP_ATOMS_N):
                             acc = S_frags[mma_m][mma_n]
@@ -1936,13 +2116,15 @@ def compile_iluvatar_flex_attention(
     paged: bool = False,
     has_alibi: bool = False,
     has_score_bias: bool = False,
+    score_mod: Optional[TracedScoreMod] = None,
     tile_config: Mapping[str, int] | None = None,
     return_lse: bool = False,
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
     This is a variant subset (causal / SWA / softcap), not a general score_mod
-    compiler.
+    compiler. Dense ``score_mod`` accepts a ``TracedScoreMod`` from
+    ``@fx.trace_score_mod`` (V3-2); dispatcher does not pass it through yet.
 
     Supported scope: Q/K/V/O = f16 or bf16, D in {64, 128, 256}, GQA
     (``H % Hkv == 0``), arbitrary ``Sq``/``Skv`` (callers pass phys-padded
@@ -1999,6 +2181,9 @@ def compile_iluvatar_flex_attention(
         has_alibi: Dense-only; enable ``alibi_slopes [H]`` additive bias.
         has_score_bias: Dense-only; enable phys-padded ``score_bias`` tensor.
             Mutually exclusive with ``has_alibi``; not supported with varlen/paged.
+        score_mod: Dense-only ``TracedScoreMod`` (or ``None``). Inlined after
+            softcap and before ``*log2e``. Closure scalars only; not a replacement
+            for ``alibi_slopes=[H]``.
         tile_config: Optional ``{"block_m": int, "block_n": int}`` with values
             in ``{32, 64}``. Default is ``64x64``. Paged requires ``block_n=64``.
         return_lse: Dense-only. If True, launch writes fp32 ``LSE [B,H,Sq_phys]``
@@ -2020,6 +2205,10 @@ def compile_iluvatar_flex_attention(
         raise ValueError("alibi_slopes and score_bias are mutually exclusive")
     if (has_alibi or has_score_bias) and (varlen or paged):
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
+    if score_mod is not None and not isinstance(score_mod, TracedScoreMod):
+        raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
+    if score_mod is not None and (varlen or paged):
+        raise ValueError("score_mod is dense-only (not supported with varlen/paged)")
     if return_lse and (varlen or paged):
         raise ValueError("return_lse is dense-only (not supported with varlen/paged)")
 
@@ -2061,6 +2250,7 @@ def compile_iluvatar_flex_attention(
         paged=paged,
         has_alibi=has_alibi,
         has_score_bias=has_score_bias,
+        score_mod=score_mod,
         block_m=block_m,
         block_n=block_n,
         return_lse=return_lse,
