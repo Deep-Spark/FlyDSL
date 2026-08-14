@@ -119,12 +119,36 @@ def _git_rev_count() -> str:
     return ""
 
 
+def _append_version_local_suffix(version: str) -> str:
+    """Append FLYDSL_VERSION_LOCAL_SUFFIX to a PEP 440 local version segment.
+
+    Example: version 0.3.0.dev20260814+abc1234 with suffix run.31762337181
+    becomes 0.3.0.dev20260814+abc1234.run.31762337181.
+    """
+    import re
+
+    local_suffix = os.environ.get("FLYDSL_VERSION_LOCAL_SUFFIX", "").strip()
+    if not local_suffix:
+        return version
+    safe = re.sub(r"[^A-Za-z0-9.]", ".", local_suffix)
+    safe = re.sub(r"\.+", ".", safe).strip(".")
+    if not safe:
+        return version
+    if "+" in version:
+        return f"{version}.{safe}"
+    return f"{version}+{safe}"
+
+
 def _read_version() -> str:
     """Build the package version based on FLYDSL_RELEASE_TYPE.
 
     FLYDSL_PACKAGE_VERSION_OVERRIDE may be set by release automation to force
     the exact package version, for example when publishing a tag-driven PyPI
     dev release without changing the source base version.
+
+    FLYDSL_VERSION_LOCAL_SUFFIX may append a PEP 440 local label (for example
+    ``run.<github_run_id>``) after the computed version, except when
+    FLYDSL_PACKAGE_VERSION_OVERRIDE is set.
 
     Release types (set via env var FLYDSL_RELEASE_TYPE):
       nightlies   -> {base}+{YYYYMMDD}.{git_hash}     (e.g. 0.1.0+20260309.a1b2c3d)
@@ -143,7 +167,7 @@ def _read_version() -> str:
         return version_override
 
     if "+" in base_version:
-        return base_version
+        return _append_version_local_suffix(base_version)
 
     release_type = os.environ.get("FLYDSL_RELEASE_TYPE", "").strip().lower()
     git_hash = _git_short_hash()
@@ -151,20 +175,22 @@ def _read_version() -> str:
 
     if release_type == "nightlies":
         local = ".".join(filter(None, [date_tag, git_hash]))
-        return f"{base_version}+{local}"
+        version = f"{base_version}+{local}"
     elif release_type == "devreleases":
         version = f"{base_version}.dev{date_tag}"
         if git_hash:
             version += f"+{git_hash}"
-        return version
     elif release_type == "release":
-        return base_version
+        version = base_version
+    else:
+        # Legacy: local dev builds without FLYDSL_RELEASE_TYPE
+        commit_count = _git_rev_count()
+        if not commit_count:
+            version = base_version
+        else:
+            version = f"{base_version}.dev{commit_count}"
 
-    # Legacy: local dev builds without FLYDSL_RELEASE_TYPE
-    commit_count = _git_rev_count()
-    if not commit_count:
-        return base_version
-    return f"{base_version}.dev{commit_count}"
+    return _append_version_local_suffix(version)
 
 
 def _load_requirements() -> list[str]:
