@@ -30,7 +30,7 @@ jobs:
       PERF_SUITE_FILE: .ci-utils/.github/perf-kernels-iluvatar.json
       PERF_DELTA_FLAT_PCT: "3"
       PERF_METRICS_ARTIFACT: perf-metrics
-      CUDA_VISIBLE_DEVICES: "0"
+      # Leave unset so run_perf_trend_in_container.sh picks an idle GPU via the selector helper.
       COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
       IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
       CI_DEVICE_IMAGE: ${{ vars.CI_DEVICE_IMAGE_REF || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}

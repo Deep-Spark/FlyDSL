@@ -24,7 +24,6 @@ fi
 WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
 CI_DEVICE_PRIVILEGED="${CI_DEVICE_PRIVILEGED:-1}"
 CI_DEVICE_RUN_AS_HOST_USER="${CI_DEVICE_RUN_AS_HOST_USER:-1}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 PERF_LOCK_WAIT_SECONDS="${PERF_LOCK_WAIT_SECONDS:-900}"
 PERF_GPU_IDLE_RETRIES="${PERF_GPU_IDLE_RETRIES:-9}"
 PERF_GPU_IDLE_SLEEP_SECONDS="${PERF_GPU_IDLE_SLEEP_SECONDS:-10}"
@@ -40,6 +39,13 @@ if [[ ! -d "${COREX_ROOT}" ]]; then
   echo "::error::COREX_ROOT does not exist: ${COREX_ROOT}"
   exit 1
 fi
+
+# Default: pick one idle GPU from the CI allow-list (override via CUDA_VISIBLE_DEVICES / FLYDSL_CI_GPU_POOL).
+SELECT_GPU_SCRIPT="${WORKSPACE}/.github/scripts/select_iluvatar_ci_gpu.sh"
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && [[ -f "${SELECT_GPU_SCRIPT}" ]]; then
+  CUDA_VISIBLE_DEVICES="$(bash "${SELECT_GPU_SCRIPT}")"
+fi
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 selected_gpu="${CUDA_VISIBLE_DEVICES%%,*}"
 selected_gpu="${selected_gpu//[[:space:]]/}"
