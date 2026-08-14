@@ -12,6 +12,7 @@ Covers:
 * Paged KV (``block_table``) vs gather-to-dense flex reference.
 * Dense alibi / score_bias and the ``flydsl_flex_attn_func`` dispatcher.
 * Dense ``score_mod=TracedScoreMod`` (V3-2) vs host ``eval_host`` reference.
+* Dense ``create_block_mask`` / ``block_mask`` sparse KV skip (V3-3) vs dense path.
 * Optional ``tile_config`` whitelist and dense ``autotune_iluvatar_flex_attention_tile``.
 """
 
@@ -302,6 +303,7 @@ def _reference_flex_attention_fp32(
     alibi_slopes=None,
     score_bias=None,
     score_mod=None,
+    mask_mod=None,
 ):
     """Hand-written fp32 reference for score modifications, including GQA."""
     torch = _require_torch()
@@ -350,6 +352,11 @@ def _reference_flex_attention_fp32(
         mask = mask | (kv_idx > q_idx + delta)
     if window_size is not None:
         mask = mask | ((q_idx - kv_idx) > window_size)
+    if mask_mod is not None:
+        for qi in range(Sq):
+            for ki in range(Skv):
+                if not bool(mask_mod.eval_host(0, 0, qi, ki)):
+                    mask[qi, ki] = True
     S = S.masked_fill(mask, float("-inf"))
     P = torch.softmax(S, dim=-1)
     P = torch.nan_to_num(P, nan=0.0)
@@ -1846,3 +1853,313 @@ def test_iluvatar_flex_attention_score_mod_with_softcap(monkeypatch):
     )
     torch = _require_torch()
     torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+
+
+# --- V3-3 BlockMask / mask_mod -------------------------------------------------
+
+
+def _element_visible_ref(q, kv, *, Sq, Skv, is_causal, window_size, mask_mod):
+    if q < 0 or kv < 0 or q >= Sq or kv >= Skv:
+        return False
+    if is_causal and kv > q:
+        return False
+    if window_size is not None and (q - kv) > int(window_size):
+        return False
+    if mask_mod is not None and not bool(mask_mod.eval_host(0, 0, q, kv)):
+        return False
+    return True
+
+
+def test_create_block_mask_matches_dense_visibility():
+    torch = _require_torch()
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        # |q-kv| <= 64 without FloorDiv (not in V3-1 whitelist).
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    B, H, Sq, Skv = 1, 2, 192, 192
+    block_m = block_n = 64
+    bm = mod.create_block_mask(
+        near_band,
+        B,
+        H,
+        Sq,
+        Skv,
+        block_m=block_m,
+        block_n=block_n,
+        is_causal=True,
+        device="cpu",
+    )
+    assert bm.num_q_tiles == 3 and bm.num_kv_tiles == 3
+    assert bm.sparsity() > 0.0
+
+    for qi in range(bm.num_q_tiles):
+        n = int(bm.kv_num_blocks[qi].item())
+        kept = {int(bm.kv_indices[qi, j].item()) for j in range(n)}
+        for kj in range(bm.num_kv_tiles):
+            q0, q1 = qi * block_m, min((qi + 1) * block_m, _phys_seq(Sq, block_m))
+            k0, k1 = kj * block_n, min((kj + 1) * block_n, _phys_seq(Skv, block_n))
+            any_vis = False
+            all_vis = True
+            for q in range(q0, q1):
+                for kv in range(k0, k1):
+                    vis = _element_visible_ref(
+                        q,
+                        kv,
+                        Sq=Sq,
+                        Skv=Skv,
+                        is_causal=True,
+                        window_size=None,
+                        mask_mod=near_band,
+                    )
+                    any_vis = any_vis or vis
+                    all_vis = all_vis and vis
+            if any_vis:
+                assert kj in kept
+                slot = int((bm.kv_indices[qi] == kj).nonzero(as_tuple=False)[0].item())
+                expect_full = bool(all_vis) and (q1 <= Sq) and (k1 <= Skv)
+                assert int(bm.kv_is_full[qi, slot].item()) == (1 if expect_full else 0)
+            else:
+                assert kj not in kept
+
+
+def test_iluvatar_flex_attention_rejects_mask_mod_block_mask_varlen_paged():
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def always(batch, head, q_idx, kv_idx):
+        return True
+
+    with pytest.raises(ValueError, match=r"dense-only"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", varlen=True, mask_mod=always
+        )
+    with pytest.raises(ValueError, match=r"dense-only"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True
+        )
+
+
+def test_iluvatar_flex_attention_dispatcher_rejects_block_mask_mask_mod(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    from kernels.attention.iluvatar import create_block_mask
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_mask_mod
+    def always(batch, head, q_idx, kv_idx):
+        return True
+
+    q = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"mask_mod|block_mask"):
+        iface.flydsl_flex_attn_func(q, k, v, mask_mod=always)
+    block_mask = create_block_mask(
+        None, 1, 4, 64, 64, block_m=64, block_n=64, is_causal=True, device=q.device
+    )
+    with pytest.raises(ValueError, match=r"block_mask"):
+        iface.flydsl_flex_attn_func(q, k, v, block_mask=block_mask)
+
+
+def _run_flex_attn_block_mask(
+    monkeypatch,
+    *,
+    mask_mod,
+    is_causal=True,
+    score_mod=None,
+    dtype="bf16",
+    Sq=128,
+    Skv=128,
+):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    B, H, D = 1, 4, 128
+    torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype]
+    tol = 2e-2 if dtype == "bf16" else 1e-2
+    sm_scale = 1.0 / math.sqrt(D)
+    block_m = block_n = 64
+    Sq_phys = _phys_seq(Sq, block_m)
+    Skv_phys = _phys_seq(Skv, block_n)
+
+    torch.manual_seed(1)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    K = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    V_natural = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq, :].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    K[:, :, :Skv, :].copy_(torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype))
+    V_natural[:, :, :Skv, :].copy_(torch.randn(B, H, Skv, D, device="cuda", dtype=torch_dtype))
+    V_transposed = V_natural.transpose(-1, -2).contiguous()
+    O_sparse = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    O_dense = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+
+    block_mask = mod.create_block_mask(
+        mask_mod,
+        B,
+        H,
+        Sq,
+        Skv,
+        block_m=block_m,
+        block_n=block_n,
+        is_causal=is_causal,
+        device=Q.device,
+    )
+
+    launch_sparse = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=is_causal,
+        sm_scale=sm_scale,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        has_block_mask=True,
+        tile_config={"block_m": block_m, "block_n": block_n},
+    )
+    launch_dense = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=is_causal,
+        sm_scale=sm_scale,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        has_block_mask=False,
+        tile_config={"block_m": block_m, "block_n": block_n},
+    )
+    launch_sparse(Q, K, V_transposed, O_sparse, block_mask=block_mask)
+    launch_dense(Q, K, V_transposed, O_dense)
+    torch.cuda.synchronize()
+
+    ref = _reference_flex_attention_fp32(
+        Q[:, :, :Sq, :],
+        K[:, :, :Skv, :],
+        V_natural[:, :, :Skv, :],
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+    )
+    return O_sparse[:, :, :Sq, :], O_dense[:, :, :Sq, :], ref, tol, block_mask
+
+
+def test_iluvatar_flex_attention_block_mask_matches_dense(monkeypatch):
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    out_s, out_d, ref, tol, bm = _run_flex_attn_block_mask(monkeypatch, mask_mod=near_band)
+    assert bm.sparsity() > 0.2
+    torch = _require_torch()
+    torch.testing.assert_close(out_s, out_d, rtol=tol, atol=tol)
+    torch.testing.assert_close(out_s.float(), ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_score_mod_with_block_mask(monkeypatch):
+    slope = 0.1
+
+    @fx.trace_mask_mod
+    def first_two_kv_tiles(batch, head, q_idx, kv_idx):
+        return kv_idx < 128
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score - slope * (q_idx - kv_idx)
+
+    out_s, out_d, ref, tol, _ = _run_flex_attn_block_mask(
+        monkeypatch,
+        mask_mod=first_two_kv_tiles,
+        score_mod=alibi_like,
+        is_causal=False,
+        Sq=128,
+        Skv=192,
+    )
+    torch = _require_torch()
+    torch.testing.assert_close(out_s, out_d, rtol=tol, atol=tol)
+    torch.testing.assert_close(out_s.float(), ref, rtol=tol, atol=tol)
+
+
+def test_iluvatar_flex_attention_block_mask_sparse_faster(monkeypatch):
+    """Loose latency check: high-sparsity BlockMask should beat dense KV loop."""
+    _require_perf_enabled()
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def first_tile_only(batch, head, q_idx, kv_idx):
+        return kv_idx < 64
+
+    B, H, Sq, Skv, D = 1, 8, 512, 512, 128
+    dtype = "bf16"
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+    block_m = block_n = 64
+    Sq_phys = _phys_seq(Sq, block_m)
+    Skv_phys = _phys_seq(Skv, block_n)
+
+    torch.manual_seed(2)
+    Q = torch.randn(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    K = torch.randn(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    V = torch.randn(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype).transpose(-1, -2).contiguous()
+    O_s = torch.empty_like(Q)
+    O_d = torch.empty_like(Q)
+
+    bm = mod.create_block_mask(
+        first_tile_only,
+        B,
+        H,
+        Sq,
+        Skv,
+        block_m=block_m,
+        block_n=block_n,
+        is_causal=False,
+        device=Q.device,
+    )
+    assert bm.sparsity() > 0.8
+
+    launch_s = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=False,
+        sm_scale=sm_scale,
+        mask_mod=first_tile_only,
+        has_block_mask=True,
+    )
+    launch_d = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=False,
+        sm_scale=sm_scale,
+        mask_mod=first_tile_only,
+        has_block_mask=False,
+    )
+
+    def run_s():
+        launch_s(Q, K, V, O_s, block_mask=bm)
+
+    def run_d():
+        launch_d(Q, K, V, O_d)
+
+    us_s = _bench_gpu_us(run_s, warmup=5, iters=20)
+    us_d = _bench_gpu_us(run_d, warmup=5, iters=20)
+    # Loose: sparse must be at least 10% faster (skip-heavy EMPTY tiles).
+    assert us_s < us_d * 0.9, f"sparse={us_s:.1f}us dense={us_d:.1f}us sparsity={bm.sparsity():.3f}"

@@ -1,17 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Iluvatar flex-attention forward kernel (V1 + V2 dense/varlen/paged + V3-2).
+"""Iluvatar flex-attention forward (dense / varlen / paged + score_mod + BlockMask).
 
-This is a variant subset of PyTorch flex_attention, not a general ``score_mod``
-compiler. It supports f16/bf16 inputs, head dimensions 64/128/256, MHA/GQA,
-self/cross-attention, physical sequence padding, causal masking, sliding-window
-attention, Gemma-2 softcap, packed varlen self-attention via ``cu_seqlens``,
-and paged KV via ``block_table``. Dense path also supports mutually exclusive
-``alibi_slopes`` / ``score_bias`` additive logits (V2-4) and optional dense
-``score_mod=TracedScoreMod`` (V3-2). Optional ``tile_config`` selects
-``block_m``/``block_n`` in ``{32,64}`` (default 64x64). Optional ``return_lse``
-writes natural-log row LSE for backward (dense-only).
+Supports f16/bf16, D in {64,128,256}, MHA/GQA, causal / SWA / softcap, varlen,
+paged KV, dense alibi/score_bias, dense ``score_mod=TracedScoreMod``, and dense
+``block_mask`` / ``mask_mod`` sparse KV skip (V3-3). Optional ``tile_config``
+and dense ``return_lse``.
 """
 
 import math
@@ -22,8 +17,9 @@ import flydsl.expr as fx
 import flydsl.expr.ixdl as ixdl
 from flydsl.expr import arith
 from flydsl.expr import math as fmath
-from flydsl.expr.trace_mod import TracedScoreMod
+from flydsl.expr.trace_mod import TracedMaskMod, TracedScoreMod
 from flydsl.expr.typing import Vector as Vec
+from kernels.attention.iluvatar.block_mask import FlexBlockMask, create_block_mask
 from kernels.gemm.iluvatar.common import GemmLayout
 from kernels.gemm.iluvatar.mr.common import (
     ATOM_K_B16,
@@ -477,6 +473,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
     has_alibi: bool = False,
     has_score_bias: bool = False,
     score_mod: Optional[TracedScoreMod] = None,
+    mask_mod: Optional[TracedMaskMod] = None,
+    has_block_mask: bool = False,
     block_m: int = BLOCK_M,
     block_n: int = BLOCK_N,
     return_lse: bool = False,
@@ -549,11 +547,21 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
     if score_mod is not None and (varlen or paged):
         raise ValueError("score_mod is dense-only (not supported with varlen/paged)")
+    if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
+        raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
+    if (mask_mod is not None or has_block_mask) and (varlen or paged):
+        raise ValueError("block_mask/mask_mod are dense-only (not supported with varlen/paged)")
+    if has_block_mask and (varlen or paged):
+        raise ValueError("block_mask is dense-only (not supported with varlen/paged)")
 
     has_score_mod = score_mod is not None
     # Captured into the nested kernel closure for JIT cache keying (forbid id(fn)).
     score_mod_fingerprint = score_mod.fingerprint if has_score_mod else ""
     score_mod_obj = score_mod
+    has_mask_mod = mask_mod is not None
+    mask_mod_fingerprint = mask_mod.fingerprint if has_mask_mod else ""
+    mask_mod_obj = mask_mod
+    has_block_mask = bool(has_block_mask)
 
     # Shadow module defaults so the nested kernel closure binds these ints.
     BLOCK_M = int(block_m)
@@ -712,6 +720,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         SeqLens: fx.Tensor,
         AlibiSlopes: fx.Tensor,
         ScoreBias: fx.Tensor,
+        KvNumBlocks: fx.Tensor,
+        KvIndices: fx.Tensor,
+        KvIsFull: fx.Tensor,
         total_tokens: fx.Int32,
     ):
         # Declared inside the kernel body so @fx.struct annotations resolve
@@ -1065,10 +1076,9 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         fx.gpu.barrier()
 
         # ---- KV loop (runtime fx.range) -----------------------------------
-        # Causal fully-masked tiles are dropped by shortening the trip count:
-        # kv_end = min(num_kv_tiles, ceil(q_tile_end / BLOCK_N)). With
-        # BLOCK_M == BLOCK_N this is min(num_kv_tiles, q_tile_idx + 1).
-        # SWA empty-window tiles are NOT skipped here (element mask still applies).
+        # Dense (no block_mask): causal fully-masked tiles are dropped by
+        # shortening kv_end. With block_mask: trip count comes from
+        # kv_num_blocks[q_tile]; kv_i is looked up from kv_indices.
         #
         # m_running / l_running are flat-packed across the scf.for boundary
         # (ROWS_PER_LANE fp32 each). O_acc stays outside and is updated in place.
@@ -1078,38 +1088,66 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # drains both. With kv_stages=1 (large D), both banks collapse to stage
         # 0 -- K_{i+1} may still prefetch into the same K bank after MMA1.
         c_num_kv = fx.Int32(num_kv_tiles)
-        if fx.const_expr(is_causal):
-            # Self (delta=0): kv_end = q_tile + 1. Cross-length paged: allow
-            # kv up through q_tile_end + causal_delta.
-            q_tile_end = q_start + fx.Int32(BLOCK_M)
-            kv_end_cand = (q_tile_end + c_causal_delta + c_block_n - fx.Int32(1)) // c_block_n
-            kv_end = (kv_end_cand < c_num_kv).select(kv_end_cand, c_num_kv)
-            kv_end = (kv_end > fx.Int32(0)).select(kv_end, fx.Int32(0))
+        if fx.const_expr(has_block_mask):
+            kv_num_view = fx.make_view(
+                fx.get_iter(KvNumBlocks),
+                fx.make_layout((num_q_tiles,), (1,)),
+            )
+            kv_idx_view = fx.make_view(
+                fx.get_iter(KvIndices),
+                fx.make_layout((num_q_tiles, num_kv_tiles), (num_kv_tiles, 1)),
+            )
+            kv_full_view = fx.make_view(
+                fx.get_iter(KvIsFull),
+                fx.make_layout((num_q_tiles, num_kv_tiles), (num_kv_tiles, 1)),
+            )
+            kv_trip = fx.memref_load(kv_num_view, q_tile_idx)
+            _mask_mod_fp = mask_mod_fingerprint
         else:
-            kv_end = c_num_kv
-        # Varlen / paged: also drop tiles past this sequence's logical KV length.
-        if fx.const_expr(varlen or paged):
-            kv_tiles_seq = (c_skv_logical + c_block_n - fx.Int32(1)) // c_block_n
-            kv_end = (kv_end < kv_tiles_seq).select(kv_end, kv_tiles_seq)
-        if fx.const_expr(varlen):
-            # Inactive q-tiles (q_start >= seqlen): skip the KV loop entirely.
-            kv_end = active.select(kv_end, fx.Int32(0))
+            if fx.const_expr(is_causal):
+                # Self (delta=0): kv_end = q_tile + 1. Cross-length paged: allow
+                # kv up through q_tile_end + causal_delta.
+                q_tile_end = q_start + fx.Int32(BLOCK_M)
+                kv_end_cand = (q_tile_end + c_causal_delta + c_block_n - fx.Int32(1)) // c_block_n
+                kv_end = (kv_end_cand < c_num_kv).select(kv_end_cand, c_num_kv)
+                kv_end = (kv_end > fx.Int32(0)).select(kv_end, fx.Int32(0))
+            else:
+                kv_end = c_num_kv
+            # Varlen / paged: also drop tiles past this sequence's logical KV length.
+            if fx.const_expr(varlen or paged):
+                kv_tiles_seq = (c_skv_logical + c_block_n - fx.Int32(1)) // c_block_n
+                kv_end = (kv_end < kv_tiles_seq).select(kv_end, kv_tiles_seq)
+            if fx.const_expr(varlen):
+                # Inactive q-tiles (q_start >= seqlen): skip the KV loop entirely.
+                kv_end = active.select(kv_end, fx.Int32(0))
+            kv_trip = kv_end
 
-        # Prologue: K0 into stage 0 (skipped when kv_end == 0).
-        if kv_end > fx.Int32(0):
-            _issue_k(fx.Int32(0), fx.Int32(0))
+        # Prologue: first K into stage 0 (skipped when kv_trip == 0).
+        if kv_trip > fx.Int32(0):
+            if fx.const_expr(has_block_mask):
+                kv0 = fx.memref_load(kv_idx_view, (q_tile_idx, fx.Int32(0)))
+                _issue_k(kv0, fx.Int32(0))
+            else:
+                _issue_k(fx.Int32(0), fx.Int32(0))
             ixdl.cp_async_commit_group()
             ixdl.cp_async_wait_group(0)
             fx.gpu.barrier()
 
         init_state = [c_neg_large for _ in range(ROWS_PER_LANE)] + [c_zero_f for _ in range(ROWS_PER_LANE)]
         loop_results = init_state
-        for kv_idx, state in fx.range(fx.Int32(0), kv_end, fx.Int32(1), init=init_state):
+        for sparse_i, state in fx.range(fx.Int32(0), kv_trip, fx.Int32(1), init=init_state):
             m_prev = [state[slot] for slot in range(ROWS_PER_LANE)]
             l_prev = [state[ROWS_PER_LANE + slot] for slot in range(ROWS_PER_LANE)]
-            kv_i = fx.Int32(kv_idx)
+            if fx.const_expr(has_block_mask):
+                kv_i = fx.memref_load(kv_idx_view, (q_tile_idx, sparse_i))
+                tile_full_i = fx.memref_load(kv_full_view, (q_tile_idx, sparse_i))
+                tile_is_full = tile_full_i != fx.Int32(0)
+            else:
+                kv_i = fx.Int32(sparse_i)
+                tile_is_full = fx.Int32(0) != fx.Int32(0)
             if fx.const_expr(KV_STAGES == 2):
-                comp_stage = kv_i % fx.Int32(2)
+                # fx.range IV may be index; force i32 before remui.
+                comp_stage = fx.Int32(sparse_i) % fx.Int32(2)
                 prefetch_stage = comp_stage ^ fx.Int32(1)
             else:
                 comp_stage = fx.Int32(0)
@@ -1155,10 +1193,13 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                             S_frags[mma_m][mma_n],
                         )
 
-            # Prefetch K_{i+1} so G2S overlaps softmax / P (other bank when
-            # kv_stages=2; same bank when kv_stages=1 after MMA1 is done).
-            next_kv = kv_i + fx.Int32(1)
-            if next_kv < kv_end:
+            # Prefetch K_{next} so G2S overlaps softmax / P.
+            next_s = fx.Int32(sparse_i) + fx.Int32(1)
+            if next_s < kv_trip:
+                if fx.const_expr(has_block_mask):
+                    next_kv = fx.memref_load(kv_idx_view, (q_tile_idx, next_s))
+                else:
+                    next_kv = next_s
                 _issue_k(next_kv, prefetch_stage)
                 ixdl.cp_async_commit_group()
 
@@ -1488,26 +1529,20 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         acc = S_frags[mma_m][mma_n]
                         acc.store(Vec(acc.load()) * c_scale_log2e)
 
+            # ---- Element masks (FULL tiles may skip via select, not scf.if) -
+            # Touch mask_mod fingerprint for JIT key (Python str, not IR).
+            if fx.const_expr(has_mask_mod):
+                _mask_mod_fp = mask_mod_fingerprint
+            do_elem = fx.Int32(1)
+            if fx.const_expr(has_block_mask):
+                do_elem = tile_is_full.select(fx.Int32(0), fx.Int32(1))
+            do_elem_b = do_elem != fx.Int32(0)
+
             # ---- Causal mask ----------------------------------------------
-            # Set S[q, k] = NEG_LARGE_F where ``kv_global > q_global``. Applied
-            # AFTER entering the log2 domain above, so the sentinel lives in
-            # the same domain as everything downstream and matches the
-            # m_running init: exp2(NEG_LARGE_F - m_new) ~= 0 for any bounded
-            # m_new. Dense causal requires Sq == Skv (delta=0). Paged causal
-            # allows Sq != Skv via c_causal_delta = seqlen_kv - Sq.
-            #
-            # Fragment coord recap (col-major C-TV, see docstring above):
-            #   m = warp_m_id * (WARP_ATOMS_M * ATOM_M) + mma_m * ATOM_M
-            #       + ei * 4 + lane_row       -- varies per ei
-            #   n = warp_n_id * (WARP_ATOMS_N * ATOM_N) + mma_n * ATOM_N
-            #       + lane_col                -- ei-invariant
+            # Set S[q, k] = NEG_LARGE_F where ``kv_global > q_global``.
             if fx.const_expr(is_causal):
                 q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
                 kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
-                # Inner ``ei`` loop is a Python list comprehension (like the
-                # O_acc alpha-scale below): a bare ``for ei in range(4):`` is
-                # picked up by the AST rewriter as a dynamic for loop and
-                # rejects Python-list loop-carried state.
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                     for mma_n in fx.range_constexpr(WARP_ATOMS_N):
                         acc = S_frags[mma_m][mma_n]
@@ -1517,8 +1552,14 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                             Vec.from_elements(
                                 [
                                     (
-                                        kv_g
-                                        > q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row + c_causal_delta
+                                        do_elem_b
+                                        & (
+                                            kv_g
+                                            > q_block_base
+                                            + fx.Int32(mma_m * ATOM_M + ei * 4)
+                                            + lane_row
+                                            + c_causal_delta
+                                        )
                                     ).select(c_neg_large, old[ei])
                                     for ei in range(4)
                                 ],
@@ -1527,9 +1568,6 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         )
 
             # ---- Sliding-window mask --------------------------------------
-            # Mask where ``q_global - kv_global > window_size``
-            # (distance == window_size remains visible). Independent of
-            # ``is_causal`` -- callers wanting a causal window must set both.
             if fx.const_expr(has_swa):
                 q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
                 kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
@@ -1542,7 +1580,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                             Vec.from_elements(
                                 [
                                     (
-                                        (q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row) - kv_g > c_window
+                                        do_elem_b
+                                        & (
+                                            (q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row)
+                                            - kv_g
+                                            > c_window
+                                        )
                                     ).select(c_neg_large, old[ei])
                                     for ei in range(4)
                                 ],
@@ -1551,9 +1594,6 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         )
 
             # ---- KV tail mask ---------------------------------------------
-            # Phys pad runs full BLOCK_N G2S tiles; mask columns beyond the
-            # logical Skv so pad K/V never enter softmax. Folded away when
-            # Skv == Skv_phys.
             if fx.const_expr(has_kv_tail):
                 kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
@@ -1563,7 +1603,37 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
                         acc.store(
                             Vec.from_elements(
-                                [(kv_g >= c_skv_logical).select(c_neg_large, old[ei]) for ei in range(4)],
+                                [
+                                    (do_elem_b & (kv_g >= c_skv_logical)).select(c_neg_large, old[ei])
+                                    for ei in range(4)
+                                ],
+                                fx.Float32,
+                            )
+                        )
+
+            # ---- mask_mod element holes (V3-3) ----------------------------
+            if fx.const_expr(has_mask_mod):
+                q_block_base = q_tile_idx * fx.Int32(BLOCK_M) + warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
+                kv_block_base = kv_i * fx.Int32(BLOCK_N) + warp_n_id * fx.Int32(WARP_ATOMS_N * ATOM_N)
+                for mma_m in fx.range_constexpr(WARP_ATOMS_M):
+                    for mma_n in fx.range_constexpr(WARP_ATOMS_N):
+                        acc = S_frags[mma_m][mma_n]
+                        old = Vec(acc.load())
+                        kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
+                        acc.store(
+                            Vec.from_elements(
+                                [
+                                    do_elem_b.select(
+                                        mask_mod_obj.apply(
+                                            b_idx,
+                                            h_idx,
+                                            q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row,
+                                            kv_g,
+                                        ).select(old[ei], c_neg_large),
+                                        old[ei],
+                                    )
+                                    for ei in range(4)
+                                ],
                                 fx.Float32,
                             )
                         )
@@ -1880,10 +1950,27 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         SeqLens: fx.Tensor,
         AlibiSlopes: fx.Tensor,
         ScoreBias: fx.Tensor,
+        KvNumBlocks: fx.Tensor,
+        KvIndices: fx.Tensor,
+        KvIsFull: fx.Tensor,
         total_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        flex_attn_kernel(Q, K, V, O, LSE, CuSeqLen, SeqLens, AlibiSlopes, ScoreBias, total_tokens).launch(
+        flex_attn_kernel(
+            Q,
+            K,
+            V,
+            O,
+            LSE,
+            CuSeqLen,
+            SeqLens,
+            AlibiSlopes,
+            ScoreBias,
+            KvNumBlocks,
+            KvIndices,
+            KvIsFull,
+            total_tokens,
+        ).launch(
             grid=(B * H, num_q_tiles, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
@@ -1900,6 +1987,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         seq_lens_kv=None,
         alibi_slopes=None,
         score_bias=None,
+        block_mask: FlexBlockMask | None = None,
         lse=None,
         stream=fx.Stream(None),
     ):
@@ -1907,9 +1995,11 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
         Dense: phys-padded BHSD; optional dense-only ``alibi_slopes`` ``[H]`` fp32
         or phys-padded ``score_bias`` ``[B,H,Sq_phys,Skv_phys]`` (mutually exclusive).
-        When compiled with ``return_lse=True``, pass or allocate fp32
-        ``lse [B,H,Sq_phys]``; the launch returns that tensor. Varlen / paged
-        contracts unchanged; alibi/score_bias / return_lse rejected there.
+        Optional ``block_mask`` (``FlexBlockMask``) when compiled with
+        ``has_block_mask=True``. When compiled with ``return_lse=True``, pass or
+        allocate fp32 ``lse [B,H,Sq_phys]``; the launch returns that tensor.
+        Varlen / paged contracts unchanged; alibi/score_bias / return_lse /
+        block_mask rejected there.
         """
         q_shape = _tensor_shape(Q)
         k_shape = _tensor_shape(K)
@@ -1925,9 +2015,34 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             # Unused when return_lse=False (kernel builds a 1-element view).
             return O if lse is None else lse
 
+        def _block_mask_placeholders():
+            if has_block_mask:
+                if block_mask is None:
+                    raise ValueError("compiled with has_block_mask=True requires block_mask=FlexBlockMask")
+                if not isinstance(block_mask, FlexBlockMask):
+                    raise TypeError(f"block_mask must be FlexBlockMask, got {type(block_mask).__name__}")
+                if int(block_mask.block_m) != int(BLOCK_M) or int(block_mask.block_n) != int(BLOCK_N):
+                    raise ValueError(
+                        f"block_mask tile ({block_mask.block_m}x{block_mask.block_n}) must match "
+                        f"compile tile ({BLOCK_M}x{BLOCK_N})"
+                    )
+                if int(block_mask.num_q_tiles) != int(num_q_tiles) or int(block_mask.num_kv_tiles) != int(
+                    num_kv_tiles
+                ):
+                    raise ValueError(
+                        f"block_mask tiles ({block_mask.num_q_tiles},{block_mask.num_kv_tiles}) "
+                        f"incompatible with compile ({num_q_tiles},{num_kv_tiles})"
+                    )
+                return block_mask.kv_num_blocks, block_mask.kv_indices, block_mask.kv_is_full
+            if block_mask is not None:
+                raise ValueError("block_mask passed but kernel compiled without has_block_mask=True")
+            return O, O, O
+
         if varlen:
             if do_return_lse:
                 raise ValueError("return_lse is dense-only (not supported with varlen)")
+            if has_block_mask or block_mask is not None:
+                raise ValueError("block_mask is dense-only (not supported with varlen)")
             if cu_seqlens is None or seq_lens is None:
                 raise ValueError("varlen launch requires cu_seqlens [B+1] and seq_lens [B] (int32)")
             if alibi_slopes is not None or score_bias is not None:
@@ -1958,8 +2073,22 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                     f"varlen total_tokens (V leading dim) must be a multiple of 32 for SME G2S, got {total}"
                 )
             ali, sb = _bias_placeholders()
+            kn, ki, kf = _block_mask_placeholders()
             launch_flex_attn(
-                Q, K, V, O, _lse_placeholder(), cu_seqlens, seq_lens, ali, sb, fx.Int32(total), stream=stream
+                Q,
+                K,
+                V,
+                O,
+                _lse_placeholder(),
+                cu_seqlens,
+                seq_lens,
+                ali,
+                sb,
+                kn,
+                ki,
+                kf,
+                fx.Int32(total),
+                stream=stream,
             )
             return None
 
@@ -1970,6 +2099,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 raise ValueError("paged launch requires block_table [B, max_num_pages] and seq_lens_kv [B] (int32)")
             if alibi_slopes is not None or score_bias is not None:
                 raise ValueError("alibi/score_bias are dense-only (not supported with paged)")
+            if has_block_mask or block_mask is not None:
+                raise ValueError("block_mask is dense-only (not supported with paged)")
             bt_shape = _tensor_shape(block_table)
             sl_shape = _tensor_shape(seq_lens_kv)
             if len(bt_shape) != 2 or bt_shape[0] != B or bt_shape[1] != max_num_pages:
@@ -1992,8 +2123,22 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             if k_shape[0] != v_shape[0]:
                 raise ValueError(f"paged K/V NumBlocks mismatch: K={k_shape[0]}, V={v_shape[0]}")
             ali, sb = _bias_placeholders()
+            kn, ki, kf = _block_mask_placeholders()
             launch_flex_attn(
-                Q, K, V, O, _lse_placeholder(), block_table, seq_lens_kv, ali, sb, fx.Int32(0), stream=stream
+                Q,
+                K,
+                V,
+                O,
+                _lse_placeholder(),
+                block_table,
+                seq_lens_kv,
+                ali,
+                sb,
+                kn,
+                ki,
+                kf,
+                fx.Int32(0),
+                stream=stream,
             )
             return None
 
@@ -2047,7 +2192,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 lse_tensor = lse
         else:
             lse_tensor = _lse_placeholder()
-        launch_flex_attn(Q, K, V, O, lse_tensor, O, O, ali, sb, fx.Int32(0), stream=stream)
+        kn, ki, kf = _block_mask_placeholders()
+        launch_flex_attn(
+            Q, K, V, O, lse_tensor, O, O, ali, sb, kn, ki, kf, fx.Int32(0), stream=stream
+        )
         return lse_tensor if do_return_lse else None
 
     return launch_flex_attn_checked
@@ -2117,14 +2265,16 @@ def compile_iluvatar_flex_attention(
     has_alibi: bool = False,
     has_score_bias: bool = False,
     score_mod: Optional[TracedScoreMod] = None,
+    mask_mod: Optional[TracedMaskMod] = None,
+    has_block_mask: bool = False,
     tile_config: Mapping[str, int] | None = None,
     return_lse: bool = False,
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
-    This is a variant subset (causal / SWA / softcap), not a general score_mod
-    compiler. Dense ``score_mod`` accepts a ``TracedScoreMod`` from
-    ``@fx.trace_score_mod`` (V3-2); dispatcher does not pass it through yet.
+    Dense path supports ``score_mod=TracedScoreMod`` and optional BlockMask
+    sparse KV iteration (``has_block_mask=True`` at compile + ``FlexBlockMask``
+    as ``block_mask=`` at launch, with optional ``mask_mod`` for element holes).
 
     Supported scope: Q/K/V/O = f16 or bf16, D in {64, 128, 256}, GQA
     (``H % Hkv == 0``), arbitrary ``Sq``/``Skv`` (callers pass phys-padded
@@ -2184,6 +2334,10 @@ def compile_iluvatar_flex_attention(
         score_mod: Dense-only ``TracedScoreMod`` (or ``None``). Inlined after
             softcap and before ``*log2e``. Closure scalars only; not a replacement
             for ``alibi_slopes=[H]``.
+        mask_mod: Dense-only ``TracedMaskMod`` for element holes (with
+            ``has_block_mask``). Same mod used in ``create_block_mask``.
+        has_block_mask: Dense-only. If True, launch must pass ``block_mask=``
+            ``FlexBlockMask``; KV loop iterates ``kv_indices``.
         tile_config: Optional ``{"block_m": int, "block_n": int}`` with values
             in ``{32, 64}``. Default is ``64x64``. Paged requires ``block_n=64``.
         return_lse: Dense-only. If True, launch writes fp32 ``LSE [B,H,Sq_phys]``
@@ -2191,8 +2345,8 @@ def compile_iluvatar_flex_attention(
 
     Returns:
         Dense: ``launch_fn(Q, K, V, O, stream=None, alibi_slopes=..., score_bias=...,
-        lse=...)``. When ``return_lse=True``, returns the LSE tensor (allocates
-        if ``lse`` omitted); otherwise returns ``None``.
+        block_mask=..., lse=...)``. When ``return_lse=True``, returns the LSE tensor
+        (allocates if ``lse`` omitted); otherwise returns ``None``.
         Varlen: ``launch_fn(Q, K, V, O, cu_seqlens=..., seq_lens=..., stream=None)``.
         Paged: ``launch_fn(Q, K, V, O, block_table=..., seq_lens_kv=..., stream=None)``.
     """
@@ -2209,6 +2363,10 @@ def compile_iluvatar_flex_attention(
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
     if score_mod is not None and (varlen or paged):
         raise ValueError("score_mod is dense-only (not supported with varlen/paged)")
+    if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
+        raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
+    if (mask_mod is not None or has_block_mask) and (varlen or paged):
+        raise ValueError("block_mask/mask_mod are dense-only (not supported with varlen/paged)")
     if return_lse and (varlen or paged):
         raise ValueError("return_lse is dense-only (not supported with varlen/paged)")
 
@@ -2251,6 +2409,8 @@ def compile_iluvatar_flex_attention(
         has_alibi=has_alibi,
         has_score_bias=has_score_bias,
         score_mod=score_mod,
+        mask_mod=mask_mod,
+        has_block_mask=bool(has_block_mask),
         block_m=block_m,
         block_n=block_n,
         return_lse=return_lse,
@@ -2259,6 +2419,8 @@ def compile_iluvatar_flex_attention(
 
 __all__ = [
     "compile_iluvatar_flex_attention",
+    "create_block_mask",
+    "FlexBlockMask",
     "BLOCK_M",
     "BLOCK_N",
     "_SUPPORTED_BLOCK",
