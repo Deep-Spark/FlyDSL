@@ -34,4 +34,4 @@ jobs:
     uses: ./.github/workflows/test-whl-iluvatar.yaml
     with:
       docker_image: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
-      wheel_artifact_name: flydsl-iluvatar-wheels
+      wheel_artifact_name: ${{ needs.build.outputs.artifact_name }}

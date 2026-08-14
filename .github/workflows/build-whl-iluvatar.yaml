@@ -17,6 +17,9 @@ on:
       wheel_names:
         description: "Space-separated built wheel filenames"
         value: ${{ jobs.build.outputs.wheel_names }}
+      artifact_name:
+        description: "Uploaded artifact name (includes github.run_id)"
+        value: ${{ jobs.build.outputs.artifact_name }}
   workflow_dispatch:
     inputs:
       python_versions:
@@ -36,16 +39,22 @@ jobs:
     timeout-minutes: 180
     outputs:
       wheel_names: ${{ steps.collect.outputs.wheel_names }}
+      artifact_name: ${{ steps.collect.outputs.artifact_name }}
     env:
       COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
       # Release wheels use sdk/ixcc-release (xiang.zhang/ixcc-flydsl-release).
       # Dev CI (ci-device / perf) continues to use sdk/ixcc.
       IXCC_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
+      DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
+      WHEEL_ARTIFACT_NAME: flydsl-iluvatar-wheels-${{ github.run_id }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          # Need full history so setup.py can resolve a stable short hash / date tag.
+          fetch-depth: 0
 
       - name: Login to GHCR (best effort)
         continue-on-error: true
@@ -56,6 +65,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Preflight release IXCC toolchain
+        id: preflight
         run: |
           set -euo pipefail
           if [[ ! -f "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake" ]]; then
@@ -70,24 +80,39 @@ jobs:
             echo "::error::Rebuild with -DMLIR_ENABLE_BINDINGS_PYTHON=ON (see prepare_ix_toolchain_release.sh)."
             exit 1
           fi
-          echo "IXCC_RELEASE_MLIR_CMAKE=${IXCC_MLIR_CMAKE}"
-          echo "IXCC_RELEASE_ROOT=${IXCC_ROOT}"
+
+          FLYDSL_COMMIT="$(git rev-parse HEAD)"
+          FLYDSL_COMMIT_SHORT="$(git rev-parse --short HEAD)"
+          IXCC_COMMIT=""
+          IXCC_COMMIT_SHORT=""
           if [[ -d "${IXCC_ROOT}/.git" || -e "${IXCC_ROOT}/.git" ]]; then
-            echo "IXCC_RELEASE_COMMIT=$(git -C "${IXCC_ROOT}" rev-parse --short HEAD)"
+            IXCC_COMMIT="$(git -C "${IXCC_ROOT}" rev-parse HEAD)"
+            IXCC_COMMIT_SHORT="$(git -C "${IXCC_ROOT}" rev-parse --short HEAD)"
             git -C "${IXCC_ROOT}" log -1 --oneline || true
           fi
+
+          {
+            echo "ixcc_root=${IXCC_ROOT}"
+            echo "flydsl_commit=${FLYDSL_COMMIT}"
+            echo "flydsl_commit_short=${FLYDSL_COMMIT_SHORT}"
+            echo "ixcc_commit=${IXCC_COMMIT}"
+            echo "ixcc_commit_short=${IXCC_COMMIT_SHORT}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "IXCC_RELEASE_MLIR_CMAKE=${IXCC_MLIR_CMAKE}"
+          echo "IXCC_RELEASE_ROOT=${IXCC_ROOT}"
+          echo "FLYDSL_COMMIT=${FLYDSL_COMMIT}"
+          echo "IXCC_COMMIT=${IXCC_COMMIT}"
           if [[ -f "${IXCC_ROOT}/.flydsl_ixcc_build_commit" ]]; then
             echo "IXCC_RELEASE_STAMP=$(tr '\n' ' ' < "${IXCC_ROOT}/.flydsl_ixcc_build_commit")"
           fi
 
       - name: Build A-track wheels in container
         env:
-          DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
-          PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
+          IXCC_ROOT: ${{ steps.preflight.outputs.ixcc_root }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
           docker run --rm \
             --network host \
             --ipc host \
@@ -101,6 +126,8 @@ jobs:
             -e IXCC_ROOT="${IXCC_ROOT}" \
             -e IXCC_MLIR_CMAKE="${IXCC_MLIR_CMAKE}" \
             -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
+            -e FLYDSL_RELEASE_TYPE=devreleases \
+            -e FLYDSL_VERSION_LOCAL_SUFFIX="run.${GITHUB_RUN_ID}" \
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
@@ -124,6 +151,8 @@ jobs:
                   FLY_REBUILD=0 \
                   FLY_BUILD_DIR="${build_dir}" \
                   MLIR_PATH="${MLIR_PREFIX}" \
+                  FLYDSL_RELEASE_TYPE=devreleases \
+                  FLYDSL_VERSION_LOCAL_SUFFIX="${FLYDSL_VERSION_LOCAL_SUFFIX}" \
                   python setup.py bdist_wheel
                 deactivate
               done
@@ -139,17 +168,37 @@ jobs:
           set -euo pipefail
           python3 .github/scripts/verify_wheel_contents.py dist/*.whl --summary-json dist/wheel-payload-summary.json
 
+      - name: Write build manifest and job summary
+        env:
+          FLYDSL_COMMIT: ${{ steps.preflight.outputs.flydsl_commit }}
+          FLYDSL_COMMIT_SHORT: ${{ steps.preflight.outputs.flydsl_commit_short }}
+          IXCC_COMMIT: ${{ steps.preflight.outputs.ixcc_commit }}
+          IXCC_COMMIT_SHORT: ${{ steps.preflight.outputs.ixcc_commit_short }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/write_iluvatar_wheel_build_manifest.py \
+            dist/*.whl \
+            --manifest-json dist/build-manifest.json \
+            --summary-md dist/build-summary.md
+
       - name: Collect wheel names
         id: collect
         run: |
           set -euo pipefail
           WHEELS="$(ls dist/*.whl | xargs -n1 basename | tr '\n' ' ')"
           echo "wheel_names=${WHEELS}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_name=${WHEEL_ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
           echo "Built wheels: ${WHEELS}"
+          echo "Artifact name: ${WHEEL_ARTIFACT_NAME}"
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: flydsl-iluvatar-wheels
-          path: dist/*.whl
+          name: ${{ env.WHEEL_ARTIFACT_NAME }}
+          path: |
+            dist/*.whl
+            dist/build-manifest.json
+            dist/build-summary.md
+            dist/wheel-payload-summary.json
           retention-days: 3
+          if-no-files-found: error
