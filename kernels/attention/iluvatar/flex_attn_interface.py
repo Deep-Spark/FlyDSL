@@ -181,6 +181,8 @@ def flydsl_flex_attn_func(
     alibi_slopes=None,
     score_bias=None,
     score_mod=None,
+    mask_mod=None,
+    block_mask=None,
     sm_scale: Optional[float] = None,
     out=None,
     # Varlen (packed): both required to select the varlen path.
@@ -212,16 +214,16 @@ def flydsl_flex_attn_func(
     ``tile_config`` is optional ``{"block_m", "block_n"}`` with values in
     ``{32, 64}`` (default 64x64). Paged requires ``block_n=64``.
 
-    ``score_mod`` is not accepted here yet (V3-2); use
-    ``compile_iluvatar_flex_attention(..., score_mod=...)`` directly.
+    ``score_mod`` / ``mask_mod`` / ``block_mask`` are not accepted here yet;
+    use ``compile_iluvatar_flex_attention`` / ``create_block_mask`` directly.
 
     Returns:
         Output in the same layout as ``q`` (logical lengths; no phys pad).
     """
-    if score_mod is not None:
+    if score_mod is not None or mask_mod is not None or block_mask is not None:
         raise ValueError(
-            "flydsl_flex_attn_func does not accept score_mod yet; "
-            "use compile_iluvatar_flex_attention(..., score_mod=TracedScoreMod) instead"
+            "flydsl_flex_attn_func does not accept score_mod/mask_mod/block_mask yet; "
+            "use compile_iluvatar_flex_attention / create_block_mask instead"
         )
     torch = _torch()
     mode = _resolve_mode(
