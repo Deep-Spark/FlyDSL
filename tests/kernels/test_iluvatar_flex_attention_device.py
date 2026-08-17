@@ -24,8 +24,9 @@ import os
 import sys
 from pathlib import Path
 
-import flydsl.expr as fx
 import pytest
+
+import flydsl.expr as fx
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.iluvatar_lower]
 
@@ -340,9 +341,7 @@ def _reference_flex_attention_fp32(
             for h in range(H):
                 for qi in range(Sq):
                     for ki in range(Skv):
-                        Sout[b, h, qi, ki] = float(
-                            score_mod.eval_host(float(S[b, h, qi, ki]), b, h, qi, ki)
-                        )
+                        Sout[b, h, qi, ki] = float(score_mod.eval_host(float(S[b, h, qi, ki]), b, h, qi, ki))
         S = Sout
     mask = torch.zeros((Sq, Skv), device=S.device, dtype=torch.bool)
     if is_causal:
@@ -1745,29 +1744,68 @@ def test_iluvatar_flex_attention_rejects_score_mod_varlen_paged():
         return score
 
     with pytest.raises(ValueError, match=r"dense-only"):
-        mod.compile_iluvatar_flex_attention(
-            1, 4, 64, 64, 128, dtype="bf16", varlen=True, score_mod=identity
-        )
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, score_mod=identity)
     with pytest.raises(ValueError, match=r"dense-only"):
-        mod.compile_iluvatar_flex_attention(
-            1, 4, 64, 64, 128, dtype="bf16", paged=True, score_mod=identity
-        )
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, score_mod=identity)
 
 
-def test_iluvatar_flex_attention_dispatcher_rejects_score_mod(monkeypatch):
+def test_iluvatar_flex_attention_dispatcher_rejects_raw_score_mod(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     from kernels.attention.iluvatar import flex_attn_interface as iface
 
-    @fx.trace_score_mod
-    def identity(score, batch, head, q_idx, kv_idx):
+    def raw(score, batch, head, q_idx, kv_idx):
         return score
 
     q = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match=r"score_mod"):
-        iface.flydsl_flex_attn_func(q, k, v, score_mod=identity)
+    with pytest.raises(ValueError, match=r"TracedScoreMod"):
+        iface.flydsl_flex_attn_func(q, k, v, score_mod=raw)
+
+
+def test_iluvatar_flex_attention_dispatcher_score_mod_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score - 0.1 * (q_idx - kv_idx)
+
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    out_disp = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, score_mod=alibi_like)
+
+    Sq_phys = _phys_seq(Sq, 64)
+    Skv_phys = _phys_seq(Skv, 64)
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        score_mod=alibi_like,
+    )
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch.bfloat16)
+    K = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    V = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    Q[:, :, :Sq].copy_(q.permute(0, 2, 1, 3))
+    K[:, :, :Skv].copy_(k.permute(0, 2, 1, 3))
+    V[:, :, :Skv].copy_(v.permute(0, 2, 1, 3))
+    V_tn = V.transpose(-1, -2).contiguous()
+    O_buf = torch.zeros_like(Q)
+    launch(Q, K, V_tn, O_buf)
+    out_direct = O_buf[:, :, :Sq, :].permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(out_disp, out_direct, rtol=0, atol=0)
 
 
 def _run_flex_attn_score_mod(monkeypatch, *, score_mod, softcap=None, is_causal=True, dtype="bf16"):
@@ -1848,9 +1886,7 @@ def test_iluvatar_flex_attention_score_mod_with_softcap(monkeypatch):
     def alibi_like(score, batch, head, q_idx, kv_idx):
         return score - slope * (q_idx - kv_idx)
 
-    out, ref, tol = _run_flex_attn_score_mod(
-        monkeypatch, score_mod=alibi_like, softcap=30.0, is_causal=True
-    )
+    out, ref, tol = _run_flex_attn_score_mod(monkeypatch, score_mod=alibi_like, softcap=30.0, is_causal=True)
     torch = _require_torch()
     torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
 
@@ -1871,7 +1907,6 @@ def _element_visible_ref(q, kv, *, Sq, Skv, is_causal, window_size, mask_mod):
 
 
 def test_create_block_mask_matches_dense_visibility():
-    torch = _require_torch()
     mod = _require_flex_attn_module()
 
     @fx.trace_mask_mod
@@ -1933,35 +1968,93 @@ def test_iluvatar_flex_attention_rejects_mask_mod_block_mask_varlen_paged():
         return True
 
     with pytest.raises(ValueError, match=r"dense-only"):
-        mod.compile_iluvatar_flex_attention(
-            1, 4, 64, 64, 128, dtype="bf16", varlen=True, mask_mod=always
-        )
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, mask_mod=always)
     with pytest.raises(ValueError, match=r"dense-only"):
-        mod.compile_iluvatar_flex_attention(
-            1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True
-        )
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True)
 
 
-def test_iluvatar_flex_attention_dispatcher_rejects_block_mask_mask_mod(monkeypatch):
+def test_iluvatar_flex_attention_dispatcher_block_mask_matches_compile(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
     from kernels.attention.iluvatar import create_block_mask
     from kernels.attention.iluvatar import flex_attn_interface as iface
 
     @fx.trace_mask_mod
-    def always(batch, head, q_idx, kv_idx):
-        return True
+    def near_band(batch, head, q_idx, kv_idx):
+        # |q-kv| <= 64 without FloorDiv (not in V3-1 whitelist).
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
 
-    q = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match=r"mask_mod|block_mask"):
-        iface.flydsl_flex_attn_func(q, k, v, mask_mod=always)
+    B, H, Sq, Skv, D = 1, 4, 128, 128, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
     block_mask = create_block_mask(
-        None, 1, 4, 64, 64, block_m=64, block_n=64, is_causal=True, device=q.device
+        near_band,
+        B,
+        H,
+        Sq,
+        Skv,
+        block_m=64,
+        block_n=64,
+        is_causal=True,
+        device=q.device,
     )
-    with pytest.raises(ValueError, match=r"block_mask"):
-        iface.flydsl_flex_attn_func(q, k, v, block_mask=block_mask)
+
+    out_disp = iface.flydsl_flex_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        sm_scale=sm_scale,
+        mask_mod=near_band,
+        block_mask=block_mask,
+    )
+
+    Sq_phys = _phys_seq(Sq, 64)
+    Skv_phys = _phys_seq(Skv, 64)
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch.bfloat16)
+    K = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    V = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch.bfloat16)
+    Q[:, :, :Sq].copy_(q.permute(0, 2, 1, 3))
+    K[:, :, :Skv].copy_(k.permute(0, 2, 1, 3))
+    V[:, :, :Skv].copy_(v.permute(0, 2, 1, 3))
+    V_tn = V.transpose(-1, -2).contiguous()
+    O_buf = torch.zeros_like(Q)
+    launch(Q, K, V_tn, O_buf, block_mask=block_mask)
+    out_direct = O_buf[:, :, :Sq, :].permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(out_disp, out_direct, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attention_dispatcher_rejects_mods_on_varlen(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_score_mod
+    def identity(score, batch, head, q_idx, kv_idx):
+        return score
+
+    q = torch.randn(64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, 64], dtype=torch.int32)
+    sl = torch.tensor([64], dtype=torch.int32)
+    with pytest.raises(ValueError, match=r"dense-only"):
+        iface.flydsl_flex_attn_func(q, k, v, cu_seqlens=cu, seq_lens=sl, score_mod=identity)
 
 
 def _run_flex_attn_block_mask(

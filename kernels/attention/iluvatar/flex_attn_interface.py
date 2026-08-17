@@ -8,8 +8,10 @@ Wraps ``compile_iluvatar_flex_attention`` behind a single Torch entry:
     ``flydsl_flex_attn_func(q, k, v, ...)``
 
 Selects dense / varlen / paged from optional metadata, caches compiled
-launchers with ``lru_cache``, and owns dense/paged phys-pad + V transpose so
-callers can pass logical BSHD (or packed varlen / natural paged pages).
+launchers (fingerprint-keyed LRU), and owns dense/paged phys-pad + V
+transpose so callers can pass logical BSHD (or packed varlen / natural
+paged pages). Dense ``score_mod`` / ``mask_mod`` / ``block_mask`` are
+passed through to ``compile_iluvatar_flex_attention``.
 
 Also exposes ``autotune_iluvatar_flex_attention_tile`` for opt-in dense-only
 tile search (returns a ``tile_config`` dict; does not alter the default path).
@@ -17,10 +19,12 @@ tile search (returns a ``tile_config`` dict; does not alter the default path).
 
 from __future__ import annotations
 
-import functools
+from collections import OrderedDict
 from typing import Mapping, Optional, Sequence
 
 import flydsl.expr as fx
+from flydsl.expr.trace_mod import TracedMaskMod, TracedScoreMod
+from kernels.attention.iluvatar.block_mask import FlexBlockMask
 from kernels.attention.iluvatar.flex_attention import (
     _SUPPORTED_BLOCK,
     _normalize_tile_config,
@@ -28,6 +32,11 @@ from kernels.attention.iluvatar.flex_attention import (
 )
 
 __all__ = ["flydsl_flex_attn_func", "autotune_iluvatar_flex_attention_tile"]
+
+# Manual LRU: Traced* objects are not safely hashable for lru_cache
+# (callable + dict closure); keys use stable fingerprints instead.
+_LAUNCHER_CACHE: OrderedDict = OrderedDict()
+_LAUNCHER_CACHE_MAX = 256
 
 
 def _torch():
@@ -80,7 +89,6 @@ def _default_tile_configs() -> list[dict[str, int]]:
     return [{"block_m": bm, "block_n": bn} for bm in _SUPPORTED_BLOCK for bn in _SUPPORTED_BLOCK]
 
 
-@functools.lru_cache(maxsize=256)
 def _build_launcher(
     B: int,
     H: int,
@@ -99,8 +107,39 @@ def _build_launcher(
     has_score_bias: bool,
     block_m: int,
     block_n: int,
+    score_mod: Optional[TracedScoreMod] = None,
+    mask_mod: Optional[TracedMaskMod] = None,
+    has_block_mask: bool = False,
 ):
-    return compile_iluvatar_flex_attention(
+    sm_fp = score_mod.fingerprint if score_mod is not None else ""
+    mm_fp = mask_mod.fingerprint if mask_mod is not None else ""
+    key = (
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        Hkv,
+        dtype,
+        is_causal,
+        window_size,
+        softcap,
+        sm_scale,
+        varlen,
+        paged,
+        has_alibi,
+        has_score_bias,
+        block_m,
+        block_n,
+        sm_fp,
+        mm_fp,
+        bool(has_block_mask),
+    )
+    hit = _LAUNCHER_CACHE.get(key)
+    if hit is not None:
+        _LAUNCHER_CACHE.move_to_end(key)
+        return hit
+    launch = compile_iluvatar_flex_attention(
         B,
         H,
         Sq,
@@ -117,7 +156,14 @@ def _build_launcher(
         has_alibi=has_alibi,
         has_score_bias=has_score_bias,
         tile_config={"block_m": block_m, "block_n": block_n},
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        has_block_mask=bool(has_block_mask),
     )
+    _LAUNCHER_CACHE[key] = launch
+    while len(_LAUNCHER_CACHE) > _LAUNCHER_CACHE_MAX:
+        _LAUNCHER_CACHE.popitem(last=False)
+    return launch
 
 
 def _bshd_to_bhsd(x):
@@ -214,17 +260,15 @@ def flydsl_flex_attn_func(
     ``tile_config`` is optional ``{"block_m", "block_n"}`` with values in
     ``{32, 64}`` (default 64x64). Paged requires ``block_n=64``.
 
-    ``score_mod`` / ``mask_mod`` / ``block_mask`` are not accepted here yet;
-    use ``compile_iluvatar_flex_attention`` / ``create_block_mask`` directly.
+    Dense-only mods (V3-4): ``score_mod`` (``TracedScoreMod``), ``mask_mod``
+    (``TracedMaskMod``), and/or ``block_mask`` (``FlexBlockMask``) are passed
+    through to ``compile_iluvatar_flex_attention``. Varlen/paged reject them.
+    If ``block_mask`` is set and ``tile_config`` is omitted, the mask tile is
+    used.
 
     Returns:
         Output in the same layout as ``q`` (logical lengths; no phys pad).
     """
-    if score_mod is not None or mask_mod is not None or block_mask is not None:
-        raise ValueError(
-            "flydsl_flex_attn_func does not accept score_mod/mask_mod/block_mask yet; "
-            "use compile_iluvatar_flex_attention / create_block_mask instead"
-        )
     torch = _torch()
     mode = _resolve_mode(
         cu_seqlens=cu_seqlens,
@@ -232,9 +276,30 @@ def flydsl_flex_attn_func(
         block_table=block_table,
         seq_lens_kv=seq_lens_kv,
     )
+
+    if score_mod is not None and not isinstance(score_mod, TracedScoreMod):
+        raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
+    if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
+        raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
+    if block_mask is not None and not isinstance(block_mask, FlexBlockMask):
+        raise TypeError(f"block_mask must be FlexBlockMask or None, got {type(block_mask).__name__}")
+    if mode != "dense" and (score_mod is not None or mask_mod is not None or block_mask is not None):
+        raise ValueError("score_mod/mask_mod/block_mask are dense-only (not supported with " f"{mode})")
+
+    if block_mask is not None and tile_config is None:
+        tile_config = {
+            "block_m": int(block_mask.block_m),
+            "block_n": int(block_mask.block_n),
+        }
+
     dtype = _dtype_str(q)
     fxs = _as_fx_stream(stream)
     block_m, block_n = _normalize_tile_config(tile_config, paged=(mode == "paged"))
+    if block_mask is not None and (int(block_mask.block_m) != int(block_m) or int(block_mask.block_n) != int(block_n)):
+        raise ValueError(
+            f"block_mask tile ({block_mask.block_m}x{block_mask.block_n}) must match "
+            f"tile_config ({block_m}x{block_n})"
+        )
 
     if mode == "dense":
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
@@ -253,6 +318,7 @@ def flydsl_flex_attn_func(
             raise ValueError("alibi_slopes and score_bias are mutually exclusive")
         has_alibi = alibi_slopes is not None
         has_score_bias = score_bias is not None
+        has_bm = block_mask is not None
         launch = _build_launcher(
             b,
             h,
@@ -271,6 +337,9 @@ def flydsl_flex_attn_func(
             has_score_bias,
             block_m,
             block_n,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            has_block_mask=has_bm,
         )
         q_bhsd = _pad_bhsd(_bshd_to_bhsd(q), sq, block_m)
         k_bhsd = _pad_bhsd(_bshd_to_bhsd(k), skv, block_n)
@@ -304,6 +373,7 @@ def flydsl_flex_attn_func(
             o_bhsd,
             alibi_slopes=ali,
             score_bias=sb_phys,
+            block_mask=block_mask,
             stream=fxs,
         )
         o_logic = _bhsd_to_bshd(o_bhsd[:, :, :sq, :])
