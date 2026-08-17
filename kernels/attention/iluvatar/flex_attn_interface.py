@@ -10,8 +10,9 @@ Wraps ``compile_iluvatar_flex_attention`` behind a single Torch entry:
 Selects dense / varlen / paged from optional metadata, caches compiled
 launchers (fingerprint-keyed LRU), and owns dense/paged phys-pad + V
 transpose so callers can pass logical BSHD (or packed varlen / natural
-paged pages). Dense ``score_mod`` / ``mask_mod`` / ``block_mask`` are
-passed through to ``compile_iluvatar_flex_attention``.
+paged pages). Dense and varlen ``score_mod`` are passed through to
+``compile_iluvatar_flex_attention``; dense also accepts ``mask_mod`` /
+``block_mask``.
 
 Also exposes ``autotune_iluvatar_flex_attention_tile`` for opt-in dense-only
 tile search (returns a ``tile_config`` dict; does not alter the default path).
@@ -260,11 +261,10 @@ def flydsl_flex_attn_func(
     ``tile_config`` is optional ``{"block_m", "block_n"}`` with values in
     ``{32, 64}`` (default 64x64). Paged requires ``block_n=64``.
 
-    Dense-only mods (V3-4): ``score_mod`` (``TracedScoreMod``), ``mask_mod``
-    (``TracedMaskMod``), and/or ``block_mask`` (``FlexBlockMask``) are passed
-    through to ``compile_iluvatar_flex_attention``. Varlen/paged reject them.
-    If ``block_mask`` is set and ``tile_config`` is omitted, the mask tile is
-    used.
+    Dense and varlen may pass ``score_mod`` (``TracedScoreMod``). Dense-only:
+    ``mask_mod`` (``TracedMaskMod``) and/or ``block_mask`` (``FlexBlockMask``).
+    Paged rejects all mods. If ``block_mask`` is set and ``tile_config`` is
+    omitted, the mask tile is used.
 
     Returns:
         Output in the same layout as ``q`` (logical lengths; no phys pad).
@@ -283,8 +283,10 @@ def flydsl_flex_attn_func(
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
     if block_mask is not None and not isinstance(block_mask, FlexBlockMask):
         raise TypeError(f"block_mask must be FlexBlockMask or None, got {type(block_mask).__name__}")
-    if mode != "dense" and (score_mod is not None or mask_mod is not None or block_mask is not None):
-        raise ValueError("score_mod/mask_mod/block_mask are dense-only (not supported with " f"{mode})")
+    if mode == "paged" and score_mod is not None:
+        raise ValueError("score_mod is not supported with paged")
+    if mode != "dense" and (mask_mod is not None or block_mask is not None):
+        raise ValueError(f"mask_mod/block_mask are dense-only (not supported with {mode})")
 
     if block_mask is not None and tile_config is None:
         tile_config = {
@@ -433,6 +435,7 @@ def flydsl_flex_attn_func(
             False,
             block_m,
             block_n,
+            score_mod=score_mod,
         )
         v_tn = v.permute(1, 2, 0).contiguous()  # [Hkv, D, total]
         o = torch.zeros_like(q) if out is None else out

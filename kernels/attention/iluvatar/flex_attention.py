@@ -4,9 +4,9 @@
 """Iluvatar flex-attention forward (dense / varlen / paged + score_mod + BlockMask).
 
 Supports f16/bf16, D in {64,128,256}, MHA/GQA, causal / SWA / softcap, varlen,
-paged KV, dense alibi/score_bias, dense ``score_mod=TracedScoreMod``, and dense
-``block_mask`` / ``mask_mod`` sparse KV skip (V3-3). Optional ``tile_config``
-and dense ``return_lse``.
+paged KV, dense alibi/score_bias, ``score_mod=TracedScoreMod`` on dense and
+varlen (V3-5), and dense ``block_mask`` / ``mask_mod`` sparse KV skip (V3-3).
+Optional ``tile_config`` and dense ``return_lse``.
 """
 
 import math
@@ -494,7 +494,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
       * ``S *= sm_scale``
       * optional ``+ alibi`` or ``+ score_bias`` (dense only; mutually exclusive)
       * optional softcap ``tanh``
-      * optional dense ``score_mod.apply`` (V3-2; after softcap)
+      * optional ``score_mod.apply`` (dense + varlen; after softcap)
       * ``S *= log2e`` (when softcap/bias/score_mod unset, fuse ``*(sm_scale*log2e)``)
       * then optional causal / SWA / KV-tail masks in the log2 domain with
         ``NEG_LARGE_F``.
@@ -545,8 +545,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
     if score_mod is not None and not isinstance(score_mod, TracedScoreMod):
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
-    if score_mod is not None and (varlen or paged):
-        raise ValueError("score_mod is dense-only (not supported with varlen/paged)")
+    if score_mod is not None and paged:
+        raise ValueError("score_mod is not supported with paged")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
     if (mask_mod is not None or has_block_mask) and (varlen or paged):
@@ -1319,9 +1319,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                                                     (
                                                         b_idx,
                                                         h_idx,
-                                                        q_block_base
-                                                        + fx.Int32(mma_m * ATOM_M + ei * 4)
-                                                        + lane_row,
+                                                        q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row,
                                                         kv_g,
                                                     ),
                                                 )
@@ -1582,8 +1580,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                                     (
                                         do_elem_b
                                         & (
-                                            (q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row)
-                                            - kv_g
+                                            (q_block_base + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row) - kv_g
                                             > c_window
                                         )
                                     ).select(c_neg_large, old[ei])
@@ -1603,10 +1600,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         kv_g = kv_block_base + fx.Int32(mma_n * ATOM_N) + lane_col
                         acc.store(
                             Vec.from_elements(
-                                [
-                                    (do_elem_b & (kv_g >= c_skv_logical)).select(c_neg_large, old[ei])
-                                    for ei in range(4)
-                                ],
+                                [(do_elem_b & (kv_g >= c_skv_logical)).select(c_neg_large, old[ei]) for ei in range(4)],
                                 fx.Float32,
                             )
                         )
@@ -1842,11 +1836,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 for mma_m in fx.range_constexpr(WARP_ATOMS_M):
                     for ei in fx.range_constexpr(4):
                         slot = mma_m * 4 + ei
-                        row = (
-                            warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M)
-                            + fx.Int32(mma_m * ATOM_M + ei * 4)
-                            + lane_row
-                        )
+                        row = warp_m_id * fx.Int32(WARP_ATOMS_M * ATOM_M) + fx.Int32(mma_m * ATOM_M + ei * 4) + lane_row
                         q_row = q_start + row
                         l_val = l_final[slot]
                         m_val = m_final[slot]
@@ -2026,9 +2016,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                         f"block_mask tile ({block_mask.block_m}x{block_mask.block_n}) must match "
                         f"compile tile ({BLOCK_M}x{BLOCK_N})"
                     )
-                if int(block_mask.num_q_tiles) != int(num_q_tiles) or int(block_mask.num_kv_tiles) != int(
-                    num_kv_tiles
-                ):
+                if int(block_mask.num_q_tiles) != int(num_q_tiles) or int(block_mask.num_kv_tiles) != int(num_kv_tiles):
                     raise ValueError(
                         f"block_mask tiles ({block_mask.num_q_tiles},{block_mask.num_kv_tiles}) "
                         f"incompatible with compile ({num_q_tiles},{num_kv_tiles})"
@@ -2193,9 +2181,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         else:
             lse_tensor = _lse_placeholder()
         kn, ki, kf = _block_mask_placeholders()
-        launch_flex_attn(
-            Q, K, V, O, lse_tensor, O, O, ali, sb, kn, ki, kf, fx.Int32(0), stream=stream
-        )
+        launch_flex_attn(Q, K, V, O, lse_tensor, O, O, ali, sb, kn, ki, kf, fx.Int32(0), stream=stream)
         return lse_tensor if do_return_lse else None
 
     return launch_flex_attn_checked
@@ -2272,9 +2258,10 @@ def compile_iluvatar_flex_attention(
 ) -> Callable:
     """Compile a fused flex-attention forward kernel for the Iluvatar backend.
 
-    Dense path supports ``score_mod=TracedScoreMod`` and optional BlockMask
-    sparse KV iteration (``has_block_mask=True`` at compile + ``FlexBlockMask``
-    as ``block_mask=`` at launch, with optional ``mask_mod`` for element holes).
+    Dense and varlen paths support ``score_mod=TracedScoreMod``. Dense also
+    supports optional BlockMask sparse KV iteration (``has_block_mask=True`` at
+    compile + ``FlexBlockMask`` as ``block_mask=`` at launch, with optional
+    ``mask_mod`` for element holes).
 
     Supported scope: Q/K/V/O = f16 or bf16, D in {64, 128, 256}, GQA
     (``H % Hkv == 0``), arbitrary ``Sq``/``Skv`` (callers pass phys-padded
@@ -2331,9 +2318,10 @@ def compile_iluvatar_flex_attention(
         has_alibi: Dense-only; enable ``alibi_slopes [H]`` additive bias.
         has_score_bias: Dense-only; enable phys-padded ``score_bias`` tensor.
             Mutually exclusive with ``has_alibi``; not supported with varlen/paged.
-        score_mod: Dense-only ``TracedScoreMod`` (or ``None``). Inlined after
-            softcap and before ``*log2e``. Closure scalars only; not a replacement
-            for ``alibi_slopes=[H]``.
+        score_mod: ``TracedScoreMod`` (or ``None``) for dense and varlen.
+            Inlined after softcap and before ``*log2e``. Closure scalars only;
+            not a replacement for ``alibi_slopes=[H]``. Not supported with paged.
+            Indices are per-sequence (``batch`` is seq id on varlen).
         mask_mod: Dense-only ``TracedMaskMod`` for element holes (with
             ``has_block_mask``). Same mod used in ``create_block_mask``.
         has_block_mask: Dense-only. If True, launch must pass ``block_mask=``
@@ -2361,8 +2349,8 @@ def compile_iluvatar_flex_attention(
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
     if score_mod is not None and not isinstance(score_mod, TracedScoreMod):
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
-    if score_mod is not None and (varlen or paged):
-        raise ValueError("score_mod is dense-only (not supported with varlen/paged)")
+    if score_mod is not None and paged:
+        raise ValueError("score_mod is not supported with paged")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
     if (mask_mod is not None or has_block_mask) and (varlen or paged):
