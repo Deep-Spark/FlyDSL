@@ -13,6 +13,7 @@ Covers:
 * Dense alibi / score_bias and the ``flydsl_flex_attn_func`` dispatcher.
 * Dense ``score_mod=TracedScoreMod`` (V3-2) and varlen ``score_mod`` (V3-5) vs host / dense concat.
 * Dense ``create_block_mask`` / ``block_mask`` sparse KV skip (V3-3) vs dense path.
+* Varlen ``create_block_masks_varlen`` / ``block_masks`` / ``mask_mod`` (V3-6) vs dense concat.
 * Optional ``tile_config`` whitelist and dense ``autotune_iluvatar_flex_attention_tile``.
 """
 
@@ -601,7 +602,9 @@ def test_iluvatar_flex_attention_forward_pr2c_sq_tail_smoke(monkeypatch):
 def test_iluvatar_flex_attention_package_export():
     from kernels.attention.iluvatar import autotune_iluvatar_flex_attention_tile as exported_tune
     from kernels.attention.iluvatar import compile_iluvatar_flex_attention as exported
+    from kernels.attention.iluvatar import create_block_masks_varlen as exported_create_varlen
     from kernels.attention.iluvatar import flydsl_flex_attn_func as exported_func
+    from kernels.attention.iluvatar import pack_block_masks_varlen as exported_pack
 
     mod = _require_flex_attn_module()
     assert exported is mod.compile_iluvatar_flex_attention
@@ -610,6 +613,8 @@ def test_iluvatar_flex_attention_package_export():
 
     assert exported_func is iface.flydsl_flex_attn_func
     assert exported_tune is iface.autotune_iluvatar_flex_attention_tile
+    assert exported_create_varlen is mod.create_block_masks_varlen
+    assert exported_pack is mod.pack_block_masks_varlen
 
 
 # --- Perf (opt-in; consumed by perf-daily-iluvatar) ----------------------------
@@ -1744,13 +1749,9 @@ def test_iluvatar_flex_attention_rejects_score_mod_paged_allows_varlen():
         return score
 
     # V3-5: varlen + score_mod is allowed (compile succeeds).
-    mod.compile_iluvatar_flex_attention(
-        1, 4, 64, 64, 128, dtype="bf16", varlen=True, score_mod=identity
-    )
+    mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, score_mod=identity)
     with pytest.raises(ValueError, match=r"paged"):
-        mod.compile_iluvatar_flex_attention(
-            1, 4, 64, 64, 128, dtype="bf16", paged=True, score_mod=identity
-        )
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, score_mod=identity)
 
 
 def test_iluvatar_flex_attention_dispatcher_rejects_raw_score_mod(monkeypatch):
@@ -2045,17 +2046,11 @@ def test_iluvatar_flex_attention_rejects_mask_mod_block_mask_paged_allows_varlen
 
     # V3-6: varlen + mask_mod / has_block_mask is allowed (compile succeeds).
     mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, mask_mod=always)
-    mod.compile_iluvatar_flex_attention(
-        1, 4, 64, 64, 128, dtype="bf16", varlen=True, has_block_mask=True
-    )
+    mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, has_block_mask=True)
     with pytest.raises(ValueError, match=r"paged"):
-        mod.compile_iluvatar_flex_attention(
-            1, 4, 64, 64, 128, dtype="bf16", paged=True, mask_mod=always
-        )
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, mask_mod=always)
     with pytest.raises(ValueError, match=r"paged"):
-        mod.compile_iluvatar_flex_attention(
-            1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True
-        )
+        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True)
 
 
 def test_iluvatar_flex_attention_dispatcher_block_mask_matches_compile(monkeypatch):
@@ -2205,9 +2200,7 @@ def test_iluvatar_flex_attention_dispatcher_varlen_block_masks_matches_compile(m
         mask_mod=near_band,
         block_masks=masks,
     )
-    packed = mod.pack_block_masks_varlen(
-        masks, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen
-    )
+    packed = mod.pack_block_masks_varlen(masks, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen)
     launch = mod.compile_iluvatar_flex_attention(
         len(seqlens),
         H,
@@ -2241,9 +2234,7 @@ def test_iluvatar_flex_attention_dispatcher_rejects_mask_mod_on_paged(monkeypatc
     bt = torch.zeros(1, 2, dtype=torch.int32, device="cuda")
     sl = torch.tensor([64], dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match=r"paged"):
-        iface.flydsl_flex_attn_func(
-            q, k, v, block_table=bt, seq_lens_kv=sl, mask_mod=always
-        )
+        iface.flydsl_flex_attn_func(q, k, v, block_table=bt, seq_lens_kv=sl, mask_mod=always)
 
 
 def test_iluvatar_flex_attention_dispatcher_rejects_score_mod_on_paged(monkeypatch):
@@ -2261,9 +2252,7 @@ def test_iluvatar_flex_attention_dispatcher_rejects_score_mod_on_paged(monkeypat
     bt = torch.zeros(1, 2, dtype=torch.int32, device="cuda")
     sl = torch.tensor([64], dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match=r"paged"):
-        iface.flydsl_flex_attn_func(
-            q, k, v, block_table=bt, seq_lens_kv=sl, score_mod=identity
-        )
+        iface.flydsl_flex_attn_func(q, k, v, block_table=bt, seq_lens_kv=sl, score_mod=identity)
 
 
 # --- V3-5 score_mod x varlen --------------------------------------------------
@@ -2289,9 +2278,7 @@ def test_iluvatar_flex_attention_varlen_score_mod_matches_dense_concat(monkeypat
     num_seqs = len(seqlens)
     block = 64
 
-    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(  # noqa: E741
-        seqlens, H, H, D, torch_dtype, seed=0
-    )
+    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(seqlens, H, H, D, torch_dtype, seed=0)  # noqa: E741
     launch_v = mod.compile_iluvatar_flex_attention(
         num_seqs,
         H,
@@ -2360,9 +2347,7 @@ def test_iluvatar_flex_attention_varlen_score_mod_with_softcap(monkeypatch):
     torch_dtype = torch.bfloat16
     sm_scale = 1.0 / math.sqrt(D)
     softcap = 30.0
-    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(  # noqa: E741
-        seqlens, H, H, D, torch_dtype, seed=1
-    )
+    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(seqlens, H, H, D, torch_dtype, seed=1)  # noqa: E741
     launch = mod.compile_iluvatar_flex_attention(
         len(seqlens),
         H,
@@ -2502,9 +2487,7 @@ def test_iluvatar_flex_attention_varlen_block_mask_matches_dense_concat(monkeypa
         is_causal=True,
         device="cuda",
     )
-    packed = mod.pack_block_masks_varlen(
-        masks, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen
-    )
+    packed = mod.pack_block_masks_varlen(masks, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen)
     launch_v = mod.compile_iluvatar_flex_attention(
         len(seqlens),
         H,
@@ -2802,3 +2785,75 @@ def test_iluvatar_flex_attention_block_mask_sparse_faster(monkeypatch):
     us_d = _bench_gpu_us(run_d, warmup=5, iters=20)
     # Loose: sparse must be at least 10% faster (skip-heavy EMPTY tiles).
     assert us_s < us_d * 0.9, f"sparse={us_s:.1f}us dense={us_d:.1f}us sparsity={bm.sparsity():.3f}"
+
+
+def test_iluvatar_flex_attention_varlen_block_mask_sparse_faster(monkeypatch):
+    """Loose latency check: packed varlen BlockMask should beat dense KV loop."""
+    _require_perf_enabled()
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def first_tile_only(batch, head, q_idx, kv_idx):
+        return kv_idx < 64
+
+    seqlens = [512, 512]
+    H, D = 8, 128
+    dtype = "bf16"
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+    block = 64
+    max_seqlen = max(seqlens)
+
+    Q, K, V, _V_nat, O_s, cu_t, seq_lens_t, _cu_phys = _pack_varlen_qkv(seqlens, H, H, D, torch_dtype, seed=3)
+    O_d = torch.empty_like(O_s)
+    masks = mod.create_block_masks_varlen(
+        first_tile_only,
+        seqlens,
+        block_m=block,
+        block_n=block,
+        H=H,
+        is_causal=False,
+        device="cuda",
+    )
+    assert all(m.sparsity() > 0.8 for m in masks)
+    packed = mod.pack_block_masks_varlen(masks, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen)
+
+    launch_s = mod.compile_iluvatar_flex_attention(
+        len(seqlens),
+        H,
+        max_seqlen,
+        max_seqlen,
+        D,
+        dtype=dtype,
+        is_causal=False,
+        sm_scale=sm_scale,
+        varlen=True,
+        mask_mod=first_tile_only,
+        has_block_mask=True,
+    )
+    launch_d = mod.compile_iluvatar_flex_attention(
+        len(seqlens),
+        H,
+        max_seqlen,
+        max_seqlen,
+        D,
+        dtype=dtype,
+        is_causal=False,
+        sm_scale=sm_scale,
+        varlen=True,
+        mask_mod=first_tile_only,
+        has_block_mask=False,
+    )
+
+    def run_s():
+        launch_s(Q, K, V, O_s, cu_seqlens=cu_t, seq_lens=seq_lens_t, block_mask=packed)
+
+    def run_d():
+        launch_d(Q, K, V, O_d, cu_seqlens=cu_t, seq_lens=seq_lens_t)
+
+    us_s = _bench_gpu_us(run_s, warmup=5, iters=20)
+    us_d = _bench_gpu_us(run_d, warmup=5, iters=20)
+    spars = [m.sparsity() for m in masks]
+    assert us_s < us_d * 0.9, f"sparse={us_s:.1f}us dense={us_d:.1f}us sparsity={spars}"
