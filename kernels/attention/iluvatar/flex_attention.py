@@ -19,7 +19,13 @@ from flydsl.expr import arith
 from flydsl.expr import math as fmath
 from flydsl.expr.trace_mod import TracedMaskMod, TracedScoreMod
 from flydsl.expr.typing import Vector as Vec
-from kernels.attention.iluvatar.block_mask import FlexBlockMask, create_block_mask
+from kernels.attention.iluvatar.block_mask import (
+    FlexBlockMask,
+    PackedVarlenBlockMask,
+    create_block_mask,
+    create_block_masks_varlen,
+    pack_block_masks_varlen,
+)
 from kernels.gemm.iluvatar.common import GemmLayout
 from kernels.gemm.iluvatar.mr.common import (
     ATOM_K_B16,
@@ -2408,7 +2414,10 @@ def compile_iluvatar_flex_attention(
 __all__ = [
     "compile_iluvatar_flex_attention",
     "create_block_mask",
+    "create_block_masks_varlen",
+    "pack_block_masks_varlen",
     "FlexBlockMask",
+    "PackedVarlenBlockMask",
     "BLOCK_M",
     "BLOCK_N",
     "_SUPPORTED_BLOCK",

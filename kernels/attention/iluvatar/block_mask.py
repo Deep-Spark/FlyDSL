@@ -1,22 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Host-side BlockMask for Iluvatar flex-attention (V3-3).
+"""Host-side BlockMask for Iluvatar flex-attention (V3-3 / V3-6).
 
 Builds a compact ``kv_num_blocks`` / ``kv_indices`` / ``kv_is_full`` table from
 preset masks (causal / SWA) and an optional ``TracedMaskMod``. The attention
 kernel iterates indices to skip EMPTY tiles; FULL tiles may skip element masks;
 PARTIAL tiles apply preset ∧ ``mask_mod`` element holes.
+
+V3-6 adds packed-varlen helpers: one ``FlexBlockMask`` per sequence plus a
+batched pack for launch (``[num_seqs, max_q_tiles, ...]``).
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from flydsl.expr.trace_mod import TracedMaskMod
 
-__all__ = ["FlexBlockMask", "create_block_mask"]
+__all__ = [
+    "FlexBlockMask",
+    "PackedVarlenBlockMask",
+    "create_block_mask",
+    "create_block_masks_varlen",
+    "pack_block_masks_varlen",
+]
 
 
 def _phys_seq(seq: int, block: int) -> int:
@@ -176,6 +186,129 @@ def create_block_mask(
         Skv=Skv,
         num_q_tiles=num_q_tiles,
         num_kv_tiles=num_kv_tiles,
+        kv_num_blocks=kv_num,
+        kv_indices=kv_indices,
+        kv_is_full=kv_is_full,
+    )
+
+
+@dataclass(frozen=True)
+class PackedVarlenBlockMask:
+    """Batched BlockMask tables for packed-varlen launch (V3-6).
+
+    Short sequences are right-padded to ``max_q_tiles`` / ``max_kv_tiles``; pad
+    q-tiles keep ``kv_num_blocks == 0`` so the kernel skips them.
+    """
+
+    block_m: int
+    block_n: int
+    max_q_tiles: int
+    max_kv_tiles: int
+    num_seqs: int
+    kv_num_blocks: Any  # int32 [num_seqs, max_q_tiles]
+    kv_indices: Any  # int32 [num_seqs, max_q_tiles, max_kv_tiles]
+    kv_is_full: Any  # int32 [num_seqs, max_q_tiles, max_kv_tiles]
+
+
+def create_block_masks_varlen(
+    mask_mod: Optional[TracedMaskMod],
+    seq_lens: Sequence[int],
+    *,
+    block_m: int,
+    block_n: int,
+    H: int = 1,
+    is_causal: bool = False,
+    window_size: int | None = None,
+    device=None,
+) -> list[FlexBlockMask]:
+    """Build one logical ``FlexBlockMask`` per sequence (self-attn).
+
+    Each entry uses logical ``Sq=Skv=seq_lens[i]`` (pad tokens invisible), matching
+    dense ``create_block_mask`` semantics. Call ``pack_block_masks_varlen`` before
+    a varlen launch that needs a single batched table.
+    """
+    if not seq_lens:
+        raise ValueError("seq_lens must be non-empty")
+    masks: list[FlexBlockMask] = []
+    for s in seq_lens:
+        s_i = int(s)
+        if s_i < 0:
+            raise ValueError(f"seq_lens entries must be non-negative, got {s}")
+        masks.append(
+            create_block_mask(
+                mask_mod,
+                B=1,
+                H=H,
+                Sq=s_i,
+                Skv=s_i,
+                block_m=block_m,
+                block_n=block_n,
+                is_causal=is_causal,
+                window_size=window_size,
+                device=device,
+            )
+        )
+    return masks
+
+
+def pack_block_masks_varlen(
+    masks: Sequence[FlexBlockMask],
+    *,
+    max_seqlen_q: int | None = None,
+    max_seqlen_kv: int | None = None,
+) -> PackedVarlenBlockMask:
+    """Pack per-seq masks into ``[num_seqs, max_q_tiles, ...]`` launch tensors.
+
+    ``max_seqlen_*`` default to the max logical length across ``masks``. Tile
+    counts follow the same phys-round as ``create_block_mask`` / compile.
+    """
+    if not masks:
+        raise ValueError("masks must be non-empty")
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("pack_block_masks_varlen requires torch") from exc
+
+    block_m = int(masks[0].block_m)
+    block_n = int(masks[0].block_n)
+    for i, m in enumerate(masks):
+        if int(m.block_m) != block_m or int(m.block_n) != block_n:
+            raise ValueError(f"masks[{i}] tile {m.block_m}x{m.block_n} != masks[0] {block_m}x{block_n}")
+
+    max_sq = max(int(m.Sq) for m in masks)
+    max_skv = max(int(m.Skv) for m in masks)
+    max_seqlen_q = int(max_seqlen_q) if max_seqlen_q is not None else max_sq
+    max_seqlen_kv = int(max_seqlen_kv) if max_seqlen_kv is not None else max_skv
+    if max_seqlen_q < max_sq or max_seqlen_kv < max_skv:
+        raise ValueError(
+            f"max_seqlen_q/kv ({max_seqlen_q},{max_seqlen_kv}) must cover " f"mask logical max ({max_sq},{max_skv})"
+        )
+
+    max_q_tiles = _phys_seq(max_seqlen_q, block_m) // block_m
+    max_kv_tiles = _phys_seq(max_seqlen_kv, block_n) // block_n
+    num_seqs = len(masks)
+    device = masks[0].kv_num_blocks.device
+
+    kv_num = torch.zeros((num_seqs, max_q_tiles), dtype=torch.int32, device=device)
+    kv_indices = torch.full((num_seqs, max_q_tiles, max_kv_tiles), -1, dtype=torch.int32, device=device)
+    kv_is_full = torch.zeros((num_seqs, max_q_tiles, max_kv_tiles), dtype=torch.int32, device=device)
+
+    for seq_id, m in enumerate(masks):
+        nq = int(m.num_q_tiles)
+        nk = int(m.num_kv_tiles)
+        if nq > max_q_tiles or nk > max_kv_tiles:
+            raise ValueError(f"masks[{seq_id}] tiles ({nq},{nk}) exceed pack " f"({max_q_tiles},{max_kv_tiles})")
+        kv_num[seq_id, :nq].copy_(m.kv_num_blocks)
+        kv_indices[seq_id, :nq, :nk].copy_(m.kv_indices)
+        kv_is_full[seq_id, :nq, :nk].copy_(m.kv_is_full)
+        # Rows [nq, max_q_tiles) stay kv_num_blocks=0 (inactive q-tiles).
+
+    return PackedVarlenBlockMask(
+        block_m=block_m,
+        block_n=block_n,
+        max_q_tiles=max_q_tiles,
+        max_kv_tiles=max_kv_tiles,
+        num_seqs=num_seqs,
         kv_num_blocks=kv_num,
         kv_indices=kv_indices,
         kv_is_full=kv_is_full,
