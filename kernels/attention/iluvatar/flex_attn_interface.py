@@ -10,9 +10,9 @@ Wraps ``compile_iluvatar_flex_attention`` behind a single Torch entry:
 Selects dense / varlen / paged from optional metadata, caches compiled
 launchers (fingerprint-keyed LRU), and owns dense/paged phys-pad + V
 transpose so callers can pass logical BSHD (or packed varlen / natural
-paged pages). Dense and varlen ``score_mod`` are passed through to
-``compile_iluvatar_flex_attention``; dense also accepts ``mask_mod`` /
-``block_mask``.
+paged pages). Dense and varlen accept ``score_mod``; dense uses
+``mask_mod`` / ``block_mask``, varlen uses ``mask_mod`` /
+``block_masks`` (V3-6).
 
 Also exposes ``autotune_iluvatar_flex_attention_tile`` for opt-in dense-only
 tile search (returns a ``tile_config`` dict; does not alter the default path).
@@ -25,7 +25,7 @@ from typing import Mapping, Optional, Sequence
 
 import flydsl.expr as fx
 from flydsl.expr.trace_mod import TracedMaskMod, TracedScoreMod
-from kernels.attention.iluvatar.block_mask import FlexBlockMask
+from kernels.attention.iluvatar.block_mask import FlexBlockMask, pack_block_masks_varlen
 from kernels.attention.iluvatar.flex_attention import (
     _SUPPORTED_BLOCK,
     _normalize_tile_config,
@@ -230,6 +230,7 @@ def flydsl_flex_attn_func(
     score_mod=None,
     mask_mod=None,
     block_mask=None,
+    block_masks=None,
     sm_scale: Optional[float] = None,
     out=None,
     # Varlen (packed): both required to select the varlen path.
@@ -261,9 +262,10 @@ def flydsl_flex_attn_func(
     ``tile_config`` is optional ``{"block_m", "block_n"}`` with values in
     ``{32, 64}`` (default 64x64). Paged requires ``block_n=64``.
 
-    Dense and varlen may pass ``score_mod`` (``TracedScoreMod``). Dense-only:
-    ``mask_mod`` (``TracedMaskMod``) and/or ``block_mask`` (``FlexBlockMask``).
-    Paged rejects all mods. If ``block_mask`` is set and ``tile_config`` is
+    Dense and varlen may pass ``score_mod`` (``TracedScoreMod``). Dense:
+    ``mask_mod`` and/or ``block_mask`` (``FlexBlockMask``). Varlen:
+    ``mask_mod`` and/or ``block_masks`` (``Sequence[FlexBlockMask]``, one per
+    seq). Paged rejects all mods. If a BlockMask is set and ``tile_config`` is
     omitted, the mask tile is used.
 
     Returns:
@@ -281,26 +283,37 @@ def flydsl_flex_attn_func(
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
+    if block_mask is not None and block_masks is not None:
+        raise ValueError("pass either block_mask (dense) or block_masks (varlen), not both")
     if block_mask is not None and not isinstance(block_mask, FlexBlockMask):
         raise TypeError(f"block_mask must be FlexBlockMask or None, got {type(block_mask).__name__}")
-    if mode == "paged" and score_mod is not None:
-        raise ValueError("score_mod is not supported with paged")
-    if mode != "dense" and (mask_mod is not None or block_mask is not None):
-        raise ValueError(f"mask_mod/block_mask are dense-only (not supported with {mode})")
+    if block_masks is not None:
+        if not isinstance(block_masks, (list, tuple)) or not block_masks:
+            raise TypeError("block_masks must be a non-empty Sequence[FlexBlockMask]")
+        if not all(isinstance(m, FlexBlockMask) for m in block_masks):
+            raise TypeError("block_masks entries must be FlexBlockMask")
+    if mode == "paged" and (
+        score_mod is not None or mask_mod is not None or block_mask is not None or block_masks is not None
+    ):
+        raise ValueError("score_mod/mask_mod/block_mask(s) are not supported with paged")
+    if mode == "dense" and block_masks is not None:
+        raise ValueError("block_masks is varlen-only; use block_mask for dense")
+    if mode == "varlen" and block_mask is not None:
+        raise ValueError("varlen uses block_masks=Sequence[FlexBlockMask], not block_mask=")
 
-    if block_mask is not None and tile_config is None:
+    tile_src = block_mask if block_mask is not None else (block_masks[0] if block_masks else None)
+    if tile_src is not None and tile_config is None:
         tile_config = {
-            "block_m": int(block_mask.block_m),
-            "block_n": int(block_mask.block_n),
+            "block_m": int(tile_src.block_m),
+            "block_n": int(tile_src.block_n),
         }
 
     dtype = _dtype_str(q)
     fxs = _as_fx_stream(stream)
     block_m, block_n = _normalize_tile_config(tile_config, paged=(mode == "paged"))
-    if block_mask is not None and (int(block_mask.block_m) != int(block_m) or int(block_mask.block_n) != int(block_n)):
+    if tile_src is not None and (int(tile_src.block_m) != int(block_m) or int(tile_src.block_n) != int(block_n)):
         raise ValueError(
-            f"block_mask tile ({block_mask.block_m}x{block_mask.block_n}) must match "
-            f"tile_config ({block_m}x{block_n})"
+            f"block_mask tile ({tile_src.block_m}x{tile_src.block_n}) must match " f"tile_config ({block_m}x{block_n})"
         )
 
     if mode == "dense":
@@ -436,12 +449,28 @@ def flydsl_flex_attn_func(
             block_m,
             block_n,
             score_mod=score_mod,
+            mask_mod=mask_mod,
+            has_block_mask=block_masks is not None,
         )
         v_tn = v.permute(1, 2, 0).contiguous()  # [Hkv, D, total]
         o = torch.zeros_like(q) if out is None else out
         if o.shape != q.shape:
             raise ValueError(f"out shape must match q {tuple(q.shape)}, got {tuple(o.shape)}")
-        launch(q, k, v_tn, o, cu_seqlens=cu_seqlens, seq_lens=seq_lens, stream=fxs)
+        packed_bm = None
+        if block_masks is not None:
+            if len(block_masks) != num_seqs:
+                raise ValueError(f"block_masks length must equal num_seqs={num_seqs}, got {len(block_masks)}")
+            packed_bm = pack_block_masks_varlen(block_masks, max_seqlen_q=max_s, max_seqlen_kv=int(max_seqlen_kv))
+        launch(
+            q,
+            k,
+            v_tn,
+            o,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            block_mask=packed_bm,
+            stream=fxs,
+        )
         return o
 
     # paged

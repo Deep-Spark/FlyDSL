@@ -2124,7 +2124,109 @@ def test_iluvatar_flex_attention_dispatcher_block_mask_matches_compile(monkeypat
     torch.testing.assert_close(out_disp, out_direct, rtol=0, atol=0)
 
 
-def test_iluvatar_flex_attention_dispatcher_rejects_mask_mod_on_varlen(monkeypatch):
+def test_iluvatar_flex_attention_dispatcher_varlen_mask_mod_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    seqlens = [64, 64]
+    H, D = 4, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    Q, K, V, V_nat, O_ref, cu_t, seq_lens_t, _ = _pack_varlen_qkv(  # noqa: E741
+        seqlens, H, H, D, torch.bfloat16, seed=20
+    )
+    out_disp = iface.flydsl_flex_attn_func(
+        Q,
+        K,
+        V_nat,
+        causal=True,
+        sm_scale=sm_scale,
+        cu_seqlens=cu_t,
+        seq_lens=seq_lens_t,
+        mask_mod=near_band,
+    )
+    launch = mod.compile_iluvatar_flex_attention(
+        len(seqlens),
+        H,
+        max(seqlens),
+        max(seqlens),
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        varlen=True,
+        mask_mod=near_band,
+    )
+    O_ref.zero_()
+    launch(Q, K, V, O_ref, cu_seqlens=cu_t, seq_lens=seq_lens_t)
+    torch.testing.assert_close(out_disp, O_ref, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attention_dispatcher_varlen_block_masks_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    seqlens = [64, 96]
+    H, D = 4, 128
+    block = 64
+    sm_scale = 1.0 / math.sqrt(D)
+    max_seqlen = max(seqlens)
+    Q, K, V, V_nat, O_ref, cu_t, seq_lens_t, _ = _pack_varlen_qkv(  # noqa: E741
+        seqlens, H, H, D, torch.bfloat16, seed=21
+    )
+    masks = mod.create_block_masks_varlen(
+        near_band,
+        seqlens,
+        block_m=block,
+        block_n=block,
+        H=H,
+        is_causal=True,
+        device="cuda",
+    )
+    out_disp = iface.flydsl_flex_attn_func(
+        Q,
+        K,
+        V_nat,
+        causal=True,
+        sm_scale=sm_scale,
+        cu_seqlens=cu_t,
+        seq_lens=seq_lens_t,
+        mask_mod=near_band,
+        block_masks=masks,
+    )
+    packed = mod.pack_block_masks_varlen(
+        masks, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen
+    )
+    launch = mod.compile_iluvatar_flex_attention(
+        len(seqlens),
+        H,
+        max_seqlen,
+        max_seqlen,
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        varlen=True,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    O_ref.zero_()
+    launch(Q, K, V, O_ref, cu_seqlens=cu_t, seq_lens=seq_lens_t, block_mask=packed)
+    torch.testing.assert_close(out_disp, O_ref, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attention_dispatcher_rejects_mask_mod_on_paged(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
     from kernels.attention.iluvatar import flex_attn_interface as iface
@@ -2133,13 +2235,15 @@ def test_iluvatar_flex_attention_dispatcher_rejects_mask_mod_on_varlen(monkeypat
     def always(batch, head, q_idx, kv_idx):
         return True
 
-    q = torch.randn(64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    cu = torch.tensor([0, 64], dtype=torch.int32)
-    sl = torch.tensor([64], dtype=torch.int32)
-    with pytest.raises(ValueError, match=r"dense-only"):
-        iface.flydsl_flex_attn_func(q, k, v, cu_seqlens=cu, seq_lens=sl, mask_mod=always)
+    q = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(2, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
+    bt = torch.zeros(1, 2, dtype=torch.int32, device="cuda")
+    sl = torch.tensor([64], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match=r"paged"):
+        iface.flydsl_flex_attn_func(
+            q, k, v, block_table=bt, seq_lens_kv=sl, mask_mod=always
+        )
 
 
 def test_iluvatar_flex_attention_dispatcher_rejects_score_mod_on_paged(monkeypatch):
