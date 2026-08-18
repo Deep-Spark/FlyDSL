@@ -51,7 +51,13 @@ public:
     moduleOp->walk([&](CopyAtomCall op) {
       auto srcTy = cast<fly::MemRefType>(op.getSrc().getType());
       auto dstTy = cast<fly::MemRefType>(op.getDst().getType());
-      if (isEligibleToPromote(srcTy) || isEligibleToPromote(dstTy))
+      // A register-space pred needs promoting on its own account: a global ->
+      // shared copy has neither operand in registers, but leaving the pred
+      // behind strands a register pointer that the later rmem-to-vector-SSA
+      // pass cannot rewrite.
+      bool predEligible =
+          op.getPred() && isEligibleToPromote(cast<fly::MemRefType>(op.getPred().getType()));
+      if (isEligibleToPromote(srcTy) || isEligibleToPromote(dstTy) || predEligible)
         copyOpsToConvert.push_back(op);
     });
 

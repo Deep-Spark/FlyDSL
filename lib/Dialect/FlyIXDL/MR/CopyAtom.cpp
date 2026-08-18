@@ -60,14 +60,23 @@ Attribute CopyOpMRAsyncCpType::getThrBitLayoutDst() const {
 Attribute CopyOpMRAsyncCpType::getThrBitLayoutRef() const { return getThrBitLayoutDst(); }
 
 // MRAsyncCp lowers a one-directional async copy global(#fly_ixdl.sme_gmem) ->
-// shared into the `ixdl.cp_async.*` op family. The core lives in the
-// non-predicated emitAtomCall; SSA / predicated entry points delegate to it
-// (mirrors FlyROCDL BufferCopyLDS).
+// shared into the `ixdl.cp_async.*` op family. All four entry points (plain /
+// predicated x value / SSA) share emitMRAsyncCp below.
 
-LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc,
-                                                Type copyAtomTyArg, Type srcMemTyArg,
-                                                Type dstMemTyArg, Value, Value src,
-                                                Value dst) const {
+namespace {
+
+// Predicated MR G2S: a false predicate selects an out-of-range SLB address
+// (0xffffff) so the hardware drops the whole transfer, including the global
+// read. The atom stays in straight-line code; an scf.if would split a region
+// and break SSA dominance in the unrolled G2S loops these atoms sit in.
+constexpr int64_t kInvalidSlbOffset = 0xffffff;
+
+// ``predVal`` is a plain i1 (or null for the unpredicated form): the value-form
+// entry point loads it out of its register memref, while the SSA form already
+// receives it promoted.
+LogicalResult emitMRAsyncCp(OpBuilder &builder, Location loc, int32_t smeSwizzle,
+                            Type copyAtomTyArg, Type srcMemTyArg, Type dstMemTyArg, Value src,
+                            Value dst, Value predVal) {
   auto copyAtomTy = dyn_cast<fly::CopyAtomType>(copyAtomTyArg);
   if (!copyAtomTy)
     return failure();
@@ -83,13 +92,20 @@ LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc
 
   // dst shared pointer -> i32 sOffset (the smem pointer is cast to uint32).
   Value sOffset = LLVM::PtrToIntOp::create(builder, loc, builder.getI32Type(), dst);
+  if (predVal) {
+    if (!predVal.getType().isInteger(1))
+      return mlir::emitError(loc) << "predicated MRAsyncCp expects an i1 predicate, got "
+                                  << predVal.getType();
+    Value invalidSlb = arith::ConstantIntOp::create(builder, loc, kInvalidSlbOffset, 32);
+    sOffset = arith::SelectOp::create(builder, loc, predVal, sOffset, invalidSlb);
+  }
 
   // src SmeGmemFatPtr -> vector<4xi32> SME descriptor built from the raw,
   // loop-invariant gmem pointer. The accumulated per-tile byte_offset is passed
   // as the hardware gOffset operand (a 32-bit offset added on top of the
   // descriptor base) instead of being folded into the 64-bit base, so the
   // descriptor hoists out of a tile loop and only the narrow offset advances
-  // (constant offsets fold into the goffimm immediate; see design doc section 10).
+  // (constant offsets fold into the goffimm immediate).
   SmeGmemFatPtr srcFat(srcMemTy.getPointerType(), src);
   Value gBase = srcFat.smeDescriptorVec(builder, loc);
   Value gOffset = srcFat.byteOffset(builder, loc);
@@ -97,7 +113,7 @@ LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc
   Value kop = arith::ConstantIntOp::create(builder, loc, 0, 32); // CacheAll cache op
 
   int32_t valBits = copyAtomTy.getValBits();
-  switch (getSmeSwizzle()) {
+  switch (smeSwizzle) {
   case 0: // NoSwizzle: b32 row-major -> bi_sme_load_16x1b64
     if (valBits != 32)
       return mlir::emitError(loc) << "MRAsyncCp NoSwizzle requires valBits = 32, got " << valBits;
@@ -132,10 +148,26 @@ LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc
   }
 }
 
-LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc, Type, Type, Type,
-                                                Type, Value, Value, Value, Value) const {
-  // Predicated MRAsyncCp (smem_ptr = 0xffffff when !pred) is deferred (phase 7.2).
-  return mlir::emitError(loc) << "predicated MRAsyncCp is not implemented yet";
+} // namespace
+
+LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc,
+                                                Type copyAtomTyArg, Type srcMemTyArg,
+                                                Type dstMemTyArg, Value, Value src,
+                                                Value dst) const {
+  return emitMRAsyncCp(builder, loc, getSmeSwizzle(), copyAtomTyArg, srcMemTyArg, dstMemTyArg, src,
+                       dst, /*predVal=*/Value{});
+}
+
+LogicalResult CopyOpMRAsyncCpType::emitAtomCall(OpBuilder &builder, Location loc,
+                                                Type copyAtomTyArg, Type srcMemTyArg,
+                                                Type dstMemTyArg, Type predMemTyArg, Value,
+                                                Value src, Value dst, Value pred) const {
+  auto predMemTy = dyn_cast<fly::MemRefType>(predMemTyArg);
+  if (!predMemTy)
+    return failure();
+  Value predVal = LLVM::LoadOp::create(builder, loc, predMemTy.getElemTy(), pred);
+  return emitMRAsyncCp(builder, loc, getSmeSwizzle(), copyAtomTyArg, srcMemTyArg, dstMemTyArg, src,
+                       dst, predVal);
 }
 
 FailureOr<Value> CopyOpMRAsyncCpType::emitAtomCallSSA(OpBuilder &builder, Location loc, Type,
@@ -148,11 +180,15 @@ FailureOr<Value> CopyOpMRAsyncCpType::emitAtomCallSSA(OpBuilder &builder, Locati
   return Value{};
 }
 
-FailureOr<Value> CopyOpMRAsyncCpType::emitAtomCallSSA(OpBuilder &builder, Location loc, Type, Type,
-                                                      Type, Type, Type, Value, Value, Value,
-                                                      Value) const {
-  // Predicated MRAsyncCp is deferred (phase 7.2).
-  return mlir::emitError(loc) << "predicated MRAsyncCp is not implemented yet";
+FailureOr<Value> CopyOpMRAsyncCpType::emitAtomCallSSA(OpBuilder &builder, Location loc, Type,
+                                                      Type copyAtomTyArg, Type srcTyArg,
+                                                      Type dstTyArg, Type, Value, Value src,
+                                                      Value dst, Value pred) const {
+  // Here ``pred`` has already been promoted out of register memory to an i1.
+  if (failed(emitMRAsyncCp(builder, loc, getSmeSwizzle(), copyAtomTyArg, srcTyArg, dstTyArg, src,
+                           dst, pred)))
+    return failure();
+  return Value{};
 }
 
 } // namespace mlir::fly_ixdl
