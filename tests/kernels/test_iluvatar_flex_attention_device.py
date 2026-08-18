@@ -11,7 +11,8 @@ Covers:
 * Packed varlen (``cu_seqlens``) self-attn vs per-seq dense concat.
 * Paged KV (``block_table``) vs gather-to-dense flex reference.
 * Dense alibi / score_bias and the ``flydsl_flex_attn_func`` dispatcher.
-* Dense ``score_mod=TracedScoreMod`` (V3-2) and varlen ``score_mod`` (V3-5) vs host / dense concat.
+* Dense ``score_mod=TracedScoreMod`` (V3-2), varlen ``score_mod`` (V3-5), and
+  paged ``score_mod`` (V3-7a) vs host / dense / gather-to-dense references.
 * Dense ``create_block_mask`` / ``block_mask`` sparse KV skip (V3-3) vs dense path.
 * Varlen ``create_block_masks_varlen`` / ``block_masks`` / ``mask_mod`` (V3-6) vs dense concat.
 * Optional ``tile_config`` whitelist and dense ``autotune_iluvatar_flex_attention_tile``.
@@ -1741,17 +1742,16 @@ def test_iluvatar_flex_attention_rejects_raw_score_mod_callable():
         mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", score_mod=raw)
 
 
-def test_iluvatar_flex_attention_rejects_score_mod_paged_allows_varlen():
+def test_iluvatar_flex_attention_score_mod_allows_varlen_and_paged():
     mod = _require_flex_attn_module()
 
     @fx.trace_score_mod
     def identity(score, batch, head, q_idx, kv_idx):
         return score
 
-    # V3-5: varlen + score_mod is allowed (compile succeeds).
+    # V3-5/V3-7a: varlen and paged + score_mod are allowed (compile succeeds).
     mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, score_mod=identity)
-    with pytest.raises(ValueError, match=r"paged"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, score_mod=identity)
+    mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, score_mod=identity)
 
 
 def test_iluvatar_flex_attention_dispatcher_rejects_raw_score_mod(monkeypatch):
@@ -2237,24 +2237,6 @@ def test_iluvatar_flex_attention_dispatcher_rejects_mask_mod_on_paged(monkeypatc
         iface.flydsl_flex_attn_func(q, k, v, block_table=bt, seq_lens_kv=sl, mask_mod=always)
 
 
-def test_iluvatar_flex_attention_dispatcher_rejects_score_mod_on_paged(monkeypatch):
-    torch = _require_torch()
-    _configure_iluvatar_env(monkeypatch)
-    from kernels.attention.iluvatar import flex_attn_interface as iface
-
-    @fx.trace_score_mod
-    def identity(score, batch, head, q_idx, kv_idx):
-        return score
-
-    q = torch.randn(1, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(2, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(2, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
-    bt = torch.zeros(1, 2, dtype=torch.int32, device="cuda")
-    sl = torch.tensor([64], dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match=r"paged"):
-        iface.flydsl_flex_attn_func(q, k, v, block_table=bt, seq_lens_kv=sl, score_mod=identity)
-
-
 # --- V3-5 score_mod x varlen --------------------------------------------------
 
 
@@ -2384,6 +2366,260 @@ def test_iluvatar_flex_attention_varlen_score_mod_with_softcap(monkeypatch):
     outs = [O[cu_phys[i] : cu_phys[i] + s].float() for i, s in enumerate(seqlens)]
     out = torch.cat(outs, dim=0)
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+# --- V3-7a score_mod x paged --------------------------------------------------
+
+
+def test_iluvatar_flex_attention_paged_score_mod_matches_dense_gather(monkeypatch):
+    """Paged + score_mod vs gather-to-dense (equal Sq/Skv) and host ref (decode)."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score + fx.Float32(-0.1) * fx.Float32(q_idx - kv_idx)
+
+    H, D = 4, 128
+    dtype = "bf16"
+    torch_dtype = torch.bfloat16
+    atol_rtol = 2e-2
+    sm_scale = 1.0 / math.sqrt(D)
+
+    # Prefill: Sq == Skv so dense compile is a valid gather reference.
+    B, Sq, seq_lens_kv = 1, 128, [128]
+    Skv = 128
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=21,
+        page_size=mod.BLOCK_N,
+    )
+    torch.manual_seed(22)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O_p = torch.zeros_like(Q)
+    launch_p = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        score_mod=alibi_like,
+    )
+    launch_p(Q, K_pages, V_pages, O_p, block_table=block_table, seq_lens_kv=seq_lens_t)
+
+    Kd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Vd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Kd[0].copy_(dense_k[0][:, :Skv])
+    Vd[0].copy_(dense_v[0][:, :Skv])
+    Od = torch.zeros_like(Q)
+    launch_d = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        score_mod=alibi_like,
+    )
+    launch_d(Q, Kd, Vd.transpose(-1, -2).contiguous(), Od)
+    torch.testing.assert_close(
+        O_p[:, :, :Sq, :].float(),
+        Od[:, :, :Sq, :].float(),
+        rtol=atol_rtol,
+        atol=atol_rtol,
+    )
+
+    # Decode: Sq=1, Skv=128 -- dense causal forbids Sq!=Skv; use host fp32 ref.
+    B, Sq, seq_lens_kv = 1, 1, [128]
+    Skv = 128
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=23,
+        page_size=mod.BLOCK_N,
+    )
+    torch.manual_seed(24)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O_p = torch.zeros_like(Q)
+    launch_p = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        score_mod=alibi_like,
+    )
+    launch_p(Q, K_pages, V_pages, O_p, block_table=block_table, seq_lens_kv=seq_lens_t)
+    ref = _reference_flex_attention_fp32(
+        Q[:, :, :Sq, :].contiguous(),
+        dense_k[0].unsqueeze(0)[:, :, :Skv, :].contiguous(),
+        dense_v[0].unsqueeze(0)[:, :, :Skv, :].contiguous(),
+        sm_scale=sm_scale,
+        is_causal=True,
+        score_mod=alibi_like,
+    )
+    torch.testing.assert_close(O_p[:, :, :Sq, :].float(), ref, rtol=atol_rtol, atol=atol_rtol)
+
+
+def test_iluvatar_flex_attention_paged_score_mod_with_softcap(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score + fx.Float32(-0.05) * fx.Float32(q_idx - kv_idx)
+
+    B, H, Sq, D = 1, 4, 64, 128
+    seq_lens_kv = [64]
+    Skv = 64
+    dtype = "bf16"
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+    softcap = 30.0
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=23,
+        page_size=mod.BLOCK_N,
+    )
+    torch.manual_seed(24)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O_p = torch.zeros_like(Q)
+
+    launch_p = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        softcap=softcap,
+        sm_scale=sm_scale,
+        paged=True,
+        score_mod=alibi_like,
+    )
+    launch_p(Q, K_pages, V_pages, O_p, block_table=block_table, seq_lens_kv=seq_lens_t)
+
+    Kd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Vd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Kd[0, :, :Skv].copy_(dense_k[0][:, :Skv])
+    Vd[0, :, :Skv].copy_(dense_v[0][:, :Skv])
+    Od = torch.zeros_like(Q)
+    launch_d = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        softcap=softcap,
+        sm_scale=sm_scale,
+        score_mod=alibi_like,
+    )
+    launch_d(Q, Kd, Vd.transpose(-1, -2).contiguous(), Od)
+    torch.testing.assert_close(
+        O_p[:, :, :Sq, :].float(),
+        Od[:, :, :Sq, :].float(),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_iluvatar_flex_attention_dispatcher_paged_score_mod_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score + fx.Float32(-0.1) * fx.Float32(q_idx - kv_idx)
+
+    B, H, Sq, D = 1, 4, 64, 128
+    seq_lens_kv = [64]
+    Skv = 64
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+
+    K_pages, V_pages_tn, V_nat, block_table, seq_lens_t, _, _, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=25,
+        page_size=mod.BLOCK_N,
+    )
+
+    torch.manual_seed(26)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch_dtype)
+    out_disp = iface.flydsl_flex_attn_func(
+        q,
+        K_pages,
+        V_nat,
+        causal=True,
+        sm_scale=sm_scale,
+        block_table=block_table,
+        seq_lens_kv=seq_lens_t,
+        score_mod=alibi_like,
+    )
+
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(q.permute(0, 2, 1, 3))
+    O = torch.zeros_like(Q)
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        score_mod=alibi_like,
+    )
+    launch(Q, K_pages, V_pages_tn, O, block_table=block_table, seq_lens_kv=seq_lens_t)
+    torch.testing.assert_close(
+        out_disp.permute(0, 2, 1, 3).contiguous(),
+        O[:, :, :Sq, :],
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_iluvatar_flex_attention_varlen_mask_mod_matches_dense_concat(monkeypatch):
