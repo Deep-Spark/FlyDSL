@@ -1964,6 +1964,78 @@ def test_create_block_mask_matches_dense_visibility():
                 assert kj not in kept
 
 
+def test_create_block_masks_varlen_matches_per_seq_create():
+    """V3-6 helper: one mask per logical seq matches hand-rolled create_block_mask."""
+    torch = _require_torch()
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    seqlens = [64, 96, 128]
+    block = 64
+    masks = mod.create_block_masks_varlen(
+        near_band,
+        seqlens,
+        block_m=block,
+        block_n=block,
+        H=2,
+        is_causal=True,
+        device="cpu",
+    )
+    assert len(masks) == len(seqlens)
+    for s, m in zip(seqlens, masks):
+        ref = mod.create_block_mask(
+            near_band,
+            1,
+            2,
+            s,
+            s,
+            block_m=block,
+            block_n=block,
+            is_causal=True,
+            device="cpu",
+        )
+        assert m.Sq == ref.Sq and m.Skv == ref.Skv
+        assert m.num_q_tiles == ref.num_q_tiles
+        assert torch.equal(m.kv_num_blocks, ref.kv_num_blocks)
+        assert torch.equal(m.kv_indices, ref.kv_indices)
+        assert torch.equal(m.kv_is_full, ref.kv_is_full)
+
+
+def test_pack_block_masks_varlen_pads_short_seq_tiles():
+    """Pack to max_seqlen tile grid; short-seq pad q-tiles have kv_num_blocks=0."""
+    torch = _require_torch()
+    mod = _require_flex_attn_module()
+
+    seqlens = [64, 96]
+    block = 64
+    masks = mod.create_block_masks_varlen(
+        None,
+        seqlens,
+        block_m=block,
+        block_n=block,
+        is_causal=True,
+        device="cpu",
+    )
+    packed = mod.pack_block_masks_varlen(masks, max_seqlen_q=128, max_seqlen_kv=128)
+    assert packed.num_seqs == 2
+    assert packed.max_q_tiles == 2 and packed.max_kv_tiles == 2
+    # Seq0 logical 64 -> 1 q-tile; row 1 must be inactive.
+    assert int(packed.kv_num_blocks[0, 0].item()) == int(masks[0].kv_num_blocks[0].item())
+    assert int(packed.kv_num_blocks[0, 1].item()) == 0
+    # Seq1 logical 96 -> 2 q-tiles (phys 128); both rows live.
+    assert int(packed.kv_num_blocks[1, 0].item()) == int(masks[1].kv_num_blocks[0].item())
+    assert int(packed.kv_num_blocks[1, 1].item()) == int(masks[1].kv_num_blocks[1].item())
+    torch.testing.assert_close(
+        packed.kv_indices[1, : masks[1].num_q_tiles, : masks[1].num_kv_tiles],
+        masks[1].kv_indices,
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_iluvatar_flex_attention_rejects_mask_mod_block_mask_varlen_paged():
     mod = _require_flex_attn_module()
 
