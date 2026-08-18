@@ -5,8 +5,9 @@
 
 Supports f16/bf16, D in {64,128,256}, MHA/GQA, causal / SWA / softcap, varlen,
 paged KV, dense alibi/score_bias, ``score_mod=TracedScoreMod`` on dense and
-varlen (V3-5), and dense ``block_mask`` / ``mask_mod`` sparse KV skip (V3-3).
-Optional ``tile_config`` and dense ``return_lse``.
+varlen (V3-5), dense ``block_mask`` / ``mask_mod`` sparse KV skip (V3-3), and
+varlen ``mask_mod`` / packed BlockMask (V3-6). Optional ``tile_config`` and
+dense ``return_lse``.
 """
 
 import math
@@ -555,10 +556,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         raise ValueError("score_mod is not supported with paged")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
-    if (mask_mod is not None or has_block_mask) and (varlen or paged):
-        raise ValueError("block_mask/mask_mod are dense-only (not supported with varlen/paged)")
-    if has_block_mask and (varlen or paged):
-        raise ValueError("block_mask is dense-only (not supported with varlen/paged)")
+    if (mask_mod is not None or has_block_mask) and paged:
+        raise ValueError("block_mask/mask_mod are not supported with paged")
 
     has_score_mod = score_mod is not None
     # Captured into the nested kernel closure for JIT cache keying (forbid id(fn)).
@@ -1095,19 +1094,41 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # 0 -- K_{i+1} may still prefetch into the same K bank after MMA1.
         c_num_kv = fx.Int32(num_kv_tiles)
         if fx.const_expr(has_block_mask):
-            kv_num_view = fx.make_view(
-                fx.get_iter(KvNumBlocks),
-                fx.make_layout((num_q_tiles,), (1,)),
-            )
-            kv_idx_view = fx.make_view(
-                fx.get_iter(KvIndices),
-                fx.make_layout((num_q_tiles, num_kv_tiles), (num_kv_tiles, 1)),
-            )
-            kv_full_view = fx.make_view(
-                fx.get_iter(KvIsFull),
-                fx.make_layout((num_q_tiles, num_kv_tiles), (num_kv_tiles, 1)),
-            )
-            kv_trip = fx.memref_load(kv_num_view, q_tile_idx)
+            if fx.const_expr(varlen):
+                # V3-6: batched tables [num_seqs, max_q_tiles, ...]; index by seq_id.
+                kv_num_view = fx.make_view(
+                    fx.get_iter(KvNumBlocks),
+                    fx.make_layout((B, num_q_tiles), (num_q_tiles, 1)),
+                )
+                kv_idx_view = fx.make_view(
+                    fx.get_iter(KvIndices),
+                    fx.make_layout(
+                        (B, num_q_tiles, num_kv_tiles),
+                        (num_q_tiles * num_kv_tiles, num_kv_tiles, 1),
+                    ),
+                )
+                kv_full_view = fx.make_view(
+                    fx.get_iter(KvIsFull),
+                    fx.make_layout(
+                        (B, num_q_tiles, num_kv_tiles),
+                        (num_q_tiles * num_kv_tiles, num_kv_tiles, 1),
+                    ),
+                )
+                kv_trip = fx.memref_load(kv_num_view, (b_idx, q_tile_idx))
+            else:
+                kv_num_view = fx.make_view(
+                    fx.get_iter(KvNumBlocks),
+                    fx.make_layout((num_q_tiles,), (1,)),
+                )
+                kv_idx_view = fx.make_view(
+                    fx.get_iter(KvIndices),
+                    fx.make_layout((num_q_tiles, num_kv_tiles), (num_kv_tiles, 1)),
+                )
+                kv_full_view = fx.make_view(
+                    fx.get_iter(KvIsFull),
+                    fx.make_layout((num_q_tiles, num_kv_tiles), (num_kv_tiles, 1)),
+                )
+                kv_trip = fx.memref_load(kv_num_view, q_tile_idx)
             _mask_mod_fp = mask_mod_fingerprint
         else:
             if fx.const_expr(is_causal):
@@ -1131,7 +1152,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # Prologue: first K into stage 0 (skipped when kv_trip == 0).
         if kv_trip > fx.Int32(0):
             if fx.const_expr(has_block_mask):
-                kv0 = fx.memref_load(kv_idx_view, (q_tile_idx, fx.Int32(0)))
+                if fx.const_expr(varlen):
+                    kv0 = fx.memref_load(kv_idx_view, (b_idx, q_tile_idx, fx.Int32(0)))
+                else:
+                    kv0 = fx.memref_load(kv_idx_view, (q_tile_idx, fx.Int32(0)))
                 _issue_k(kv0, fx.Int32(0))
             else:
                 _issue_k(fx.Int32(0), fx.Int32(0))
@@ -1145,8 +1169,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             m_prev = [state[slot] for slot in range(ROWS_PER_LANE)]
             l_prev = [state[ROWS_PER_LANE + slot] for slot in range(ROWS_PER_LANE)]
             if fx.const_expr(has_block_mask):
-                kv_i = fx.memref_load(kv_idx_view, (q_tile_idx, sparse_i))
-                tile_full_i = fx.memref_load(kv_full_view, (q_tile_idx, sparse_i))
+                if fx.const_expr(varlen):
+                    kv_i = fx.memref_load(kv_idx_view, (b_idx, q_tile_idx, sparse_i))
+                    tile_full_i = fx.memref_load(kv_full_view, (b_idx, q_tile_idx, sparse_i))
+                else:
+                    kv_i = fx.memref_load(kv_idx_view, (q_tile_idx, sparse_i))
+                    tile_full_i = fx.memref_load(kv_full_view, (q_tile_idx, sparse_i))
                 tile_is_full = tile_full_i != fx.Int32(0)
             else:
                 kv_i = fx.Int32(sparse_i)
@@ -1203,7 +1231,10 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             next_s = fx.Int32(sparse_i) + fx.Int32(1)
             if next_s < kv_trip:
                 if fx.const_expr(has_block_mask):
-                    next_kv = fx.memref_load(kv_idx_view, (q_tile_idx, next_s))
+                    if fx.const_expr(varlen):
+                        next_kv = fx.memref_load(kv_idx_view, (b_idx, q_tile_idx, next_s))
+                    else:
+                        next_kv = fx.memref_load(kv_idx_view, (q_tile_idx, next_s))
                 else:
                     next_kv = next_s
                 _issue_k(next_kv, prefetch_stage)
@@ -1991,11 +2022,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
         Dense: phys-padded BHSD; optional dense-only ``alibi_slopes`` ``[H]`` fp32
         or phys-padded ``score_bias`` ``[B,H,Sq_phys,Skv_phys]`` (mutually exclusive).
-        Optional ``block_mask`` (``FlexBlockMask``) when compiled with
-        ``has_block_mask=True``. When compiled with ``return_lse=True``, pass or
-        allocate fp32 ``lse [B,H,Sq_phys]``; the launch returns that tensor.
-        Varlen / paged contracts unchanged; alibi/score_bias / return_lse /
-        block_mask rejected there.
+        Optional ``block_mask``: dense ``FlexBlockMask``, or varlen
+        ``PackedVarlenBlockMask`` / ``Sequence[FlexBlockMask]`` when compiled
+        with ``has_block_mask=True``. When compiled with ``return_lse=True``,
+        pass or allocate fp32 ``lse [B,H,Sq_phys]``; the launch returns that
+        tensor. Paged rejects block_mask; alibi/score_bias / return_lse stay
+        dense-only.
         """
         q_shape = _tensor_shape(Q)
         k_shape = _tensor_shape(K)
@@ -2013,6 +2045,28 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
         def _block_mask_placeholders():
             if has_block_mask:
+                if varlen:
+                    packed = block_mask
+                    if isinstance(packed, (list, tuple)):
+                        packed = pack_block_masks_varlen(packed, max_seqlen_q=Sq, max_seqlen_kv=Skv)
+                    if not isinstance(packed, PackedVarlenBlockMask):
+                        raise TypeError(
+                            "varlen has_block_mask requires PackedVarlenBlockMask "
+                            f"or Sequence[FlexBlockMask], got {type(packed).__name__}"
+                        )
+                    if int(packed.block_m) != int(BLOCK_M) or int(packed.block_n) != int(BLOCK_N):
+                        raise ValueError(
+                            f"block_mask tile ({packed.block_m}x{packed.block_n}) must match "
+                            f"compile tile ({BLOCK_M}x{BLOCK_N})"
+                        )
+                    if int(packed.max_q_tiles) != int(num_q_tiles) or int(packed.max_kv_tiles) != int(num_kv_tiles):
+                        raise ValueError(
+                            f"packed block_mask tiles ({packed.max_q_tiles},{packed.max_kv_tiles}) "
+                            f"incompatible with compile ({num_q_tiles},{num_kv_tiles})"
+                        )
+                    if int(packed.num_seqs) != int(B):
+                        raise ValueError(f"packed block_mask num_seqs={packed.num_seqs} must match B={B}")
+                    return packed.kv_num_blocks, packed.kv_indices, packed.kv_is_full
                 if block_mask is None:
                     raise ValueError("compiled with has_block_mask=True requires block_mask=FlexBlockMask")
                 if not isinstance(block_mask, FlexBlockMask):
@@ -2035,8 +2089,6 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         if varlen:
             if do_return_lse:
                 raise ValueError("return_lse is dense-only (not supported with varlen)")
-            if has_block_mask or block_mask is not None:
-                raise ValueError("block_mask is dense-only (not supported with varlen)")
             if cu_seqlens is None or seq_lens is None:
                 raise ValueError("varlen launch requires cu_seqlens [B+1] and seq_lens [B] (int32)")
             if alibi_slopes is not None or score_bias is not None:
@@ -2094,7 +2146,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             if alibi_slopes is not None or score_bias is not None:
                 raise ValueError("alibi/score_bias are dense-only (not supported with paged)")
             if has_block_mask or block_mask is not None:
-                raise ValueError("block_mask is dense-only (not supported with paged)")
+                raise ValueError("block_mask is not supported with paged")
             bt_shape = _tensor_shape(block_table)
             sl_shape = _tensor_shape(seq_lens_kv)
             if len(bt_shape) != 2 or bt_shape[0] != B or bt_shape[1] != max_num_pages:
@@ -2359,8 +2411,8 @@ def compile_iluvatar_flex_attention(
         raise ValueError("score_mod is not supported with paged")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
-    if (mask_mod is not None or has_block_mask) and (varlen or paged):
-        raise ValueError("block_mask/mask_mod are dense-only (not supported with varlen/paged)")
+    if (mask_mod is not None or has_block_mask) and paged:
+        raise ValueError("block_mask/mask_mod are not supported with paged")
     if return_lse and (varlen or paged):
         raise ValueError("return_lse is dense-only (not supported with varlen/paged)")
 
