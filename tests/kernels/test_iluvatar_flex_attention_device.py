@@ -2036,17 +2036,26 @@ def test_pack_block_masks_varlen_pads_short_seq_tiles():
     )
 
 
-def test_iluvatar_flex_attention_rejects_mask_mod_block_mask_varlen_paged():
+def test_iluvatar_flex_attention_rejects_mask_mod_block_mask_paged_allows_varlen():
     mod = _require_flex_attn_module()
 
     @fx.trace_mask_mod
     def always(batch, head, q_idx, kv_idx):
         return True
 
-    with pytest.raises(ValueError, match=r"dense-only"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, mask_mod=always)
-    with pytest.raises(ValueError, match=r"dense-only"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True)
+    # V3-6: varlen + mask_mod / has_block_mask is allowed (compile succeeds).
+    mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, mask_mod=always)
+    mod.compile_iluvatar_flex_attention(
+        1, 4, 64, 64, 128, dtype="bf16", varlen=True, has_block_mask=True
+    )
+    with pytest.raises(ValueError, match=r"paged"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", paged=True, mask_mod=always
+        )
+    with pytest.raises(ValueError, match=r"paged"):
+        mod.compile_iluvatar_flex_attention(
+            1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True
+        )
 
 
 def test_iluvatar_flex_attention_dispatcher_block_mask_matches_compile(monkeypatch):
@@ -2286,6 +2295,162 @@ def test_iluvatar_flex_attention_varlen_score_mod_with_softcap(monkeypatch):
     outs = [O[cu_phys[i] : cu_phys[i] + s].float() for i, s in enumerate(seqlens)]
     out = torch.cat(outs, dim=0)
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_iluvatar_flex_attention_varlen_mask_mod_matches_dense_concat(monkeypatch):
+    """V3-6: packed varlen + mask_mod alone matches per-seq dense concat."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    seqlens = [64, 96]
+    H, D = 4, 128
+    torch_dtype = torch.bfloat16
+    atol_rtol = 2e-2
+    max_seqlen = max(seqlens)
+    sm_scale = 1.0 / math.sqrt(D)
+    block = 64
+
+    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(  # noqa: E741
+        seqlens, H, H, D, torch_dtype, seed=10
+    )
+    launch_v = mod.compile_iluvatar_flex_attention(
+        len(seqlens),
+        H,
+        max_seqlen,
+        max_seqlen,
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        varlen=True,
+        mask_mod=near_band,
+    )
+    launch_v(Q, K, V, O, cu_seqlens=cu_t, seq_lens=seq_lens_t)
+    torch.cuda.synchronize()
+
+    dense_outs = []
+    for i, s in enumerate(seqlens):
+        lo = cu_phys[i]
+        q_i = Q[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        k_i = K[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        v_i = V_nat[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        Sq_phys = _phys_seq(s, block)
+        Skv_phys = _phys_seq(s, block)
+        Qd = torch.zeros(1, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+        Kd = torch.zeros(1, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+        Vd = torch.zeros(1, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+        Qd[:, :, :s].copy_(q_i)
+        Kd[:, :, :s].copy_(k_i)
+        Vd[:, :, :s].copy_(v_i)
+        Vd_tn = Vd.transpose(-1, -2).contiguous()
+        Od = torch.zeros_like(Qd)
+        launch_d = mod.compile_iluvatar_flex_attention(
+            1,
+            H,
+            s,
+            s,
+            D,
+            dtype="bf16",
+            is_causal=True,
+            sm_scale=sm_scale,
+            mask_mod=near_band,
+        )
+        launch_d(Qd, Kd, Vd_tn, Od)
+        dense_outs.append(Od[0, :, :s, :].transpose(0, 1).contiguous())
+
+    ref = torch.cat(dense_outs, dim=0)
+    out = torch.cat([O[cu_phys[i] : cu_phys[i] + s] for i, s in enumerate(seqlens)], dim=0)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=atol_rtol, atol=atol_rtol)
+
+
+def test_iluvatar_flex_attention_varlen_block_mask_matches_dense_concat(monkeypatch):
+    """V3-6: packed varlen + packed BlockMask matches per-seq dense sparse path."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    seqlens = [64, 96]
+    H, D = 4, 128
+    torch_dtype = torch.bfloat16
+    atol_rtol = 2e-2
+    max_seqlen = max(seqlens)
+    sm_scale = 1.0 / math.sqrt(D)
+    block = 64
+
+    Q, K, V, V_nat, O, cu_t, seq_lens_t, cu_phys = _pack_varlen_qkv(  # noqa: E741
+        seqlens, H, H, D, torch_dtype, seed=11
+    )
+    masks = mod.create_block_masks_varlen(
+        near_band,
+        seqlens,
+        block_m=block,
+        block_n=block,
+        H=H,
+        is_causal=True,
+        device="cuda",
+    )
+    packed = mod.pack_block_masks_varlen(
+        masks, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen
+    )
+    launch_v = mod.compile_iluvatar_flex_attention(
+        len(seqlens),
+        H,
+        max_seqlen,
+        max_seqlen,
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        varlen=True,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    launch_v(Q, K, V, O, cu_seqlens=cu_t, seq_lens=seq_lens_t, block_mask=packed)
+    torch.cuda.synchronize()
+
+    dense_outs = []
+    for i, s in enumerate(seqlens):
+        lo = cu_phys[i]
+        q_i = Q[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        k_i = K[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        v_i = V_nat[lo : lo + s].transpose(0, 1).unsqueeze(0).contiguous()
+        Sq_phys = _phys_seq(s, block)
+        Skv_phys = _phys_seq(s, block)
+        Qd = torch.zeros(1, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+        Kd = torch.zeros(1, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+        Vd = torch.zeros(1, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+        Qd[:, :, :s].copy_(q_i)
+        Kd[:, :, :s].copy_(k_i)
+        Vd[:, :, :s].copy_(v_i)
+        Vd_tn = Vd.transpose(-1, -2).contiguous()
+        Od = torch.zeros_like(Qd)
+        launch_d = mod.compile_iluvatar_flex_attention(
+            1,
+            H,
+            s,
+            s,
+            D,
+            dtype="bf16",
+            is_causal=True,
+            sm_scale=sm_scale,
+            mask_mod=near_band,
+            has_block_mask=True,
+        )
+        launch_d(Qd, Kd, Vd_tn, Od, block_mask=masks[i])
+        dense_outs.append(Od[0, :, :s, :].transpose(0, 1).contiguous())
+
+    ref = torch.cat(dense_outs, dim=0)
+    out = torch.cat([O[cu_phys[i] : cu_phys[i] + s] for i, s in enumerate(seqlens)], dim=0)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=atol_rtol, atol=atol_rtol)
 
 
 def test_iluvatar_flex_attention_dispatcher_varlen_score_mod_matches_compile(monkeypatch):
