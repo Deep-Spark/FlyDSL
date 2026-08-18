@@ -4,10 +4,10 @@
 """Iluvatar flex-attention forward (dense / varlen / paged + score_mod + BlockMask).
 
 Supports f16/bf16, D in {64,128,256}, MHA/GQA, causal / SWA / softcap, varlen,
-paged KV, dense alibi/score_bias, ``score_mod=TracedScoreMod`` on dense and
-varlen (V3-5), dense ``block_mask`` / ``mask_mod`` sparse KV skip (V3-3), and
-varlen ``mask_mod`` / packed BlockMask (V3-6). Optional ``tile_config`` and
-dense ``return_lse``.
+paged KV, dense alibi/score_bias, ``score_mod=TracedScoreMod`` on dense, varlen
+(V3-5), and paged (V3-7a), dense ``block_mask`` / ``mask_mod`` sparse KV skip
+(V3-3), and varlen ``mask_mod`` / packed BlockMask (V3-6). Optional ``tile_config``
+and dense ``return_lse``.
 """
 
 import math
@@ -552,8 +552,6 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
     if score_mod is not None and not isinstance(score_mod, TracedScoreMod):
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
-    if score_mod is not None and paged:
-        raise ValueError("score_mod is not supported with paged")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
     if (mask_mod is not None or has_block_mask) and paged:
@@ -2376,14 +2374,16 @@ def compile_iluvatar_flex_attention(
         has_alibi: Dense-only; enable ``alibi_slopes [H]`` additive bias.
         has_score_bias: Dense-only; enable phys-padded ``score_bias`` tensor.
             Mutually exclusive with ``has_alibi``; not supported with varlen/paged.
-        score_mod: ``TracedScoreMod`` (or ``None``) for dense and varlen.
+        score_mod: ``TracedScoreMod`` (or ``None``) for dense, varlen, and paged.
             Inlined after softcap and before ``*log2e``. Closure scalars only;
-            not a replacement for ``alibi_slopes=[H]``. Not supported with paged.
-            Indices are per-sequence (``batch`` is seq id on varlen).
-        mask_mod: Dense-only ``TracedMaskMod`` for element holes (with
-            ``has_block_mask``). Same mod used in ``create_block_mask``.
-        has_block_mask: Dense-only. If True, launch must pass ``block_mask=``
-            ``FlexBlockMask``; KV loop iterates ``kv_indices``.
+            not a replacement for ``alibi_slopes=[H]``. Indices are sequence-local
+            (``batch`` is seq id on varlen, batch item on dense/paged).
+        mask_mod: ``TracedMaskMod`` for element holes (with ``has_block_mask``
+            on dense/varlen). Same mod used in ``create_block_mask``. Not
+            supported with paged (V3-7b).
+        has_block_mask: Dense/varlen. If True, launch must pass ``block_mask=``
+            (dense ``FlexBlockMask`` or varlen packed tables). Not supported
+            with paged (V3-7b).
         tile_config: Optional ``{"block_m": int, "block_n": int}`` with values
             in ``{32, 64}``. Default is ``64x64``. Paged requires ``block_n=64``.
         return_lse: Dense-only. If True, launch writes fp32 ``LSE [B,H,Sq_phys]``
@@ -2407,8 +2407,6 @@ def compile_iluvatar_flex_attention(
         raise ValueError("alibi/score_bias are dense-only in V2-4 (not supported with varlen/paged)")
     if score_mod is not None and not isinstance(score_mod, TracedScoreMod):
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
-    if score_mod is not None and paged:
-        raise ValueError("score_mod is not supported with paged")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
     if (mask_mod is not None or has_block_mask) and paged:
