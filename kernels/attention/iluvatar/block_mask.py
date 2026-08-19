@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Host-side BlockMask for Iluvatar flex-attention (V3-3 / V3-6).
+"""Host-side BlockMask for Iluvatar flex-attention (V3-3 / V3-6 / V3-7b).
 
 Builds a compact ``kv_num_blocks`` / ``kv_indices`` / ``kv_is_full`` table from
 preset masks (causal / SWA) and an optional ``TracedMaskMod``. The attention
@@ -10,6 +10,9 @@ PARTIAL tiles apply preset ∧ ``mask_mod`` element holes.
 
 V3-6 adds packed-varlen helpers: one ``FlexBlockMask`` per sequence plus a
 batched pack for launch (``[num_seqs, max_q_tiles, ...]``).
+
+V3-7b adds paged helpers: one mask per batch item with cross-length causal
+(``kv > q + (Skv - Sq)``); pack reuses the same batched table layout as varlen.
 """
 
 from __future__ import annotations
@@ -23,9 +26,12 @@ from flydsl.expr.trace_mod import TracedMaskMod
 __all__ = [
     "FlexBlockMask",
     "PackedVarlenBlockMask",
+    "PackedPagedBlockMask",
     "create_block_mask",
     "create_block_masks_varlen",
+    "create_block_masks_paged",
     "pack_block_masks_varlen",
+    "pack_block_masks_paged",
 ]
 
 
@@ -42,10 +48,12 @@ def _element_visible(
     is_causal: bool,
     window_size: int | None,
     mask_mod: Optional[TracedMaskMod],
+    causal_delta: int = 0,
 ) -> bool:
     if q < 0 or kv < 0 or q >= Sq or kv >= Skv:
         return False
-    if is_causal and kv > q:
+    # Dense self-attn: causal_delta=0 => kv > q. Paged cross-length: delta=Skv-Sq.
+    if is_causal and kv > q + int(causal_delta):
         return False
     if window_size is not None and (q - kv) > int(window_size):
         return False
@@ -91,6 +99,7 @@ def create_block_mask(
     is_causal: bool = False,
     window_size: int | None = None,
     device=None,
+    causal_delta: int | None = None,
 ):
     """Host-build a ``FlexBlockMask`` from presets ∧ optional ``mask_mod``.
 
@@ -103,6 +112,8 @@ def create_block_mask(
         block_m, block_n: Must match the attention compile tile.
         is_causal, window_size: Preset masks combined with ``mask_mod``.
         device: Torch device for the output tensors (default CUDA if available).
+        causal_delta: Extra offset for cross-length causal (paged:
+            ``seqlen_kv - Sq``). ``None`` defaults to ``0`` (dense ``kv > q``).
 
     Returns:
         ``FlexBlockMask`` with phys-tiled FULL / PARTIAL indices; pad is invisible.
@@ -128,6 +139,7 @@ def create_block_mask(
     Skv = int(Skv)
     block_m = int(block_m)
     block_n = int(block_n)
+    delta = 0 if causal_delta is None else int(causal_delta)
     Sq_phys = _phys_seq(Sq, block_m)
     Skv_phys = _phys_seq(Skv, block_n)
     num_q_tiles = Sq_phys // block_m
@@ -168,6 +180,7 @@ def create_block_mask(
                         is_causal=bool(is_causal),
                         window_size=window_size,
                         mask_mod=mask_mod,
+                        causal_delta=delta,
                     )
                     any_vis = any_vis or vis
                     all_vis = all_vis and vis
@@ -312,4 +325,71 @@ def pack_block_masks_varlen(
         kv_num_blocks=kv_num,
         kv_indices=kv_indices,
         kv_is_full=kv_is_full,
+    )
+
+
+# Same batched layout as varlen: [B, max_q_tiles, ...]; logical kv tile indices.
+PackedPagedBlockMask = PackedVarlenBlockMask
+
+
+def create_block_masks_paged(
+    mask_mod: Optional[TracedMaskMod],
+    seq_lens_q: Sequence[int],
+    seq_lens_kv: Sequence[int],
+    *,
+    block_m: int,
+    block_n: int,
+    H: int = 1,
+    is_causal: bool = False,
+    window_size: int | None = None,
+    device=None,
+) -> list[FlexBlockMask]:
+    """Build one logical ``FlexBlockMask`` per batch item (paged Q/KV lengths).
+
+    Causal visibility matches the paged kernel: ``kv > q + (Skv - Sq)``.
+    ``kv_indices`` store logical KV tile ids for ``block_table[b, kj]`` gather.
+    ``block_n`` must be 64 (page size) for paged compile.
+    """
+    if not seq_lens_q or not seq_lens_kv:
+        raise ValueError("seq_lens_q and seq_lens_kv must be non-empty")
+    if len(seq_lens_q) != len(seq_lens_kv):
+        raise ValueError(f"seq_lens_q/kv length mismatch: {len(seq_lens_q)} vs {len(seq_lens_kv)}")
+    if int(block_n) != 64:
+        raise ValueError(f"paged BlockMask requires block_n=64 (page_size), got {block_n}")
+
+    masks: list[FlexBlockMask] = []
+    for sq, skv in zip(seq_lens_q, seq_lens_kv):
+        sq_i = int(sq)
+        skv_i = int(skv)
+        if sq_i < 0 or skv_i < 0:
+            raise ValueError(f"seq lengths must be non-negative, got Sq={sq}, Skv={skv}")
+        masks.append(
+            create_block_mask(
+                mask_mod,
+                B=1,
+                H=H,
+                Sq=sq_i,
+                Skv=skv_i,
+                block_m=block_m,
+                block_n=block_n,
+                is_causal=is_causal,
+                window_size=window_size,
+                device=device,
+                causal_delta=skv_i - sq_i,
+            )
+        )
+    return masks
+
+
+def pack_block_masks_paged(
+    masks: Sequence[FlexBlockMask],
+    *,
+    max_seqlen_q: int | None = None,
+    max_seqlen_kv: int | None = None,
+) -> PackedPagedBlockMask:
+    """Pack per-batch paged masks into ``[B, max_q_tiles, ...]`` launch tensors."""
+    return pack_block_masks_varlen(
+        masks,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
     )

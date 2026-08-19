@@ -4,10 +4,9 @@
 """Iluvatar flex-attention forward (dense / varlen / paged + score_mod + BlockMask).
 
 Supports f16/bf16, D in {64,128,256}, MHA/GQA, causal / SWA / softcap, varlen,
-paged KV, dense alibi/score_bias, ``score_mod=TracedScoreMod`` on dense, varlen
-(V3-5), and paged (V3-7a), dense ``block_mask`` / ``mask_mod`` sparse KV skip
-(V3-3), and varlen ``mask_mod`` / packed BlockMask (V3-6). Optional ``tile_config``
-and dense ``return_lse``.
+paged KV, dense alibi/score_bias, ``score_mod=TracedScoreMod`` on dense, varlen,
+and paged; dense/varlen/paged ``mask_mod`` / BlockMask sparse KV skip; optional
+``tile_config`` and dense ``return_lse``.
 """
 
 import math
@@ -22,9 +21,12 @@ from flydsl.expr.trace_mod import TracedMaskMod, TracedScoreMod
 from flydsl.expr.typing import Vector as Vec
 from kernels.attention.iluvatar.block_mask import (
     FlexBlockMask,
+    PackedPagedBlockMask,
     PackedVarlenBlockMask,
     create_block_mask,
+    create_block_masks_paged,
     create_block_masks_varlen,
+    pack_block_masks_paged,
     pack_block_masks_varlen,
 )
 from kernels.gemm.iluvatar.common import GemmLayout
@@ -554,8 +556,6 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
-    if (mask_mod is not None or has_block_mask) and paged:
-        raise ValueError("block_mask/mask_mod are not supported with paged")
 
     has_score_mod = score_mod is not None
     # Captured into the nested kernel closure for JIT cache keying (forbid id(fn)).
@@ -1092,8 +1092,8 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # 0 -- K_{i+1} may still prefetch into the same K bank after MMA1.
         c_num_kv = fx.Int32(num_kv_tiles)
         if fx.const_expr(has_block_mask):
-            if fx.const_expr(varlen):
-                # V3-6: batched tables [num_seqs, max_q_tiles, ...]; index by seq_id.
+            if fx.const_expr(varlen or paged):
+                # Batched tables [B, max_q_tiles, ...]; index by batch/seq id.
                 kv_num_view = fx.make_view(
                     fx.get_iter(KvNumBlocks),
                     fx.make_layout((B, num_q_tiles), (num_q_tiles, 1)),
@@ -1150,7 +1150,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
         # Prologue: first K into stage 0 (skipped when kv_trip == 0).
         if kv_trip > fx.Int32(0):
             if fx.const_expr(has_block_mask):
-                if fx.const_expr(varlen):
+                if fx.const_expr(varlen or paged):
                     kv0 = fx.memref_load(kv_idx_view, (b_idx, q_tile_idx, fx.Int32(0)))
                 else:
                     kv0 = fx.memref_load(kv_idx_view, (q_tile_idx, fx.Int32(0)))
@@ -1167,7 +1167,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             m_prev = [state[slot] for slot in range(ROWS_PER_LANE)]
             l_prev = [state[ROWS_PER_LANE + slot] for slot in range(ROWS_PER_LANE)]
             if fx.const_expr(has_block_mask):
-                if fx.const_expr(varlen):
+                if fx.const_expr(varlen or paged):
                     kv_i = fx.memref_load(kv_idx_view, (b_idx, q_tile_idx, sparse_i))
                     tile_full_i = fx.memref_load(kv_full_view, (b_idx, q_tile_idx, sparse_i))
                 else:
@@ -1229,7 +1229,7 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
             next_s = fx.Int32(sparse_i) + fx.Int32(1)
             if next_s < kv_trip:
                 if fx.const_expr(has_block_mask):
-                    if fx.const_expr(varlen):
+                    if fx.const_expr(varlen or paged):
                         next_kv = fx.memref_load(kv_idx_view, (b_idx, q_tile_idx, next_s))
                     else:
                         next_kv = fx.memref_load(kv_idx_view, (q_tile_idx, next_s))
@@ -2020,12 +2020,12 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
         Dense: phys-padded BHSD; optional dense-only ``alibi_slopes`` ``[H]`` fp32
         or phys-padded ``score_bias`` ``[B,H,Sq_phys,Skv_phys]`` (mutually exclusive).
-        Optional ``block_mask``: dense ``FlexBlockMask``, or varlen
-        ``PackedVarlenBlockMask`` / ``Sequence[FlexBlockMask]`` when compiled
-        with ``has_block_mask=True``. When compiled with ``return_lse=True``,
-        pass or allocate fp32 ``lse [B,H,Sq_phys]``; the launch returns that
-        tensor. Paged rejects block_mask; alibi/score_bias / return_lse stay
-        dense-only.
+        Optional ``block_mask``: dense ``FlexBlockMask``, or varlen/paged
+        ``PackedVarlenBlockMask`` / ``PackedPagedBlockMask`` /
+        ``Sequence[FlexBlockMask]`` when compiled with ``has_block_mask=True``.
+        When compiled with ``return_lse=True``, pass or allocate fp32
+        ``lse [B,H,Sq_phys]``; the launch returns that tensor. Alibi/score_bias
+        and return_lse stay dense-only.
         """
         q_shape = _tensor_shape(Q)
         k_shape = _tensor_shape(K)
@@ -2043,14 +2043,17 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
 
         def _block_mask_placeholders():
             if has_block_mask:
-                if varlen:
+                if varlen or paged:
                     packed = block_mask
+                    pack_fn = pack_block_masks_varlen if varlen else pack_block_masks_paged
                     if isinstance(packed, (list, tuple)):
-                        packed = pack_block_masks_varlen(packed, max_seqlen_q=Sq, max_seqlen_kv=Skv)
+                        packed = pack_fn(packed, max_seqlen_q=Sq, max_seqlen_kv=Skv)
                     if not isinstance(packed, PackedVarlenBlockMask):
+                        kind = "varlen" if varlen else "paged"
                         raise TypeError(
-                            "varlen has_block_mask requires PackedVarlenBlockMask "
-                            f"or Sequence[FlexBlockMask], got {type(packed).__name__}"
+                            f"{kind} has_block_mask requires PackedVarlenBlockMask "
+                            f"/ PackedPagedBlockMask or Sequence[FlexBlockMask], "
+                            f"got {type(packed).__name__}"
                         )
                     if int(packed.block_m) != int(BLOCK_M) or int(packed.block_n) != int(BLOCK_N):
                         raise ValueError(
@@ -2143,8 +2146,6 @@ def _build_flex_attention_launcher(  # noqa: C901  (readability over cyclomatic 
                 raise ValueError("paged launch requires block_table [B, max_num_pages] and seq_lens_kv [B] (int32)")
             if alibi_slopes is not None or score_bias is not None:
                 raise ValueError("alibi/score_bias are dense-only (not supported with paged)")
-            if has_block_mask or block_mask is not None:
-                raise ValueError("block_mask is not supported with paged")
             bt_shape = _tensor_shape(block_table)
             sl_shape = _tensor_shape(seq_lens_kv)
             if len(bt_shape) != 2 or bt_shape[0] != B or bt_shape[1] != max_num_pages:
@@ -2378,12 +2379,10 @@ def compile_iluvatar_flex_attention(
             Inlined after softcap and before ``*log2e``. Closure scalars only;
             not a replacement for ``alibi_slopes=[H]``. Indices are sequence-local
             (``batch`` is seq id on varlen, batch item on dense/paged).
-        mask_mod: ``TracedMaskMod`` for element holes (with ``has_block_mask``
-            on dense/varlen). Same mod used in ``create_block_mask``. Not
-            supported with paged (V3-7b).
-        has_block_mask: Dense/varlen. If True, launch must pass ``block_mask=``
-            (dense ``FlexBlockMask`` or varlen packed tables). Not supported
-            with paged (V3-7b).
+        mask_mod: ``TracedMaskMod`` for element holes (with or without BlockMask)
+            on dense, varlen, and paged. Same mod used in ``create_block_mask``.
+        has_block_mask: If True, launch must pass ``block_mask=`` (dense
+            ``FlexBlockMask``, or varlen/paged packed / ``Sequence[FlexBlockMask]``).
         tile_config: Optional ``{"block_m": int, "block_n": int}`` with values
             in ``{32, 64}``. Default is ``64x64``. Paged requires ``block_n=64``.
         return_lse: Dense-only. If True, launch writes fp32 ``LSE [B,H,Sq_phys]``
@@ -2409,8 +2408,6 @@ def compile_iluvatar_flex_attention(
         raise ValueError(f"score_mod must be TracedScoreMod or None, got {type(score_mod).__name__}")
     if mask_mod is not None and not isinstance(mask_mod, TracedMaskMod):
         raise ValueError(f"mask_mod must be TracedMaskMod or None, got {type(mask_mod).__name__}")
-    if (mask_mod is not None or has_block_mask) and paged:
-        raise ValueError("block_mask/mask_mod are not supported with paged")
     if return_lse and (varlen or paged):
         raise ValueError("return_lse is dense-only (not supported with varlen/paged)")
 
@@ -2465,9 +2462,12 @@ __all__ = [
     "compile_iluvatar_flex_attention",
     "create_block_mask",
     "create_block_masks_varlen",
+    "create_block_masks_paged",
     "pack_block_masks_varlen",
+    "pack_block_masks_paged",
     "FlexBlockMask",
     "PackedVarlenBlockMask",
+    "PackedPagedBlockMask",
     "BLOCK_M",
     "BLOCK_N",
     "_SUPPORTED_BLOCK",
