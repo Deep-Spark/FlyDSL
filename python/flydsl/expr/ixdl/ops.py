@@ -74,6 +74,38 @@ def readfirstlane(val):
     raise TypeError(f"readfirstlane supports i32/i64, got width={width}")
 
 
+def _dot4_call(name, a, b, c):
+    from ..numeric import Int32
+
+    return Int32(
+        _llvm.call_intrinsic(
+            T.i32,
+            name,
+            [_arith.unwrap(a), _arith.unwrap(b), _arith.unwrap(c)],
+            [],
+            [],
+        )
+    )
+
+
+def idot4(a, b, c):
+    """Signed int8x4 dot-accumulate: r = sum_i(a[i]*b[i]) + c.
+
+    Emits ``llvm.bi.idot4``. ``a`` / ``b`` are packed i32 (four signed int8
+    lanes); ``c`` and the result are i32.
+    """
+    return _dot4_call("llvm.bi.idot4", a, b, c)
+
+
+def udot4(a, b, c):
+    """Unsigned int8x4 dot-accumulate: r = sum_i(a[i]*b[i]) + c.
+
+    Emits ``llvm.bi.udot4``. ``a`` / ``b`` are packed i32 (four unsigned int8
+    lanes); ``c`` and the result are i32.
+    """
+    return _dot4_call("llvm.bi.udot4", a, b, c)
+
+
 def _llvm_ptr(ptr, *, addrspace: int | None = 1):
     """Materialize ``!fly.ptr`` as ``!llvm.ptr`` / ``!llvm.ptr<AS>`` via ptrtoint/inttoptr.
 

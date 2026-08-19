@@ -30,6 +30,7 @@ from .mr import (
 from .ops import (
     atomic_cas,
     byte_permute,
+    idot4,
     readfirstlane,
     stp_vs_b8,
     stp_vs_b16,
@@ -41,6 +42,7 @@ from .ops import (
     stp_vs_pred_b32,
     stp_vs_pred_b64,
     stp_vs_pred_b128,
+    udot4,
 )
 from .sync import (
     cp_async_commit_group,
@@ -85,6 +87,8 @@ __all__ = [
     "nbarrier_wait",
     "nbarrier_sync",
     "byte_permute",
+    "idot4",
+    "udot4",
     "readfirstlane",
     "atomic_cas",
     "stp_vs_b8",
