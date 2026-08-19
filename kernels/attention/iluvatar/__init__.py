@@ -5,9 +5,12 @@
 
 from .block_mask import (
     FlexBlockMask,
+    PackedPagedBlockMask,
     PackedVarlenBlockMask,
     create_block_mask,
+    create_block_masks_paged,
     create_block_masks_varlen,
+    pack_block_masks_paged,
     pack_block_masks_varlen,
 )
 from .flex_attention import compile_iluvatar_flex_attention
@@ -21,9 +24,12 @@ __all__ = [
     "compile_iluvatar_flex_attention_bwd",
     "create_block_mask",
     "create_block_masks_varlen",
+    "create_block_masks_paged",
     "pack_block_masks_varlen",
+    "pack_block_masks_paged",
     "FlexBlockMask",
     "PackedVarlenBlockMask",
+    "PackedPagedBlockMask",
     "flydsl_flex_attn_func",
     "autotune_iluvatar_flex_attention_tile",
 ]

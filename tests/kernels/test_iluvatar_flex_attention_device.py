@@ -15,6 +15,7 @@ Covers:
   paged ``score_mod`` (V3-7a) vs host / dense / gather-to-dense references.
 * Dense ``create_block_mask`` / ``block_mask`` sparse KV skip (V3-3) vs dense path.
 * Varlen ``create_block_masks_varlen`` / ``block_masks`` / ``mask_mod`` (V3-6) vs dense concat.
+* Paged ``create_block_masks_paged`` / ``block_masks`` / ``mask_mod`` (V3-7b) vs gather-to-dense / host.
 * Optional ``tile_config`` whitelist and dense ``autotune_iluvatar_flex_attention_tile``.
 """
 
@@ -603,8 +604,10 @@ def test_iluvatar_flex_attention_forward_pr2c_sq_tail_smoke(monkeypatch):
 def test_iluvatar_flex_attention_package_export():
     from kernels.attention.iluvatar import autotune_iluvatar_flex_attention_tile as exported_tune
     from kernels.attention.iluvatar import compile_iluvatar_flex_attention as exported
+    from kernels.attention.iluvatar import create_block_masks_paged as exported_create_paged
     from kernels.attention.iluvatar import create_block_masks_varlen as exported_create_varlen
     from kernels.attention.iluvatar import flydsl_flex_attn_func as exported_func
+    from kernels.attention.iluvatar import pack_block_masks_paged as exported_pack_paged
     from kernels.attention.iluvatar import pack_block_masks_varlen as exported_pack
 
     mod = _require_flex_attn_module()
@@ -616,6 +619,8 @@ def test_iluvatar_flex_attention_package_export():
     assert exported_tune is iface.autotune_iluvatar_flex_attention_tile
     assert exported_create_varlen is mod.create_block_masks_varlen
     assert exported_pack is mod.pack_block_masks_varlen
+    assert exported_create_paged is mod.create_block_masks_paged
+    assert exported_pack_paged is mod.pack_block_masks_paged
 
 
 # --- Perf (opt-in; consumed by perf-daily-iluvatar) ----------------------------
@@ -2037,20 +2042,18 @@ def test_pack_block_masks_varlen_pads_short_seq_tiles():
     )
 
 
-def test_iluvatar_flex_attention_rejects_mask_mod_block_mask_paged_allows_varlen():
+def test_iluvatar_flex_attention_allows_mask_mod_block_mask_varlen_and_paged():
     mod = _require_flex_attn_module()
 
     @fx.trace_mask_mod
     def always(batch, head, q_idx, kv_idx):
         return True
 
-    # V3-6: varlen + mask_mod / has_block_mask is allowed (compile succeeds).
+    # V3-6 / V3-7b: varlen and paged + mask_mod / has_block_mask are allowed.
     mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, mask_mod=always)
     mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", varlen=True, has_block_mask=True)
-    with pytest.raises(ValueError, match=r"paged"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, mask_mod=always)
-    with pytest.raises(ValueError, match=r"paged"):
-        mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True)
+    mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, mask_mod=always)
+    mod.compile_iluvatar_flex_attention(1, 4, 64, 64, 128, dtype="bf16", paged=True, has_block_mask=True)
 
 
 def test_iluvatar_flex_attention_dispatcher_block_mask_matches_compile(monkeypatch):
@@ -2219,9 +2222,10 @@ def test_iluvatar_flex_attention_dispatcher_varlen_block_masks_matches_compile(m
     torch.testing.assert_close(out_disp, O_ref, rtol=0, atol=0)
 
 
-def test_iluvatar_flex_attention_dispatcher_rejects_mask_mod_on_paged(monkeypatch):
+def test_iluvatar_flex_attention_dispatcher_rejects_dense_block_mask_on_paged(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
     from kernels.attention.iluvatar import flex_attn_interface as iface
 
     @fx.trace_mask_mod
@@ -2233,8 +2237,9 @@ def test_iluvatar_flex_attention_dispatcher_rejects_mask_mod_on_paged(monkeypatc
     v = torch.randn(2, 64, 4, 128, device="cuda", dtype=torch.bfloat16)
     bt = torch.zeros(1, 2, dtype=torch.int32, device="cuda")
     sl = torch.tensor([64], dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match=r"paged"):
-        iface.flydsl_flex_attn_func(q, k, v, block_table=bt, seq_lens_kv=sl, mask_mod=always)
+    bm = mod.create_block_mask(always, 1, 4, 64, 64, block_m=64, block_n=64, device=q.device)
+    with pytest.raises(ValueError, match=r"block_masks"):
+        iface.flydsl_flex_attn_func(q, k, v, block_table=bt, seq_lens_kv=sl, block_mask=bm)
 
 
 # --- V3-5 score_mod x varlen --------------------------------------------------
@@ -3093,3 +3098,469 @@ def test_iluvatar_flex_attention_varlen_block_mask_sparse_faster(monkeypatch):
     us_d = _bench_gpu_us(run_d, warmup=5, iters=20)
     spars = [m.sparsity() for m in masks]
     assert us_s < us_d * 0.9, f"sparse={us_s:.1f}us dense={us_d:.1f}us sparsity={spars}"
+
+
+# --- V3-7b mask_mod / BlockMask x paged --------------------------------------
+
+
+def test_create_block_masks_paged_matches_per_batch_create():
+    mod = _require_flex_attn_module()
+    torch = _require_torch()
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    seq_q = [64, 1]
+    seq_kv = [64, 128]
+    H = 4
+    block = 64
+    masks = mod.create_block_masks_paged(
+        near_band,
+        seq_q,
+        seq_kv,
+        block_m=block,
+        block_n=block,
+        H=H,
+        is_causal=True,
+        device="cuda",
+    )
+    assert len(masks) == 2
+    for sq, skv, m in zip(seq_q, seq_kv, masks):
+        ref = mod.create_block_mask(
+            near_band,
+            B=1,
+            H=H,
+            Sq=sq,
+            Skv=skv,
+            block_m=block,
+            block_n=block,
+            is_causal=True,
+            device="cuda",
+            causal_delta=skv - sq,
+        )
+        assert m.num_q_tiles == ref.num_q_tiles
+        assert m.num_kv_tiles == ref.num_kv_tiles
+        torch.testing.assert_close(m.kv_num_blocks, ref.kv_num_blocks, rtol=0, atol=0)
+        torch.testing.assert_close(m.kv_indices, ref.kv_indices, rtol=0, atol=0)
+        torch.testing.assert_close(m.kv_is_full, ref.kv_is_full, rtol=0, atol=0)
+
+
+def test_create_block_masks_paged_rejects_non_page_block_n():
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def always(batch, head, q_idx, kv_idx):
+        return True
+
+    with pytest.raises(ValueError, match=r"block_n=64"):
+        mod.create_block_masks_paged(always, [64], [64], block_m=64, block_n=32, is_causal=False)
+
+
+def test_pack_block_masks_paged_pads_short_q_tiles():
+    mod = _require_flex_attn_module()
+    torch = _require_torch()
+
+    @fx.trace_mask_mod
+    def always(batch, head, q_idx, kv_idx):
+        return True
+
+    masks = mod.create_block_masks_paged(
+        always,
+        [64, 128],
+        [64, 128],
+        block_m=64,
+        block_n=64,
+        is_causal=False,
+        device="cuda",
+    )
+    packed = mod.pack_block_masks_paged(masks, max_seqlen_q=128, max_seqlen_kv=128)
+    assert packed.kv_num_blocks.shape[0] == 2
+    assert int(packed.kv_num_blocks[0, 0].item()) == int(masks[0].kv_num_blocks[0].item())
+    # Short seq (64) has one q-tile; pad row for q-tile 1 must be empty.
+    assert int(packed.kv_num_blocks[0, 1].item()) == 0
+    assert int(packed.kv_num_blocks[1, 0].item()) == int(masks[1].kv_num_blocks[0].item())
+    torch.testing.assert_close(
+        packed.kv_indices[1, : masks[1].num_q_tiles, : masks[1].num_kv_tiles],
+        masks[1].kv_indices,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_iluvatar_flex_attention_paged_mask_mod_matches_dense_gather(monkeypatch):
+    """Paged + mask_mod alone vs gather-to-dense (Sq==Skv) and host ref (decode)."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    H, D = 4, 128
+    dtype = "bf16"
+    torch_dtype = torch.bfloat16
+    atol_rtol = 2e-2
+    sm_scale = 1.0 / math.sqrt(D)
+
+    B, Sq, seq_lens_kv = 1, 128, [128]
+    Skv = 128
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    Skv_phys = _phys_seq(Skv, mod.BLOCK_N)
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=31,
+        page_size=mod.BLOCK_N,
+    )
+    torch.manual_seed(32)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O_p = torch.zeros_like(Q)
+    launch_p = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        mask_mod=near_band,
+    )
+    launch_p(Q, K_pages, V_pages, O_p, block_table=block_table, seq_lens_kv=seq_lens_t)
+
+    Kd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Vd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Kd[0].copy_(dense_k[0][:, :Skv])
+    Vd[0].copy_(dense_v[0][:, :Skv])
+    Od = torch.zeros_like(Q)
+    launch_d = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        mask_mod=near_band,
+    )
+    launch_d(Q, Kd, Vd.transpose(-1, -2).contiguous(), Od)
+    torch.testing.assert_close(
+        O_p[:, :, :Sq, :].float(),
+        Od[:, :, :Sq, :].float(),
+        rtol=atol_rtol,
+        atol=atol_rtol,
+    )
+
+    # Decode cross-len: Sq=1, Skv=128 -- host fp32 ref (dense causal forbids Sq!=Skv).
+    B, Sq, seq_lens_kv = 1, 1, [128]
+    Skv = 128
+    Sq_phys = _phys_seq(Sq, mod.BLOCK_M)
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=33,
+        page_size=mod.BLOCK_N,
+    )
+    torch.manual_seed(34)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O_p = torch.zeros_like(Q)
+    launch_p = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        mask_mod=near_band,
+    )
+    launch_p(Q, K_pages, V_pages, O_p, block_table=block_table, seq_lens_kv=seq_lens_t)
+    ref = _reference_flex_attention_fp32(
+        Q[:, :, :Sq, :].contiguous(),
+        dense_k[0].unsqueeze(0)[:, :, :Skv, :].contiguous(),
+        dense_v[0].unsqueeze(0)[:, :, :Skv, :].contiguous(),
+        sm_scale=sm_scale,
+        is_causal=True,
+        mask_mod=near_band,
+    )
+    torch.testing.assert_close(O_p[:, :, :Sq, :].float(), ref, rtol=atol_rtol, atol=atol_rtol)
+
+
+def test_iluvatar_flex_attention_paged_block_mask_matches_dense_gather(monkeypatch):
+    """Paged + packed BlockMask (+ mask_mod) vs gather-to-dense sparse path."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    B, H, Sq, D = 1, 4, 128, 128
+    seq_lens_kv = [128]
+    Skv = 128
+    dtype = "bf16"
+    torch_dtype = torch.bfloat16
+    atol_rtol = 2e-2
+    sm_scale = 1.0 / math.sqrt(D)
+    block = 64
+    Sq_phys = _phys_seq(Sq, block)
+    Skv_phys = _phys_seq(Skv, block)
+
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=35,
+        page_size=block,
+    )
+    masks = mod.create_block_masks_paged(
+        near_band,
+        [Sq],
+        seq_lens_kv,
+        block_m=block,
+        block_n=block,
+        H=H,
+        is_causal=True,
+        device="cuda",
+    )
+    packed = mod.pack_block_masks_paged(masks, max_seqlen_q=Sq, max_seqlen_kv=Skv)
+
+    torch.manual_seed(36)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O_p = torch.zeros_like(Q)
+    launch_p = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    launch_p(Q, K_pages, V_pages, O_p, block_table=block_table, seq_lens_kv=seq_lens_t, block_mask=packed)
+
+    Kd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Vd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Kd[0].copy_(dense_k[0][:, :Skv])
+    Vd[0].copy_(dense_v[0][:, :Skv])
+    Od = torch.zeros_like(Q)
+    launch_d = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    launch_d(Q, Kd, Vd.transpose(-1, -2).contiguous(), Od, block_mask=masks[0])
+    torch.testing.assert_close(
+        O_p[:, :, :Sq, :].float(),
+        Od[:, :, :Sq, :].float(),
+        rtol=atol_rtol,
+        atol=atol_rtol,
+    )
+
+
+def test_iluvatar_flex_attention_paged_score_and_mask_mod_matches_dense(monkeypatch):
+    """Paged score_mod + mask_mod (+ BlockMask) vs gather-to-dense."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+
+    @fx.trace_score_mod
+    def alibi_like(score, batch, head, q_idx, kv_idx):
+        return score + fx.Float32(-0.1) * fx.Float32(q_idx - kv_idx)
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    B, H, Sq, D = 1, 4, 64, 128
+    seq_lens_kv = [64]
+    Skv = 64
+    dtype = "bf16"
+    torch_dtype = torch.bfloat16
+    atol_rtol = 2e-2
+    sm_scale = 1.0 / math.sqrt(D)
+    block = 64
+    Sq_phys = _phys_seq(Sq, block)
+    Skv_phys = _phys_seq(Skv, block)
+
+    K_pages, V_pages, _V_nat, block_table, seq_lens_t, dense_k, dense_v, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=37,
+        page_size=block,
+    )
+    masks = mod.create_block_masks_paged(
+        near_band,
+        [Sq],
+        seq_lens_kv,
+        block_m=block,
+        block_n=block,
+        H=H,
+        is_causal=True,
+        device="cuda",
+    )
+    packed = mod.pack_block_masks_paged(masks, max_seqlen_q=Sq, max_seqlen_kv=Skv)
+
+    torch.manual_seed(38)
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(torch.randn(B, H, Sq, D, device="cuda", dtype=torch_dtype))
+    O_p = torch.zeros_like(Q)
+    launch_p = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        score_mod=alibi_like,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    launch_p(Q, K_pages, V_pages, O_p, block_table=block_table, seq_lens_kv=seq_lens_t, block_mask=packed)
+
+    Kd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Vd = torch.zeros(B, H, Skv_phys, D, device="cuda", dtype=torch_dtype)
+    Kd[0, :, :Skv].copy_(dense_k[0][:, :Skv])
+    Vd[0, :, :Skv].copy_(dense_v[0][:, :Skv])
+    Od = torch.zeros_like(Q)
+    launch_d = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype=dtype,
+        is_causal=True,
+        sm_scale=sm_scale,
+        score_mod=alibi_like,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    launch_d(Q, Kd, Vd.transpose(-1, -2).contiguous(), Od, block_mask=masks[0])
+    torch.testing.assert_close(
+        O_p[:, :, :Sq, :].float(),
+        Od[:, :, :Sq, :].float(),
+        rtol=atol_rtol,
+        atol=atol_rtol,
+    )
+
+
+def test_iluvatar_flex_attention_dispatcher_paged_block_mask_matches_compile(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    mod = _require_flex_attn_module()
+    from kernels.attention.iluvatar import flex_attn_interface as iface
+
+    @fx.trace_mask_mod
+    def near_band(batch, head, q_idx, kv_idx):
+        return fx.where((q_idx - kv_idx) <= 64, (kv_idx - q_idx) <= 64, False)
+
+    B, H, Sq, D = 1, 4, 64, 128
+    seq_lens_kv = [64]
+    Skv = 64
+    torch_dtype = torch.bfloat16
+    sm_scale = 1.0 / math.sqrt(D)
+    block = 64
+    Sq_phys = _phys_seq(Sq, block)
+
+    K_pages, V_pages_tn, V_nat, block_table, seq_lens_t, _, _, _ = _build_paged_kv(
+        B=B,
+        Hkv=H,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch_dtype,
+        seed=39,
+        page_size=block,
+    )
+    masks = mod.create_block_masks_paged(
+        near_band,
+        [Sq],
+        seq_lens_kv,
+        block_m=block,
+        block_n=block,
+        H=H,
+        is_causal=True,
+        device="cuda",
+    )
+    packed = mod.pack_block_masks_paged(masks, max_seqlen_q=Sq, max_seqlen_kv=Skv)
+
+    torch.manual_seed(40)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch_dtype)
+    out_disp = iface.flydsl_flex_attn_func(
+        q,
+        K_pages,
+        V_nat,
+        causal=True,
+        sm_scale=sm_scale,
+        block_table=block_table,
+        seq_lens_kv=seq_lens_t,
+        mask_mod=near_band,
+        block_masks=masks,
+    )
+
+    Q = torch.zeros(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)
+    Q[:, :, :Sq].copy_(q.permute(0, 2, 1, 3))
+    O_buf = torch.zeros_like(Q)
+    launch = mod.compile_iluvatar_flex_attention(
+        B,
+        H,
+        Sq,
+        Skv,
+        D,
+        dtype="bf16",
+        is_causal=True,
+        sm_scale=sm_scale,
+        paged=True,
+        mask_mod=near_band,
+        has_block_mask=True,
+    )
+    launch(
+        Q,
+        K_pages,
+        V_pages_tn,
+        O_buf,
+        block_table=block_table,
+        seq_lens_kv=seq_lens_t,
+        block_mask=packed,
+    )
+    torch.testing.assert_close(
+        out_disp.permute(0, 2, 1, 3).contiguous(),
+        O_buf[:, :, :Sq, :],
+        rtol=0,
+        atol=0,
+    )
