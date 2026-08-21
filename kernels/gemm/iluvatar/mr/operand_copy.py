@@ -169,6 +169,61 @@ def mr_cta_smem_grid(
     )
 
 
+def _clamp_chunk(cta_lin, atoms_total: int | None):
+    """Fold surplus chunk indices onto the last real chunk.
+
+    When the chunk count does not divide the warp count, the tail warps run one
+    iteration past the end. Rather than branching (which would put the copy atom
+    in its own region and break SSA dominance) those iterations are redirected to
+    the final chunk: they read a valid global address and write the bytes that
+    chunk already receives, so the duplicate store is a no-op in effect. ``None``
+    means the counts divide and no clamp is emitted at all.
+    """
+    if fx.const_expr(atoms_total is None):
+        return cta_lin
+    last = fx.Int32(atoms_total - 1)
+    over = fx.arith.cmpi(fx.arith.CmpIPredicate.ugt, cta_lin, last)
+    return fx.Int32(fx.arith.select(over, last, cta_lin))
+
+
+def _pred_frag(template_iter, cond):
+    """Wrap a boolean into the single-element predicate an SME copy expects.
+
+    ``make_fragment_like`` only borrows the layout, so any one-element view
+    serves as the template. A false predicate makes the SME copy drop the whole
+    transfer (the backend redirects it to an invalid SLB address), which is how
+    a warp skips a copy without branching.
+    """
+    pred = fx.make_fragment_like(
+        fx.make_view(template_iter, fx.make_layout(1, 1)),
+        dtype=fx.Boolean,
+    )
+    pred[0] = cond
+    return pred
+
+
+def _chunk_guard(cta_lin_raw, atoms_total: int | None, num_warps: int | None):
+    """Predicate off warps that have no chunk of their own.
+
+    A tile whose chunk count is below the warp count (BM=128 at BK=64 yields 8
+    A-chunks for 16 warps) still wants the wider warp count for the MMA and for
+    the other operand. ``_clamp_chunk`` keeps the surplus warps pointed at a
+    legal address; this drops their transfer so they cost no bandwidth.
+    ``None`` when every warp owns a chunk.
+    """
+    if fx.const_expr(atoms_total is None or num_warps is None or atoms_total >= num_warps):
+        return None
+    return cta_lin_raw < fx.Int32(atoms_total)
+
+
+def _and(a, b):
+    if fx.const_expr(a is None):
+        return b
+    if fx.const_expr(b is None):
+        return a
+    return a & b
+
+
 def mr_gemm_g2s_issue_a_warp(
     *,
     a_mn_major: bool,
@@ -183,14 +238,25 @@ def mr_gemm_g2s_issue_a_warp(
     bn: int,
     bk: int,
     geom: MrOperandGeom,
+    a_atoms_total: int | None = None,
+    a_row_base=None,
+    m_valid=None,
+    num_warps: int | None = None,
 ):
     """Issue this warp's A-tile SME async G2S copies for one pipeline stage.
 
     A k-major: cta_m = cta_lin // cta_a_k_cnt_k_major, cta_k = cta_lin % cta_a_k_cnt_k_major.
     A mn-major: cta_m = cta_lin // cta_a_k_cnt, cta_k = cta_lin % cta_a_k_cnt.
     Smem: cta_lin * cta_chunk_elems within ``smem_a``. Does not commit async.
-    Parameters: see mr_gemm_g2s_issue_operands.
+
+    ``a_atoms_total`` / ``num_warps``: when the chunk count does not divide the
+    warp count, surplus iterations clamp to the last chunk and are predicated
+    off. ``None`` (default) means every warp owns a chunk. ``m_valid`` (k-major
+    A only) predicates off chunks that start at or past the live row count;
+    ``a_row_base`` is this CTA's first global A row and is required then.
     """
+    if fx.const_expr(m_valid is not None and a_mn_major):
+        raise ValueError("M-boundary predication is only defined for k-major A")
     cta_grid = mr_cta_smem_grid(
         a_mn_major=a_mn_major,
         b_mn_major=b_mn_major,
@@ -201,7 +267,8 @@ def mr_gemm_g2s_issue_a_warp(
     )
     warp_a_start = warp_id * fx.Int32(a_per_warp)
     for t in fx.range_constexpr(a_per_warp):
-        cta_lin = warp_a_start + fx.Int32(t)
+        cta_lin_raw = warp_a_start + fx.Int32(t)
+        cta_lin = _clamp_chunk(cta_lin_raw, a_atoms_total)
         if fx.const_expr(a_mn_major):
             cta_m = cta_lin // fx.Int32(cta_grid.cta_a_k_cnt)
             cta_k = cta_lin % fx.Int32(cta_grid.cta_a_k_cnt)
@@ -213,17 +280,24 @@ def mr_gemm_g2s_issue_a_warp(
         # an MMA atom's K-bricks are contiguous without a remap (cta_lin == cta_m *
         # cta_a_k_cnt + cta_k). The mirror decode lives in mr_gemm_s2r_a_tile.
         a_off = cta_lin * fx.Int32(cta_grid.cta_chunk_elems)
-        fx.copy_atom_call(
-            g2s_sme.sme_atom_a,
-            a_src,
-            mr_sme_shared_view(
-                smem_a,
-                a_off,
-                g2s_sme.a_sme_sw,
-                elem_dtype,
-                major=g2s_sme.a_smem_major,
-            ),
+        a_dst = mr_sme_shared_view(
+            smem_a,
+            a_off,
+            g2s_sme.a_sme_sw,
+            elem_dtype,
+            major=g2s_sme.a_smem_major,
         )
+        cond = _chunk_guard(cta_lin_raw, a_atoms_total, num_warps)
+        if fx.const_expr(m_valid is not None):
+            # One chunk spans SMEM_ROWS rows of A, so this only skips chunks that
+            # start past the end. A chunk straddling the boundary still loads all
+            # SMEM_ROWS rows; the epilogue's row guard drops the surplus.
+            row_base = a_row_base + cta_m * fx.Int32(SMEM_ROWS)
+            cond = _and(cond, row_base < m_valid)
+        if fx.const_expr(cond is None):
+            fx.copy_atom_call(g2s_sme.sme_atom_a, a_src, a_dst)
+        else:
+            fx.copy_atom_call(g2s_sme.sme_atom_a, a_src, a_dst, pred=_pred_frag(smem_a, cond))
 
 
 def mr_gemm_g2s_issue_b_warp(
@@ -242,6 +316,8 @@ def mr_gemm_g2s_issue_b_warp(
     geom: MrOperandGeom,
     b_n_swizzle: int = 1,
     b_leading: int = 0,
+    b_atoms_total: int | None = None,
+    num_warps: int | None = None,
 ):
     """Issue this warp's B-tile SME async G2S copies for one pipeline stage.
 
@@ -255,7 +331,8 @@ def mr_gemm_g2s_issue_b_warp(
     * swizzle`` so one Col SME load covers every-``swizzle``-th N row. SMEM
     placement stays ``cta_lin``-ordered. In that
     mode ``b_cta_gmem_view`` must be the unsplit SME CTA tensor (not
-    ``zipped_divide``). Parameters: see mr_gemm_g2s_issue_operands.
+    ``zipped_divide``). ``b_atoms_total`` / ``num_warps`` match
+    ``mr_gemm_g2s_issue_a_warp``: surplus warps clamp and drop the copy.
     """
     cta_grid = mr_cta_smem_grid(
         a_mn_major=a_mn_major,
@@ -267,7 +344,8 @@ def mr_gemm_g2s_issue_b_warp(
     )
     warp_b_start = warp_id * fx.Int32(b_per_warp)
     for t in fx.range_constexpr(b_per_warp):
-        cta_lin = warp_b_start + fx.Int32(t)
+        cta_lin_raw = warp_b_start + fx.Int32(t)
+        cta_lin = _clamp_chunk(cta_lin_raw, b_atoms_total)
         if fx.const_expr(b_mn_major):
             cta_n = cta_lin % fx.Int32(cta_grid.cta_b_n_cnt)
             cta_k = cta_lin // fx.Int32(cta_grid.cta_b_n_cnt)
@@ -301,17 +379,18 @@ def mr_gemm_g2s_issue_b_warp(
             )
         else:
             b_src = fx.slice(b_cta_gmem_view, (None, (cta_n, cta_k)))
-        fx.copy_atom_call(
-            g2s_sme.sme_atom_b,
-            b_src,
-            mr_sme_shared_view(
-                smem_b,
-                b_off,
-                g2s_sme.b_sme_sw,
-                elem_dtype,
-                major=g2s_sme.b_smem_major,
-            ),
+        b_dst = mr_sme_shared_view(
+            smem_b,
+            b_off,
+            g2s_sme.b_sme_sw,
+            elem_dtype,
+            major=g2s_sme.b_smem_major,
         )
+        cond = _chunk_guard(cta_lin_raw, b_atoms_total, num_warps)
+        if fx.const_expr(cond is None):
+            fx.copy_atom_call(g2s_sme.sme_atom_b, b_src, b_dst)
+        else:
+            fx.copy_atom_call(g2s_sme.sme_atom_b, b_src, b_dst, pred=_pred_frag(smem_b, cond))
 
 
 def mr_gemm_g2s_issue_operands(
@@ -337,9 +416,9 @@ def mr_gemm_g2s_issue_operands(
 ):
     """Issue this warp's A and B SME async G2S copies for one pipeline stage.
 
-    Calls mr_gemm_g2s_issue_a_warp then mr_gemm_g2s_issue_b_warp. Each warp issues
-    a_per_warp / b_per_warp chunks with cta_lin = warp_id * per_warp + t. When commit
-    is True (default), calls ixdl.cp_async_commit_group after both operands.
+    Always A then B. Each warp issues a_per_warp / b_per_warp chunks with
+    cta_lin = warp_id * per_warp + t. When commit is True (default), calls
+    ixdl.cp_async_commit_group after both operands.
 
     Args:
         a_mn_major: True when logical A(m,k) is M-major; selects A cta_lin decode and

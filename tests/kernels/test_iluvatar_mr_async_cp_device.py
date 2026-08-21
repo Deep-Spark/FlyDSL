@@ -838,6 +838,128 @@ def test_mr_async_cp_runtime_goffset_loop_device(monkeypatch):
     torch.testing.assert_close(dst, expected, rtol=0, atol=0)
 
 
+def test_mr_async_cp_predicated_drops_transfer_device(monkeypatch):
+    """A false predicate drops the whole SME transfer, global read included.
+
+    This is the property that lets a GEMM skip host-side padding of A: an M-edge
+    CTA can issue the same SME copy for rows past the end of the tensor as long
+    as the predicate is false. The kernel proves both halves of that claim at
+    once -- block 1 runs the instruction with ``pred=False`` against a source
+    address far past the end of the allocation, so if the read were still issued
+    the launch would fault rather than merely return wrong data.
+
+    Shared memory is poisoned with a sentinel first, which distinguishes "the
+    copy was dropped" from "the copy landed zeros".
+    """
+    flyc, fx, ixdl = _require_imports()
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+
+    swizzle = ixdl.SMESwizzle.NoSwizzle
+    tile_m = 16
+    tile_n = 16
+    tile_elems = tile_m * tile_n
+    src_stride_n = 80  # 80 * 4B = 320B = 5 * 64B, keeps the descriptor 64B-aligned
+    smem_bytes = tile_elems * 4
+    sentinel = -12345.0
+    # Far past the end of the 16 x 80 f32 source allocation.
+    oob_elems = 1 << 26
+
+    threads_n = THREADS // tile_m
+    val_n = tile_n // threads_n
+
+    @flyc.kernel
+    def kernel(src: fx.Tensor, dst: fx.Tensor):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        smem_phys = ixdl.make_sme_shared_layout(swizzle, fx.Float32, major=ixdl.SMEMajor.K)
+        load_layout = fx.make_layout((tile_m, tile_n), (1, tile_m))
+
+        smem = fx.make_view(fx.get_dyn_shared(fx.Float32), fx.make_layout(tile_elems, 1))
+        smem_iter = fx.get_iter(smem)
+        dst_iter = fx.get_iter(dst)
+        sme_src = ixdl.make_sme_gmem_tensor(src, leading_stride=src_stride_n)
+        sme_src_iter = fx.get_iter(sme_src)
+
+        scalar_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+        tiled_st = fx.make_tiled_copy_tv(
+            scalar_atom,
+            fx.make_layout((tile_m, threads_n), (1, tile_m)),
+            fx.make_layout((1, val_n), (1, 1)),
+        )
+        st = tiled_st.get_slice(tid)
+        smem_tile = fx.make_view(smem_iter, smem_phys)
+        part_smem = st.partition_D(smem_tile)
+
+        poison = fx.make_fragment_like(part_smem)
+        for a in fx.range_constexpr(fx.size(poison.shape).unpack()):
+            poison[a] = fx.Float32(sentinel)
+        fx.copy(scalar_atom, poison, part_smem)
+        fx.gpu.barrier()
+
+        do_copy = bid == fx.Int32(0)
+        src_off = fx.arith.select(do_copy, fx.Int32(0), fx.Int32(oob_elems))
+        pred = fx.make_fragment_like(
+            fx.make_view(smem_iter, fx.make_layout(1, 1)),
+            dtype=fx.Boolean,
+        )
+        pred[0] = do_copy
+
+        async_atom = fx.make_copy_atom(ixdl.MRAsyncCp(swizzle), fx.Float32)
+        fx.copy_atom_call(
+            async_atom,
+            fx.make_view(fx.add_offset(sme_src_iter, src_off), load_layout),
+            fx.make_view(smem_iter, load_layout),
+            pred=pred,
+        )
+        ixdl.cp_async_commit_group()
+        ixdl.cp_async_wait_group(0)
+        fx.gpu.barrier()
+
+        dst_tile = fx.make_view(
+            fx.add_offset(dst_iter, bid * fx.Int32(tile_elems)),
+            fx.make_layout((tile_m, tile_n), (tile_n, 1)),
+        )
+        frag = fx.make_fragment_like(part_smem)
+        fx.copy(scalar_atom, st.partition_S(smem_tile), frag)
+        fx.copy(scalar_atom, frag, st.partition_D(dst_tile))
+
+    @flyc.jit
+    def launch(src: fx.Tensor, dst: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
+        kernel(src, dst).launch(
+            grid=(2, 1, 1),
+            block=(THREADS, 1, 1),
+            smem=smem_bytes,
+            stream=stream,
+        )
+
+    storage = torch.zeros((tile_m, src_stride_n), device="cuda", dtype=torch.float32)
+    rows = torch.arange(tile_m, device="cuda", dtype=torch.float32).view(tile_m, 1)
+    cols = torch.arange(tile_n, device="cuda", dtype=torch.float32).view(1, tile_n)
+    storage[:, :tile_n] = rows * tile_n + cols
+    src = storage[:, :tile_n]
+    dst = torch.empty(2 * tile_elems, device="cuda", dtype=torch.float32)
+
+    launch(src, dst)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        dst[:tile_elems],
+        src.reshape(-1),
+        rtol=0,
+        atol=0,
+        msg="pred=True block did not receive the source tile",
+    )
+    torch.testing.assert_close(
+        dst[tile_elems:],
+        torch.full((tile_elems,), sentinel, device="cuda", dtype=torch.float32),
+        rtol=0,
+        atol=0,
+        msg="pred=False block wrote to shared memory; the transfer was not dropped",
+    )
+
+
 _B16_DTYPE = next(c for c in _MULTIBRICK_DTYPE_CASES if c["name"] == "b16")
 
 
