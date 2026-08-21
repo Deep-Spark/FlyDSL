@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Reusable Iluvatar MR HGEMM epilogue helpers.
+"""Reusable Iluvatar MR HGEMM / IGEMM epilogue helpers.
 
   mr_hgemm_epilogue_store_shfl -- f16/bf16 via warp shuffle + packed i32 store
   mr_hgemm_epilogue_store_tiled -- f16/bf16 via trunc_f + make_tiled_copy_C
   mr_hgemm_epilogue_store_read_c_accum -- fp32 make_tiled_copy_C
+  mr_igemm_epilogue_store_i32 -- int32 direct store
+  mr_igemm_epilogue_store_i8_packed -- int8 packed store (no quant scale)
+  mr_igemm_epilogue_store_scaled -- dequant (+ optional bias) -> f16/bf16
+      via PackSlb packed store
 
 mr_hgemm_epilogue_store dispatches on store_mode.
 """
 
 import flydsl.expr as fx
-from flydsl.expr.ixdl import byte_permute, stp_vs_b32
+from flydsl.expr.ixdl import byte_permute, stp_vs_b32, stp_vs_pred_b32
 from flydsl.expr.typing import Vector as Vec
 from kernels.gemm.iluvatar.common import WARP_SIZE
 from kernels.gemm.iluvatar.mr.common import ATOM_M, ATOM_N, TCU_LANE_COLS
@@ -21,6 +25,41 @@ EPILOGUE_STORE_TILED = "tiled"
 EPILOGUE_STORE_READ_C_ACCUM = "read_c_accum"
 EPILOGUE_STORE_ATOMIC_SPLITK = "atomic_splitk"
 EPILOGUE_STORE_SERIAL_SPLITK = "serial_splitk"
+
+# PackSlb C stores use write-through (BK != 32).
+_PACKSLB_STORE_KOP = 3
+# 512B shared scratch per warp for b16 PackSlb (128 i32).
+B16_PACK_SLB_BYTES_PER_WARP = 512
+B16_PACK_SLB_I32_PER_WARP = B16_PACK_SLB_BYTES_PER_WARP // 4
+
+
+def _b16x2_pack_slb(*, sk, lane_id, in1, in2):
+    """Pack two i32 b16x2 pairs through 512B/warp shared into coalesced stores.
+
+    ``in1`` = packed ``{val0, val2}``, ``in2`` = packed ``{val1, val3}`` as i32.
+    Returns ``(out0, out1)`` ready for coalesced b16x2 stores.
+    ``sk`` is this warp's 128-i32 shared scratch.
+    """
+    lane_row = lane_id.shrui(fx.Int32(4))
+    lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)
+    lane0 = lane_col & fx.Int32(1)
+    lane123 = lane_col.shrui(fx.Int32(1))
+    xor_mask = lane0 * fx.Int32(8)
+    base = lane0 * fx.Int32(64) + lane_row * fx.Int32(16) + lane123
+    fx.ptr_store(in1, fx.add_offset(sk, fx.make_int_tuple(base ^ xor_mask)))
+    fx.ptr_store(in2, fx.add_offset(sk, fx.make_int_tuple((base + fx.Int32(8)) ^ xor_mask)))
+    loaded0 = fx.ptr_load(fx.add_offset(sk, fx.make_int_tuple(lane_id)))
+    loaded1 = fx.ptr_load(fx.add_offset(sk, fx.make_int_tuple(fx.Int32(64) + (lane_id ^ fx.Int32(8)))))
+    out0 = byte_permute(loaded0, loaded1, 0x5410)
+    out1 = byte_permute(loaded0, loaded1, 0x7632)
+    return out0, out1
+
+
+def _pack_and_swizzle_4x2b_to_2x4b_slb(*, sk, lane_id, h0, h1, h2, h3, out_dtype):
+    """Pack four b16 values at ``(r,c), (r,c+16), (r+4,c), (r+4,c+16)`` for PackSlb."""
+    val02 = Vec(Vec.from_elements([h0, h2], out_dtype)).bitcast(fx.Int32)[0]
+    val13 = Vec(Vec.from_elements([h1, h3], out_dtype)).bitcast(fx.Int32)[0]
+    return _b16x2_pack_slb(sk=sk, lane_id=lane_id, in1=val02, in2=val13)
 
 
 def mr_hgemm_epilogue_store_shfl(
@@ -277,6 +316,141 @@ def mr_igemm_epilogue_store_i32(
             for jn in fx.range_constexpr(warp_atoms_n):
                 soffset = row_soffset + fx.Int32(jn * ATOM_N * 4)
                 stp_vs_b32(loaded[jn][ei], c_warp_ptr, voffset, soffset)
+
+
+def mr_igemm_epilogue_store_scaled(
+    *,
+    lane_id,
+    warp_id,
+    warp_m_id,
+    warp_n_id,
+    m_tile,
+    n_tile,
+    accs,
+    scale_a,
+    scale_b,
+    bias,
+    gC_warp,
+    smem_base,
+    c_global_n: int,
+    bm: int,
+    bn: int,
+    warp_m: int,
+    warp_n: int,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+    out_dtype,
+    apply_bias: bool = False,
+    skip_cta_barrier: bool = False,
+    m_valid: int | None = None,
+):
+    """Scaled int32-acc store: dequant to bf16/fp16, then PackSlb.
+
+    ``D = float(acc) * scale_a[m] * scale_b[n] [+ bias[n]]`` -> bf16/fp16, then
+    pack 4xb16 ``(r,c)/(r,c+16)/(r+4,c)/(r+4,c+16)`` through 512B/warp shared
+    and write coalesced i32 words. No alpha/beta/relu.
+
+    Acc layout matches i32 IGEMM: lane owns rows ``{r,r+4,r+8,r+12}`` at
+    ``lane_col`` in each 16x16 atom. Requires even ``warp_atoms_n``.
+    When ``m_valid`` is set, rows with ``global_m >= m_valid`` are not stored
+    (dynamic-M / short-M edge). It may be a Python ``int`` (folded at compile
+    time) or an SSA value carrying the runtime row count.
+    """
+    if fx.const_expr(warp_atoms_n % 2 != 0):
+        raise ValueError("scaled PackSlb requires even warp_atoms_n")
+
+    # Python int folds to a constant; anything else is already an SSA row count
+    # (dynamic-M launcher passes the runtime M).
+    m_limit = None
+    if fx.const_expr(m_valid is not None):
+        m_limit = fx.Int32(m_valid) if fx.const_expr(isinstance(m_valid, int)) else m_valid
+
+    lane_row = lane_id.shrui(fx.Int32(4))  # 0..3
+    lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)
+
+    m_base = m_tile * fx.Int32(bm)
+    n_base = n_tile * fx.Int32(bn)
+    warp_m_base = warp_m_id * fx.Int32(warp_m)
+    warp_n_base = warp_n_id * fx.Int32(warp_n)
+
+    # Preload per-row scale_a and per-column scale_b / bias before the store.
+    # The dq load runs ahead of the row guard below, so a tile hanging off the
+    # end of M would read past ``scale_a``. Clamping the row to the last live
+    # one keeps the read in bounds and lets callers pass ``scale_a`` at its
+    # natural M length; the value fetched for a dead row is discarded with the
+    # row itself.
+    dq_m = []
+    if fx.const_expr(m_valid is not None):
+        m_last = m_limit - fx.Int32(1)
+    for im in range(warp_atoms_m):
+        row = []
+        for ei in range(4):
+            global_m = m_base + warp_m_base + fx.Int32(im * ATOM_M + ei * 4) + lane_row
+            if fx.const_expr(m_valid is not None):
+                over = fx.arith.cmpi(fx.arith.CmpIPredicate.ugt, global_m, m_last)
+                global_m = fx.Int32(fx.arith.select(over, m_last, global_m))
+            row.append(fx.Float32(scale_a[global_m]))
+        dq_m.append(row)
+    dq_n = []
+    bias_n = []
+    for jn in range(warp_atoms_n):
+        global_n = n_base + warp_n_base + fx.Int32(jn * ATOM_N) + lane_col
+        dq_n.append(fx.Float32(scale_b[global_n]))
+        if fx.const_expr(apply_bias):
+            bias_n.append(fx.Float32(bias[global_n]))
+
+    if fx.const_expr(not skip_cta_barrier):
+        fx.gpu.barrier()
+
+    smem_warp_i32 = fx.recast_iter(
+        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared),
+        smem_base,
+    )
+    sk = fx.add_offset(smem_warp_i32, fx.make_int_tuple(warp_id * fx.Int32(B16_PACK_SLB_I32_PER_WARP)))
+
+    # Bake the per-lane byte offset once; each store is a constexpr tile soffset
+    # plus that voffset. Write-through so the one-shot C burst does not fill L1.
+    c_warp_ptr = fx.get_iter(gC_warp)
+    voffset = (lane_row * fx.Int32(c_global_n) + lane_col * fx.Int32(2)) * fx.Int32(2)
+
+    for im in fx.range_constexpr(warp_atoms_m):
+        loaded = [Vec(accs[im][jn].load()) for jn in range(warp_atoms_n)]
+        for ei_base in fx.range_constexpr(0, 4, 2):
+            for jn in fx.range_constexpr(0, warp_atoms_n, 2):
+                out0 = loaded[jn][ei_base].to(fx.Float32) * dq_m[im][ei_base] * dq_n[jn]
+                out1 = loaded[jn + 1][ei_base].to(fx.Float32) * dq_m[im][ei_base] * dq_n[jn + 1]
+                out2 = loaded[jn][ei_base + 1].to(fx.Float32) * dq_m[im][ei_base + 1] * dq_n[jn]
+                out3 = loaded[jn + 1][ei_base + 1].to(fx.Float32) * dq_m[im][ei_base + 1] * dq_n[jn + 1]
+                if fx.const_expr(apply_bias):
+                    out0 = out0 + bias_n[jn]
+                    out1 = out1 + bias_n[jn + 1]
+                    out2 = out2 + bias_n[jn]
+                    out3 = out3 + bias_n[jn + 1]
+                packed0, packed1 = _pack_and_swizzle_4x2b_to_2x4b_slb(
+                    sk=sk,
+                    lane_id=lane_id,
+                    h0=out0.to(out_dtype),
+                    h1=out1.to(out_dtype),
+                    h2=out2.to(out_dtype),
+                    h3=out3.to(out_dtype),
+                    out_dtype=out_dtype,
+                )
+                # Packed i32 word at (row, col) of bf16 C: byte = (row*N + col)*2
+                # with col = jn*16 + lane_col*2 (two b16 values).
+                soffset0 = fx.Int32((im * ATOM_M + ei_base * 4) * c_global_n * 2 + jn * ATOM_N * 2)
+                soffset1 = fx.Int32((im * ATOM_M + (ei_base + 1) * 4) * c_global_n * 2 + jn * ATOM_N * 2)
+                if fx.const_expr(m_valid is not None):
+                    local_row0 = fx.Int32(im * ATOM_M + ei_base * 4) + lane_row
+                    local_row1 = fx.Int32(im * ATOM_M + (ei_base + 1) * 4) + lane_row
+                    global_m0 = m_base + warp_m_base + local_row0
+                    global_m1 = m_base + warp_m_base + local_row1
+                    ok0 = fx.arith.cmpi(fx.arith.CmpIPredicate.ult, global_m0, m_limit)
+                    ok1 = fx.arith.cmpi(fx.arith.CmpIPredicate.ult, global_m1, m_limit)
+                    stp_vs_pred_b32(ok0, packed0, c_warp_ptr, voffset, soffset0, _PACKSLB_STORE_KOP)
+                    stp_vs_pred_b32(ok1, packed1, c_warp_ptr, voffset, soffset1, _PACKSLB_STORE_KOP)
+                else:
+                    stp_vs_b32(packed0, c_warp_ptr, voffset, soffset0, _PACKSLB_STORE_KOP)
+                    stp_vs_b32(packed1, c_warp_ptr, voffset, soffset1, _PACKSLB_STORE_KOP)
 
 
 def mr_igemm_epilogue_store_i8_pack_only(

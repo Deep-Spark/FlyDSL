@@ -20,12 +20,12 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Pipeline sync** | **MR:** `sl_waitmem` + `sl_pipebar_arrive` / `sl_pipebar_wait` (`pipe-bar`). **CQ:** `nbarrier_reach` / `nbarrier_wait` / `nbarrier_sync` (`named-bar` / `named-bar-sync`). Do not emit pipebar on CQ. See `python/flydsl/expr/ixdl/sync.py` |
 | **Tensor core MMA** | `MRMma` -- **16x16x16 f16** and **16x16x32 i8->i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` -- double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |
-| **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` -- int8xint8 -> i32/i8, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
+| **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` -- int8xint8 -> i32/i8/`scaled_bf16`/`scaled_fp16`, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
 | **Flex-attention L3** | `compile_iluvatar_flex_attention` (dense / varlen / paged) + Torch entry `flydsl_flex_attn_func` in `kernels.attention.iluvatar`; optional `tile_config` (`{32,64}x{32,64}`, default 64x64) + dense-only `autotune_iluvatar_flex_attention_tile`; causal / SWA / softcap; f16/bf16; D in {64,128,256}; GQA; dense alibi/score_bias; `score_mod=TracedScoreMod` on dense, varlen, and paged; dense `create_block_mask` / `mask_mod` / `has_block_mask`; varlen `create_block_masks_varlen` / `block_masks` / `mask_mod`; paged `create_block_masks_paged` / `block_masks` / `mask_mod` (dispatcher packs tables); dense `return_lse` + `compile_iluvatar_flex_attention_bwd` (MHA, D in {64,128}, correctness-first) |
 | **MoE GEMM V1** | `kernels.moe.iluvatar.mr` -- sorted grouped GEMM, `int8` / `int8smooth`, f16/bf16/f32 out (A gather + B SME) |
 | **GEMV V1** | `kernels.gemm.iluvatar.gemv` -- `F.linear`-aligned M=1, fp16/bf16, fp32 accum |
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |
-| **Unit / device tests** | `tests/kernels/test_iluvatar_*` (device kernels: G2S/S2R/MMA/epilogue/HGEMM stages, GEMV, RMSNorm, LayerNorm, flex-attention, atomic CAS, split-K) + `tests/unit/test_iluvatar_*` (backend, runtime, JIT launch/binary smokes); select via `-m iluvatar_lower`. IGEMM via example `--check` |
+| **Unit / device tests** | `tests/kernels/test_iluvatar_*` (device kernels: G2S/S2R/MMA/epilogue/HGEMM stages, scaled IGEMM, GEMV, RMSNorm, LayerNorm, flex-attention, atomic CAS, split-K) + `tests/unit/test_iluvatar_*` (backend, runtime, JIT launch/binary smokes); select via `-m iluvatar_lower`. IGEMM i32/i8 also via example `--check` |
 | **CI (optional)** | Iluvatar `ci-core` / `ci-device`, IX toolchain refresh, publish-image, perf-daily (see `.github/workflows/*iluvatar*`) |
 
 ### CQ shared-memory access paths
@@ -52,7 +52,7 @@ the matrix-load instruction consumes that mapping in hardware.
 ```text
 kernels/gemm/iluvatar/
   common.py          # GemmLayout, WARP_SIZE, parse_major_pattern, ...
-  epilogue.py        # HGEMM fp16 stores + IGEMM i32 / i8 packed stores
+  epilogue.py        # HGEMM fp16 stores + IGEMM i32 / i8 / scaled f16|bf16 stores
   gemv.py            # GEMV V1
   mr/
     common.py        # MrOperandGeom, mr_stage_smem_ab, byte_perm, ...
@@ -136,7 +136,7 @@ Start here after a successful Iluvatar build:
 |---------|---------|
 | [`examples/02-tiledCopy-iluvatar-mr.py`](examples/02-tiledCopy-iluvatar-mr.py) | **Teaching** TiledCopy + SME async G2S/S2R on a single 16x16 tile per warp; explicit `cp_async_wait`; good for layout/swizzle debugging |
 | [`examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py`](examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py) | **Check / bench** harness for pipelined **f16 HGEMM** (`--check`, `--bench`, CTA presets, epilogue / store modes) |
-| [`examples/03-tiledMma-iluvatar-mr-pipeline-igemm.py`](examples/03-tiledMma-iluvatar-mr-pipeline-igemm.py) | **Check / bench** harness for pipelined **int8 IGEMM** (`--epilogue i32\|i8`, four `major_pattern`s) |
+| [`examples/03-tiledMma-iluvatar-mr-pipeline-igemm.py`](examples/03-tiledMma-iluvatar-mr-pipeline-igemm.py) | **Check / bench** harness for pipelined **int8 IGEMM** (`--epilogue i32\|i8\|scaled_bf16\|scaled_fp16`, four `major_pattern`s; scaled also checks M not a multiple of BM) |
 
 ```bash
 export FLYDSL_COMPILE_BACKEND=iluvatar
@@ -146,8 +146,9 @@ export ARCH=ivcore11
 # HGEMM correctness (small shapes)
 python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --check
 
-# IGEMM correctness (default check shape; try --epilogue i8 / other patterns)
+# IGEMM correctness (default check shape; try --epilogue i8 / scaled_bf16 / other patterns)
 python examples/03-tiledMma-iluvatar-mr-pipeline-igemm.py --check --major-pattern tn --epilogue i32
+python examples/03-tiledMma-iluvatar-mr-pipeline-igemm.py --check --major-pattern tn --epilogue scaled_bf16
 
 # HGEMM peak-shape reference (Gate2-style contract -- see performance section)
 python examples/03-tiledMma-iluvatar-mr-pipeline-hgemm.py --bench \
@@ -177,7 +178,7 @@ launch_h(A, B, C, stream=torch.cuda.Stream())
 launch_i = compile_iluvatar_mr_igemm(
     M=1024, N=1024, K=1024,
     major_pattern="tn",
-    epilogue="i32",             # or "i8" (packed store, truncating cast)
+    epilogue="i32",             # or "i8" / "scaled_bf16" / "scaled_fp16"
 )
 launch_i(A_i8, B_i8, C_i32, stream=torch.cuda.Stream())
 
@@ -316,8 +317,10 @@ similar across all four when host tensors use the expected physical layout.
 `epilogue_store` applies to `no_c_read` only: **`shfl`** (default, fastest) or
 **`tiled`** (`trunc_f` + `UniversalCopy16b`).
 
-IGEMM uses `--epilogue i32` (direct int32 store) or `i8` (packed store with
-truncating cast; no quant scale).
+IGEMM uses `--epilogue i32` (direct int32 store), `i8` (packed store with
+truncating cast; no quant scale), or `scaled_bf16` / `scaled_fp16`
+(`D = acc * scale_a[m] * scale_b[n] [+ bias]` via PackSlb). Scaled kernels
+accept a live M that is not a multiple of BM (`allow_dynamic_m`).
 
 ### Global Split-K (HGEMM)
 
@@ -380,7 +383,8 @@ for p in nt tn nn tt; do
 done
 ```
 
-**IGEMM** -- four patterns x `{i32,i8}`:
+**IGEMM** -- four patterns x `{i32,i8}`, plus scaled PackSlb on `tn` (also
+exercises M=100, which is not a multiple of BM):
 
 ```bash
 for p in tn nt nn tt; do
@@ -390,6 +394,9 @@ for p in tn nt nn tt; do
       --major-pattern "$p" --epilogue "$e" || exit 1
   done
 done
+FLYDSL_COMPILE_BACKEND=iluvatar FLYDSL_RUNTIME_KIND=iluvatar \
+  python examples/03-tiledMma-iluvatar-mr-pipeline-igemm.py --check \
+  --major-pattern tn --epilogue scaled_bf16
 ```
 
 Staged device kernel tests (`tests/kernels/test_iluvatar_mr_*`,
@@ -447,7 +454,7 @@ MLIR FileCheck (needs `fly-opt` + `FileCheck` on `PATH`):
 | Area | Status | Notes |
 |------|--------|-------|
 | **Small-shape HGEMM perf** | Sub-peak / noisy | Below **~2048^3**, TFLOPS are far from 4k peak and sensitive to launch/JIT and `k_atoms`. Quote **Gate2 contract** medians; treat smaller shapes as indicative. |
-| **B8 / INT8 GEMM** | **Implemented (MR IGEMM)** | `kernels.gemm.iluvatar.mr.igemm` + example 03-igemm; i32 / i8 epilogues; four major patterns. Further quant-scale / fused epilogues still open. |
+| **B8 / INT8 GEMM** | **Implemented (MR IGEMM)** | `kernels.gemm.iluvatar.mr.igemm` + example 03-igemm; i32 / i8 / **scaled_bf16|scaled_fp16** (PackSlb) epilogues; four major patterns. `allow_dynamic_m` / `dynamic_m` for a live M that is not a multiple of BM. |
 | **GEMV** | V1 only | `kernels.gemm.iluvatar.gemv` -- M=1, strict N/K tile divisibility; not a general batched GEMV. |
 | **Flex-attention** | L3 forward (dense / varlen / paged) via `compile_*` + `flydsl_flex_attn_func`; optional `tile_config` / dense `autotune_*_tile`; `score_mod` on dense+varlen+paged; dense/varlen/paged `mask_mod` / BlockMask sparse skip; dense `return_lse` + `compile_*_bwd` (MHA bring-up) | Not a full PyTorch flex_attention compiler (no dynamo / arbitrary gather). Bwd is dense-MHA correctness-first (not MMA-opt). Relative to Torch SDPA still has a gap on long sequences. |
 | **Other production kernels** | Mostly ROCm-only | Broader FlyDSL portfolio (FP8/INT4 preshuffle GEMM, CDNA flash-attn family, all-reduce, ...) still has **no** full Iluvatar port beyond HGEMM / IGEMM / GEMV / MoE GEMM / flex-attention V1 + teaching/unit coverage. |
