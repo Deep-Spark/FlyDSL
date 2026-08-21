@@ -43,8 +43,10 @@ def build_simt_decode_attention_kernel(
     assert num_splits >= 1
     assert k_warps in (1, 2, 4, 8, 16)
     if d256_gqa4:
-        # Two Q warps in one CTA cover all four query heads sharing a KV head.
-        assert k_warps == 1
+        # Match ixinfer's small-context GQA schedule: two Q warps cover the
+        # four query heads sharing one KV head, while K warps partition the
+        # complete KV range inside one CTA.
+        assert num_splits == 1 or k_warps == 1
     elif num_splits > 1:
         assert k_warps == 1
 
@@ -89,8 +91,11 @@ def build_simt_decode_attention_kernel(
         k_warp = worker_warp
         q_warp = fx.Int32(0)
         if fx.const_expr(d256_gqa4):
-            k_warp = fx.Int32(0)
-            q_warp = fx.Int32(worker_warp)
+            # ixinfer V4 mapping:
+            #   kWarpIdx = warpId / Q_WARPS
+            #   qWarpIdx = warpId % Q_WARPS
+            k_warp = fx.Int32(worker_warp // q_warps)
+            q_warp = fx.Int32(worker_warp % q_warps)
         b = fx.Int32(fx.block_idx.x)
         split = fx.Int32(fx.block_idx.y)
         block_head = fx.Int32(fx.block_idx.z)
@@ -233,11 +238,25 @@ def build_simt_decode_attention_kernel(
             page_end_raw = page_start + pages_per_split
             page_end = (page_end_raw < pages).select(page_end_raw, pages)
             page_step = fx.Int32(1)
+        elif fx.const_expr(d256_gqa4 and k_warps > 1):
+            # Every K-warp pair must execute the same number of iterations
+            # because the D256 path synchronizes the whole CTA around the
+            # shared K/V stage. Clamp padded iterations to the final valid page
+            # and mask their math below, matching ixinfer's fake block extent.
+            page_start = fx.Int32(0)
+            page_end = (pages + fx.Int32(k_warps - 1)) // fx.Int32(k_warps)
+            page_step = fx.Int32(1)
         else:
             page_start = k_warp
             page_end = pages
             page_step = fx.Int32(k_warps)
-        for page in range(page_start, page_end, page_step):
+        for page_iter in range(page_start, page_end, page_step):
+            page = fx.Int32(page_iter)
+            page_active = fx.Int32(1)
+            if fx.const_expr(d256_gqa4 and not split_mode and k_warps > 1):
+                page = fx.Int32(page_iter) * fx.Int32(k_warps) + k_warp
+                page_active = page < pages
+                page = page_active.select(page, pages - fx.Int32(1))
             if fx.const_expr(d256_gqa4):
                 if q_warp == fx.Int32(0):
                     issue_sme_page(KCache, fx.Int32(page), fx.Int32(0))
@@ -249,7 +268,7 @@ def build_simt_decode_attention_kernel(
                 issue_sme_page(VCache, fx.Int32(page), fx.Int32(1))
                 ixdl.sl_waitmem(g2s=sme_bricks_per_page)
             tok = fx.Int32(page) * fx.Int32(PAGE_SIZE) + x
-            valid = tok < cache_len
+            valid = (tok < cache_len) & page_active
             score0, score1 = zero, zero
             for r in range_constexpr(dot_repeats):
                 k_packed = load_sme_pair(fx.Int32(0), fx.Int32(r // 4), fx.Int32(r % 4))
@@ -309,7 +328,7 @@ def build_simt_decode_attention_kernel(
                     fx.memref_store(o0[2 * r + 1], PartialOut, (b, 0, qh0, split, d + 1))
                     fx.memref_store(o1[2 * r], PartialOut, (b, 0, qh1, split, d))
                     fx.memref_store(o1[2 * r + 1], PartialOut, (b, 0, qh1, split, d + 1))
-        elif fx.const_expr(d256_gqa4):
+        elif fx.const_expr(d256_gqa4 and k_warps == 1):
             # One CTA owns the complete KV range. Each Q warp writes its two
             # disjoint query heads directly, avoiding split workspace/reduce.
             if x == fx.Int32(0):
@@ -342,8 +361,12 @@ def build_simt_decode_attention_kernel(
             # Reuse the K/V LDS allocation for short-context K-warp reduction.
             gpu.barrier()
             partial_ptr = fx.recast_iter(fx.PointerType.get(fx.Float32.ir_type, fx.AddressSpace.Shared), sme_ptr)
-            partials = fx.Tensor(fx.make_view(partial_ptr, fx.make_layout(k_warps * partial_stride, 1)))
-            base = k_warp * fx.Int32(partial_stride)
+            partial_warps = k_warps * (q_warps if d256_gqa4 else 1)
+            partials = fx.Tensor(fx.make_view(partial_ptr, fx.make_layout(partial_warps * partial_stride, 1)))
+            partial_warp = k_warp
+            if fx.const_expr(d256_gqa4):
+                partial_warp = q_warp * fx.Int32(k_warps) + k_warp
+            base = partial_warp * fx.Int32(partial_stride)
             if x == fx.Int32(0) and y == fx.Int32(0):
                 # Use the same finite empty-state sentinel as split mode. This
                 # keeps the K-warp merge from evaluating -inf - -inf.
@@ -352,7 +375,7 @@ def build_simt_decode_attention_kernel(
                 fx.memref_store((l1 > zero).select(m1, reduce_neg_inf), partials, base + (2 + head_dim))
                 fx.memref_store(l1, partials, base + (3 + head_dim))
             if x == fx.Int32(0):
-                for r in range_constexpr(16):
+                for r in range_constexpr(dot_repeats):
                     d = fx.Int32((r // 4) * 32 + (r % 4) * 8) + y * fx.Int32(2)
                     fx.memref_store(o0[2 * r], partials, base + 2 + d)
                     fx.memref_store(o0[2 * r + 1], partials, base + 3 + d)
@@ -363,13 +386,19 @@ def build_simt_decode_attention_kernel(
             def merge_stats(head):
                 max_value = neg_inf
                 for w in range_constexpr(k_warps):
+                    warp_base = fx.Int32(w)
+                    if fx.const_expr(d256_gqa4):
+                        warp_base = q_warp * fx.Int32(k_warps) + fx.Int32(w)
                     max_value = arith.maxnumf(
                         max_value,
-                        partials[w * partial_stride + head * (2 + head_dim)],
+                        partials[warp_base * partial_stride + head * (2 + head_dim)],
                     )
                 denom = zero
                 for w in range_constexpr(k_warps):
-                    pbase = fx.Int32(w * partial_stride + head * (2 + head_dim))
+                    warp_base = fx.Int32(w)
+                    if fx.const_expr(d256_gqa4):
+                        warp_base = q_warp * fx.Int32(k_warps) + fx.Int32(w)
+                    pbase = warp_base * fx.Int32(partial_stride) + fx.Int32(head * (2 + head_dim))
                     local_max = partials[pbase]
                     weight = fmath.exp2((local_max - max_value) * fx.Float32(_LOG2E), fastmath=fm_fast)
                     denom = denom + partials[pbase + 1] * weight
@@ -378,7 +407,10 @@ def build_simt_decode_attention_kernel(
             def merge_value(head, d, max_value):
                 value = zero
                 for w in range_constexpr(k_warps):
-                    pbase = fx.Int32(w * partial_stride + head * (2 + head_dim))
+                    warp_base = fx.Int32(w)
+                    if fx.const_expr(d256_gqa4):
+                        warp_base = q_warp * fx.Int32(k_warps) + fx.Int32(w)
+                    pbase = warp_base * fx.Int32(partial_stride) + fx.Int32(head * (2 + head_dim))
                     local_max = partials[pbase]
                     weight = fmath.exp2((local_max - max_value) * fx.Float32(_LOG2E), fastmath=fm_fast)
                     value = value + partials[pbase + 2 + d] * weight

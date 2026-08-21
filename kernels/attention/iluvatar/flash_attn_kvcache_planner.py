@@ -187,6 +187,23 @@ def _simt_fast_schedule(q, k_cache, max_context_len) -> tuple[int, int]:
     )
 
 
+def _has_hnd_inner_contiguous_layout(tensor: torch.Tensor) -> bool:
+    """Accept dense HND blocks even when consecutive blocks have padding.
+
+    vLLM stores K/V together as ``[2, blocks, Hkv, page, D]`` and exposes
+    each cache with ``unbind(0)``.  The resulting 4-D view has dense Hkv/page/D
+    dimensions but a doubled block stride, so ``is_contiguous()`` is false.
+    """
+    if tensor.ndim != 4:
+        return False
+    _, num_heads, page_size, head_dim = tensor.shape
+    block_elements = num_heads * page_size * head_dim
+    return (
+        tuple(tensor.stride()[1:]) == (page_size * head_dim, head_dim, 1)
+        and tensor.stride(0) >= block_elements
+    )
+
+
 def _simt_runtime_metadata_valid(
     q,
     k_cache,
@@ -225,8 +242,8 @@ def _simt_runtime_metadata_valid(
         return False
     if (
         not q.is_contiguous()
-        or not k_cache.is_contiguous()
-        or not v_cache.is_contiguous()
+        or not _has_hnd_inner_contiguous_layout(k_cache)
+        or not _has_hnd_inner_contiguous_layout(v_cache)
         or not cache_seqlens.is_contiguous()
         or block_table.stride(1) != 1
     ):
@@ -360,6 +377,7 @@ class _SimtDecodeLaunchPlan:
         "stream",
         "stream_ptr",
         "signature",
+        "split1_bufs",
     )
 
     def __init__(self, entry, current_stream, q, k_cache, v_cache, block_table):
@@ -367,6 +385,11 @@ class _SimtDecodeLaunchPlan:
         self.stream = fx.Stream(current_stream)
         self.stream_ptr = current_stream.cuda_stream
         self.signature = _simt_plan_signature(q, k_cache, v_cache, block_table)
+        self.split1_bufs = (
+            _cached_split1_bufs(q.device, self.stream_ptr)
+            if self.num_splits == 1
+            else None
+        )
 
     def _split_bufs(self, q):
         if self.num_splits > 1:
@@ -415,6 +438,30 @@ class _SimtDecodeLaunchPlan:
             launch_stream,
         )
         return out_buf
+
+    def launch_pinned(self, q, k_cache, v_cache, cache_seqlens, block_table, out):
+        """Launch a validated single-stream, split-one integration plan.
+
+        The vLLM adapter validates the shape/schedule before pinning and always
+        supplies ``out``. Avoid repeating tensor metadata, signature, workspace,
+        and current-stream lookups on every model layer.
+        """
+        if self.num_splits != 1 or out is None:
+            return self(q, k_cache, v_cache, cache_seqlens, block_table, out)
+        group_max, group_sum, partial_out = self.split1_bufs
+        self.compiled(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens,
+            block_table,
+            out,
+            group_max,
+            group_sum,
+            partial_out,
+            self.stream,
+        )
+        return out
 
 
 def _get_simt_decode_launch_plan(

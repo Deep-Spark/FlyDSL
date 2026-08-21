@@ -182,6 +182,14 @@ def compute_qwen_simt_decode_config(
         and head_dim == 256
         and max_seqlen_k > 0
     ):
+        # Mirror ixinfer's small-batch D256/GQA4 schedule. Up to 256 tokens it
+        # keeps one CTA per (batch, KV head), partitions K across 1/2/4/8
+        # K-warps, reduces inside the CTA, and writes Out directly.
+        if batch_size <= 2 and max_seqlen_k <= 256:
+            k_tiles = (max_seqlen_k + 31) // 32
+            k_warps = min(8, 1 << max(0, (k_tiles - 1).bit_length()))
+            return 1, k_warps
+
         # Schedule D256 GQA4 in 16-token chunks. Each CTA owns two query heads;
         # two sibling CTAs cover the four heads sharing one KV head.
         logical_pages = (max_seqlen_k + 15) // 16

@@ -38,30 +38,30 @@ def _select(**overrides):
 
 @pytest.mark.l0_backend_agnostic
 @pytest.mark.parametrize(
-    ("batch_size", "max_seqlen_k", "expected_splits"),
+    ("batch_size", "max_seqlen_k", "expected_config"),
     [
-        (1, 128, 8),
-        (1, 512, 16),
-        (3, 1024, 11),
-        (4, 1024, 8),
-        (5, 1024, 7),
-        (6, 1024, 6),
-        (7, 1024, 5),
-        (8, 1024, 4),
-        (11, 1024, 3),
-        (15, 1024, 3),
-        (16, 1024, 2),
-        (48, 128, 2),
-        (48, 512, 2),
-        (48, 544, 2),
-        (48, 1024, 2),
-        (32, 1024, 2),
+        (1, 128, (1, 4)),
+        (1, 512, (16, 1)),
+        (3, 1024, (11, 1)),
+        (4, 1024, (8, 1)),
+        (5, 1024, (7, 1)),
+        (6, 1024, (6, 1)),
+        (7, 1024, (5, 1)),
+        (8, 1024, (4, 1)),
+        (11, 1024, (3, 1)),
+        (15, 1024, (3, 1)),
+        (16, 1024, (2, 1)),
+        (48, 128, (2, 1)),
+        (48, 512, (2, 1)),
+        (48, 544, (2, 1)),
+        (48, 1024, (2, 1)),
+        (32, 1024, (2, 1)),
     ],
 )
 def test_qwen_d256_simt_splits_are_batch_aware(
     batch_size: int,
     max_seqlen_k: int,
-    expected_splits: int,
+    expected_config: tuple[int, int],
 ):
     assert compute_qwen_simt_decode_config(
         batch_size=batch_size,
@@ -70,7 +70,7 @@ def test_qwen_d256_simt_splits_are_batch_aware(
         num_kv_heads=4,
         head_dim=256,
         max_seqlen_k=max_seqlen_k,
-    ) == (expected_splits, 1)
+    ) == expected_config
 
 
 @pytest.mark.l0_backend_agnostic
@@ -354,6 +354,31 @@ def test_simt_runtime_metadata_rejects_stale_leading_dimensions():
     )
 
 
+def test_simt_runtime_metadata_accepts_vllm_unbound_hnd_cache():
+    from kernels.attention.iluvatar.flash_attn_kvcache_planner import (
+        _simt_runtime_metadata_valid,
+    )
+
+    q = torch.empty((1, 1, 16, 256), dtype=torch.bfloat16)
+    block_major_cache = torch.empty((8, 2, 4, 16, 256), dtype=torch.bfloat16)
+    kv_cache = block_major_cache.transpose(0, 1)
+    k, v = kv_cache.unbind(0)
+    lens = torch.zeros(1, dtype=torch.int32)
+    table = torch.zeros((1, 8), dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    assert not k.is_contiguous()
+    assert k.stride() == (32768, 4096, 256, 1)
+    assert _simt_runtime_metadata_valid(q, k, v, lens, table, out)
+
+    inner_strided = torch.empty(
+        (8, 4, 16, 2, 256), dtype=torch.bfloat16
+    )[:, :, :, 0, :]
+    assert not _simt_runtime_metadata_valid(
+        q, inner_strided, inner_strided, lens, table, out
+    )
+
+
 @pytest.mark.l2_device
 @pytest.mark.iluvatar_lower
 def test_simt_plan_uses_runtime_current_stream():
@@ -389,6 +414,45 @@ def test_simt_plan_uses_runtime_current_stream():
         raw_stream if isinstance(raw_stream, int) else raw_stream.cuda_stream
     )
     assert stream_ptr == other.cuda_stream
+
+
+@pytest.mark.l2_device
+@pytest.mark.iluvatar_lower
+def test_simt_pinned_split_one_launch_skips_revalidation(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA-compatible device is not available")
+    from kernels.attention.iluvatar import flash_attn_kvcache_planner as planner
+
+    launches = []
+    current = torch.cuda.current_stream()
+    q = torch.empty((1, 1, 16, 256), device="cuda", dtype=torch.bfloat16)
+    storage = torch.empty((8, 2, 4, 16, 256), device="cuda", dtype=torch.bfloat16)
+    k, v = storage[:, 0], storage[:, 1]
+    lens = torch.ones(1, device="cuda", dtype=torch.int32)
+    table = torch.zeros((1, 8), device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+    plan = planner._SimtDecodeLaunchPlan(
+        (lambda *args: launches.append(args), 1, 1, 16, 256),
+        current,
+        q,
+        k,
+        v,
+        table,
+    )
+    monkeypatch.setattr(
+        planner,
+        "_simt_runtime_metadata_valid",
+        lambda *args: pytest.fail("pinned launch unexpectedly revalidated metadata"),
+    )
+
+    plan.launch_pinned(q, k, v, lens, table, out)
+
+    assert launches[0][5] is out
+    raw_stream = launches[0][-1].value
+    stream_ptr = (
+        raw_stream if isinstance(raw_stream, int) else raw_stream.cuda_stream
+    )
+    assert stream_ptr == current.cuda_stream
 
 
 def test_clear_kvcache_caches_also_clears_prefill_state():

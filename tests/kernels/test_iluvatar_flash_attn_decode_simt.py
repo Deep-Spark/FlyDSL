@@ -103,6 +103,7 @@ def test_flash_attn_with_kvcache_simt_decode_empty_non_split():
     ("bsz", "active_seqlen", "strided_cache", "num_splits"),
     [
         (1, 127, False, 0),
+        (2, 127, False, 0),
         (1, 513, False, 0),
         (1, 513, True, 0),
         (1, 1025, False, 0),
@@ -172,6 +173,74 @@ def test_flash_attn_with_kvcache_d256_gqa4_simt_528_page(
     torch.testing.assert_close(out.float(), ref.float(), atol=4e-2, rtol=4e-2)
 
 
+def test_d256_gqa4_plan_accepts_vllm_block_major_kv_view():
+    """vLLM's block-major K/V view must populate and reuse the fast plan."""
+    torch.manual_seed(421)
+    device = "cuda"
+    dtype = torch.bfloat16
+    active_seqlen = 127
+    block_size = 528
+    num_blocks = 2
+    q = torch.empty(1, 1, 16, 256, device=device, dtype=dtype).uniform_(-1, 1)
+    k_dense = torch.empty(
+        1, 4, num_blocks * block_size, 256, device=device, dtype=dtype
+    ).uniform_(-1, 1)
+    v_dense = torch.empty_like(k_dense).uniform_(-1, 1)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).view(1, -1)
+    contiguous_k = _dense_to_paged(k_dense, block_table, block_size, num_blocks)
+    contiguous_v = _dense_to_paged(v_dense, block_table, block_size, num_blocks)
+    block_major_cache = torch.empty(
+        num_blocks, 2, 4, block_size, 256, device=device, dtype=dtype
+    )
+    block_major_cache[:, 0] = contiguous_k
+    block_major_cache[:, 1] = contiguous_v
+    k_cache = block_major_cache[:, 0]
+    v_cache = block_major_cache[:, 1]
+    cache_seqlens = torch.tensor([active_seqlen], device=device, dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    assert not k_cache.is_contiguous()
+    assert k_cache.stride() == (2 * 4 * block_size * 256, block_size * 256, 256, 1)
+    flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        max_context_len=active_seqlen,
+        causal=True,
+        force_upstream_cache_layout=False,
+        out=out,
+    )
+    plan = _get_simt_decode_launch_plan(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens,
+        block_table,
+        softmax_scale=None,
+        causal=True,
+        num_splits=0,
+        out=out,
+        max_context_len=active_seqlen,
+    )
+    assert plan is not None
+    plan_out = torch.empty_like(q)
+    plan(q, k_cache, v_cache, cache_seqlens, block_table, plan_out)
+    torch.cuda.synchronize()
+
+    ref = _attention_ref(
+        q,
+        k_dense.transpose(1, 2),
+        v_dense.transpose(1, 2),
+        cache_seqlens,
+        causal=True,
+        window_size=(-1, -1),
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(plan_out.float(), ref.float(), atol=4e-2, rtol=4e-2)
+
+
 @pytest.mark.parametrize(
     ("active_seqlen", "expected_config"),
     [
@@ -206,8 +275,12 @@ def test_qwen_simt_decode_k_warp_planner(active_seqlen: int, expected_config: tu
 @pytest.mark.parametrize(
     ("active_seqlen", "expected_config"),
     [
-        (32, (2, 1)),
-        (128, (8, 1)),
+        (32, (1, 1)),
+        (64, (1, 2)),
+        (128, (1, 4)),
+        (192, (1, 8)),
+        (256, (1, 8)),
+        (320, (16, 1)),
         (512, (16, 1)),
         (528, (16, 1)),
         (1024, (16, 1)),
