@@ -38,7 +38,7 @@ RUN set -eux; \
     }; \
     retry pip install --upgrade pip --retries 10 --timeout 180; \
     retry pip install --no-cache-dir --retries 10 --timeout 180 \
-      nanobind \
+      "nanobind>=2.9,<3" \
       pybind11 \
       "numpy<2" \
       pytest

@@ -61,7 +61,7 @@ echo "Configuring LLVM..."
 
 # Install dependencies for Python bindings
 echo "Installing Python dependencies..."
-pip install nanobind numpy pybind11
+pip install 'nanobind>=2.9,<3' numpy pybind11
 
 # Check for ninja
 GENERATOR="Unix Makefiles"
