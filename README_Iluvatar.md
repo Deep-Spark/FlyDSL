@@ -21,7 +21,7 @@ examples, and HGEMM / IGEMM performance vs hand-tuned kernels.
 | **Tensor core MMA** | `MRMma` -- **16x16x16 f16** and **16x16x32 i8->i32**; MMA-coupled S2R via `make_tiled_copy_A/B` |
 | **Production HGEMM** | `kernels.gemm.iluvatar.mr.hgemm` -- double-buffered G2S, Ki-deferred S2R/MMA, configurable epilogue / major pattern |
 | **Production IGEMM** | `kernels.gemm.iluvatar.mr.igemm` -- int8xint8 -> i32/i8/`scaled_bf16`/`scaled_fp16`, same MR SME pipeline helpers as HGEMM (`mr_gemm_*`) |
-| **Flex-attention L3** | `compile_iluvatar_flex_attention` (dense / varlen / paged) + Torch entry `flydsl_flex_attn_func` in `kernels.attention.iluvatar`; optional `tile_config` (`{32,64}x{32,64}`, default 64x64) + dense-only `autotune_iluvatar_flex_attention_tile`; causal / SWA / softcap; f16/bf16; D in {64,128,256}; GQA; dense alibi/score_bias; `score_mod=TracedScoreMod` on dense, varlen, and paged; dense `create_block_mask` / `mask_mod` / `has_block_mask`; varlen `create_block_masks_varlen` / `block_masks` / `mask_mod`; paged `create_block_masks_paged` / `block_masks` / `mask_mod` (dispatcher packs tables); dense `return_lse` + `compile_iluvatar_flex_attention_bwd` (MHA, D in {64,128}, correctness-first) |
+| **Flex-attention L3** | `compile_iluvatar_flex_attention` (dense / varlen / paged) + Torch entry `flydsl_flex_attn_func` in `kernels.attention.iluvatar`; vanilla bf16 `D in {128,256}` (no mods / no explicit `tile_config`) routes to `flash_attn_varlen_func` unless `FLYDSL_FLEX_FA_FASTPATH=0`; optional `tile_config` (`{32,64}x{32,64}`, default 64x64) + dense-only `autotune_iluvatar_flex_attention_tile`; causal / SWA / softcap; f16/bf16; D in {64,128,256}; GQA; dense alibi/score_bias; `score_mod=TracedScoreMod` on dense, varlen, and paged; dense `create_block_mask` / `mask_mod` / `has_block_mask`; varlen `create_block_masks_varlen` / `block_masks` / `mask_mod`; paged `create_block_masks_paged` / `block_masks` / `mask_mod` (dispatcher packs tables); dense `return_lse` + `compile_iluvatar_flex_attention_bwd` (MHA, D in {64,128}, correctness-first) |
 | **MoE GEMM V1** | `kernels.moe.iluvatar.mr` -- sorted grouped GEMM, `int8` / `int8smooth`, f16/bf16/f32 out (A gather + B SME) |
 | **GEMV V1** | `kernels.gemm.iluvatar.gemv` -- `F.linear`-aligned M=1, fp16/bf16, fp32 accum |
 | **JIT runtime** | `libfly_iluvatar_jit_runtime.so`, `FLYDSL_RUNTIME_KIND=iluvatar` |
@@ -68,6 +68,7 @@ kernels/attention/iluvatar/
   flex_attention.py       # compile_iluvatar_flex_attention (dense / varlen / paged; optional return_lse)
   flex_attention_bwd.py   # compile_iluvatar_flex_attention_bwd (dense MHA)
   flex_attn_interface.py  # flydsl_flex_attn_func + autotune_*_tile
+  flex_attn_fa_backend.py # vanilla flydsl_flex_attn_func -> flash_attn_varlen_func
 ```
 
 ## Supported hardware
@@ -124,6 +125,7 @@ export LD_LIBRARY_PATH="${CUDAToolkit_ROOT}/lib64:${PWD}/build-fly/python_packag
 | `COMPILE_ONLY` | `1` | Compile without device execution (CI / no GPU) |
 | `FLYDSL_RUNTIME_ENABLE_CACHE` | `0` | Disable disk cache while iterating on kernel or pass changes |
 | `FLYDSL_ILUVATAR_RUN_FLEX_ATTN_PERF` | `1` | Opt-in flex-attention large-shape perf probe (`tests/kernels/test_iluvatar_flex_attention_device.py`) |
+| `FLYDSL_FLEX_FA_FASTPATH` | `0` / `false` | Disable vanilla `flydsl_flex_attn_func` routing to `flash_attn_varlen_func` (default on) |
 | `FLYDSL_ILUVATAR_SMOKE_BLOB_PATH` / `FLYDSL_ILUVATAR_SMOKE_KERNEL` | path / symbol | Blob + kernel name consumed by `tests/unit/test_iluvatar_runtime_smoke.py`; tests are skipped when unset |
 
 Iluvatar examples set the first three via `os.environ.setdefault(...)`.
@@ -456,7 +458,7 @@ MLIR FileCheck (needs `fly-opt` + `FileCheck` on `PATH`):
 | **Small-shape HGEMM perf** | Sub-peak / noisy | Below **~2048^3**, TFLOPS are far from 4k peak and sensitive to launch/JIT and `k_atoms`. Quote **Gate2 contract** medians; treat smaller shapes as indicative. |
 | **B8 / INT8 GEMM** | **Implemented (MR IGEMM)** | `kernels.gemm.iluvatar.mr.igemm` + example 03-igemm; i32 / i8 / **scaled_bf16|scaled_fp16** (PackSlb) epilogues; four major patterns. `allow_dynamic_m` / `dynamic_m` for a live M that is not a multiple of BM. |
 | **GEMV** | V1 only | `kernels.gemm.iluvatar.gemv` -- M=1, strict N/K tile divisibility; not a general batched GEMV. |
-| **Flex-attention** | L3 forward (dense / varlen / paged) via `compile_*` + `flydsl_flex_attn_func`; optional `tile_config` / dense `autotune_*_tile`; `score_mod` on dense+varlen+paged; dense/varlen/paged `mask_mod` / BlockMask sparse skip; dense `return_lse` + `compile_*_bwd` (MHA bring-up) | Not a full PyTorch flex_attention compiler (no dynamo / arbitrary gather). Bwd is dense-MHA correctness-first (not MMA-opt). Relative to Torch SDPA still has a gap on long sequences. |
+| **Flex-attention** | L3 forward (dense / varlen / paged) via `compile_*` + `flydsl_flex_attn_func`; vanilla bf16 D in {128,256} uses the FA fast path; optional `tile_config` / dense `autotune_*_tile`; `score_mod` on dense+varlen+paged; dense/varlen/paged `mask_mod` / BlockMask sparse skip; dense `return_lse` + `compile_*_bwd` (MHA bring-up) | Not a full PyTorch flex_attention compiler (no dynamo / arbitrary gather). Bwd is dense-MHA correctness-first (not MMA-opt). Relative to Torch SDPA still has a gap on long sequences. |
 | **Other production kernels** | Mostly ROCm-only | Broader FlyDSL portfolio (FP8/INT4 preshuffle GEMM, CDNA flash-attn family, all-reduce, ...) still has **no** full Iluvatar port beyond HGEMM / IGEMM / GEMV / MoE GEMM / flex-attention V1 + teaching/unit coverage. |
 | **S2R register pressure** | Tuning item | Shared->register uses generic `UniversalCopy32b` tiling rather than a TCU-specialized load; SRF usage on large shapes is higher than ideal and may leave headroom on the table. |
 | **Multi-GPU** | Not supported | No Iluvatar multi-device runtime or collective kernels (e.g. custom all-reduce). |
