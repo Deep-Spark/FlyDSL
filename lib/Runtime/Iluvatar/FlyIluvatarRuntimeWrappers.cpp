@@ -39,19 +39,41 @@ static CUdevice getDefaultCuDevice() {
   return device;
 }
 
+static void ensureCudaInitialized() {
+  static const bool initialized = [] {
+    CUDA_REPORT_IF_ERROR(cuInit(/*flags=*/0));
+    return true;
+  }();
+  (void)initialized;
+}
+
+// Use the caller-owned CUDA context when one is current so load/launch stay
+// on that device. Push the primary context of defaultDevice only when none
+// is current. Serving already has a context, so this skips the push/pop pair.
 class ScopedContext {
+  bool ownsPush = false;
+
 public:
   ScopedContext() {
-    static CUcontext context = [] {
-      CUDA_REPORT_IF_ERROR(cuInit(/*flags=*/0));
+    ensureCudaInitialized();
+    CUcontext current = nullptr;
+    CUresult status = cuCtxGetCurrent(&current);
+    if (status == CUDA_SUCCESS && current != nullptr)
+      return;
+
+    static CUcontext primary = [] {
       CUcontext ctx = nullptr;
       CUDA_REPORT_IF_ERROR(cuDevicePrimaryCtxRetain(&ctx, getDefaultCuDevice()));
       return ctx;
     }();
-    CUDA_REPORT_IF_ERROR(cuCtxPushCurrent(context));
+    CUDA_REPORT_IF_ERROR(cuCtxPushCurrent(primary));
+    ownsPush = true;
   }
 
-  ~ScopedContext() { CUDA_REPORT_IF_ERROR(cuCtxPopCurrent(nullptr)); }
+  ~ScopedContext() {
+    if (ownsPush)
+      CUDA_REPORT_IF_ERROR(cuCtxPopCurrent(nullptr));
+  }
 };
 
 extern "C" CUmodule mgpuModuleLoad(void *data, size_t /*gpuBlobSize*/) {
