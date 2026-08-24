@@ -7,11 +7,14 @@ Wraps ``compile_iluvatar_flex_attention`` behind a single Torch entry:
 
     ``flydsl_flex_attn_func(q, k, v, ...)``
 
-Selects dense / varlen / paged from optional metadata, caches compiled
-launchers (fingerprint-keyed LRU), and owns dense/paged phys-pad + V
-transpose so callers can pass logical BSHD (or packed varlen / natural
-paged pages). Dense, varlen, and paged accept ``score_mod`` / ``mask_mod``;
-dense uses ``block_mask``; varlen/paged use ``block_masks``.
+Selects dense / varlen / paged from optional metadata. Vanilla calls
+(no score/mask mods, bf16, D in {128,256}, no explicit ``tile_config``)
+route to ``flash_attn_varlen_func`` unless ``FLYDSL_FLEX_FA_FASTPATH=0``.
+Otherwise caches compiled generic launchers (fingerprint-keyed LRU) and
+owns dense/paged phys-pad + V transpose so callers can pass logical BSHD
+(or packed varlen / natural paged pages). Dense, varlen, and paged accept
+``score_mod`` / ``mask_mod``; dense uses ``block_mask``; varlen/paged use
+``block_masks``.
 
 Also exposes ``autotune_iluvatar_flex_attention_tile`` for opt-in dense-only
 tile search (returns a ``tile_config`` dict; does not alter the default path).
@@ -33,6 +36,11 @@ from kernels.attention.iluvatar.flex_attention import (
     _SUPPORTED_BLOCK,
     _normalize_tile_config,
     compile_iluvatar_flex_attention,
+)
+from kernels.attention.iluvatar.flex_attn_fa_backend import (
+    is_flex_fa_fastpath_eligible,
+    run_flex_attn_fa_fastpath,
+    varlen_pack_is_tight,
 )
 
 __all__ = ["flydsl_flex_attn_func", "autotune_iluvatar_flex_attention_tile"]
@@ -263,7 +271,8 @@ def flydsl_flex_attn_func(
         ``cu_seqlens`` must already be 32-aligned (no re-pack).
 
     ``tile_config`` is optional ``{"block_m", "block_n"}`` with values in
-    ``{32, 64}`` (default 64x64). Paged requires ``block_n=64``.
+    ``{32, 64}`` (default 64x64). Paged requires ``block_n=64``. Passing
+    ``tile_config`` forces the generic kernel (no FA fast path).
 
     Dense, varlen, and paged may pass ``score_mod`` (``TracedScoreMod``) and/or
     ``mask_mod`` (``TracedMaskMod``). Dense: ``block_mask`` (``FlexBlockMask``).
@@ -302,6 +311,7 @@ def flydsl_flex_attn_func(
     if mode == "paged" and block_mask is not None:
         raise ValueError("paged uses block_masks=Sequence[FlexBlockMask], not block_mask=")
 
+    user_tile_config = tile_config is not None
     tile_src = block_mask if block_mask is not None else (block_masks[0] if block_masks else None)
     if tile_src is not None and tile_config is None:
         tile_config = {
@@ -310,6 +320,47 @@ def flydsl_flex_attn_func(
         }
 
     dtype = _dtype_str(q)
+    sq_i = int(q.shape[1]) if mode == "dense" and q.dim() == 4 else 0
+    skv_i = int(k.shape[1]) if mode == "dense" and k.dim() == 4 else 0
+    varlen_tight = True
+    if mode == "varlen" and cu_seqlens is not None and seq_lens is not None:
+        varlen_tight = varlen_pack_is_tight(cu_seqlens, seq_lens)
+    if is_flex_fa_fastpath_eligible(
+        mode=mode,
+        dtype=dtype,
+        head_dim=int(q.shape[-1]),
+        causal=bool(causal),
+        sq=sq_i,
+        skv=skv_i,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        score_bias=score_bias,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        block_mask=block_mask,
+        block_masks=block_masks,
+        tile_config_explicit=user_tile_config,
+        varlen_tight=varlen_tight,
+    ):
+        # Forward stream as-is. Wrapping None as fx.Stream(None) makes FA treat
+        # it as the CUDA default stream and reject a non-default current stream.
+        return run_flex_attn_fa_fastpath(
+            mode,
+            q,
+            k,
+            v,
+            causal=bool(causal),
+            sm_scale=sm_scale,
+            out=out,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            seq_lens_kv=seq_lens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            stream=stream,
+        )
     fxs = _as_fx_stream(stream)
     block_m, block_n = _normalize_tile_config(tile_config, paged=(mode == "paged"))
     if tile_src is not None and (int(tile_src.block_m) != int(block_m) or int(tile_src.block_n) != int(block_n)):

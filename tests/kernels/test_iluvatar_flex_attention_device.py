@@ -11,6 +11,9 @@ Covers:
 * Packed varlen (``cu_seqlens``) self-attn vs per-seq dense concat.
 * Paged KV (``block_table``) vs gather-to-dense flex reference.
 * Dense alibi / score_bias and the ``flydsl_flex_attn_func`` dispatcher.
+* Vanilla dispatcher vs direct ``flash_attn_varlen_func`` (FA fast path),
+  vs ``compile_*`` when ``FLYDSL_FLEX_FA_FASTPATH=0``, and FA vs generic
+  kernel on the same ``flydsl_flex_attn_func`` call.
 * Dense ``score_mod=TracedScoreMod`` (V3-2), varlen ``score_mod`` (V3-5), and
   paged ``score_mod`` (V3-7a) vs host / dense / gather-to-dense references.
 * Dense ``create_block_mask`` / ``block_mask`` sparse KV skip (V3-3) vs dense path.
@@ -1188,9 +1191,36 @@ def _require_flex_attn_interface():
     return iface
 
 
+def _flash_attn_varlen_dense_ref(q, k, v, *, causal, sm_scale, stream=None):
+    from kernels.attention.iluvatar.flash_attn_varlen import flash_attn_varlen_func
+
+    b, sq, h, d = q.shape
+    skv = k.shape[1]
+    q_pack = q.contiguous().reshape(b * sq, h, d)
+    k_pack = k.contiguous().reshape(b * skv, k.shape[2], d)
+    v_pack = v.contiguous().reshape(b * skv, v.shape[2], d)
+    torch = _require_torch()
+    cu_q = torch.arange(0, b + 1, device=q.device, dtype=torch.int32) * sq
+    cu_k = torch.arange(0, b + 1, device=q.device, dtype=torch.int32) * skv
+    o_pack = flash_attn_varlen_func(
+        q_pack,
+        k_pack,
+        v_pack,
+        cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=sq,
+        max_seqlen_k=skv,
+        softmax_scale=sm_scale,
+        causal=causal,
+        stream=stream,
+    )
+    return o_pack.reshape(b, sq, h, d)
+
+
 def test_iluvatar_flex_attn_func_dense_matches_compile(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "0")
     mod = _require_flex_attn_module()
     iface = _require_flex_attn_interface()
 
@@ -1221,9 +1251,29 @@ def test_iluvatar_flex_attn_func_dense_matches_compile(monkeypatch):
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
+def test_iluvatar_flex_attn_func_dense_matches_fa(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 2, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(0)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    out = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    ref = _flash_attn_varlen_dense_ref(q, k, v, causal=True, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
 def test_iluvatar_flex_attn_func_varlen_matches_compile(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "0")
     mod = _require_flex_attn_module()
     iface = _require_flex_attn_interface()
 
@@ -1260,9 +1310,49 @@ def test_iluvatar_flex_attn_func_varlen_matches_compile(monkeypatch):
     torch.testing.assert_close(out, O_ref, rtol=0, atol=0)
 
 
+def test_iluvatar_flex_attn_func_varlen_matches_fa(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+    from kernels.attention.iluvatar.flash_attn_varlen import flash_attn_varlen_func
+
+    seqlens = [64, 64]
+    H, Hkv, D = 4, 4, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    Q, K, _V_tn, V_nat, _O_unused, cu_t, seq_lens_t, _ = _pack_varlen_qkv(seqlens, H, Hkv, D, torch.bfloat16, seed=1)
+    out = iface.flydsl_flex_attn_func(
+        Q,
+        K,
+        V_nat,
+        causal=True,
+        sm_scale=sm_scale,
+        cu_seqlens=cu_t,
+        seq_lens=seq_lens_t,
+    )
+    torch.cuda.synchronize()
+    end = int(cu_t[-1].item())
+    ref = torch.zeros_like(Q)
+    flash_attn_varlen_func(
+        Q[:end].contiguous(),
+        K[:end].contiguous(),
+        V_nat[:end].contiguous(),
+        cu_t,
+        cu_seqlens_k=cu_t,
+        max_seqlen_q=max(seqlens),
+        max_seqlen_k=max(seqlens),
+        softmax_scale=sm_scale,
+        causal=True,
+        seqused_k=seq_lens_t,
+        out=ref[:end],
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
 def test_iluvatar_flex_attn_func_paged_matches_compile(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "0")
     mod = _require_flex_attn_module()
     iface = _require_flex_attn_interface()
 
@@ -1311,6 +1401,161 @@ def test_iluvatar_flex_attn_func_paged_matches_compile(monkeypatch):
     torch.cuda.synchronize()
     ref = O[:, :, :Sq].permute(0, 2, 1, 3).contiguous()
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attn_func_paged_matches_fa(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+    mod = _require_flex_attn_module()
+    from kernels.attention.iluvatar.flash_attn_varlen import flash_attn_varlen_func
+
+    B, H, Hkv, Sq, D = 1, 4, 4, 64, 128
+    seq_lens_kv = [64]
+    sm_scale = 1.0 / math.sqrt(D)
+    K_pages, _V_pages, V_nat, block_table, seq_lens_t, _, _, _ = _build_paged_kv(
+        B=B,
+        Hkv=Hkv,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch.bfloat16,
+        seed=2,
+        page_size=mod.BLOCK_N,
+    )
+    torch.manual_seed(3)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    out = iface.flydsl_flex_attn_func(
+        q,
+        K_pages,
+        V_nat,
+        causal=True,
+        sm_scale=sm_scale,
+        block_table=block_table,
+        seq_lens_kv=seq_lens_t,
+    )
+    torch.cuda.synchronize()
+    q_pack = q.contiguous().reshape(B * Sq, H, D)
+    cu_q = torch.arange(0, B + 1, device=q.device, dtype=torch.int32) * Sq
+    ref = flash_attn_varlen_func(
+        q_pack,
+        K_pages.contiguous(),
+        V_nat.contiguous(),
+        cu_q,
+        max_seqlen_q=Sq,
+        max_seqlen_k=max(seq_lens_kv),
+        softmax_scale=sm_scale,
+        causal=True,
+        block_table=block_table,
+        seqused_k=seq_lens_t,
+        kv_cache_layout="NHD",
+    ).reshape(B, Sq, H, D)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def _assert_fa_matches_generic(monkeypatch, launch):
+    """Default FA fast path vs ``FLYDSL_FLEX_FA_FASTPATH=0`` on the same inputs."""
+    torch = _require_torch()
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "1")
+    out_fa = launch()
+    torch.cuda.synchronize()
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "0")
+    out_gen = launch()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_fa, out_gen, rtol=2e-2, atol=2e-2)
+
+
+def test_iluvatar_flex_attn_func_dense_fa_matches_generic(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 2, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(0)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    _assert_fa_matches_generic(
+        monkeypatch,
+        lambda: iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale),
+    )
+
+
+def test_iluvatar_flex_attn_func_varlen_fa_matches_generic(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+
+    seqlens = [64, 64]
+    H, Hkv, D = 4, 4, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    Q, K, _V_tn, V_nat, _O_unused, cu_t, seq_lens_t, _ = _pack_varlen_qkv(seqlens, H, Hkv, D, torch.bfloat16, seed=1)
+    _assert_fa_matches_generic(
+        monkeypatch,
+        lambda: iface.flydsl_flex_attn_func(
+            Q,
+            K,
+            V_nat,
+            causal=True,
+            sm_scale=sm_scale,
+            cu_seqlens=cu_t,
+            seq_lens=seq_lens_t,
+        ),
+    )
+
+
+def test_iluvatar_flex_attn_func_paged_fa_matches_generic(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+    mod = _require_flex_attn_module()
+
+    B, H, Hkv, Sq, D = 1, 4, 4, 64, 128
+    seq_lens_kv = [64]
+    sm_scale = 1.0 / math.sqrt(D)
+    K_pages, _V_pages, V_nat, block_table, seq_lens_t, _, _, _ = _build_paged_kv(
+        B=B,
+        Hkv=Hkv,
+        D=D,
+        seq_lens_kv=seq_lens_kv,
+        torch_dtype=torch.bfloat16,
+        seed=2,
+        page_size=mod.BLOCK_N,
+    )
+    torch.manual_seed(3)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    _assert_fa_matches_generic(
+        monkeypatch,
+        lambda: iface.flydsl_flex_attn_func(
+            q,
+            K_pages,
+            V_nat,
+            causal=True,
+            sm_scale=sm_scale,
+            block_table=block_table,
+            seq_lens_kv=seq_lens_t,
+        ),
+    )
+
+
+def test_iluvatar_flex_attn_func_fa_stream_none_on_current(monkeypatch):
+    """FA path must accept stream=None when the current CUDA stream is not default."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(4)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        out = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale)
+    side.synchronize()
+    assert out.shape == q.shape
 
 
 def test_iluvatar_flex_attn_func_rejects_mode_conflict(monkeypatch):
@@ -1572,6 +1817,7 @@ def test_iluvatar_flex_attention_d256_paged_smoke(monkeypatch):
 def test_iluvatar_flex_attn_func_d256_dense_matches_compile(monkeypatch):
     torch = _require_torch()
     _configure_iluvatar_env(monkeypatch)
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "0")
     mod = _require_flex_attn_module()
     iface = _require_flex_attn_interface()
 
@@ -1599,6 +1845,25 @@ def test_iluvatar_flex_attn_func_d256_dense_matches_compile(monkeypatch):
     launch(Q, K, Vt, O)
     torch.cuda.synchronize()
     ref = O[:, :, :Sq].permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attn_func_d256_dense_matches_fa(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 1, 4, 64, 64, 256
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(3)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    out = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    ref = _flash_attn_varlen_dense_ref(q, k, v, causal=True, sm_scale=sm_scale)
+    torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 

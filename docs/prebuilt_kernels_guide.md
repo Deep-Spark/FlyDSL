@@ -265,6 +265,11 @@ Unsupported ALiBi and softmax-LSE options raise `NotImplementedError`.
 Backend/runtime selection must be configured by the caller or CI; importing
 these modules does not change process environment.
 
+Vanilla `flydsl_flex_attn_func` (no `score_mod` / `mask_mod` / BlockMask /
+ALiBi / `score_bias` / SWA / softcap, bf16, `D in {128, 256}`, no explicit
+`tile_config`) dispatches to `flash_attn_varlen_func`. Set
+`FLYDSL_FLEX_FA_FASTPATH=0` to keep the generic flex kernel.
+
 For Iluvatar JIT compilation, point `IXA_ROOT` at a CoreX tree that contains
 `nvvm/libdevice` before the first kernel launch. The IXDL linker resolves
 device-library functions (including `__nv_exp2f` used by attention softmax)

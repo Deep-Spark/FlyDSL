@@ -298,6 +298,14 @@ class RuntimeEnvManager(EnvManager):
         False,
         description=("Skip JIT compilation; only load AOT cache. " "Raise RuntimeError on cache miss."),
     )
+    flex_fa_fastpath = OptBool(
+        True,
+        env_var="FLYDSL_FLEX_FA_FASTPATH",
+        description=(
+            "Route vanilla flydsl_flex_attn_func (no score/mask mods, bf16, "
+            "D in {128,256}, no explicit tile_config) to flash_attn_varlen_func"
+        ),
+    )
 
 
 autotune = AutotuneEnvManager()
