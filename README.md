@@ -103,7 +103,7 @@ pip install -e .
 If you already have an MLIR build with Python bindings enabled, point to it instead:
 
 ```bash
-pip install nanobind numpy pybind11  # build.sh does not install these
+pip install 'nanobind>=2.9,<3' numpy pybind11  # build.sh does not install these
 export MLIR_PATH=/path/to/llvm-project/build-flydsl/mlir_install
 MLIR_PATH=$MLIR_PATH bash scripts/build.sh -j64
 pip install -e .
