@@ -726,9 +726,13 @@ def _parse_flex_attn_perf_cases(cfg: dict):
         if softcap is not None:
             softcap = float(softcap)
         dtype_str = str(case["dtype"])
-        backend = str(case.get("backend", "compile"))
-        if backend not in ("compile", "fa"):
-            raise ValueError(f"perf_config.cases[{i}].backend must be compile or fa, got {backend!r}")
+        backend_raw = case.get("backend", None)
+        if backend_raw is not None and backend_raw != "fa":
+            raise ValueError(
+                f"perf_config.cases[{i}].backend must be omitted (compile is implicit) "
+                f"or set to 'fa', got {backend_raw!r}"
+            )
+        backend = "fa" if backend_raw == "fa" else "compile"
         if backend == "fa":
             if window_size is not None or softcap is not None:
                 raise ValueError("perf_config backend=fa is vanilla-only (no window_size/softcap)")
@@ -1592,6 +1596,56 @@ def test_iluvatar_flex_attn_func_dense_fa_out_is_in_place(monkeypatch):
     ref = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attn_func_dense_fa_out_noncontiguous(monkeypatch):
+    """Non-contiguous ``out`` falls back to alloc-then-copy without corrupting values."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "1")
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 2, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(7)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    # Non-contiguous [B, Sq, H, D] view: allocate as [D, B, Sq, H] then permute.
+    buf = torch.empty(D, B, Sq, H, device="cuda", dtype=torch.bfloat16)
+    out = buf.permute(1, 2, 3, 0)
+    assert tuple(out.shape) == (B, Sq, H, D) and not out.is_contiguous()
+
+    returned = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, out=out)
+    torch.cuda.synchronize()
+    assert returned is out
+    ref = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_iluvatar_flex_attn_func_fa_rejects_bad_out(monkeypatch):
+    """Interface-level ``out`` shape/dtype/device check runs before FA dispatch."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "1")
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 2, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(8)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    out_bad_shape = torch.empty(B, Sq, H, D + 8, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="out shape must match q"):
+        iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, out=out_bad_shape)
+
+    out_bad_dtype = torch.empty(B, Sq, H, D, device="cuda", dtype=torch.float16)
+    with pytest.raises(ValueError, match="dtype/device"):
+        iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, out=out_bad_dtype)
 
 
 def test_iluvatar_flex_attn_func_varlen_fa_matches_generic(monkeypatch):

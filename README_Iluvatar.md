@@ -245,10 +245,13 @@ For a pytest-based benchmark:
    `FLYDSL_PERF_CONFIG_PATH` to the **repo-relative** path (so the file is
    visible inside the perf container where the workspace is mounted at
    `/workspace`). The flex perf test reads the file when present; with no path
-   it falls back to the same matrix hardcoded in the test (six ``compile_*``
-   groups plus vanilla causal bf16 ``backend: fa`` -> metric key
-   ``causal.bf16.fa``). Prefer editing the json to add/drop daily groups or
-   change shape, instead of hardcoding a new matrix in pytest.
+   it falls back to the same matrix hardcoded in the test (six
+   ``compile``-backend groups plus vanilla causal bf16 ``backend: fa`` ->
+   metric key ``causal.bf16.fa``). ``backend`` must be omitted (``compile``
+   is the implicit default and never appears as an explicit value or as a
+   metric-key suffix) or set to ``"fa"``. Prefer editing the json to add /
+   drop daily groups or change shape, instead of hardcoding a new matrix in
+   pytest.
 
 Use a stable `id` so later runs can find the previous result in the
 `perf-metrics` artifact. A missing baseline (for example, on the first run)

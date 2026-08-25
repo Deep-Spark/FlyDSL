@@ -343,6 +343,17 @@ def flydsl_flex_attn_func(
         tile_config_explicit=user_tile_config,
         varlen_tight=varlen_tight,
     ):
+        # Validate ``out`` uniformly across dense/varlen/paged FA modes before
+        # dispatch. Inner _run_* helpers rely on ``out.view(...)`` which would
+        # otherwise raise a confusing RuntimeError for a wrong-shape buffer.
+        if out is not None:
+            if tuple(out.shape) != tuple(q.shape):
+                raise ValueError(f"out shape must match q {tuple(q.shape)}, got {tuple(out.shape)}")
+            if out.dtype != q.dtype or out.device != q.device:
+                raise ValueError(
+                    f"out must match q dtype/device; got dtype={out.dtype} device={out.device}, "
+                    f"expected dtype={q.dtype} device={q.device}"
+                )
         # Forward stream as-is. Wrapping None as fx.Stream(None) makes FA treat
         # it as the CUDA default stream and reject a non-default current stream.
         return run_flex_attn_fa_fastpath(
