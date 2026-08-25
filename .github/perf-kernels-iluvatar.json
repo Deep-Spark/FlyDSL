@@ -89,6 +89,14 @@
               "is_causal": true,
               "window_size": null,
               "softcap": null,
+              "dtype": "bf16",
+              "backend": "fa"
+            },
+            {
+              "name": "causal",
+              "is_causal": true,
+              "window_size": null,
+              "softcap": null,
               "dtype": "f16"
             },
             {

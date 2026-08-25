@@ -195,6 +195,10 @@ def _run_dense(q, k, v, *, causal, sm_scale, out, stream, flash_attn_varlen_func
     v_pack = _pack_bshd_as_varlen(v)
     cu_q = _dense_cu_seqlens(batch=b, seqlen=sq, device=q.device)
     cu_k = _dense_cu_seqlens(batch=b, seqlen=skv, device=q.device)
+    # Route contiguous out into FA as its own out= view so FA writes directly
+    # into caller storage; skip alloc + copy. Non-contiguous out keeps the
+    # legacy alloc-then-copy path.
+    o_pack_out = out.view(b * sq, h, d) if out is not None and out.is_contiguous() else None
     o_pack = flash_attn_varlen_func(
         q_pack,
         k_pack,
@@ -205,13 +209,14 @@ def _run_dense(q, k, v, *, causal, sm_scale, out, stream, flash_attn_varlen_func
         max_seqlen_k=skv,
         softmax_scale=sm_scale,
         causal=causal,
+        out=o_pack_out,
         stream=stream,
     )
-    o_logic = o_pack.reshape(b, sq, h, d)
-    if out is not None:
-        out.copy_(o_logic)
-        return out
-    return o_logic
+    if out is None:
+        return o_pack.reshape(b, sq, h, d)
+    if o_pack_out is None:
+        out.copy_(o_pack.reshape(b, sq, h, d))
+    return out
 
 
 def _run_varlen(
@@ -340,6 +345,8 @@ def _run_paged(
     bt = _i32_on(block_table, q.device)
     max_k = int(seqused.max().item()) if max_seqlen_kv is None else int(max_seqlen_kv)
 
+    # Route contiguous BSHD out into FA as [B*Sq, H, D] view; skip alloc + copy.
+    o_pack_out = out.view(b * sq, h, d) if out is not None and out.is_contiguous() else None
     o_pack = flash_attn_varlen_func(
         q_pack,
         k.contiguous(),
@@ -352,10 +359,11 @@ def _run_paged(
         block_table=bt,
         seqused_k=seqused,
         kv_cache_layout="NHD",
+        out=o_pack_out,
         stream=stream,
     )
-    o_logic = o_pack.reshape(b, sq, h, d)
-    if out is not None:
-        out.copy_(o_logic)
-        return out
-    return o_logic
+    if out is None:
+        return o_pack.reshape(b, sq, h, d)
+    if o_pack_out is None:
+        out.copy_(o_pack.reshape(b, sq, h, d))
+    return out

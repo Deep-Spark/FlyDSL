@@ -637,6 +637,14 @@ _DEFAULT_FLEX_ATTN_PERF_CONFIG = {
     "iters": 10,
     "cases": [
         {"name": "causal", "is_causal": True, "window_size": None, "softcap": None, "dtype": "bf16"},
+        {
+            "name": "causal",
+            "is_causal": True,
+            "window_size": None,
+            "softcap": None,
+            "dtype": "bf16",
+            "backend": "fa",
+        },
         {"name": "causal", "is_causal": True, "window_size": None, "softcap": None, "dtype": "f16"},
         {
             "name": "causal_swa1024",
@@ -718,12 +726,28 @@ def _parse_flex_attn_perf_cases(cfg: dict):
         if softcap is not None:
             softcap = float(softcap)
         dtype_str = str(case["dtype"])
-        cases.append((name, is_causal, window_size, softcap, dtype_str))
+        backend = str(case.get("backend", "compile"))
+        if backend not in ("compile", "fa"):
+            raise ValueError(f"perf_config.cases[{i}].backend must be compile or fa, got {backend!r}")
+        if backend == "fa":
+            if window_size is not None or softcap is not None:
+                raise ValueError("perf_config backend=fa is vanilla-only (no window_size/softcap)")
+            if dtype_str != "bf16":
+                raise ValueError("perf_config backend=fa requires dtype=bf16")
+            if D not in (128, 256):
+                raise ValueError(f"perf_config backend=fa requires D in {{128,256}}, got {D}")
+        cases.append((name, is_causal, window_size, softcap, dtype_str, backend))
     return B, H, Hkv, Sq, Skv, D, cases
 
 
+def _flex_attn_perf_metric_key(name: str, dtype_str: str, backend: str) -> str:
+    if backend == "fa":
+        return f"{name}.{dtype_str}.fa"
+    return f"{name}.{dtype_str}"
+
+
 def test_iluvatar_flex_attention_perf(monkeypatch):
-    """Large-shape latency probe for daily trend (six cases by default)."""
+    """Large-shape latency probe for daily trend (compile cases + optional FA)."""
     _require_perf_enabled()
     torch = _require_torch()
     # The kv loop is unrolled at trace time, so JIT compilation for these shapes
@@ -747,7 +771,12 @@ def test_iluvatar_flex_attention_perf(monkeypatch):
     assert Sq_phys == Sq and Skv_phys == Skv
 
     metrics = {}
-    for case_name, is_causal, window_size, softcap, dtype_str in cases:
+    iface = _require_flex_attn_interface() if any(b == "fa" for *_, b in cases) else None
+    # SDPA baseline depends only on (dtype, is_causal, window_size, softcap)
+    # for a fixed shape; cache so the compile bf16 case and its fa twin do
+    # not re-bench the same reference back-to-back.
+    torch_baseline_us: dict = {}
+    for case_name, is_causal, window_size, softcap, dtype_str, backend in cases:
         torch_dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[dtype_str]
         sm_scale = 1.0 / math.sqrt(D)
 
@@ -755,26 +784,79 @@ def test_iluvatar_flex_attention_perf(monkeypatch):
         Q = torch.randn(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype).contiguous()
         K = torch.randn(B, Hkv, Skv_phys, D, device="cuda", dtype=torch_dtype).contiguous()
         V_natural = torch.randn(B, Hkv, Skv_phys, D, device="cuda", dtype=torch_dtype).contiguous()
-        V_transposed = V_natural.transpose(-1, -2).contiguous()
-        O = torch.empty(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)  # noqa: E741
 
-        launch = mod.compile_iluvatar_flex_attention(
-            B,
-            H,
-            Sq,
-            Skv,
-            D,
-            Hkv=Hkv,
-            dtype=dtype_str,
-            is_causal=is_causal,
-            window_size=window_size,
-            softcap=softcap,
-            sm_scale=sm_scale,
-        )
-        stream = torch.cuda.current_stream()
+        if backend == "fa":
+            # Default env is on, but a caller can flip it off in the perf
+            # container. Force it on so the fa key never silently records the
+            # generic kernel, and assert the fast path is actually reached.
+            monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "1")
+            from kernels.attention.iluvatar.flex_attn_fa_backend import (
+                is_flex_fa_fastpath_eligible,
+            )
 
-        def run_flydsl():
-            launch(Q, K, V_transposed, O, stream=stream)
+            assert is_flex_fa_fastpath_eligible(
+                mode="dense",
+                dtype=dtype_str,
+                head_dim=D,
+                causal=is_causal,
+                sq=Sq,
+                skv=Skv,
+                window_size=window_size,
+                softcap=softcap,
+                alibi_slopes=None,
+                score_bias=None,
+                score_mod=None,
+                mask_mod=None,
+                block_mask=None,
+                block_masks=None,
+                tile_config_explicit=False,
+            ), "FA fast path must be eligible for backend=fa perf case"
+
+            q_bshd = Q.permute(0, 2, 1, 3).contiguous()
+            k_bshd = K.permute(0, 2, 1, 3).contiguous()
+            v_bshd = V_natural.permute(0, 2, 1, 3).contiguous()
+            # Preallocate output so the timed loop does not include torch alloc
+            # per iter; matches the compile branch's preallocated ``O``.
+            O_bshd = torch.empty(B, Sq_phys, H, D, device="cuda", dtype=torch_dtype)
+
+            def run_flydsl(
+                q_bshd=q_bshd,
+                k_bshd=k_bshd,
+                v_bshd=v_bshd,
+                out=O_bshd,
+                causal=is_causal,
+                sm_scale=sm_scale,
+                iface=iface,
+            ):
+                iface.flydsl_flex_attn_func(
+                    q_bshd,
+                    k_bshd,
+                    v_bshd,
+                    causal=causal,
+                    sm_scale=sm_scale,
+                    out=out,
+                )
+
+        else:
+            V_transposed = V_natural.transpose(-1, -2).contiguous()
+            O = torch.empty(B, H, Sq_phys, D, device="cuda", dtype=torch_dtype)  # noqa: E741
+            launch = mod.compile_iluvatar_flex_attention(
+                B,
+                H,
+                Sq,
+                Skv,
+                D,
+                Hkv=Hkv,
+                dtype=dtype_str,
+                is_causal=is_causal,
+                window_size=window_size,
+                softcap=softcap,
+                sm_scale=sm_scale,
+            )
+            stream = torch.cuda.current_stream()
+
+            def run_flydsl(launch=launch, Q=Q, K=K, V_transposed=V_transposed, O=O, stream=stream):  # noqa: E741
+                launch(Q, K, V_transposed, O, stream=stream)
 
         flydsl_us = _bench_gpu_us(run_flydsl, warmup=warmup, iters=iters)
         tflops = _attention_tflops(B=B, H=H, Sq=Sq, Skv=Skv, D=D, latency_us=flydsl_us)
@@ -788,26 +870,30 @@ def test_iluvatar_flex_attention_perf(monkeypatch):
         torch_us = None
         speedup = None
         if compare_torch:
-            # SDPA expects natural V layout [B, Hkv, Skv, D]; expand GQA heads for torch.
-            group = H // Hkv
-            K_torch = K.repeat_interleave(group, dim=1)
-            V_torch = V_natural.repeat_interleave(group, dim=1)
+            baseline_key = (dtype_str, bool(is_causal), window_size, softcap)
+            torch_us = torch_baseline_us.get(baseline_key)
+            if torch_us is None:
+                # SDPA expects natural V layout [B, Hkv, Skv, D]; expand GQA heads for torch.
+                group = H // Hkv
+                K_torch = K.repeat_interleave(group, dim=1)
+                V_torch = V_natural.repeat_interleave(group, dim=1)
 
-            def run_torch():
-                torch.nn.functional.scaled_dot_product_attention(
-                    Q,
-                    K_torch,
-                    V_torch,
-                    is_causal=True,
-                    scale=sm_scale,
-                )
+                def run_torch(Q=Q, K_torch=K_torch, V_torch=V_torch, sm_scale=sm_scale):
+                    torch.nn.functional.scaled_dot_product_attention(
+                        Q,
+                        K_torch,
+                        V_torch,
+                        is_causal=True,
+                        scale=sm_scale,
+                    )
 
-            torch_us = _bench_gpu_us(run_torch, warmup=warmup, iters=iters)
+                torch_us = _bench_gpu_us(run_torch, warmup=warmup, iters=iters)
+                torch_baseline_us[baseline_key] = torch_us
             speedup = torch_us / flydsl_us if flydsl_us > 0 else 0.0
             point_metrics["torch_latency_us"] = float(torch_us)
             point_metrics["speedup_torch"] = float(speedup)
 
-        metric_key = f"{case_name}.{dtype_str}"
+        metric_key = _flex_attn_perf_metric_key(case_name, dtype_str, backend)
         print(
             f"[iluvatar-flex-attn-perf] key={metric_key} "
             f"shape=B{B}_H{H}_Hkv{Hkv}_Sq{Sq}_Skv{Skv}_D{D} "
@@ -1480,6 +1566,32 @@ def test_iluvatar_flex_attn_func_dense_fa_matches_generic(monkeypatch):
         monkeypatch,
         lambda: iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale),
     )
+
+
+def test_iluvatar_flex_attn_func_dense_fa_out_is_in_place(monkeypatch):
+    """FA fast path with contiguous ``out=`` writes into caller storage directly."""
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    monkeypatch.setenv("FLYDSL_FLEX_FA_FASTPATH", "1")
+    iface = _require_flex_attn_interface()
+
+    B, H, Sq, Skv, D = 2, 4, 64, 64, 128
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(5)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Skv, H, D, device="cuda", dtype=torch.bfloat16)
+
+    out = torch.empty(B, Sq, H, D, device="cuda", dtype=torch.bfloat16)
+    out_ptr = out.data_ptr()
+    returned = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale, out=out)
+    torch.cuda.synchronize()
+    assert returned is out
+    assert returned.data_ptr() == out_ptr
+
+    ref = iface.flydsl_flex_attn_func(q, k, v, causal=True, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
 def test_iluvatar_flex_attn_func_varlen_fa_matches_generic(monkeypatch):

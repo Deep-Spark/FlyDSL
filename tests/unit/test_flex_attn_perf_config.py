@@ -34,10 +34,11 @@ def test_load_flex_attn_perf_config_fallback(monkeypatch):
     monkeypatch.delenv(mod._FLEX_ATTN_PERF_CONFIG_ENV, raising=False)
     cfg = mod._load_flex_attn_perf_config()
     assert cfg["shape"]["Sq"] == 4096
-    assert len(cfg["cases"]) == 6
-    keys = [f"{c['name']}.{c['dtype']}" for c in cfg["cases"]]
+    assert len(cfg["cases"]) == 7
+    keys = [mod._flex_attn_perf_metric_key(c["name"], c["dtype"], c.get("backend", "compile")) for c in cfg["cases"]]
     assert keys == [
         "causal.bf16",
+        "causal.bf16.fa",
         "causal.f16",
         "causal_swa1024.bf16",
         "causal_swa1024.f16",
@@ -68,6 +69,45 @@ def test_load_flex_attn_perf_config_from_path(monkeypatch, tmp_path):
     cfg = mod._load_flex_attn_perf_config()
     B, H, Hkv, Sq, Skv, D, cases = mod._parse_flex_attn_perf_cases(cfg)
     assert (B, H, Hkv, Sq, Skv, D) == (1, 4, 2, 128, 128, 64)
-    assert cases == [("causal", True, None, None, "f16")]
+    assert cases == [("causal", True, None, None, "f16", "compile")]
     assert int(cfg["warmup"]) == 2
     assert int(cfg["iters"]) == 3
+
+
+def test_parse_flex_attn_perf_fa_backend(monkeypatch):
+    mod = _load_flex_perf_helpers()
+    cfg = {
+        "shape": {"B": 2, "H": 32, "Hkv": 8, "Sq": 4096, "Skv": 4096, "D": 128},
+        "cases": [
+            {
+                "name": "causal",
+                "is_causal": True,
+                "dtype": "bf16",
+                "backend": "fa",
+            }
+        ],
+    }
+    B, H, Hkv, Sq, Skv, D, cases = mod._parse_flex_attn_perf_cases(cfg)
+    assert (B, H, Hkv, Sq, Skv, D) == (2, 32, 8, 4096, 4096, 128)
+    assert cases == [("causal", True, None, None, "bf16", "fa")]
+    assert mod._flex_attn_perf_metric_key("causal", "bf16", "fa") == "causal.bf16.fa"
+
+
+@pytest.mark.parametrize(
+    "shape_D,case,match",
+    [
+        (128, {"name": "causal", "dtype": "f16", "backend": "fa"}, "bf16"),
+        (128, {"name": "causal", "dtype": "bf16", "backend": "fa", "window_size": 1024}, "vanilla-only"),
+        (128, {"name": "causal", "dtype": "bf16", "backend": "fa", "softcap": 30.0}, "vanilla-only"),
+        (64, {"name": "causal", "dtype": "bf16", "backend": "fa"}, r"D in \{128,256\}"),
+        (128, {"name": "causal", "dtype": "bf16", "backend": "generic"}, "compile or fa"),
+    ],
+)
+def test_parse_flex_attn_perf_rejects_invalid_fa(shape_D, case, match):
+    mod = _load_flex_perf_helpers()
+    cfg = {
+        "shape": {"B": 2, "H": 32, "Hkv": 8, "Sq": 4096, "Skv": 4096, "D": shape_D},
+        "cases": [case],
+    }
+    with pytest.raises(ValueError, match=match):
+        mod._parse_flex_attn_perf_cases(cfg)
