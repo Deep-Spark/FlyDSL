@@ -100,7 +100,8 @@ def test_parse_flex_attn_perf_fa_backend(monkeypatch):
         (128, {"name": "causal", "dtype": "bf16", "backend": "fa", "window_size": 1024}, "vanilla-only"),
         (128, {"name": "causal", "dtype": "bf16", "backend": "fa", "softcap": 30.0}, "vanilla-only"),
         (64, {"name": "causal", "dtype": "bf16", "backend": "fa"}, r"D in \{128,256\}"),
-        (128, {"name": "causal", "dtype": "bf16", "backend": "generic"}, "compile or fa"),
+        (128, {"name": "causal", "dtype": "bf16", "backend": "generic"}, "omitted"),
+        (128, {"name": "causal", "dtype": "bf16", "backend": "compile"}, "omitted"),
     ],
 )
 def test_parse_flex_attn_perf_rejects_invalid_fa(shape_D, case, match):
