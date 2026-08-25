@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""High-level API for the Iluvatar MR async copy (SME Load series).
+"""High-level API for the Iluvatar MR async copy (SME Load / Store series).
 
-Copy atoms are parameterised by ``sme_swizzle``, which selects the SME
+G2S copy atoms are parameterised by ``sme_swizzle``, which selects the SME
 shared-memory swizzle state. Element dtype and ``Major::K/MN`` axis are carried
-elsewhere (``fly.copy_atom`` / kernel layout factories).
+elsewhere (``fly.copy_atom`` / kernel layout factories). S2G store atoms are
+parameterised by the per-instruction byte width (``MRAsyncStore``).
 """
 
 from ..._mlir import ir
-from ..._mlir._mlir_libs._mlirDialectsFlyIXDL import CopyOpMRAsyncCpType, MmaOpMRMmaType
+from ..._mlir._mlir_libs._mlirDialectsFlyIXDL import (
+    CopyOpMRAsyncCpType,
+    CopyOpMRAsyncStoreType,
+    MmaOpMRMmaType,
+)
 from ..._mlir.dialects.fly import ModSwizzleType, PointerType, SwizzleType
 from ..._mlir.dialects.fly_ixdl import TargetAddressSpace
 from ..primitive import (
@@ -93,6 +98,39 @@ MRAsyncCpNoSwizzle = lambda: CopyOpMRAsyncCpType.get(SMESwizzle.NoSwizzle)  # b3
 MRAsyncCpCol = lambda: CopyOpMRAsyncCpType.get(SMESwizzle.Col)  # colxfb8 (incl. bf16/fp16 col)
 MRAsyncCpRow8b = lambda: CopyOpMRAsyncCpType.get(SMESwizzle.Row8b)  # rowxfb8 (Swizzle_Mod)
 MRAsyncCpRow16b = lambda: CopyOpMRAsyncCpType.get(SMESwizzle.Row16b)  # rowxfb16
+
+
+def MRAsyncStore(store_bytes):
+    """Create an Iluvatar MR async store atom (SME Store series).
+
+    Warp-collective shared -> global async copy, the S2G counterpart of
+    :func:`MRAsyncCp`. One instruction moves ``store_bytes`` bytes from the
+    shared-memory source (its pointer becomes the hardware ``sOffset``) to the
+    global destination described by an SME gmem tensor
+    (:func:`make_sme_gmem_tensor`). Lowers to ``ixdl.cp_async.store.b{N}``
+    (``bi_sme_store_b64/b128/b256``); feature: "async-copy-sme" (MR only).
+
+    Args:
+        store_bytes: per-instruction transfer width in bytes: 64, 128, or 256.
+
+    Note:
+        Predication is not supported: a suppressed S2G store has no safe sink
+        (unlike the G2S invalid-SLB-offset trick). Bound the tile loop instead.
+        Drain outstanding stores with ``ixdl.sl_waitmem(s2g=0)`` before
+        reusing the shared buffer or exiting the kernel.
+    """
+    store_bytes = int(store_bytes)
+    if store_bytes not in (64, 128, 256):
+        raise ValueError(
+            f"MRAsyncStore store_bytes must be one of 64/128/256, got {store_bytes}"
+        )
+    return CopyOpMRAsyncStoreType.get(store_bytes)
+
+
+# Convenience aliases (the 3 SME store widths, in bytes).
+MRAsyncStoreB64 = lambda: MRAsyncStore(64)
+MRAsyncStoreB128 = lambda: MRAsyncStore(128)
+MRAsyncStoreB256 = lambda: MRAsyncStore(256)
 
 
 def _elem_bits(elem_type) -> int:
