@@ -35,6 +35,22 @@ struct PyCopyOpMRAsyncCpType : PyConcreteType<PyCopyOpMRAsyncCpType> {
   }
 };
 
+struct PyCopyOpMRAsyncStoreType : PyConcreteType<PyCopyOpMRAsyncStoreType> {
+  FLYDSL_REGISTER_TYPE_BINDING(CopyOpMRAsyncStoreType, "CopyOpMRAsyncStoreType");
+
+  static void bindDerived(ClassTy &c) {
+    c.def_static(
+        "get",
+        [](int32_t storeBytes, DefaultingPyMlirContext context) {
+          MLIRContext *ctx = unwrap(context.get()->get());
+          return PyCopyOpMRAsyncStoreType(context->getRef(),
+                                          wrap(CopyOpMRAsyncStoreType::get(ctx, storeBytes)));
+        },
+        "store_bytes"_a, nb::kw_only(), "context"_a = nb::none(),
+        "Create a CopyOpMRAsyncStoreType (SME store width in bytes: 64, 128 or 256)");
+  }
+};
+
 struct PyCopyOpCQSmexCpType : PyConcreteType<PyCopyOpCQSmexCpType> {
   FLYDSL_REGISTER_TYPE_BINDING(CopyOpCQSmexCpType, "CopyOpCQSmexCpType");
 
@@ -117,6 +133,7 @@ NB_MODULE(_mlirDialectsFlyIXDL, m) {
   m.doc() = "MLIR Python FlyIXDL Extension";
 
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpMRAsyncCpType::bind(m);
+  ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpMRAsyncStoreType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpCQSmexCpType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyCopyOpCQMtxLoadnType::bind(m);
   ::mlir::python::MLIR_BINDINGS_PYTHON_DOMAIN::fly_ixdl::PyMmaOpMRMmaType::bind(m);

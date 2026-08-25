@@ -191,4 +191,136 @@ FailureOr<Value> CopyOpMRAsyncCpType::emitAtomCallSSA(OpBuilder &builder, Locati
   return Value{};
 }
 
+//===----------------------------------------------------------------------===//
+// CopyOpMRAsyncStoreType: SME store series (shared -> global), the S2G
+// counterpart of MRAsyncCp. One warp-collective instruction moves
+// ``storeBytes`` bytes (64/128/256) from shared to global memory.
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+CopyOpMRAsyncStoreType::verify(function_ref<InFlightDiagnostic()> emitError,
+                               int32_t storeBytes) {
+  if (storeBytes != 64 && storeBytes != 128 && storeBytes != 256)
+    return emitError() << "unsupported storeBytes = " << storeBytes
+                       << " for MRAsyncStore (expected 64, 128 or 256)";
+  return success();
+}
+
+bool CopyOpMRAsyncStoreType::isStatic() const { return true; }
+
+// Same rationale as CopyOpMRAsyncCpType: the enclosing !fly.copy_atom wrapper
+// rebuilds the make_copy_atom op; this type has nothing to rebuild on its own.
+Value CopyOpMRAsyncStoreType::rebuildStaticValue(OpBuilder &, Location, Value) const {
+  return nullptr;
+}
+
+Attribute CopyOpMRAsyncStoreType::getThrLayout() const {
+  // Warp-collective SME store: modeled as a single logical thread that owns the
+  // whole tile; the 64-lane cooperation is internal to the hardware instruction.
+  return FxLayout(FxC(1), FxC(1));
+}
+
+Attribute CopyOpMRAsyncStoreType::getThrBitLayoutSrc() const {
+  // One SME store instruction moves storeBytes bytes, owned by the single
+  // logical thread: src layout (1,bits):(0,1) -- thr mode size 1 (injective),
+  // val mode contiguous bits.
+  int64_t bits = static_cast<int64_t>(getStoreBytes()) * 8;
+  return FxLayout(FxShape(FxC(1), FxC(bits)), FxStride(FxC(0), FxC(1)));
+}
+
+Attribute CopyOpMRAsyncStoreType::getThrBitLayoutDst() const { return getThrBitLayoutSrc(); }
+
+Attribute CopyOpMRAsyncStoreType::getThrBitLayoutRef() const { return getThrBitLayoutDst(); }
+
+namespace {
+
+// S2G direction of emitMRAsyncCp: the shared pointer becomes the hardware
+// sOffset operand and the SmeGmem fat pointer provides the descriptor / gOffset,
+// exactly like the G2S path but with src/dst roles swapped.
+LogicalResult emitMRAsyncStore(OpBuilder &builder, Location loc, int32_t storeBytes,
+                               Type copyAtomTyArg, Type srcMemTyArg, Type dstMemTyArg,
+                               Value src, Value dst) {
+  auto copyAtomTy = dyn_cast<fly::CopyAtomType>(copyAtomTyArg);
+  if (!copyAtomTy)
+    return failure();
+
+  auto srcMemTy = dyn_cast<fly::MemRefType>(srcMemTyArg);
+  auto dstMemTy = dyn_cast<fly::MemRefType>(dstMemTyArg);
+  if (!srcMemTy || !dstMemTy)
+    return failure();
+
+  if (!isGenericAddressSpace<fly::AddressSpace::Shared>(srcMemTy.getAddressSpace()) ||
+      !isTargetAddressSpace<SmeGmemAddressAttr>(dstMemTy.getAddressSpace()))
+    return failure();
+
+  // src shared pointer -> i32 sOffset (the smem pointer is cast to uint32).
+  Value sOffset = LLVM::PtrToIntOp::create(builder, loc, builder.getI32Type(), src);
+
+  // dst SmeGmemFatPtr -> vector<4xi32> SME descriptor + 32-bit gOffset (same
+  // hoisting contract as the G2S path: descriptor from the raw loop-invariant
+  // base, per-tile byte offset as the hardware gOffset operand).
+  SmeGmemFatPtr dstFat(dstMemTy.getPointerType(), dst);
+  Value gBase = dstFat.smeDescriptorVec(builder, loc);
+  Value gOffset = dstFat.byteOffset(builder, loc);
+
+  Value kop = arith::ConstantIntOp::create(builder, loc, 0, 32); // CacheAll cache op
+
+  switch (storeBytes) {
+  case 64:
+    IXDL::CpAsync_Store_b64Op::create(builder, loc, sOffset, gBase, gOffset, kop);
+    return success();
+  case 128:
+    IXDL::CpAsync_Store_b128Op::create(builder, loc, sOffset, gBase, gOffset, kop);
+    return success();
+  case 256:
+    IXDL::CpAsync_Store_b256Op::create(builder, loc, sOffset, gBase, gOffset, kop);
+    return success();
+  default:
+    llvm_unreachable("CopyOpMRAsyncStoreType::verify should reject unsupported store widths");
+  }
+}
+
+LogicalResult emitPredicatedStoreUnsupported(Location loc) {
+  // The G2S predication trick (false pred -> invalid SLB offset -> hardware
+  // drops the transfer) has no S2G analogue: redirecting the shared offset
+  // still issues the global write, and redirecting the global offset would
+  // fault. There is no safe sink for a suppressed store, so predicated S2G is
+  // rejected instead of silently writing.
+  return mlir::emitError(loc) << "MRAsyncStore does not support predication: a suppressed "
+                                 "shared->global store has no safe sink";
+}
+
+} // namespace
+
+LogicalResult CopyOpMRAsyncStoreType::emitAtomCall(OpBuilder &builder, Location loc,
+                                                   Type copyAtomTyArg, Type srcMemTyArg,
+                                                   Type dstMemTyArg, Value, Value src,
+                                                   Value dst) const {
+  return emitMRAsyncStore(builder, loc, getStoreBytes(), copyAtomTyArg, srcMemTyArg, dstMemTyArg,
+                          src, dst);
+}
+
+LogicalResult CopyOpMRAsyncStoreType::emitAtomCall(OpBuilder &builder, Location loc, Type, Type,
+                                                   Type, Type, Value, Value, Value, Value) const {
+  return emitPredicatedStoreUnsupported(loc);
+}
+
+FailureOr<Value> CopyOpMRAsyncStoreType::emitAtomCallSSA(OpBuilder &builder, Location loc, Type,
+                                                         Type copyAtomTyArg, Type srcTyArg,
+                                                         Type dstTyArg, Value atomVal, Value src,
+                                                         Value dst) const {
+  if (failed(emitAtomCall(builder, loc, copyAtomTyArg, srcTyArg, dstTyArg, atomVal, src, dst)))
+    return failure();
+  // Async fire-and-forget: no SSA result.
+  return Value{};
+}
+
+FailureOr<Value> CopyOpMRAsyncStoreType::emitAtomCallSSA(OpBuilder &builder, Location loc, Type,
+                                                         Type, Type, Type, Type, Value, Value,
+                                                         Value, Value) const {
+  if (failed(emitPredicatedStoreUnsupported(loc)))
+    return failure();
+  return Value{};
+}
+
 } // namespace mlir::fly_ixdl

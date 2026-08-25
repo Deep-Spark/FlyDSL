@@ -17,6 +17,19 @@ def FlyIXDL_CopyOpMRAsyncCp : FlyIXDL_CopyOp<"CopyOpMRAsyncCp", "mr.async_copy">
   let genVerifyDecl = 1;
 }
 
+// Iluvatar MR async store (SME Store series): warp-collective shared ->
+// global copy, the S2G counterpart of mr.async_copy. Lowers to the
+// ixdl.cp_async.store.b{64,128,256} ops (bi_sme_store_b64/b128/b256), one
+// instruction moving storeBytes bytes (64/128/256) per warp.
+def FlyIXDL_CopyOpMRAsyncStore : FlyIXDL_CopyOp<"CopyOpMRAsyncStore", "mr.async_store"> {
+  let parameters = (ins
+    // SME store width in bytes per instruction: 64, 128, or 256
+    "int32_t":$storeBytes
+  );
+  let assemblyFormat = "`<` `bytes` `=` $storeBytes `>`";
+  let genVerifyDecl = 1;
+}
+
 // Iluvatar CQ SMEX G2S (smex_load{,n}_* / *_pred_*). Stateful atom carries
 // row_mask (i64), col_mask (i32), optional pred (i1). Defaults: masks all-1s,
 // pred disabled (non-pred IXDL op). rows: 4/16/64.
