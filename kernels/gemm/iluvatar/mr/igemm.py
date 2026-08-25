@@ -910,7 +910,7 @@ def _build_igemm_kernel(
         if apply_bias:
 
             @flyc.kernel(known_block_size=[threads, 1, 1])
-            def gemm_kernel(
+            def mr_igemm(
                 A: fx.Tensor,
                 B: fx.Tensor,
                 scale_a: fx.Tensor,
@@ -924,7 +924,7 @@ def _build_igemm_kernel(
         else:
 
             @flyc.kernel(known_block_size=[threads, 1, 1])
-            def gemm_kernel(
+            def mr_igemm(
                 A: fx.Tensor,
                 B: fx.Tensor,
                 scale_a: fx.Tensor,
@@ -938,7 +938,7 @@ def _build_igemm_kernel(
         if apply_bias:
 
             @flyc.kernel(known_block_size=[threads, 1, 1])
-            def gemm_kernel(
+            def mr_igemm(
                 A: fx.Tensor,
                 B: fx.Tensor,
                 scale_a: fx.Tensor,
@@ -951,7 +951,7 @@ def _build_igemm_kernel(
         else:
 
             @flyc.kernel(known_block_size=[threads, 1, 1])
-            def gemm_kernel(
+            def mr_igemm(
                 A: fx.Tensor,
                 B: fx.Tensor,
                 scale_a: fx.Tensor,
@@ -963,10 +963,10 @@ def _build_igemm_kernel(
     else:
 
         @flyc.kernel(known_block_size=[threads, 1, 1])
-        def gemm_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
+        def mr_igemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
             _igemm_body(A, B, C, None, None, None)
 
-    return gemm_kernel, threads, smem_elems, bm, bn, bk
+    return mr_igemm, threads, smem_elems, bm, bn, bk
 
 
 def compile_iluvatar_mr_igemm(

@@ -43,7 +43,7 @@ def compile_iluvatar_mr_moe_reduction_b16(
     col_tiles = (model_dim + cols_per_cta - 1) // cols_per_cta
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def reduction(
+    def moe_reduction_b16(
         X: fx.Tensor,
         Y: fx.Tensor,
         valid_mask: fx.Tensor,
@@ -78,7 +78,7 @@ def compile_iluvatar_mr_moe_reduction_b16(
         tokens_in: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        reduction(X, Y, valid_mask, tokens_in).launch(
+        moe_reduction_b16(X, Y, valid_mask, tokens_in).launch(
             grid=(tokens_in, col_tiles, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,

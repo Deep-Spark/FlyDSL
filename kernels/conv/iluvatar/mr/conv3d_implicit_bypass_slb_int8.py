@@ -160,7 +160,7 @@ def compile_conv3d_implicit_bypass_slb(
     assert b_atoms_total == 4
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def conv3d_bypass_slb_kernel(x: fx.Tensor, weight: fx.Tensor, y: fx.Tensor):
+    def conv3d_bypass_slb_int8_kernel(x: fx.Tensor, weight: fx.Tensor, y: fx.Tensor):
         tid = fx.thread_idx.x
         block_n, group_id, block_m = fx.block_idx
         lane_id = tid
@@ -508,7 +508,7 @@ def compile_conv3d_implicit_bypass_slb(
         y: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
-        conv3d_bypass_slb_kernel(x, weight, y).launch(
+        conv3d_bypass_slb_int8_kernel(x, weight, y).launch(
             grid=grid,
             block=block,
             stream=stream,

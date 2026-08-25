@@ -265,7 +265,7 @@ def build_scalar_kvcache_kernels(
                 _store_kv(head, d, k_val, v_val)
 
     @flyc.kernel(known_block_size=[ATTN_THREADS, 1, 1])
-    def attention_kernel(
+    def kvcache_scalar_attention(
         QWork: fx.Tensor,
         KCache: fx.Tensor,
         VCache: fx.Tensor,
@@ -752,4 +752,4 @@ def build_scalar_kvcache_kernels(
                     acc = acc + prob_num * _load_v(tok_i, d)
                 _store_partial(d, acc)
 
-    return update_cache_kernel, attention_kernel, split_attention_kernel
+    return update_cache_kernel, kvcache_scalar_attention, split_attention_kernel

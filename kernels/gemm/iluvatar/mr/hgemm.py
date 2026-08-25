@@ -174,7 +174,7 @@ def _build_swizzle_kernel(
     main_k_remainder = main_k_trip - main_k_full
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
-    def gemm_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
+    def mr_hgemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
         tid = fx.thread_idx.x
         bid_x, bid_y, _ = fx.block_idx
         warp_id = tid // WARP_SIZE
@@ -418,7 +418,7 @@ def _build_swizzle_kernel(
             )
 
     smem_bytes = stage_elems * 2 * STAGES
-    return gemm_kernel, threads, smem_bytes, bm, bn, bk
+    return mr_hgemm, threads, smem_bytes, bm, bn, bk
 
 
 def compile_iluvatar_mr_hgemm(

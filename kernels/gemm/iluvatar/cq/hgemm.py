@@ -247,7 +247,7 @@ def _build_pipeline_kernel(
         fx.gpu.barrier()
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
-    def gemm_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
+    def cq_hgemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
         tid = fx.thread_idx.x
         bid_x, bid_y, _ = fx.block_idx
         warp_id = tid // WARP_SIZE
@@ -465,7 +465,7 @@ def _build_pipeline_kernel(
             )
 
     smem_bytes = stage_elems * 2 * STAGES
-    return gemm_kernel, threads, smem_bytes, bm, bn, bk
+    return cq_hgemm, threads, smem_bytes, bm, bn, bk
 
 
 def compile_iluvatar_cq_hgemm(

@@ -169,7 +169,7 @@ def build_iluvatar_silu_and_mul_module(
     #   token_num:
     #     Number of original input tokens; used to reject sorting sentinels.
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def _kernel(
+    def moe_silu_and_mul(
         x: fx.Tensor,
         out: fx.Tensor,
         sorted_ids: fx.Tensor,
@@ -302,7 +302,7 @@ def build_iluvatar_silu_and_mul_module(
     ):
         # Grid X follows sorted rows, while each 256-thread CTA covers the
         # inter_dim columns of one decoded token-slot row.
-        _kernel(
+        moe_silu_and_mul(
             x,
             out,
             sorted_ids,
