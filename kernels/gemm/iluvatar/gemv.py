@@ -79,7 +79,7 @@ def compile_iluvatar_gemv(*, N: int, K: int) -> Callable:
 
     def _build_gemv_kernel(out_elem_dtype):
         @flyc.kernel(known_block_size=[TILE_N, 1, 1])
-        def _gemv_kernel(x_vec: fx.Tensor, w_mat: fx.Tensor, y_vec: fx.Tensor):
+        def iluvatar_gemv(x_vec: fx.Tensor, w_mat: fx.Tensor, y_vec: fx.Tensor):
             tid = fx.thread_idx.x
             bid = fx.block_idx.x
             n_idx = fx.Int32(bid * TILE_N + tid)
@@ -103,7 +103,7 @@ def compile_iluvatar_gemv(*, N: int, K: int) -> Callable:
             # Single loop-carried value is returned as scalar ArithValue.
             y[n_idx] = fx.Float32(results).to(out_elem_dtype)
 
-        return _gemv_kernel
+        return iluvatar_gemv
 
     def _build_launcher(kernel_fn):
         @flyc.jit

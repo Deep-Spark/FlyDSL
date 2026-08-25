@@ -106,7 +106,7 @@ def _build_dense_stage_launcher(
     threads = 256
 
     @flyc.kernel
-    def stage_kernel(
+    def flash_attn_prefill_stage(
         K: fx.Pointer,
         V: fx.Pointer,
         CuK: fx.Pointer,
@@ -210,7 +210,7 @@ def _build_dense_stage_launcher(
 
     @flyc.jit
     def launch(K, V, CuK, SeqK, KOut, VOut, PaddedCu, SafeSeq, stream=fx.Stream(None)):
-        stage_kernel(
+        flash_attn_prefill_stage(
             fx.get_iter(K),
             fx.get_iter(V),
             fx.get_iter(CuK),

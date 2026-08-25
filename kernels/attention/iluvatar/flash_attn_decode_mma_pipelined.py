@@ -139,7 +139,7 @@ def build_pipelined_mma_decode_attention_kernel(
     inv_log2e = 1.0 / _LOG2E
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
-    def mma_decode_kernel(
+    def mma_decode_pipelined_kernel(
         QWork: fx.Tensor,
         KCache: fx.Tensor,
         VCache: fx.Tensor,
@@ -661,4 +661,4 @@ def build_pipelined_mma_decode_attention_kernel(
                     fx.copy(copy_atom_i32, r_o, thr_d, pred=pred)
 
     grid = (num_splits, batch_size, num_kv_heads)
-    return mma_decode_kernel, threads, smem_bytes, grid
+    return mma_decode_pipelined_kernel, threads, smem_bytes, grid

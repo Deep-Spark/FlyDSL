@@ -118,7 +118,7 @@ def build_splitk_reduce_kernel(*, bm: int, bn: int, m: int, n: int, split_k: int
     mn_elems = m * n
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
-    def reduce_kernel(Workspace: fx.Tensor, C: fx.Tensor):
+    def splitk_reduce_kernel(Workspace: fx.Tensor, C: fx.Tensor):
         tid = fx.thread_idx.x
         bid_x, bid_y, _ = fx.block_idx
 
@@ -148,7 +148,7 @@ def build_splitk_reduce_kernel(*, bm: int, bn: int, m: int, n: int, split_k: int
             c_off = row * fx.Int32(n) + col
             fx.ptr_store(out, fx.add_offset(c_ptr, fx.make_int_tuple(c_off)))
 
-    return reduce_kernel
+    return splitk_reduce_kernel
 
 
 def make_splitk_workspace(split_k: int, m: int, n: int, device):

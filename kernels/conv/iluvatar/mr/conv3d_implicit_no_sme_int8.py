@@ -140,7 +140,7 @@ def compile_conv3d_implicit_no_sme(
     assert b_packs % BLOCK_THREADS == 0
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def conv3d_no_sme_kernel(x: fx.Tensor, weight: fx.Tensor, y: fx.Tensor):
+    def conv3d_no_sme_int8_kernel(x: fx.Tensor, weight: fx.Tensor, y: fx.Tensor):
         tid = fx.thread_idx.x
         block_n, group_id, block_m = fx.block_idx
         warp_id = tid // WARP_SIZE
@@ -369,7 +369,7 @@ def compile_conv3d_implicit_no_sme(
         y: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
-        conv3d_no_sme_kernel(x, weight, y).launch(
+        conv3d_no_sme_int8_kernel(x, weight, y).launch(
             grid=grid,
             block=block,
             stream=stream,

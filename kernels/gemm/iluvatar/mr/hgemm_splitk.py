@@ -132,7 +132,7 @@ def _build_splitk_kernel(
     tiles_n = n // bn
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
-    def gemm_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, aux: fx.Tensor):
+    def mr_hgemm_splitk(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, aux: fx.Tensor):
         tid = fx.thread_idx.x
         bid_x, bid_y, bid_z = fx.block_idx
         warp_id = tid // WARP_SIZE
@@ -383,7 +383,7 @@ def _build_splitk_kernel(
             )
 
     smem_bytes = stage_elems * 2 * STAGES
-    return gemm_kernel, threads, smem_bytes, bm, bn, bk
+    return mr_hgemm_splitk, threads, smem_bytes, bm, bn, bk
 
 
 def compile_iluvatar_mr_hgemm_splitk(

@@ -64,7 +64,7 @@ def _build_delta_kernel(*, B: int, H: int, Sq_phys: int, D: int, dtype: str):
     num_q_tiles = Sq_phys // BLOCK_M
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
-    def delta_kernel(O: fx.Tensor, dO: fx.Tensor, Delta: fx.Tensor):  # noqa: E741
+    def flex_attn_bwd_delta(O: fx.Tensor, dO: fx.Tensor, Delta: fx.Tensor):  # noqa: E741
         bh_idx = fx.block_idx.x
         q_tile_idx = fx.block_idx.y
         tid = fx.thread_idx.x
@@ -132,7 +132,7 @@ def _build_delta_kernel(*, B: int, H: int, Sq_phys: int, D: int, dtype: str):
 
     @flyc.jit
     def launch_delta(O: fx.Tensor, dO: fx.Tensor, Delta: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
-        delta_kernel(O, dO, Delta).launch(
+        flex_attn_bwd_delta(O, dO, Delta).launch(
             grid=(B * H, num_q_tiles, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
