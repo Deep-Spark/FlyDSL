@@ -140,7 +140,7 @@ jobs:
                 venv=".venvs/release/${py_tag}"
                 "${py}" -m venv "${venv}"
                 source "${venv}/bin/activate"
-                python -m pip install -U pip setuptools wheel numpy 'nanobind>=2.9,<3' pybind11 auditwheel
+                python -m pip install -U pip setuptools wheel numpy "nanobind>=2.9,<3" pybind11 auditwheel
                 cmake -S . -B "${build_dir}" -G Ninja \
                   -DFLYDSL_BACKENDS=iluvatar \
                   -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
