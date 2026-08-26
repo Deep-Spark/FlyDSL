@@ -14,8 +14,13 @@
 
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
+#include <atomic>
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "cuda.h"
@@ -47,18 +52,23 @@ static void ensureCudaInitialized() {
   (void)initialized;
 }
 
-// Use the caller-owned CUDA context when one is current so load/launch stay
-// on that device. Push the primary context of defaultDevice only when none
-// is current. Serving already has a context, so this skips the push/pop pair.
+// Make a CUDA context current for this scope. Does not move a CUmodule or
+// CUfunction onto that context -- those stay bound to the context that
+// loaded them. The fallback primary is retained once, from the first
+// defaultDevice seen in this process.
 class ScopedContext {
+  CUcontext currentContext = nullptr;
   bool ownsPush = false;
 
 public:
   ScopedContext() {
     ensureCudaInitialized();
-    CUcontext current = nullptr;
-    CUresult status = cuCtxGetCurrent(&current);
-    if (status == CUDA_SUCCESS && current != nullptr)
+    CUresult status = cuCtxGetCurrent(&currentContext);
+    if (status != CUDA_SUCCESS) {
+      CUDA_REPORT_IF_ERROR(status);
+      currentContext = nullptr;
+    }
+    if (currentContext != nullptr)
       return;
 
     static CUcontext primary = [] {
@@ -67,6 +77,7 @@ public:
       return ctx;
     }();
     CUDA_REPORT_IF_ERROR(cuCtxPushCurrent(primary));
+    currentContext = primary;
     ownsPush = true;
   }
 
@@ -74,37 +85,158 @@ public:
     if (ownsPush)
       CUDA_REPORT_IF_ERROR(cuCtxPopCurrent(nullptr));
   }
+
+  // The context every call in this scope runs against, so callers that also
+  // need it do not pay for a second cuCtxGetCurrent.
+  CUcontext context() const { return currentContext; }
 };
 
-extern "C" CUmodule mgpuModuleLoad(void *data, size_t /*gpuBlobSize*/) {
+// Cubin/PTX bytes plus the module loaded from them into each CUDA context that
+// used them. A CUmodule, and every CUfunction resolved from it, only works in
+// the context that created it, while the JIT host stub holds a single handle
+// for all callers -- so a context that has not seen this binary loads its own
+// copy instead of reusing a handle that does not belong to it.
+struct LoadedGpuBinary {
+  std::vector<char> blob;
+  int jitOptLevel = -1;
+  std::mutex mutex;
+  std::unordered_map<CUcontext, CUmodule> modules;
+
+  CUmodule loadInCurrentContext() {
+    CUmodule module = nullptr;
+    if (jitOptLevel >= 0) {
+      char jitErrorBuffer[4096] = {0};
+      CUjit_option jitOptions[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                                   CU_JIT_OPTIMIZATION_LEVEL};
+      void *jitOptionsVals[] = {jitErrorBuffer, reinterpret_cast<void *>(sizeof(jitErrorBuffer)),
+                                reinterpret_cast<void *>(jitOptLevel)};
+      CUresult result = cuModuleLoadDataEx(&module, blob.data(), 3, jitOptions, jitOptionsVals);
+      if (result) {
+        fprintf(stderr, "JIT compilation failed with: '%s'\n", jitErrorBuffer);
+        CUDA_REPORT_IF_ERROR(result);
+      }
+      return module;
+    }
+    CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, blob.data()));
+    return module;
+  }
+
+  // `context` must be the current one, since loading targets whatever context
+  // is current.
+  CUmodule moduleFor(CUcontext context) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = modules.find(context);
+    if (it != modules.end())
+      return it->second;
+    CUmodule module = loadInCurrentContext();
+    if (module)
+      modules.emplace(context, module);
+    return module;
+  }
+};
+
+// Bumped whenever a binary is unloaded, so memo entries that may name a
+// CUfunction from a freed module stop matching. Allocators reuse addresses,
+// so the memo cannot rely on the binary pointer alone staying meaningful.
+static std::atomic<uint64_t> unloadGeneration{1};
+
+// The JIT host stub re-resolves the kernel on every launch, and walking the
+// shared table costs a chain of dependent loads that miss cache when a launch
+// touches it just once. A direct-mapped thread-local memo answers the repeat
+// case out of a single line, without locking, and is trusted only while it
+// still agrees with the current context and generation.
+struct FunctionMemoEntry {
+  CUmodule binary = nullptr;
+  const char *name = nullptr;
+  CUcontext context = nullptr;
+  CUfunction function = nullptr;
+  uint64_t generation = 0;
+};
+
+static FunctionMemoEntry &functionMemoSlot(CUmodule binary, const char *name) {
+  constexpr size_t numSlots = 64;
+  static thread_local FunctionMemoEntry memo[numSlots];
+  uintptr_t mixed =
+      (reinterpret_cast<uintptr_t>(binary) >> 4) ^ (reinterpret_cast<uintptr_t>(name) >> 3);
+  return memo[mixed & (numSlots - 1)];
+}
+
+static CUmodule makeLoadedGpuBinary(CUcontext context, const char *data, size_t size,
+                                    int jitOptLevel) {
+  if (!context || !data || size == 0)
+    return nullptr;
+  auto *binary = new LoadedGpuBinary();
+  binary->blob.assign(data, data + size);
+  binary->jitOptLevel = jitOptLevel;
+  if (!binary->moduleFor(context)) {
+    delete binary;
+    return nullptr;
+  }
+  return reinterpret_cast<CUmodule>(binary);
+}
+
+extern "C" CUmodule mgpuModuleLoad(void *data, size_t gpuBlobSize) {
   ScopedContext scopedContext;
-  CUmodule module = nullptr;
-  CUDA_REPORT_IF_ERROR(cuModuleLoadData(&module, data));
-  return module;
+  return makeLoadedGpuBinary(scopedContext.context(), static_cast<const char *>(data), gpuBlobSize,
+                             /*jitOptLevel=*/-1);
 }
 
 extern "C" CUmodule mgpuModuleLoadJIT(void *data, int optLevel) {
   ScopedContext scopedContext;
-  CUmodule module = nullptr;
-  char jitErrorBuffer[4096] = {0};
-  CUjit_option jitOptions[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
-                               CU_JIT_OPTIMIZATION_LEVEL};
-  void *jitOptionsVals[] = {jitErrorBuffer, reinterpret_cast<void *>(sizeof(jitErrorBuffer)),
-                            reinterpret_cast<void *>(optLevel)};
-
-  CUresult result = cuModuleLoadDataEx(&module, data, 3, jitOptions, jitOptionsVals);
-  if (result) {
-    fprintf(stderr, "JIT compilation failed with: '%s'\n", jitErrorBuffer);
-    CUDA_REPORT_IF_ERROR(result);
-  }
-  return module;
+  if (!data)
+    return nullptr;
+  const char *text = static_cast<const char *>(data);
+  return makeLoadedGpuBinary(scopedContext.context(), text, std::strlen(text) + 1, optLevel);
 }
 
-extern "C" void mgpuModuleUnload(CUmodule module) { CUDA_REPORT_IF_ERROR(cuModuleUnload(module)); }
+extern "C" void mgpuModuleUnload(CUmodule module) {
+  if (!module)
+    return;
+  auto *binary = reinterpret_cast<LoadedGpuBinary *>(module);
+  std::unordered_map<CUcontext, CUmodule> modules;
+  {
+    std::lock_guard<std::mutex> lock(binary->mutex);
+    modules.swap(binary->modules);
+  }
+  unloadGeneration.fetch_add(1, std::memory_order_relaxed);
+  CUcontext current = nullptr;
+  CUDA_REPORT_IF_ERROR(cuCtxGetCurrent(&current));
+  for (const auto &entry : modules) {
+    bool pushed = false;
+    if (current != entry.first) {
+      CUresult status = cuCtxPushCurrent(entry.first);
+      if (status != CUDA_SUCCESS) {
+        CUDA_REPORT_IF_ERROR(status);
+        continue;
+      }
+      pushed = true;
+    }
+    CUDA_REPORT_IF_ERROR(cuModuleUnload(entry.second));
+    if (pushed)
+      CUDA_REPORT_IF_ERROR(cuCtxPopCurrent(nullptr));
+  }
+  delete binary;
+}
 
 extern "C" CUfunction mgpuModuleGetFunction(CUmodule module, const char *name) {
+  if (!module || !name)
+    return nullptr;
+  ScopedContext scopedContext;
+  CUcontext context = scopedContext.context();
+  uint64_t generation = unloadGeneration.load(std::memory_order_relaxed);
+  FunctionMemoEntry &slot = functionMemoSlot(module, name);
+  if (slot.binary == module && slot.name == name && slot.context == context &&
+      slot.generation == generation)
+    return slot.function;
+
+  auto *binary = reinterpret_cast<LoadedGpuBinary *>(module);
+  CUmodule cuModule = binary->moduleFor(context);
+  if (!cuModule)
+    return nullptr;
   CUfunction function = nullptr;
-  CUDA_REPORT_IF_ERROR(cuModuleGetFunction(&function, module, name));
+  CUDA_REPORT_IF_ERROR(cuModuleGetFunction(&function, cuModule, name));
+  if (function)
+    slot = {module, name, context, function, generation};
   return function;
 }
 
@@ -251,4 +383,8 @@ extern "C" StridedMemRefType<int32_t, 1> mgpuMemGetDeviceMemRef1dInt32(int32_t *
   return {devicePtr, devicePtr, offset, {size}, {stride}};
 }
 
-extern "C" void mgpuSetDefaultDevice(int32_t device) { defaultDevice = device; }
+extern "C" void mgpuSetDefaultDevice(int32_t device) {
+  // Thread-local only. The no-current-context fallback in ScopedContext is a
+  // process-static retain of whichever defaultDevice was first observed.
+  defaultDevice = device;
+}
