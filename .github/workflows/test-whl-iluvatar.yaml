@@ -18,6 +18,11 @@ on:
         type: string
         required: false
         default: ""
+      source_ref:
+        description: "Git ref to check out for tests (empty uses the caller SHA)"
+        type: string
+        required: false
+        default: ""
   workflow_dispatch:
     inputs:
       docker_image:
@@ -47,6 +52,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Download wheel artifacts (current run)
         if: ${{ (inputs.build_run_id || '') == '' }}
