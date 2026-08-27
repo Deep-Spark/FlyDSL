@@ -48,6 +48,7 @@ __all__ = [
     "cmpi",
     "cmpf",
     "maxnumf",
+    "minnumf",
     "maximumf",
     "minimumf",
     "shrui",
@@ -91,6 +92,20 @@ def maxnumf(a, b, **kwargs):
     from .typing import Vector
 
     result = arith.maxnumf(as_ir_value(a), as_ir_value(b), **kwargs)
+    if isinstance(a, Vector):
+        return Vector(result, a.shape, a.dtype)
+    if isinstance(a, Numeric):
+        return Numeric.from_ir_type(result.type)(result)
+    return result
+
+
+@dsl_loc_tracing
+def minnumf(a, b, **kwargs):
+    """Floating-point minimum, returning the non-NaN operand when one input is NaN (libm ``fmin``)."""
+    from .numeric import Numeric
+    from .typing import Vector
+
+    result = arith.minnumf(as_ir_value(a), as_ir_value(b), **kwargs)
     if isinstance(a, Vector):
         return Vector(result, a.shape, a.dtype)
     if isinstance(a, Numeric):
