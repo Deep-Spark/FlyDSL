@@ -23,6 +23,11 @@ on:
         type: string
         required: false
         default: ""
+      suite:
+        description: "smoke: import/link/compile-only. full: also run must-pass device tests"
+        type: string
+        required: false
+        default: "smoke"
   workflow_dispatch:
     inputs:
       docker_image:
@@ -73,6 +78,7 @@ jobs:
       - name: Install wheel and run Iluvatar smoke tests
         env:
           DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+          TEST_SUITE: ${{ inputs.suite || 'smoke' }}
         run: |
           set -euo pipefail
           GPU_DEVICES=""
@@ -121,6 +127,7 @@ jobs:
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
             -w /workspace \
             -e COREX_ROOT="${COREX_ROOT}" \
+            -e TEST_SUITE="${TEST_SUITE}" \
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
@@ -136,4 +143,15 @@ jobs:
               FLYDSL_RUNTIME_KIND=iluvatar \
               COMPILE_ONLY=1 \
               python -m pytest tests/unit/test_iluvatar_compile_backend.py -v
+              if [ "${TEST_SUITE}" = "full" ]; then
+                FLYDSL_COMPILE_BACKEND=iluvatar \
+                FLYDSL_RUNTIME_KIND=iluvatar \
+                python -m pytest \
+                  tests/unit/test_iluvatar_binary_pipeline_smoke.py \
+                  tests/unit/test_iluvatar_compile_backend.py \
+                  tests/unit/test_iluvatar_jit_launch_smoke.py \
+                  tests/unit/test_iluvatar_jit_runtime_resolution.py \
+                  tests/kernels/test_iluvatar_*.py \
+                  -m iluvatar_lower -v
+              fi
             '
