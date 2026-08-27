@@ -35,6 +35,7 @@ FLYDSL_ILUVATAR_SMOKE_BLOB_PATH="${FLYDSL_ILUVATAR_SMOKE_BLOB_PATH:-}"
 FLYDSL_ILUVATAR_SMOKE_KERNEL="${FLYDSL_ILUVATAR_SMOKE_KERNEL:-}"
 FLYDSL_ILUVATAR_LAUNCH_KERNEL="${FLYDSL_ILUVATAR_LAUNCH_KERNEL:-}"
 COREX_VERSION_TAG="${COREX_VERSION_TAG:-}"
+CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 
 if [[ ! -d "${WORKSPACE}" ]]; then
   echo "::error::Workspace does not exist: ${WORKSPACE}"
@@ -175,6 +176,7 @@ docker_args=(
   -e HOST_MPI_LIB_DIR="${host_mpi_lib_dir}"
   -e PYTHONUNBUFFERED=1
   -e CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+  -e CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
 )
 
 if [[ -n "${host_mpi_lib_dir}" ]]; then
@@ -272,6 +274,7 @@ PY
     python3 /workspace/.github/scripts/ci_device_cuda_preflight.py
 
     cmake -S . -B build-fly -G Ninja \
+      -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
       -DFLYDSL_BACKENDS=iluvatar \
       -DMLIR_DIR="${MLIR_DIR}" \
       -DCUDAToolkit_ROOT="${CUDAToolkit_ROOT}" \

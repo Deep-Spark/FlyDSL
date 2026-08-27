@@ -16,6 +16,13 @@ on:
         description: "Iluvatar build/test image"
         type: string
         default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      cmake_build_type:
+        description: "FlyDSL CMake build type"
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
@@ -27,6 +34,7 @@ jobs:
     with:
       python_versions: ${{ inputs.python_versions || '3.12' }}
       docker_image: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      cmake_build_type: ${{ inputs.cmake_build_type || 'Release' }}
 
   test:
     needs: build

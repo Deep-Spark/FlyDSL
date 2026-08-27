@@ -11,6 +11,14 @@ on:
         required: false
         type: string
         default: ""
+      cmake_build_type:
+        description: "FlyDSL CMake build type"
+        required: false
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
 
 permissions:
   contents: read
@@ -37,6 +45,7 @@ jobs:
       IXCC_WORKING_ROOT: ${{ vars.IXCC_WORKING_ROOT || '' }}
       IXSDK_WORKING_ROOT: ${{ vars.IXSDK_WORKING_ROOT || '' }}
       IX_TOOLCHAIN_DAILY_STATE_FILE: ${{ vars.IX_TOOLCHAIN_DAILY_STATE_FILE || '' }}
+      CMAKE_BUILD_TYPE: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
     steps:
       - name: Checkout CI utils (workflow ref)
         uses: actions/checkout@v4
@@ -124,6 +133,7 @@ jobs:
             fi
             rm -rf /workspace/build-fly
             cmake -S /workspace -B /workspace/build-fly -G Ninja \
+              -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
               -DFLYDSL_BACKENDS=iluvatar \
               -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
               -DCUDAToolkit_ROOT="${COREX_ROOT}" \

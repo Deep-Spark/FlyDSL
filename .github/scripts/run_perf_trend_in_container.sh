@@ -132,6 +132,7 @@ docker_args=(
   -e HOME=/workspace
   -e XDG_CACHE_HOME="${PERF_CACHE_ROOT}"
   -e FLYDSL_RUNTIME_CACHE_DIR="${PERF_CACHE_DIR}"
+  -e CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 )
 
 # Forward suite defaults.env / host FLYDSL_* (+ ARCH) into the container.
