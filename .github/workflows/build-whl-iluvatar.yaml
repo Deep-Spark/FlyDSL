@@ -13,6 +13,11 @@ on:
         type: string
         required: false
         default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      cmake_build_type:
+        description: "FlyDSL CMake build type"
+        type: string
+        required: false
+        default: "Release"
     outputs:
       wheel_names:
         description: "Space-separated built wheel filenames"
@@ -32,6 +37,14 @@ on:
         type: string
         required: false
         default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      cmake_build_type:
+        description: "FlyDSL CMake build type"
+        type: choice
+        required: false
+        options:
+          - Release
+          - Debug
+        default: Release
 
 jobs:
   build:
@@ -48,6 +61,7 @@ jobs:
       DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
       PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
       WHEEL_ARTIFACT_NAME: flydsl-iluvatar-wheels-${{ github.run_id }}
+      CMAKE_BUILD_TYPE: ${{ inputs.cmake_build_type || 'Release' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -128,6 +142,7 @@ jobs:
             -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
             -e FLYDSL_RELEASE_TYPE=devreleases \
             -e FLYDSL_VERSION_LOCAL_SUFFIX="run.${GITHUB_RUN_ID}" \
+            -e CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
@@ -142,6 +157,7 @@ jobs:
                 source "${venv}/bin/activate"
                 python -m pip install -U pip setuptools wheel numpy "nanobind>=2.9,<3" pybind11 auditwheel
                 cmake -S . -B "${build_dir}" -G Ninja \
+                  -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
                   -DFLYDSL_BACKENDS=iluvatar \
                   -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
                   -DCUDAToolkit_ROOT="${COREX_ROOT}" \
