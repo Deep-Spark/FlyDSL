@@ -1,0 +1,136 @@
+name: Weekly Wheels (Iluvatar A-track)
+
+# Builds the latest iluvatar branch, tests the wheel, then publishes a GitHub
+# Release whose latest/download URL stays stable:
+#   .../releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl
+# The self-hosted build stages a local incoming copy; latest is overwritten
+# only after tests pass:
+#   /home/flydsl/sw_home/local/flydsl-wheels/iluvatar/latest/
+#
+# schedule only runs from the repository default branch. workflow_dispatch can
+# be used on this branch before that. Manual ci-whl-iluvatar is unchanged.
+
+on:
+  schedule:
+    # Sunday 03:00 UTC == Sunday 11:00 Asia/Shanghai, so Monday has a fresh wheel.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Git ref to build (default iluvatar)"
+        type: string
+        required: false
+        default: "iluvatar"
+      python_versions:
+        description: "Space-separated python versions"
+        type: string
+        required: false
+        default: "3.12"
+      docker_image:
+        description: "Iluvatar build/test image"
+        type: string
+        required: false
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      cmake_build_type:
+        description: "FlyDSL CMake build type"
+        type: choice
+        required: false
+        options:
+          - Release
+          - Debug
+        default: Release
+
+permissions:
+  contents: write
+  actions: read
+  packages: read
+
+concurrency:
+  group: weekly-whl-iluvatar
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-whl-iluvatar.yaml
+    with:
+      python_versions: ${{ github.event_name == 'workflow_dispatch' && inputs.python_versions || '3.12' }}
+      docker_image: ${{ github.event_name == 'workflow_dispatch' && inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      source_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}
+      local_wheel_dir: ${{ format('{0}/incoming', vars.FLYDSL_ILUVATAR_WEEKLY_WHEEL_DIR || '/home/flydsl/sw_home/local/flydsl-wheels/iluvatar') }}
+      cmake_build_type: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
+    permissions:
+      contents: read
+      packages: read
+
+  test:
+    needs: build
+    uses: ./.github/workflows/test-whl-iluvatar.yaml
+    with:
+      docker_image: ${{ github.event_name == 'workflow_dispatch' && inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      wheel_artifact_name: ${{ needs.build.outputs.artifact_name }}
+      source_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}
+      suite: full
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+
+  promote-local:
+    needs: [build, test]
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 10
+    env:
+      WHEEL_ROOT: ${{ vars.FLYDSL_ILUVATAR_WEEKLY_WHEEL_DIR || '/home/flydsl/sw_home/local/flydsl-wheels/iluvatar' }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v4
+
+      - name: Promote incoming wheels to latest
+        run: |
+          set -euo pipefail
+          bash .github/scripts/promote_iluvatar_weekly_wheel_local.sh \
+            "${WHEEL_ROOT}/incoming" "${WHEEL_ROOT}/latest"
+
+      - name: Write local promote summary
+        run: |
+          {
+            echo "### Local weekly wheel copy"
+            echo
+            echo "- Directory: \`${{ env.WHEEL_ROOT }}/latest\`"
+            echo "- Install: \`pip install ${{ env.WHEEL_ROOT }}/latest/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  publish:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v4
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: dist
+
+      - name: Publish weekly GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          find dist -type f | sort
+          bash .github/scripts/publish_iluvatar_weekly_release.sh dist \
+            "${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}"
+
+      - name: Write publish summary
+        run: |
+          {
+            echo "### Iluvatar weekly wheel"
+            echo
+            echo "- Source ref: \`${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}\`"
+            echo "- Artifact: \`${{ needs.build.outputs.artifact_name }}\`"
+            echo "- Stable URL: https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+            echo "- Local copy: \`/home/flydsl/sw_home/local/flydsl-wheels/iluvatar/latest/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
