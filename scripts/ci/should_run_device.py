@@ -81,6 +81,23 @@ def _fetch_pull_request_files(owner_repo: str, pr_number: int, token: str) -> li
     return files
 
 
+def _fetch_compare_files(owner_repo: str, base_sha: str, head_sha: str, token: str) -> tuple[list[str], bool]:
+    url = (
+        f"https://api.github.com/repos/{owner_repo}/compare/"
+        + urllib.parse.quote(base_sha)
+        + "..."
+        + urllib.parse.quote(head_sha)
+    )
+    payload = _api_get(url, token)
+    if not isinstance(payload, dict):
+        return [], False
+    files: list[str] = []
+    for item in payload.get("files", []) or []:
+        if isinstance(item, dict) and "filename" in item:
+            files.append(str(item["filename"]))
+    return files, bool(payload.get("truncated"))
+
+
 def _matches_path_filters(changed_files: list[str], path_filters: list[str]) -> tuple[bool, list[str]]:
     matches: list[str] = []
     for changed_file in changed_files:
@@ -178,6 +195,23 @@ def _decide(
             return False, "Skipped by policy: fork pull_request cannot auto-run ci-device.", [], []
         labels = _fetch_pull_request_labels(repository, int(pr_number), token)
         changed_files = _fetch_pull_request_files(repository, int(pr_number), token)
+    elif event_name == "push":
+        before_sha = str(event_payload.get("before") or "").strip()
+        after_sha = str(event_payload.get("after") or "").strip()
+        zero_sha = "0" * 40
+        if not after_sha:
+            return False, "Skipped by policy: push event has no after SHA.", [], []
+        if not before_sha or before_sha == zero_sha:
+            return True, "Running because this is a new ref with no compare base.", [], []
+        changed_files, truncated = _fetch_compare_files(repository, before_sha, after_sha, token)
+        if truncated:
+            return (
+                True,
+                "Running because GitHub compare result is truncated; treating as matched.",
+                changed_files,
+                changed_files,
+            )
+        labels = []
     else:
         return False, f"Skipped by policy: unsupported event `{event_name}`.", [], []
 
@@ -204,7 +238,7 @@ def main() -> int:
     if not event_name or not event_path:
         print("Missing GITHUB_EVENT_NAME or GITHUB_EVENT_PATH", file=sys.stderr)
         return 2
-    needs_api = event_name in {"pull_request", "workflow_run"}
+    needs_api = event_name in {"pull_request", "workflow_run", "push"}
     if needs_api and (not repository or not token):
         print("Missing GITHUB_REPOSITORY or GITHUB_TOKEN", file=sys.stderr)
         return 2
