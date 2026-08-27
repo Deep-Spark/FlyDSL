@@ -163,3 +163,52 @@ def test_workflow_run_same_repo_with_head_fork_flag_still_runs_by_path(monkeypat
     assert "path filter" in reason
     assert "kernels/foo.py" in changed
     assert "kernels/foo.py" in matched
+
+
+def test_push_path_match_triggers(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(
+        module,
+        "_fetch_compare_files",
+        lambda *_args, **_kwargs: (["python/flydsl/compiler/foo.py", "README.md"], False),
+    )
+    should_run, reason, changed, matched = module._decide(  # pylint: disable=protected-access
+        event_name="push",
+        event_payload={"before": "aaa", "after": "bbb"},
+        config=_base_config(),
+        repository="deepspark/FlyDSL",
+        token="dummy",
+    )
+    assert should_run is True
+    assert "path filter" in reason
+    assert "python/flydsl/compiler/foo.py" in changed
+    assert "python/flydsl/compiler/foo.py" in matched
+
+
+def test_push_unmatched_paths_skip(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "_fetch_compare_files", lambda *_args, **_kwargs: (["docs/readme.md"], False))
+    should_run, reason, _, _ = module._decide(  # pylint: disable=protected-access
+        event_name="push",
+        event_payload={"before": "aaa", "after": "bbb"},
+        config=_base_config(),
+        repository="deepspark/FlyDSL",
+        token="dummy",
+    )
+    assert should_run is False
+    assert "no matched paths" in reason
+
+
+def test_push_new_ref_runs_without_compare():
+    module = _load_module()
+    should_run, reason, changed, matched = module._decide(  # pylint: disable=protected-access
+        event_name="push",
+        event_payload={"before": "0" * 40, "after": "abc"},
+        config=_base_config(),
+        repository="deepspark/FlyDSL",
+        token="dummy",
+    )
+    assert should_run is True
+    assert "new ref" in reason
+    assert changed == []
+    assert matched == []

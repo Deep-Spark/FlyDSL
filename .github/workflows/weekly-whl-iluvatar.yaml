@@ -1,18 +1,19 @@
-name: Weekly Wheels (Iluvatar A-track)
+name: Publish Wheels (Iluvatar A-track)
 
-# Builds the latest iluvatar branch, tests the wheel, then publishes a GitHub
-# Release whose latest/download URL stays stable:
-#   .../releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl
-# The self-hosted build stages a local incoming copy; latest is overwritten
-# only after tests pass:
-#   /home/flydsl/sw_home/local/flydsl-wheels/iluvatar/latest/
-#
-# schedule only runs from the repository default branch. workflow_dispatch can
-# be used on this branch before that. Manual ci-whl-iluvatar is unchanged.
+# Two channels:
+# - ci: push to iluvatar (ci-device path filters). Smoke tests only.
+#   URL: .../releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl
+#   Local: .../flydsl-wheels/iluvatar/ci/
+# - weekly: Sunday / dispatch. Fuller device tests; GitHub "latest".
+#   URL: .../releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl
+#   Local: .../flydsl-wheels/iluvatar/latest/
 
 on:
+  push:
+    branches:
+      - iluvatar
   schedule:
-    # Sunday 03:00 UTC == Sunday 11:00 Asia/Shanghai, so Monday has a fresh wheel.
+    # Sunday 03:00 UTC == Sunday 11:00 Asia/Shanghai.
     - cron: "0 3 * * 0"
   workflow_dispatch:
     inputs:
@@ -39,6 +40,14 @@ on:
           - Release
           - Debug
         default: Release
+      package_kind:
+        description: "ci: smoke-tested downstream CI wheel. weekly: fuller-tested formal wheel"
+        type: choice
+        required: false
+        options:
+          - weekly
+          - ci
+        default: weekly
 
 permissions:
   contents: write
@@ -46,37 +55,120 @@ permissions:
   packages: read
 
 concurrency:
-  group: weekly-whl-iluvatar
-  cancel-in-progress: false
+  group: publish-whl-iluvatar-${{ github.event_name == 'push' && 'ci' || (github.event_name == 'workflow_dispatch' && inputs.package_kind == 'ci' && 'ci' || 'weekly') }}
+  cancel-in-progress: true
 
 jobs:
+  gate:
+    name: should-publish
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+      source_ref: ${{ steps.refs.outputs.source_ref }}
+      channel: ${{ steps.gate.outputs.channel }}
+      test_suite: ${{ steps.gate.outputs.test_suite }}
+      local_name: ${{ steps.gate.outputs.local_name }}
+    steps:
+      - name: Resolve source ref
+        id: refs
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            workflow_dispatch)
+              echo "source_ref=${{ inputs.source_ref || 'iluvatar' }}" >> "${GITHUB_OUTPUT}"
+              ;;
+            push)
+              echo "source_ref=${{ github.sha }}" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "source_ref=iluvatar" >> "${GITHUB_OUTPUT}"
+              ;;
+          esac
+
+      - name: Checkout
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+
+      - name: Decide whether this push needs a wheel
+        id: decision
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/ci/should_run_device.py --config .github/ci-config.yaml
+
+      - name: Finalize gate
+        id: gate
+        run: |
+          set -euo pipefail
+          event="${{ github.event_name }}"
+          if [ "${event}" = "push" ]; then
+            channel=ci
+            echo "should_run=${{ steps.decision.outputs.should_run }}" >> "${GITHUB_OUTPUT}"
+            echo "reason=${{ steps.decision.outputs.reason }}" >> "${GITHUB_OUTPUT}"
+          elif [ "${event}" = "workflow_dispatch" ] && [ "${{ inputs.package_kind }}" = "ci" ]; then
+            channel=ci
+            echo "should_run=true" >> "${GITHUB_OUTPUT}"
+            echo "reason=Manual Iluvatar CI wheel publish." >> "${GITHUB_OUTPUT}"
+          else
+            channel=weekly
+            echo "should_run=true" >> "${GITHUB_OUTPUT}"
+            echo "reason=Scheduled or manual Iluvatar weekly wheel publish." >> "${GITHUB_OUTPUT}"
+          fi
+          if [ "${channel}" = "ci" ]; then
+            echo "channel=ci" >> "${GITHUB_OUTPUT}"
+            echo "test_suite=smoke" >> "${GITHUB_OUTPUT}"
+            echo "local_name=ci" >> "${GITHUB_OUTPUT}"
+          else
+            echo "channel=weekly" >> "${GITHUB_OUTPUT}"
+            echo "test_suite=full" >> "${GITHUB_OUTPUT}"
+            echo "local_name=latest" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Write gate summary
+        run: |
+          {
+            echo "### Iluvatar wheel publish gate"
+            echo
+            echo "- event: \`${{ github.event_name }}\`"
+            echo "- channel: \`${{ steps.gate.outputs.channel }}\`"
+            echo "- source_ref: \`${{ steps.refs.outputs.source_ref }}\`"
+            echo "- should_run: \`${{ steps.gate.outputs.should_run }}\`"
+            echo "- test_suite: \`${{ steps.gate.outputs.test_suite }}\`"
+            echo "- reason: ${{ steps.gate.outputs.reason }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   build:
+    needs: [gate]
+    if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' }}
     uses: ./.github/workflows/build-whl-iluvatar.yaml
     with:
       python_versions: ${{ github.event_name == 'workflow_dispatch' && inputs.python_versions || '3.12' }}
       docker_image: ${{ github.event_name == 'workflow_dispatch' && inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
-      source_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}
-      local_wheel_dir: ${{ format('{0}/incoming', vars.FLYDSL_ILUVATAR_WEEKLY_WHEEL_DIR || '/home/flydsl/sw_home/local/flydsl-wheels/iluvatar') }}
+      source_ref: ${{ needs.gate.outputs.source_ref }}
+      local_wheel_dir: ${{ format('{0}/incoming-{1}', vars.FLYDSL_ILUVATAR_WEEKLY_WHEEL_DIR || '/home/flydsl/sw_home/local/flydsl-wheels/iluvatar', needs.gate.outputs.channel) }}
       cmake_build_type: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
     permissions:
       contents: read
       packages: read
 
   test:
-    needs: build
+    needs: [gate, build]
+    if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' && needs.build.result == 'success' }}
     uses: ./.github/workflows/test-whl-iluvatar.yaml
     with:
       docker_image: ${{ github.event_name == 'workflow_dispatch' && inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
       wheel_artifact_name: ${{ needs.build.outputs.artifact_name }}
-      source_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}
-      suite: full
+      source_ref: ${{ needs.gate.outputs.source_ref }}
+      suite: ${{ needs.gate.outputs.test_suite }}
     permissions:
       contents: read
       actions: read
       packages: read
 
   promote-local:
-    needs: [build, test]
+    needs: [gate, build, test]
+    if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' && needs.test.result == 'success' }}
     runs-on: [self-hosted, linux, x64, gpu-iluvatar]
     timeout-minutes: 10
     env:
@@ -89,19 +181,21 @@ jobs:
         run: |
           set -euo pipefail
           bash .github/scripts/promote_iluvatar_weekly_wheel_local.sh \
-            "${WHEEL_ROOT}/incoming" "${WHEEL_ROOT}/latest"
+            "${WHEEL_ROOT}/incoming-${{ needs.gate.outputs.channel }}" \
+            "${WHEEL_ROOT}/${{ needs.gate.outputs.local_name }}"
 
       - name: Write local promote summary
         run: |
           {
-            echo "### Local weekly wheel copy"
+            echo "### Local ${{ needs.gate.outputs.channel }} wheel copy"
             echo
-            echo "- Directory: \`${{ env.WHEEL_ROOT }}/latest\`"
-            echo "- Install: \`pip install ${{ env.WHEEL_ROOT }}/latest/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
+            echo "- Directory: \`${{ env.WHEEL_ROOT }}/${{ needs.gate.outputs.local_name }}\`"
+            echo "- Install: \`pip install ${{ env.WHEEL_ROOT }}/${{ needs.gate.outputs.local_name }}/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   publish:
-    needs: [build, test]
+    needs: [gate, build, test]
+    if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' && needs.test.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -122,15 +216,20 @@ jobs:
           set -euo pipefail
           find dist -type f | sort
           bash .github/scripts/publish_iluvatar_weekly_release.sh dist \
-            "${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}"
+            "${{ needs.gate.outputs.source_ref }}" \
+            "${{ needs.gate.outputs.channel }}"
 
       - name: Write publish summary
         run: |
           {
-            echo "### Iluvatar weekly wheel"
+            echo "### Iluvatar ${{ needs.gate.outputs.channel }} wheel"
             echo
-            echo "- Source ref: \`${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'iluvatar' }}\`"
+            echo "- Source ref: \`${{ needs.gate.outputs.source_ref }}\`"
             echo "- Artifact: \`${{ needs.build.outputs.artifact_name }}\`"
-            echo "- Stable URL: https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
-            echo "- Local copy: \`/home/flydsl/sw_home/local/flydsl-wheels/iluvatar/latest/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
+            if [ "${{ needs.gate.outputs.channel }}" = "ci" ]; then
+              echo "- URL: https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+            else
+              echo "- URL: https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+            fi
+            echo "- Local copy: \`/home/flydsl/sw_home/local/flydsl-wheels/iluvatar/${{ needs.gate.outputs.local_name }}/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
           } >> "${GITHUB_STEP_SUMMARY}"
