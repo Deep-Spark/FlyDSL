@@ -13,6 +13,16 @@ on:
         type: string
         required: false
         default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      source_ref:
+        description: "Git ref to build (empty uses the caller SHA)"
+        type: string
+        required: false
+        default: ""
+      local_wheel_dir:
+        description: "If set, stage a stable-named copy here on this runner after upload (incoming, not latest)"
+        type: string
+        required: false
+        default: ""
       cmake_build_type:
         description: "FlyDSL CMake build type"
         type: string
@@ -69,6 +79,7 @@ jobs:
           submodules: recursive
           # Need full history so setup.py can resolve a stable short hash / date tag.
           fetch-depth: 0
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Login to GHCR (best effort)
         continue-on-error: true
@@ -218,3 +229,14 @@ jobs:
             dist/wheel-payload-summary.json
           retention-days: 3
           if-no-files-found: error
+
+      # Stage onto this runner at upload time. Weekly promote to latest happens
+      # only after tests pass.
+      - name: Stage a local incoming wheel copy
+        if: ${{ inputs.local_wheel_dir != '' }}
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/stage_iluvatar_weekly_wheel_local.sh dist \
+            "${{ inputs.local_wheel_dir }}"
