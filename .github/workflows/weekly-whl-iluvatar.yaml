@@ -2,9 +2,9 @@ name: Publish Wheels (Iluvatar A-track)
 
 # Two channels:
 # - ci: push to iluvatar (ci-device path filters). Smoke tests only.
-#   Ubuntu 20.04 + cp310 and cp312 (ixaite / glibc 2.31).
+#   Ubuntu 20.04 cp312 by default (ixaite / glibc 2.31).
 # - weekly: Sunday / dispatch. Fuller device tests; GitHub "latest".
-#   Ubuntu 20.04 + cp310/cp312 and Ubuntu 24.04 + cp312.
+#   Ubuntu 20.04 (optional cp310/cp312, default cp312) and Ubuntu 24.04 cp312.
 # Optional local copies use vars.FLYDSL_ILUVATAR_WHEEL_DIR (unset skips staging).
 
 on:
@@ -21,13 +21,13 @@ on:
         type: string
         required: false
         default: "iluvatar"
-      python_versions:
-        description: "Ignored. CI and weekly both build 20.04 cp310 and cp312; weekly also builds 24.04 cp312."
+      u2004_python_versions:
+        description: "Space-separated Ubuntu 20.04 python versions (default 3.12)"
         type: string
         required: false
-        default: ""
+        default: "3.12"
       docker_image:
-        description: "Ignored. CI uses Ubuntu 20.04; weekly builds 20.04 and 24.04."
+        description: "Ignored. CI uses Ubuntu 20.04; weekly also builds Ubuntu 24.04 cp312."
         type: string
         required: false
         default: ""
@@ -102,8 +102,10 @@ jobs:
         env:
           U2004_IMAGE: ${{ vars.FLYDSL_ILUVATAR_U2004_IMAGE || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
           U2404_IMAGE: ${{ vars.FLYDSL_ILUVATAR_U2404_IMAGE || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
-          IXCC_U2004_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_U2004_MLIR_CMAKE }}
+          IXCC_U2004_CP310_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_U2004_CP310_MLIR_CMAKE }}
+          IXCC_U2004_CP312_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_U2004_CP312_MLIR_CMAKE }}
           IXCC_U2404_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_MLIR_CMAKE }}
+          U2004_PYTHON_VERSIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.u2004_python_versions || '3.12' }}
         run: |
           set -euo pipefail
           event="${{ github.event_name }}"
@@ -134,32 +136,40 @@ jobs:
           import os
 
           channel = os.environ["CHANNEL"]
-          u2004_cp310 = {
-              "id": "u2004-cp310",
-              "python_versions": "3.10",
-              "docker_image": os.environ["U2004_IMAGE"],
-              "test_suite": "smoke",
-              "ixcc_mlir_cmake": os.environ.get("IXCC_U2004_MLIR_CMAKE", ""),
+          u2004_image = os.environ["U2004_IMAGE"]
+          u2004_versions = [v.strip() for v in os.environ["U2004_PYTHON_VERSIONS"].split() if v.strip()]
+          ixcc_by_py = {
+              "3.10": os.environ.get("IXCC_U2004_CP310_MLIR_CMAKE", ""),
+              "3.12": os.environ.get("IXCC_U2004_CP312_MLIR_CMAKE", ""),
           }
-          u2004_cp312 = {
-              "id": "u2004-cp312",
-              "python_versions": "3.12",
-              "docker_image": os.environ["U2004_IMAGE"],
-              "test_suite": "smoke",
-              "ixcc_mlir_cmake": os.environ.get("IXCC_U2004_MLIR_CMAKE", ""),
-          }
-          u2404_cp312 = {
-              "id": "u2404-cp312",
-              "python_versions": "3.12",
-              "docker_image": os.environ["U2404_IMAGE"],
-              "test_suite": "full" if channel == "weekly" else "smoke",
-              "ixcc_mlir_cmake": os.environ.get("IXCC_U2404_MLIR_CMAKE", ""),
-          }
-          matrix = (
-              [u2004_cp310, u2004_cp312]
-              if channel == "ci"
-              else [u2004_cp310, u2004_cp312, u2404_cp312]
-          )
+
+          matrix = []
+          for ver in u2004_versions:
+              cp = ver.replace(".", "")
+              matrix.append(
+                  {
+                      "id": f"u2004-cp{cp}",
+                      "python_versions": ver,
+                      "docker_image": u2004_image,
+                      "test_suite": "smoke",
+                      "ixcc_mlir_cmake": ixcc_by_py.get(ver, ""),
+                  }
+              )
+
+          if channel == "weekly":
+              matrix.append(
+                  {
+                      "id": "u2404-cp312",
+                      "python_versions": "3.12",
+                      "docker_image": os.environ["U2404_IMAGE"],
+                      "test_suite": "full",
+                      "ixcc_mlir_cmake": os.environ.get("IXCC_U2404_MLIR_CMAKE", ""),
+                  }
+              )
+
+          if not matrix:
+              raise SystemExit("u2004_python_versions produced an empty build matrix")
+
           print("build_matrix=" + json.dumps(matrix, separators=(",", ":")))
           PY
 
@@ -296,9 +306,9 @@ jobs:
             echo "- Channel: \`${{ needs.gate.outputs.channel }}\`"
             echo "- URLs:"
             if [ "${{ needs.gate.outputs.channel }}" = "ci" ]; then
-              echo "  - https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp310-manylinux_x86_64.whl"
+              echo "  - https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
             else
-              echo "  - https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp310-manylinux_x86_64.whl"
               echo "  - https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+              echo "  - (optional cp310 when built) https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp310-manylinux_x86_64.whl"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
