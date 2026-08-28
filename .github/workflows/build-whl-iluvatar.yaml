@@ -9,10 +9,10 @@ on:
         required: false
         default: "3.12"
       docker_image:
-        description: "Iluvatar build image"
+        description: "Iluvatar build image (default u2004; u2404 stable image opt-in only)"
         type: string
         required: false
-        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+        default: "10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest"
       source_ref:
         description: "Git ref to build (empty uses the caller SHA)"
         type: string
@@ -53,10 +53,10 @@ on:
         required: false
         default: "3.12"
       docker_image:
-        description: "Iluvatar build image"
+        description: "Iluvatar build image (default u2004; u2404 stable image opt-in only)"
         type: string
         required: false
-        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+        default: "10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest"
       cmake_build_type:
         description: "FlyDSL CMake build type"
         type: choice
@@ -75,10 +75,12 @@ jobs:
       artifact_name: ${{ steps.collect.outputs.artifact_name }}
     env:
       COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
+      SW_HOME: ${{ vars.SW_HOME || '/home/flydsl/sw_home' }}
+      U2004_CONDA_BASE: ${{ format('{0}/sdk/.conda-u2004', vars.SW_HOME || '/home/flydsl/sw_home') }}
       # Release wheels use sdk/ixcc-release (xiang.zhang/ixcc-flydsl-release).
       # Dev CI (ci-device / perf) continues to use sdk/ixcc.
       IXCC_MLIR_CMAKE: ${{ inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
-      DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      DOCKER_IMAGE: ${{ inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
       PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
       WHEEL_ARTIFACT_NAME: ${{ inputs.artifact_name || format('flydsl-iluvatar-wheels-{0}', github.run_id) }}
       CMAKE_BUILD_TYPE: ${{ inputs.cmake_build_type || 'Release' }}
@@ -99,8 +101,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Ensure u2004 IXCC matches wheel Python
+        id: ensure_ixcc
+        if: ${{ contains(inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable', '20.04') }}
+        env:
+          SW_HOME: ${{ vars.SW_HOME || '/home/flydsl/sw_home' }}
+          U2004_CONDA_BASE: ${{ format('{0}/sdk/.conda-u2004', vars.SW_HOME || '/home/flydsl/sw_home') }}
+        run: |
+          set -euo pipefail
+          ver="${PYTHON_VERSIONS%% *}"
+          ixcc_root="${SW_HOME}/sdk/ixcc-release-u2004-cp${ver//./}"
+          mlir_cmake="${ixcc_root}/build/lib/cmake/mlir"
+          if [[ -n "${{ inputs.ixcc_mlir_cmake }}" ]]; then
+            mlir_cmake="${{ inputs.ixcc_mlir_cmake }}"
+            ixcc_root="$(cd "${mlir_cmake}/../../../.." && pwd)"
+          fi
+          # shellcheck disable=SC1091
+          source .github/scripts/u2004_conda_python.sh
+          bash .github/scripts/prepare_ix_toolchain_release.sh \
+            --docker-image "${DOCKER_IMAGE}" \
+            --python-version "${ver}" \
+            --ixcc-release-root "${ixcc_root}"
+          echo "ixcc_mlir_cmake=${mlir_cmake}" >> "${GITHUB_OUTPUT}"
+          echo "ixcc_root=${ixcc_root}" >> "${GITHUB_OUTPUT}"
+
       - name: Preflight release IXCC toolchain
         id: preflight
+        env:
+          IXCC_MLIR_CMAKE: ${{ steps.ensure_ixcc.outputs.ixcc_mlir_cmake || inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
         run: |
           set -euo pipefail
           if [[ ! -f "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake" ]]; then
@@ -154,13 +182,18 @@ jobs:
             "${DOCKER_IMAGE}" \
             "${tblgen}" --version >/dev/null; then
             echo "::error::mlir-tblgen cannot run inside the wheel image (glibc mismatch)."
-            echo "::error::For Ubuntu 20.04 wheels run ix-toolchain-daily-refresh with abi=u2004 and set vars.IXCC_RELEASE_U2004_MLIR_CMAKE."
+            echo "::error::For Ubuntu 20.04 wheels run ix-toolchain-daily-refresh with abi=u2004."
+            echo "::error::Or let the build job ensure ixcc-release-u2004-cp<py> via prepare_ix_toolchain_release.sh."
             exit 1
           fi
 
       - name: Build A-track wheels in container
         env:
           IXCC_ROOT: ${{ steps.preflight.outputs.ixcc_root }}
+          # Must match preflight's IXCC_MLIR_CMAKE resolution (see step above) so IXCC_ROOT
+          # and IXCC_MLIR_CMAKE point at the same tree; otherwise CMake finds an MLIRConfig
+          # that references a mismatched LLVM version and find_package(LLVM ...) fails.
+          IXCC_MLIR_CMAKE: ${{ steps.ensure_ixcc.outputs.ixcc_mlir_cmake || inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -169,67 +202,107 @@ jobs:
             --ipc host \
             --ulimit nofile=65536:65536 \
             --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp/flydsl-u2004-home \
             -v "${PWD}:/workspace" \
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
             -v "${IXCC_ROOT}:${IXCC_ROOT}:ro" \
             -v "${IXCC_MLIR_CMAKE}:${IXCC_MLIR_CMAKE}:ro" \
+            -v "${U2004_CONDA_BASE}:${U2004_CONDA_BASE}" \
             -w /workspace \
             -e COREX_ROOT="${COREX_ROOT}" \
             -e IXCC_ROOT="${IXCC_ROOT}" \
             -e IXCC_MLIR_CMAKE="${IXCC_MLIR_CMAKE}" \
             -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
+            -e U2004_CONDA_BASE="${U2004_CONDA_BASE}" \
             -e FLYDSL_RELEASE_TYPE=devreleases \
             -e FLYDSL_VERSION_LOCAL_SUFFIX="run.${GITHUB_RUN_ID}" \
             -e CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
+              mkdir -p "${HOME:-/tmp/flydsl-u2004-home}"
               export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
               MLIR_PREFIX="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
-              resolve_python() {
-                local ver="$1"
-                if [[ -x "/usr/local/conda/envs/py${ver}/bin/python" ]]; then
-                  echo "/usr/local/conda/envs/py${ver}/bin/python"
-                  return
-                fi
-                if [[ -x "/opt/conda/envs/py${ver}/bin/python" ]]; then
-                  echo "/opt/conda/envs/py${ver}/bin/python"
-                  return
-                fi
-                if command -v "python${ver}" >/dev/null 2>&1; then
-                  command -v "python${ver}"
-                  return
-                fi
-                echo "cannot find python ${ver}" >&2
-                exit 1
-              }
+              # shellcheck disable=SC1091
+              source /workspace/.github/scripts/u2004_conda_python.sh
+              . /etc/os-release
               for ver in ${PYTHON_VERSIONS}; do
-                py="$(resolve_python "${ver}")"
-                py_lib="$(cd "$(dirname "${py}")/../lib" && pwd)"
-                export LD_LIBRARY_PATH="${py_lib}:${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+                cmake_compiler_args=()
+                cmake_python_args=()
+                if [[ "${VERSION_ID}" == "20.04" ]]; then
+                  py="$(u2004_resolve_python "${ver}")"
+                  u2004_isolate_python_runtime "${py}"
+                  mapfile -t cmake_python_args < <(u2004_cmake_python_args "${py}")
+                  build_python="${py}"
+                  "${build_python}" -m pip install -U pip setuptools wheel numpy "nanobind>=2.9,<3" pybind11 auditwheel patchelf
+                  # conda env site-packages is root-owned; pip --user is the actual install site.
+                  # Add its script dir to PATH so shutil.which in setup.py resolves patchelf/auditwheel.
+                  user_bin="$("${build_python}" -m site --user-base)/bin"
+                  if [[ -d "${user_bin}" ]]; then
+                    export PATH="${user_bin}:${PATH}"
+                  fi
+                else
+                  if [[ -x "/usr/local/conda/envs/py${ver}/bin/python" ]]; then
+                    py="/usr/local/conda/envs/py${ver}/bin/python"
+                  elif [[ -x "/opt/conda/envs/py${ver}/bin/python" ]]; then
+                    py="/opt/conda/envs/py${ver}/bin/python"
+                  elif command -v "python${ver}" >/dev/null 2>&1; then
+                    py="$(command -v "python${ver}")"
+                  else
+                    echo "cannot find python ${ver}" >&2
+                    exit 1
+                  fi
+                  py_lib="$(cd "$(dirname "${py}")/../lib" && pwd)"
+                  export LD_LIBRARY_PATH="${py_lib}:${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+                  build_python="${py}"
+                fi
                 py_tag="cp${ver//./}"
                 build_dir="build-fly/build_py${ver//./}"
-                venv=".venvs/release/${py_tag}"
-                "${py}" -m venv "${venv}"
-                source "${venv}/bin/activate"
-                python -m pip install -U pip setuptools wheel numpy "nanobind>=2.9,<3" pybind11 auditwheel
+                rm -rf "${build_dir}"
+                if [[ "${VERSION_ID}" != "20.04" ]]; then
+                  venv=".venvs/release/${py_tag}"
+                  rm -rf "${venv}"
+                  "${build_python}" -m venv "${venv}"
+                  source "${venv}/bin/activate"
+                  build_python="$(command -v python)"
+                  python -m pip install -U pip setuptools wheel numpy "nanobind>=2.9,<3" pybind11 auditwheel patchelf
+                fi
+                py_bin_dir="$(dirname "${build_python}")"
+                # _auditwheel_repair_in_place in setup.py resolves patchelf/auditwheel via
+                # shutil.which (PATH lookup), so check on PATH -- not just py_bin_dir --
+                # to catch conda-env + pip-user-install where the binary lands in ~/.local/bin.
+                patchelf_bin="$(command -v patchelf || true)"
+                auditwheel_bin="$(command -v auditwheel || true)"
+                if [[ -z "${patchelf_bin}" || -z "${auditwheel_bin}" ]]; then
+                  echo "::error::patchelf/auditwheel not on PATH (patchelf=[${patchelf_bin}], auditwheel=[${auditwheel_bin}]); setup.py auditwheel repair will silently skip and ship a plain linux_x86_64 wheel"
+                  echo "PATH=${PATH}" >&2
+                  exit 1
+                fi
+                echo "patchelf -> ${patchelf_bin}"
+                echo "auditwheel -> ${auditwheel_bin}"
                 cmake -S . -B "${build_dir}" -G Ninja \
                   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
                   -DFLYDSL_BACKENDS=iluvatar \
                   -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
                   -DCUDAToolkit_ROOT="${COREX_ROOT}" \
-                  -DPython3_EXECUTABLE="$(command -v python)" \
+                  -DPython3_EXECUTABLE="${build_python}" \
                   -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
-                  -DCMAKE_MODULE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+                  -DCMAKE_MODULE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+                  "${cmake_python_args[@]}" \
+                  "${cmake_compiler_args[@]}"
                 cmake --build "${build_dir}" -j"$(nproc)"
-                PATH="${venv}/bin:${PATH}" \
+                # PATH already carries user_bin (u2004) or venv/bin (u2404); prepend py_bin_dir
+                # so subprocess.run inherits a consistent auditwheel/patchelf/python resolution.
+                PATH="${py_bin_dir}:${PATH}" \
                   FLY_REBUILD=0 \
                   FLY_BUILD_DIR="${build_dir}" \
                   MLIR_PATH="${MLIR_PREFIX}" \
                   FLYDSL_RELEASE_TYPE=devreleases \
                   FLYDSL_VERSION_LOCAL_SUFFIX="${FLYDSL_VERSION_LOCAL_SUFFIX}" \
-                  python setup.py bdist_wheel
-                deactivate
+                  "${build_python}" setup.py bdist_wheel
+                if [[ "${VERSION_ID}" != "20.04" ]]; then
+                  deactivate
+                fi
               done
             '
 
@@ -242,6 +315,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/verify_wheel_contents.py dist/*.whl --summary-json dist/wheel-payload-summary.json
+
+      - name: Verify wheel toolchain / manylinux tag
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_wheel_toolchain.py dist/*.whl
 
       - name: Write build manifest and job summary
         env:

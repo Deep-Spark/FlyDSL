@@ -46,13 +46,13 @@ fi
 if [[ "${CHANNEL}" == "ci" ]]; then
   tag="iluvatar-ci"
   title="Iluvatar CI wheel"
-  kind_blurb="CI wheel for downstream CI (Ubuntu 20.04 / cp310). Smoke-tested only; not a full-function/perf release."
+  kind_blurb="CI wheel for downstream CI (Ubuntu 20.04 / cp312 by default). Smoke-tested only; not a full-function/perf release."
   extra_flags=(--prerelease)
   install_prefix="${GITHUB_SERVER_URL}/${REPO}/releases/download/${tag}"
 else
   tag="iluvatar-weekly-$(date -u +%F)"
   title="Iluvatar weekly wheel (${tag#iluvatar-weekly-})"
-  kind_blurb="Weekly wheels: Ubuntu 20.04 / cp310 and Ubuntu 24.04 / cp312. cp312 also runs the fuller device suite."
+  kind_blurb="Weekly wheels: Ubuntu 20.04 (default cp312; optional cp310) and Ubuntu 24.04 cp312. u2404 cp312 runs the fuller device suite."
   extra_flags=(--latest)
   install_prefix="${GITHUB_SERVER_URL}/${REPO}/releases/latest/download"
 fi
