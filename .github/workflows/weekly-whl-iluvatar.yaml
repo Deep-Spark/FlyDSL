@@ -2,11 +2,10 @@ name: Publish Wheels (Iluvatar A-track)
 
 # Two channels:
 # - ci: push to iluvatar (ci-device path filters). Smoke tests only.
-#   URL: .../releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl
-#   Local: .../flydsl-wheels/iluvatar/ci/
+#   Ubuntu 20.04 + cp310 and cp312 (ixaite / glibc 2.31).
 # - weekly: Sunday / dispatch. Fuller device tests; GitHub "latest".
-#   URL: .../releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl
-#   Local: .../flydsl-wheels/iluvatar/latest/
+#   Ubuntu 20.04 + cp310/cp312 and Ubuntu 24.04 + cp312.
+# Optional local copies use vars.FLYDSL_ILUVATAR_WHEEL_DIR (unset skips staging).
 
 on:
   push:
@@ -23,15 +22,15 @@ on:
         required: false
         default: "iluvatar"
       python_versions:
-        description: "Space-separated python versions"
+        description: "Ignored. CI and weekly both build 20.04 cp310 and cp312; weekly also builds 24.04 cp312."
         type: string
         required: false
-        default: "3.12"
+        default: ""
       docker_image:
-        description: "Iluvatar build/test image"
+        description: "Ignored. CI uses Ubuntu 20.04; weekly builds 20.04 and 24.04."
         type: string
         required: false
-        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+        default: ""
       cmake_build_type:
         description: "FlyDSL CMake build type"
         type: choice
@@ -69,6 +68,7 @@ jobs:
       channel: ${{ steps.gate.outputs.channel }}
       test_suite: ${{ steps.gate.outputs.test_suite }}
       local_name: ${{ steps.gate.outputs.local_name }}
+      build_matrix: ${{ steps.gate.outputs.build_matrix }}
     steps:
       - name: Resolve source ref
         id: refs
@@ -99,6 +99,11 @@ jobs:
 
       - name: Finalize gate
         id: gate
+        env:
+          U2004_IMAGE: ${{ vars.FLYDSL_ILUVATAR_U2004_IMAGE || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
+          U2404_IMAGE: ${{ vars.FLYDSL_ILUVATAR_U2404_IMAGE || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+          IXCC_U2004_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_U2004_MLIR_CMAKE }}
+          IXCC_U2404_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_MLIR_CMAKE }}
         run: |
           set -euo pipefail
           event="${{ github.event_name }}"
@@ -124,6 +129,39 @@ jobs:
             echo "test_suite=full" >> "${GITHUB_OUTPUT}"
             echo "local_name=latest" >> "${GITHUB_OUTPUT}"
           fi
+          CHANNEL="${channel}" python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import json
+          import os
+
+          channel = os.environ["CHANNEL"]
+          u2004_cp310 = {
+              "id": "u2004-cp310",
+              "python_versions": "3.10",
+              "docker_image": os.environ["U2004_IMAGE"],
+              "test_suite": "smoke",
+              "ixcc_mlir_cmake": os.environ.get("IXCC_U2004_MLIR_CMAKE", ""),
+          }
+          u2004_cp312 = {
+              "id": "u2004-cp312",
+              "python_versions": "3.12",
+              "docker_image": os.environ["U2004_IMAGE"],
+              "test_suite": "smoke",
+              "ixcc_mlir_cmake": os.environ.get("IXCC_U2004_MLIR_CMAKE", ""),
+          }
+          u2404_cp312 = {
+              "id": "u2404-cp312",
+              "python_versions": "3.12",
+              "docker_image": os.environ["U2404_IMAGE"],
+              "test_suite": "full" if channel == "weekly" else "smoke",
+              "ixcc_mlir_cmake": os.environ.get("IXCC_U2404_MLIR_CMAKE", ""),
+          }
+          matrix = (
+              [u2004_cp310, u2004_cp312]
+              if channel == "ci"
+              else [u2004_cp310, u2004_cp312, u2404_cp312]
+          )
+          print("build_matrix=" + json.dumps(matrix, separators=(",", ":")))
+          PY
 
       - name: Write gate summary
         run: |
@@ -135,18 +173,25 @@ jobs:
             echo "- source_ref: \`${{ steps.refs.outputs.source_ref }}\`"
             echo "- should_run: \`${{ steps.gate.outputs.should_run }}\`"
             echo "- test_suite: \`${{ steps.gate.outputs.test_suite }}\`"
+            echo "- matrix: \`${{ steps.gate.outputs.build_matrix }}\`"
             echo "- reason: ${{ steps.gate.outputs.reason }}"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   build:
     needs: [gate]
     if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gate.outputs.build_matrix) }}
     uses: ./.github/workflows/build-whl-iluvatar.yaml
     with:
-      python_versions: ${{ github.event_name == 'workflow_dispatch' && inputs.python_versions || '3.12' }}
-      docker_image: ${{ github.event_name == 'workflow_dispatch' && inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      python_versions: ${{ matrix.python_versions }}
+      docker_image: ${{ matrix.docker_image }}
       source_ref: ${{ needs.gate.outputs.source_ref }}
-      local_wheel_dir: ${{ format('{0}/incoming-{1}', vars.FLYDSL_ILUVATAR_WEEKLY_WHEEL_DIR || '/home/flydsl/sw_home/local/flydsl-wheels/iluvatar', needs.gate.outputs.channel) }}
+      artifact_name: flydsl-iluvatar-wheels-${{ matrix.id }}-${{ github.run_id }}
+      ixcc_mlir_cmake: ${{ matrix.ixcc_mlir_cmake }}
+      local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.channel, matrix.id) || '' }}
       cmake_build_type: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
     permissions:
       contents: read
@@ -155,12 +200,17 @@ jobs:
   test:
     needs: [gate, build]
     if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' && needs.build.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gate.outputs.build_matrix) }}
     uses: ./.github/workflows/test-whl-iluvatar.yaml
     with:
-      docker_image: ${{ github.event_name == 'workflow_dispatch' && inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
-      wheel_artifact_name: ${{ needs.build.outputs.artifact_name }}
+      docker_image: ${{ matrix.docker_image }}
+      python_versions: ${{ matrix.python_versions }}
+      wheel_artifact_name: flydsl-iluvatar-wheels-${{ matrix.id }}-${{ github.run_id }}
       source_ref: ${{ needs.gate.outputs.source_ref }}
-      suite: ${{ needs.gate.outputs.test_suite }}
+      suite: ${{ matrix.test_suite }}
     permissions:
       contents: read
       actions: read
@@ -168,11 +218,12 @@ jobs:
 
   promote-local:
     needs: [gate, build, test]
-    if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' && needs.test.result == 'success' }}
+    if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' && needs.test.result == 'success' && vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' }}
     runs-on: [self-hosted, linux, x64, gpu-iluvatar]
     timeout-minutes: 10
     env:
-      WHEEL_ROOT: ${{ vars.FLYDSL_ILUVATAR_WEEKLY_WHEEL_DIR || '/home/flydsl/sw_home/local/flydsl-wheels/iluvatar' }}
+      WHEEL_ROOT: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR }}
+      FLYDSL_ILUVATAR_WHEEL_ARTIFACT_DIR: ${{ vars.FLYDSL_ILUVATAR_WHEEL_ARTIFACT_DIR || '/srv/artifacts/wheels/flydsl' }}
     steps:
       - name: Checkout workflow scripts
         uses: actions/checkout@v4
@@ -180,18 +231,34 @@ jobs:
       - name: Promote incoming wheels to latest
         run: |
           set -euo pipefail
+          channel="${{ needs.gate.outputs.channel }}"
+          dest="${WHEEL_ROOT}/${{ needs.gate.outputs.local_name }}"
+          merge="${WHEEL_ROOT}/incoming-${channel}-merged"
+          shopt -s nullglob
+          dirs=("${WHEEL_ROOT}/incoming-${channel}-"*)
+          if [ "${#dirs[@]}" -eq 0 ]; then
+            echo "No incoming wheel dirs under ${WHEEL_ROOT}/incoming-${channel}-*" >&2
+            exit 1
+          fi
+          rm -rf "${merge}"
+          mkdir -p "${merge}"
+          for d in "${dirs[@]}"; do
+            case "$(basename "${d}")" in
+              incoming-${channel}-merged) continue ;;
+            esac
+            cp -a "${d}/." "${merge}/"
+          done
           bash .github/scripts/promote_iluvatar_weekly_wheel_local.sh \
-            "${WHEEL_ROOT}/incoming-${{ needs.gate.outputs.channel }}" \
-            "${WHEEL_ROOT}/${{ needs.gate.outputs.local_name }}"
-
-      - name: Write local promote summary
-        run: |
-          {
-            echo "### Local ${{ needs.gate.outputs.channel }} wheel copy"
-            echo
-            echo "- Directory: \`${{ env.WHEEL_ROOT }}/${{ needs.gate.outputs.local_name }}\`"
-            echo "- Install: \`pip install ${{ env.WHEEL_ROOT }}/${{ needs.gate.outputs.local_name }}/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
-          } >> "${GITHUB_STEP_SUMMARY}"
+            "${merge}" \
+            "${dest}"
+          rm -rf "${merge}"
+          if [[ -d "${FLYDSL_ILUVATAR_WHEEL_ARTIFACT_DIR}" ]]; then
+            bash .github/scripts/publish_iluvatar_wheel_artifacts.sh \
+              "${dest}" \
+              "${{ needs.gate.outputs.local_name }}"
+          else
+            echo "skip artifact HTTP publish: ${FLYDSL_ILUVATAR_WHEEL_ARTIFACT_DIR} does not exist"
+          fi
 
   publish:
     needs: [gate, build, test]
@@ -206,7 +273,8 @@ jobs:
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.build.outputs.artifact_name }}
+          pattern: flydsl-iluvatar-wheels-*-${{ github.run_id }}
+          merge-multiple: true
           path: dist
 
       - name: Publish weekly GitHub Release
@@ -225,11 +293,12 @@ jobs:
             echo "### Iluvatar ${{ needs.gate.outputs.channel }} wheel"
             echo
             echo "- Source ref: \`${{ needs.gate.outputs.source_ref }}\`"
-            echo "- Artifact: \`${{ needs.build.outputs.artifact_name }}\`"
+            echo "- Channel: \`${{ needs.gate.outputs.channel }}\`"
+            echo "- URLs:"
             if [ "${{ needs.gate.outputs.channel }}" = "ci" ]; then
-              echo "- URL: https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+              echo "  - https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp310-manylinux_x86_64.whl"
             else
-              echo "- URL: https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+              echo "  - https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp310-manylinux_x86_64.whl"
+              echo "  - https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
             fi
-            echo "- Local copy: \`/home/flydsl/sw_home/local/flydsl-wheels/iluvatar/${{ needs.gate.outputs.local_name }}/flydsl-iluvatar-cp312-manylinux_x86_64.whl\`"
           } >> "${GITHUB_STEP_SUMMARY}"

@@ -28,6 +28,16 @@ on:
         type: string
         required: false
         default: "Release"
+      artifact_name:
+        description: "Artifact name for uploaded wheels (empty uses flydsl-iluvatar-wheels-<run_id>)"
+        type: string
+        required: false
+        default: ""
+      ixcc_mlir_cmake:
+        description: "MLIRConfig.cmake directory for this wheel ABI (empty uses vars.IXCC_RELEASE_MLIR_CMAKE)"
+        type: string
+        required: false
+        default: ""
     outputs:
       wheel_names:
         description: "Space-separated built wheel filenames"
@@ -67,10 +77,10 @@ jobs:
       COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
       # Release wheels use sdk/ixcc-release (xiang.zhang/ixcc-flydsl-release).
       # Dev CI (ci-device / perf) continues to use sdk/ixcc.
-      IXCC_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
+      IXCC_MLIR_CMAKE: ${{ inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
       DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
       PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
-      WHEEL_ARTIFACT_NAME: flydsl-iluvatar-wheels-${{ github.run_id }}
+      WHEEL_ARTIFACT_NAME: ${{ inputs.artifact_name || format('flydsl-iluvatar-wheels-{0}', github.run_id) }}
       CMAKE_BUILD_TYPE: ${{ inputs.cmake_build_type || 'Release' }}
     steps:
       - name: Checkout code
@@ -132,6 +142,22 @@ jobs:
             echo "IXCC_RELEASE_STAMP=$(tr '\n' ' ' < "${IXCC_ROOT}/.flydsl_ixcc_build_commit")"
           fi
 
+          tblgen="${IXCC_ROOT}/build/bin/mlir-tblgen"
+          if [[ ! -x "${tblgen}" ]]; then
+            echo "::error::mlir-tblgen missing under the selected IXCC build."
+            echo "::error::For Ubuntu 20.04 wheels run ix-toolchain-daily-refresh with abi=u2004."
+            exit 1
+          fi
+          if ! docker run --rm --user "$(id -u):$(id -g)" \
+            --ulimit nofile=65536:65536 \
+            -v "${IXCC_ROOT}:${IXCC_ROOT}:ro" \
+            "${DOCKER_IMAGE}" \
+            "${tblgen}" --version >/dev/null; then
+            echo "::error::mlir-tblgen cannot run inside the wheel image (glibc mismatch)."
+            echo "::error::For Ubuntu 20.04 wheels run ix-toolchain-daily-refresh with abi=u2004 and set vars.IXCC_RELEASE_U2004_MLIR_CMAKE."
+            exit 1
+          fi
+
       - name: Build A-track wheels in container
         env:
           IXCC_ROOT: ${{ steps.preflight.outputs.ixcc_root }}
@@ -141,6 +167,7 @@ jobs:
           docker run --rm \
             --network host \
             --ipc host \
+            --ulimit nofile=65536:65536 \
             --user "$(id -u):$(id -g)" \
             -v "${PWD}:/workspace" \
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
@@ -159,8 +186,27 @@ jobs:
               set -euo pipefail
               export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
               MLIR_PREFIX="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
+              resolve_python() {
+                local ver="$1"
+                if [[ -x "/usr/local/conda/envs/py${ver}/bin/python" ]]; then
+                  echo "/usr/local/conda/envs/py${ver}/bin/python"
+                  return
+                fi
+                if [[ -x "/opt/conda/envs/py${ver}/bin/python" ]]; then
+                  echo "/opt/conda/envs/py${ver}/bin/python"
+                  return
+                fi
+                if command -v "python${ver}" >/dev/null 2>&1; then
+                  command -v "python${ver}"
+                  return
+                fi
+                echo "cannot find python ${ver}" >&2
+                exit 1
+              }
               for ver in ${PYTHON_VERSIONS}; do
-                py="python${ver}"
+                py="$(resolve_python "${ver}")"
+                py_lib="$(cd "$(dirname "${py}")/../lib" && pwd)"
+                export LD_LIBRARY_PATH="${py_lib}:${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
                 py_tag="cp${ver//./}"
                 build_dir="build-fly/build_py${ver//./}"
                 venv=".venvs/release/${py_tag}"
@@ -172,7 +218,9 @@ jobs:
                   -DFLYDSL_BACKENDS=iluvatar \
                   -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
                   -DCUDAToolkit_ROOT="${COREX_ROOT}" \
-                  -DPython3_EXECUTABLE="$(command -v python)"
+                  -DPython3_EXECUTABLE="$(command -v python)" \
+                  -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+                  -DCMAKE_MODULE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
                 cmake --build "${build_dir}" -j"$(nproc)"
                 PATH="${venv}/bin:${PATH}" \
                   FLY_REBUILD=0 \

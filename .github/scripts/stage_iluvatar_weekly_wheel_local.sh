@@ -12,23 +12,20 @@ if [[ ${#wheels[@]} -eq 0 ]]; then
 fi
 
 mkdir -p "${DEST_DIR}"
-# Drop previous weekly wheels so the directory only contains the current set.
-rm -f "${DEST_DIR}"/flydsl-iluvatar-*-manylinux_x86_64.whl
-rm -f "${DEST_DIR}"/CURRENT.txt
+rm -f "${DEST_DIR}"/flydsl-*.whl
+rm -f "${DEST_DIR}"/CURRENT.txt "${DEST_DIR}"/index.html
 
 copied=()
 for whl in "${wheels[@]}"; do
   base="$(basename "${whl}")"
-  if [[ "${base}" =~ -cp([0-9]+)- ]]; then
-    stable_name="flydsl-iluvatar-cp${BASH_REMATCH[1]}-manylinux_x86_64.whl"
-    cp -f "${whl}" "${DEST_DIR}/${stable_name}"
-    copied+=("${stable_name}")
-  fi
+  cp -f "${whl}" "${DEST_DIR}/${base}"
+  copied+=("${base}")
 done
 if [[ ${#copied[@]} -eq 0 ]]; then
-  echo "Could not derive cp tag from wheel names: ${wheels[*]}" >&2
+  echo "No flydsl wheels copied from ${DIST_DIR}" >&2
   exit 1
 fi
+bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/write_iluvatar_wheel_http_index.sh" "${DEST_DIR}"
 
 manifest="$(find "${DIST_DIR}" -type f -name 'build-manifest.json' | head -n 1 || true)"
 if [[ -n "${manifest}" ]]; then

@@ -46,15 +46,15 @@ fi
 if [[ "${CHANNEL}" == "ci" ]]; then
   tag="iluvatar-ci"
   title="Iluvatar CI wheel"
-  kind_blurb="CI wheel for downstream CI. Smoke-tested only; not a full-function/perf release."
-  install_url="${GITHUB_SERVER_URL}/${REPO}/releases/download/${tag}/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+  kind_blurb="CI wheel for downstream CI (Ubuntu 20.04 / cp310). Smoke-tested only; not a full-function/perf release."
   extra_flags=(--prerelease)
+  install_prefix="${GITHUB_SERVER_URL}/${REPO}/releases/download/${tag}"
 else
   tag="iluvatar-weekly-$(date -u +%F)"
   title="Iluvatar weekly wheel (${tag#iluvatar-weekly-})"
-  kind_blurb="Weekly validated wheel after the fuller device test suite."
-  install_url="${GITHUB_SERVER_URL}/${REPO}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+  kind_blurb="Weekly wheels: Ubuntu 20.04 / cp310 and Ubuntu 24.04 / cp312. cp312 also runs the fuller device suite."
   extra_flags=(--latest)
+  install_prefix="${GITHUB_SERVER_URL}/${REPO}/releases/latest/download"
 fi
 notes="$(mktemp)"
 {
@@ -72,10 +72,12 @@ notes="$(mktemp)"
     echo "- \`$(basename "${whl}")\`"
   done
   echo
-  echo "Install (cp312):"
+  echo "Install:"
   echo
   echo '```bash'
-  echo "pip install ${install_url}"
+  for name in "${stable_names[@]}"; do
+    echo "pip install ${install_prefix}/${name}"
+  done
   echo '```'
 } > "${notes}"
 
