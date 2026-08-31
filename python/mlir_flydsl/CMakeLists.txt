@@ -226,6 +226,11 @@ foreach(_m IN LISTS _flydsl_stubgen_modules)
   string(APPEND _flydsl_stubgen_m_flags " -m ${_m}")
 endforeach()
 
+# Stub generation is best effort. The .pyi files are editor type hints only:
+# they are picked up by a package_data glob, so a build without them still
+# produces a working wheel. Importing the MLIR bindings under python 3.12
+# currently segfaults inside module init on the Iluvatar toolchain, which
+# would otherwise take down the whole wheel build over optional metadata.
 add_custom_command(
   OUTPUT "${_STUB_MARKER_FILE}"
   COMMAND /bin/bash -c "\
@@ -233,7 +238,8 @@ add_custom_command(
     if '${Python3_EXECUTABLE}' -c 'import nanobind.stubgen' >/dev/null 2>&1; then \
       '${Python3_EXECUTABLE}' -m nanobind.stubgen \
         -q -r${_flydsl_stubgen_m_flags} \
-        -O '${_MLIR_LIBS_DIR}'; \
+        -O '${_MLIR_LIBS_DIR}' \
+      || echo 'Warning: nanobind.stubgen failed -- .pyi type stubs omitted from this build'; \
     else \
       echo 'Warning: nanobind.stubgen not available -- skipping stub generation'; \
     fi"
