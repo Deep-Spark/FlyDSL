@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Write Iluvatar wheel build provenance (manifest JSON + GitHub Step Summary)."""
+"""Write Iluvatar wheel build provenance (manifest JSON + runner log)."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def main() -> int:
     parser.add_argument(
         "--summary-md",
         default="",
-        help="Optional markdown path; also appends to $GITHUB_STEP_SUMMARY when set",
+        help="Optional markdown path (also printed to stdout)",
     )
     args = parser.parse_args()
 
@@ -128,11 +128,6 @@ def main() -> int:
         summary_path = Path(args.summary_md)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(summary, encoding="utf-8")
-
-    step_summary = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
-    if step_summary:
-        with Path(step_summary).open("a", encoding="utf-8") as fh:
-            fh.write(summary)
 
     print(summary, end="")
     return 0

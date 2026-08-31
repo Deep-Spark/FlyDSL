@@ -8,6 +8,11 @@ on:
         type: string
         required: false
         default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      python_versions:
+        description: "Python version used to create the test venv"
+        type: string
+        required: false
+        default: "3.12"
       wheel_artifact_name:
         description: "Artifact name produced by build job"
         type: string
@@ -78,6 +83,7 @@ jobs:
       - name: Install wheel and run Iluvatar smoke tests
         env:
           DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+          PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
           TEST_SUITE: ${{ inputs.suite || 'smoke' }}
         run: |
           set -euo pipefail
@@ -127,12 +133,26 @@ jobs:
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
             -w /workspace \
             -e COREX_ROOT="${COREX_ROOT}" \
+            -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
             -e TEST_SUITE="${TEST_SUITE}" \
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
               export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
-              python3 -m venv /tmp/flydsl-whl-test
+              ver="${PYTHON_VERSIONS%% *}"
+              if [[ -x "/usr/local/conda/envs/py${ver}/bin/python" ]]; then
+                py="/usr/local/conda/envs/py${ver}/bin/python"
+              elif [[ -x "/opt/conda/envs/py${ver}/bin/python" ]]; then
+                py="/opt/conda/envs/py${ver}/bin/python"
+              elif command -v "python${ver}" >/dev/null 2>&1; then
+                py="$(command -v "python${ver}")"
+              else
+                echo "cannot find python ${ver}" >&2
+                exit 1
+              fi
+              py_lib="$(cd "$(dirname "${py}")/../lib" && pwd)"
+              export LD_LIBRARY_PATH="${py_lib}:${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+              "${py}" -m venv /tmp/flydsl-whl-test
               source /tmp/flydsl-whl-test/bin/activate
               python -m pip install -U pip setuptools
               python -m pip install numpy pytest

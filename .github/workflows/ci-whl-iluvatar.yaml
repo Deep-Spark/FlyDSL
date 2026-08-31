@@ -11,11 +11,11 @@ on:
       python_versions:
         description: "Space-separated python versions for wheel build"
         type: string
-        default: "3.12"
+        default: "3.10"
       docker_image:
         description: "Iluvatar build/test image"
         type: string
-        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+        default: "10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest"
       cmake_build_type:
         description: "FlyDSL CMake build type"
         type: choice
@@ -32,8 +32,8 @@ jobs:
   build:
     uses: ./.github/workflows/build-whl-iluvatar.yaml
     with:
-      python_versions: ${{ inputs.python_versions || '3.12' }}
-      docker_image: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      python_versions: ${{ inputs.python_versions || '3.10' }}
+      docker_image: ${{ inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
       cmake_build_type: ${{ inputs.cmake_build_type || 'Release' }}
 
   test:
@@ -41,5 +41,5 @@ jobs:
     if: ${{ !(inputs.skip_tests || false) }}
     uses: ./.github/workflows/test-whl-iluvatar.yaml
     with:
-      docker_image: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      docker_image: ${{ inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
       wheel_artifact_name: ${{ needs.build.outputs.artifact_name }}
