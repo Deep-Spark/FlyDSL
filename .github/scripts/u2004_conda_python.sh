@@ -80,6 +80,12 @@ u2004_isolate_python_runtime() {
   export PATH="${py_bin}:/usr/local/bin:/usr/bin:/bin"
   export PYTHONHOME="${py_root}"
   unset PYTHONPATH PYTHONUSERBASE CONDA_PREFIX CONDA_DEFAULT_ENV _CONDA_EXE || true
+  # The corex-base-20.04 image hard-codes CPATH/_COREX_PY_INC to the py3.10
+  # headers even after we activate a py3.12 conda env. GCC still ranks CPATH
+  # ahead of the compile-line -isystem, so <Python.h> silently resolves to
+  # the py3.10 tree. The 32-byte PyHeapTypeObject drift then corrupts
+  # ht_qualname during nb_type_new and crashes at import (ASLR-sensitive).
+  unset CPATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH _COREX_PY_INC || true
   export LD_LIBRARY_PATH="${py_root}/lib:${COREX_ROOT:+${COREX_ROOT}/lib64:}${LD_LIBRARY_PATH:-}"
 }
 

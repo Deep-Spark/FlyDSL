@@ -34,10 +34,15 @@ on:
         required: false
         default: ""
       ixcc_mlir_cmake:
-        description: "MLIRConfig.cmake directory for this wheel ABI (empty uses vars.IXCC_RELEASE_MLIR_CMAKE)"
+        description: "u2404 only: MLIRConfig.cmake directory for the host-side IXCC tree (empty uses vars.IXCC_RELEASE_MLIR_CMAKE)"
         type: string
         required: false
         default: ""
+      ixcc_ref:
+        description: "u2004 fresh flow: git ref to check out inside the ixcc.git repo"
+        type: string
+        required: false
+        default: "origin/xiang.zhang/ixcc-flydsl-release"
     outputs:
       wheel_names:
         description: "Space-separated built wheel filenames"
@@ -65,6 +70,11 @@ on:
           - Release
           - Debug
         default: Release
+      ixcc_ref:
+        description: "u2004 fresh flow: git ref to check out inside the ixcc.git repo"
+        type: string
+        required: false
+        default: "origin/xiang.zhang/ixcc-flydsl-release"
 
 jobs:
   build:
@@ -84,6 +94,14 @@ jobs:
       PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
       WHEEL_ARTIFACT_NAME: ${{ inputs.artifact_name || format('flydsl-iluvatar-wheels-{0}', github.run_id) }}
       CMAKE_BUILD_TYPE: ${{ inputs.cmake_build_type || 'Release' }}
+      IXCC_REF: ${{ inputs.ixcc_ref || 'origin/xiang.zhang/ixcc-flydsl-release' }}
+      # u2004 wheel builds run a fully hermetic docker container (fresh sw_home clone,
+      # fresh ixcc clone at IXCC_REF, `source enable ${PY}` to activate ixconda, ccache-backed
+      # LLVM build). u2404 wheels still use the host-side persistent IXCC tree. Auto-select
+      # by image tag; do not hardcode `contains(...)` checks elsewhere in this file.
+      IS_FRESH_U2004: ${{ contains(inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest', 'corex_base/ubuntu:20.04') && 'true' || 'false' }}
+      # Host-side ccache dir. Persists across runs; ~35min cold, ~10min warm.
+      CCACHE_DIR_HOST: ${{ format('{0}/sdk/.ccache-flydsl-u2004', vars.SW_HOME || '/home/flydsl/sw_home') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -101,46 +119,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Ensure u2004 IXCC matches wheel Python
-        id: ensure_ixcc
-        if: ${{ contains(inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable', '20.04') }}
-        env:
-          SW_HOME: ${{ vars.SW_HOME || '/home/flydsl/sw_home' }}
-          U2004_CONDA_BASE: ${{ format('{0}/sdk/.conda-u2004', vars.SW_HOME || '/home/flydsl/sw_home') }}
-        run: |
-          set -euo pipefail
-          ver="${PYTHON_VERSIONS%% *}"
-          ixcc_root="${SW_HOME}/sdk/ixcc-release-u2004-cp${ver//./}"
-          mlir_cmake="${ixcc_root}/build/lib/cmake/mlir"
-          if [[ -n "${{ inputs.ixcc_mlir_cmake }}" ]]; then
-            mlir_cmake="${{ inputs.ixcc_mlir_cmake }}"
-            ixcc_root="$(cd "${mlir_cmake}/../../../.." && pwd)"
-          fi
-          # shellcheck disable=SC1091
-          source .github/scripts/u2004_conda_python.sh
-          bash .github/scripts/prepare_ix_toolchain_release.sh \
-            --docker-image "${DOCKER_IMAGE}" \
-            --python-version "${ver}" \
-            --ixcc-release-root "${ixcc_root}"
-          echo "ixcc_mlir_cmake=${mlir_cmake}" >> "${GITHUB_OUTPUT}"
-          echo "ixcc_root=${ixcc_root}" >> "${GITHUB_OUTPUT}"
-
-      - name: Preflight release IXCC toolchain
+      # Preflight only runs for the u2404 legacy path (stable image + host-side
+       # persistent IXCC tree at vars.IXCC_RELEASE_MLIR_CMAKE). u2004 wheels
+       # now build IXCC fresh inside the container per invocation.
+      - name: Preflight release IXCC toolchain (u2404 legacy path)
         id: preflight
+        if: ${{ env.IS_FRESH_U2004 != 'true' }}
         env:
-          IXCC_MLIR_CMAKE: ${{ steps.ensure_ixcc.outputs.ixcc_mlir_cmake || inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
+          IXCC_MLIR_CMAKE: ${{ inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
         run: |
           set -euo pipefail
           if [[ ! -f "${IXCC_MLIR_CMAKE}/MLIRConfig.cmake" ]]; then
             echo "::error::Release IXCC MLIR missing at ${IXCC_MLIR_CMAKE}."
-            echo "::error::Build sdk/ixcc-release first, or set vars.IXCC_RELEASE_MLIR_CMAKE."
-            echo "::error::Helper: bash .github/scripts/prepare_ix_toolchain_release.sh"
+            echo "::error::Set vars.IXCC_RELEASE_MLIR_CMAKE to a host-built IXCC tree, or use the u2004 fresh flow."
             exit 1
           fi
           IXCC_ROOT="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
           if [[ ! -d "${IXCC_ROOT}/build/tools/mlir/python_packages/mlir_core" ]]; then
             echo "::error::Release IXCC was built without MLIR Python bindings."
-            echo "::error::Rebuild with -DMLIR_ENABLE_BINDINGS_PYTHON=ON (see prepare_ix_toolchain_release.sh)."
+            echo "::error::Rebuild with -DMLIR_ENABLE_BINDINGS_PYTHON=ON."
             exit 1
           fi
 
@@ -173,7 +170,6 @@ jobs:
           tblgen="${IXCC_ROOT}/build/bin/mlir-tblgen"
           if [[ ! -x "${tblgen}" ]]; then
             echo "::error::mlir-tblgen missing under the selected IXCC build."
-            echo "::error::For Ubuntu 20.04 wheels run ix-toolchain-daily-refresh with abi=u2004."
             exit 1
           fi
           if ! docker run --rm --user "$(id -u):$(id -g)" \
@@ -182,18 +178,65 @@ jobs:
             "${DOCKER_IMAGE}" \
             "${tblgen}" --version >/dev/null; then
             echo "::error::mlir-tblgen cannot run inside the wheel image (glibc mismatch)."
-            echo "::error::For Ubuntu 20.04 wheels run ix-toolchain-daily-refresh with abi=u2004."
-            echo "::error::Or let the build job ensure ixcc-release-u2004-cp<py> via prepare_ix_toolchain_release.sh."
             exit 1
           fi
 
-      - name: Build A-track wheels in container
+      # ------------------------------------------------------------------
+      # u2004 fresh flow: single hermetic docker run per python version.
+      # Container does: git clone sw_home, source enable ${py}, repo-manager
+      # download ixdriver/ixcc/ixsdk, git clone ixcc @ IXCC_REF, pip install
+      # pinned build deps, configure+build IXCC LLVM/MLIR (ccache), configure+
+      # build FlyDSL, bdist_wheel, auditwheel repair, verify_wheel_import
+      # (--check-aslr-off), chown output to runner uid.
+      #
+      # See .github/scripts/_build_wheel_fresh_body.sh for the contract.
+      # ------------------------------------------------------------------
+      - name: Build A-track wheels in container (u2004 fresh)
+        id: fresh_build
+        if: ${{ env.IS_FRESH_U2004 == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist "${CCACHE_DIR_HOST}"
+          for ver in ${PYTHON_VERSIONS}; do
+            echo "::group::Fresh build wheel for python ${ver}"
+            docker run --rm \
+              --network host \
+              --dns 10.101.1.104 \
+              --dns 10.101.1.101 \
+              --dns-search iluvatar.local \
+              --ulimit nofile=65536:65536 \
+              -e HOST_UID="$(id -u)" \
+              -e HOST_GID="$(id -g)" \
+              -e PYTHON_VERSION="${ver}" \
+              -e IXCC_REF="${IXCC_REF}" \
+              -e CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+              -e FLYDSL_VERSION_LOCAL_SUFFIX="run.${GITHUB_RUN_ID}" \
+              -v "${HOME}/.ssh:/host-ssh:ro" \
+              -v "${PWD}:/flydsl-src:ro" \
+              -v "${PWD}/dist:/output" \
+              -v "${CCACHE_DIR_HOST}:/root/.ccache" \
+              -w /home/build \
+              "${DOCKER_IMAGE}" \
+              bash /flydsl-src/.github/scripts/_build_wheel_fresh_body.sh
+            echo "::endgroup::"
+          done
+          # Body wrote commit stamps into dist/ (one .txt per identity). Pipe
+          # them into step outputs for the manifest step.
+          {
+            echo "flydsl_commit=$(cat dist/flydsl_commit.txt)"
+            echo "flydsl_commit_short=$(cat dist/flydsl_commit_short.txt)"
+            echo "ixcc_commit=$(cat dist/ixcc_commit.txt)"
+            echo "ixcc_commit_short=$(cat dist/ixcc_commit_short.txt)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build A-track wheels in container (u2404 legacy path)
+        if: ${{ env.IS_FRESH_U2004 != 'true' }}
         env:
           IXCC_ROOT: ${{ steps.preflight.outputs.ixcc_root }}
           # Must match preflight's IXCC_MLIR_CMAKE resolution (see step above) so IXCC_ROOT
           # and IXCC_MLIR_CMAKE point at the same tree; otherwise CMake finds an MLIRConfig
           # that references a mismatched LLVM version and find_package(LLVM ...) fails.
-          IXCC_MLIR_CMAKE: ${{ steps.ensure_ixcc.outputs.ixcc_mlir_cmake || inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
+          IXCC_MLIR_CMAKE: ${{ inputs.ixcc_mlir_cmake || vars.IXCC_RELEASE_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc-release/build/lib/cmake/mlir' }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -323,8 +366,40 @@ jobs:
 
       # The checks above inspect the wheel without loading it, so a wheel whose
       # extension modules crash on import passes all of them. Import for real,
-      # in the container, under an interpreter matching the wheel ABI tag.
-      - name: Verify wheel extension modules import
+      # in a fresh container, under an interpreter matching the wheel ABI tag.
+      #
+      # For the fresh-u2004 flow the body script already ran the same check
+      # inside the build container -- this outer step re-imports the wheel
+      # from a cold container to catch cases where build-container state
+      # accidentally made the wheel work.
+      - name: Verify wheel extension modules import (u2004 fresh)
+        if: ${{ env.IS_FRESH_U2004 == 'true' }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --privileged --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+            --network host --dns 10.101.1.104 --dns 10.101.1.101 \
+            -v "${PWD}:/flydsl-src:ro" \
+            -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              for ver in ${PYTHON_VERSIONS}; do
+                py="/usr/local/conda/envs/py${ver}/bin/python"
+                py_tag="cp${ver//./}"
+                shopt -s nullglob
+                wheels=(/flydsl-src/dist/*"${py_tag}"*.whl)
+                shopt -u nullglob
+                if (( ${#wheels[@]} == 0 )); then
+                  echo "::error::no wheel matching ${py_tag} in /flydsl-src/dist/"
+                  exit 1
+                fi
+                "${py}" /flydsl-src/.github/scripts/verify_wheel_import.py "${wheels[@]}" --check-aslr-off
+              done
+            '
+
+      - name: Verify wheel extension modules import (u2404 legacy path)
+        if: ${{ env.IS_FRESH_U2004 != 'true' }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -363,10 +438,10 @@ jobs:
 
       - name: Write build manifest and job summary
         env:
-          FLYDSL_COMMIT: ${{ steps.preflight.outputs.flydsl_commit }}
-          FLYDSL_COMMIT_SHORT: ${{ steps.preflight.outputs.flydsl_commit_short }}
-          IXCC_COMMIT: ${{ steps.preflight.outputs.ixcc_commit }}
-          IXCC_COMMIT_SHORT: ${{ steps.preflight.outputs.ixcc_commit_short }}
+          FLYDSL_COMMIT: ${{ steps.preflight.outputs.flydsl_commit || steps.fresh_build.outputs.flydsl_commit }}
+          FLYDSL_COMMIT_SHORT: ${{ steps.preflight.outputs.flydsl_commit_short || steps.fresh_build.outputs.flydsl_commit_short }}
+          IXCC_COMMIT: ${{ steps.preflight.outputs.ixcc_commit || steps.fresh_build.outputs.ixcc_commit }}
+          IXCC_COMMIT_SHORT: ${{ steps.preflight.outputs.ixcc_commit_short || steps.fresh_build.outputs.ixcc_commit_short }}
         run: |
           set -euo pipefail
           python3 .github/scripts/write_iluvatar_wheel_build_manifest.py \

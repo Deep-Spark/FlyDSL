@@ -53,11 +53,24 @@ def _extension_modules(root: Path) -> list[str]:
     return sorted(names)
 
 
+def _setarch_r_works() -> bool:
+    """Whether `setarch -R` can actually clear ADDR_NO_RANDOMIZE in this env.
+
+    Setting personality via setarch -R needs CAP_SYS_PTRACE, which in
+    containers means either --privileged or --cap-add SYS_PTRACE. Without it,
+    every child exits 1 before running, and the ASLR-off probe would flag
+    100% of the modules as regressions rather than measuring anything. Probe
+    once and let the caller decide to skip instead of misreport.
+    """
+    if shutil.which("setarch") is None:
+        return False
+    probe = subprocess.run(["setarch", "-R", "true"], capture_output=True)
+    return probe.returncode == 0
+
+
 def _import_ok(module: str, pythonpath: Path, *, no_aslr: bool) -> tuple[bool, str]:
     cmd = [sys.executable, "-c", f"import {module}"]
     if no_aslr:
-        if shutil.which("setarch") is None:
-            return True, "setarch unavailable, skipped"
         cmd = ["setarch", "-R", *cmd]
     # Inherit the environment: a conda interpreter needs HOME and its own vars
     # to start at all, and stripping them turns every import into a false
@@ -99,17 +112,23 @@ def _check_wheel(wheel: Path, *, check_aslr_off: bool) -> int:
                 violations += 1
 
         if check_aslr_off:
-            unlucky = []
-            for module in modules:
-                ok, _ = _import_ok(module, root, no_aslr=True)
-                if not ok:
-                    unlucky.append(module)
-            if unlucky:
+            if not _setarch_r_works():
                 print(
-                    f"::warning::{wheel.name}: {len(unlucky)}/{len(modules)} extension modules "
-                    "fail to import with ASLR disabled. The build works by virtue of its memory "
-                    "layout rather than being sound; an unrelated code change can flip it."
+                    f"   ASLR-off probe skipped: setarch -R cannot set personality "
+                    f"in this environment (needs CAP_SYS_PTRACE / --privileged)"
                 )
+            else:
+                unlucky = []
+                for module in modules:
+                    ok, _ = _import_ok(module, root, no_aslr=True)
+                    if not ok:
+                        unlucky.append(module)
+                if unlucky:
+                    print(
+                        f"::warning::{wheel.name}: {len(unlucky)}/{len(modules)} extension modules "
+                        "fail to import with ASLR disabled. The build works by virtue of its memory "
+                        "layout rather than being sound; an unrelated code change can flip it."
+                    )
 
     return violations
 
