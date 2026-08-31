@@ -321,6 +321,46 @@ jobs:
           set -euo pipefail
           python3 .github/scripts/verify_wheel_toolchain.py dist/*.whl
 
+      # The checks above inspect the wheel without loading it, so a wheel whose
+      # extension modules crash on import passes all of them. Import for real,
+      # in the container, under an interpreter matching the wheel ABI tag.
+      - name: Verify wheel extension modules import
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --network host \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp/flydsl-u2004-home \
+            -v "${PWD}:/workspace" \
+            -v "${U2004_CONDA_BASE}:${U2004_CONDA_BASE}" \
+            -w /workspace \
+            -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
+            -e U2004_CONDA_BASE="${U2004_CONDA_BASE}" \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              mkdir -p "${HOME:-/tmp/flydsl-u2004-home}"
+              # shellcheck disable=SC1091
+              source /workspace/.github/scripts/u2004_conda_python.sh
+              . /etc/os-release
+              for ver in ${PYTHON_VERSIONS}; do
+                if [[ "${VERSION_ID}" == "20.04" ]]; then
+                  py="$(u2004_resolve_python "${ver}")"
+                else
+                  py="/usr/local/conda/envs/py${ver}/bin/python"
+                fi
+                py_tag="cp${ver//./}"
+                shopt -s nullglob
+                wheels=(dist/*"${py_tag}"*.whl)
+                shopt -u nullglob
+                if (( ${#wheels[@]} == 0 )); then
+                  echo "::error::no wheel matching ${py_tag} in dist/"
+                  exit 1
+                fi
+                "${py}" .github/scripts/verify_wheel_import.py "${wheels[@]}" --check-aslr-off
+              done
+            '
+
       - name: Write build manifest and job summary
         env:
           FLYDSL_COMMIT: ${{ steps.preflight.outputs.flydsl_commit }}
