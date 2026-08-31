@@ -47,6 +47,11 @@ on:
           - weekly
           - ci
         default: weekly
+      ixcc_ref:
+        description: "u2004 fresh flow only: git ref inside ixcc.git (default xiang.zhang/ixcc-flydsl-release)"
+        type: string
+        required: false
+        default: "origin/xiang.zhang/ixcc-flydsl-release"
 
 permissions:
   contents: write
@@ -201,6 +206,7 @@ jobs:
       source_ref: ${{ needs.gate.outputs.source_ref }}
       artifact_name: flydsl-iluvatar-wheels-${{ matrix.id }}-${{ github.run_id }}
       ixcc_mlir_cmake: ${{ matrix.ixcc_mlir_cmake }}
+      ixcc_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ixcc_ref || 'origin/xiang.zhang/ixcc-flydsl-release' }}
       local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.channel, matrix.id) || '' }}
       cmake_build_type: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
     permissions:
