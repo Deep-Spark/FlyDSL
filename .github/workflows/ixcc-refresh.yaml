@@ -1,0 +1,109 @@
+name: ixcc-refresh
+
+# 30-min IXCC working-tree refresh.
+#
+# Two parallel variants:
+#   internal -> sw_home/sdk/ixcc         @ origin/working
+#               (consumed by ci-device, perf-daily, and the internal wheel channel)
+#   external -> sw_home/sdk/ixcc-external @ origin/xiang.zhang/ixcc-flydsl-release
+#               (consumed by the external release wheel channel)
+#
+# Each variant fetches its branch, computes stamp..HEAD diff filtered by the
+# MLIR-gate pathspecs, and only takes the flock + runs sw_home/build.sh if
+# the diff is non-empty. A tick that adds only non-MLIR commits is a no-op.
+#
+# The MLIR-gate default is the "medium" set: mlir subtree plus the LLVM
+# headers / IR / Support / Bitcode / cmake dirs that MLIR is most sensitive
+# to. Adjust if we discover a class of MLIR-relevant changes it misses.
+#
+# Concurrency is per-variant so internal and external refreshes never block
+# each other. Within a variant we set cancel-in-progress: false because a
+# long rebuild triggered by an MLIR change must not be killed by the next
+# 30-min tick -- the flock on the ixcc tree serialises concurrent writers.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Ignore MLIR gate and rebuild both variants"
+        required: false
+        type: boolean
+        default: false
+      reason:
+        description: "Why manual run is requested"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: internal
+            root: ${{ vars.IXCC_WORKING_ROOT || '/home/flydsl/sw_home/sdk/ixcc' }}
+            branch: working
+          - variant: external
+            root: ${{ vars.IXCC_EXTERNAL_ROOT || '/home/flydsl/sw_home/sdk/ixcc-external' }}
+            branch: xiang.zhang/ixcc-flydsl-release
+
+    name: refresh-ixcc-${{ matrix.variant }}
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 240
+
+    concurrency:
+      group: ixcc-refresh-${{ matrix.variant }}
+      cancel-in-progress: false
+
+    env:
+      IXCC_ROOT: ${{ matrix.root }}
+      IXCC_BRANCH: ${{ matrix.branch }}
+      # Medium-scope MLIR gate. Any commit in stamp..origin/${IXCC_BRANCH}
+      # that touches at least one of these top-level monorepo dirs triggers
+      # a rebuild. Note: MLIR is at ./mlir/ (llvm-project monorepo layout),
+      # not ./llvm/mlir/.
+      MLIR_GATE: "mlir,llvm/include/llvm,llvm/lib/IR,llvm/lib/Support,llvm/lib/Bitcode,llvm/cmake,cmake"
+
+    steps:
+      - name: Checkout FlyDSL (for the refresh script)
+        uses: actions/checkout@v4
+
+      - name: Refresh IXCC ${{ matrix.variant }}
+        id: refresh
+        run: |
+          set -euo pipefail
+          args=(
+            --ixcc-root   "${IXCC_ROOT}"
+            --ixcc-branch "${IXCC_BRANCH}"
+            --mlir-gate   "${MLIR_GATE}"
+          )
+          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || 'false' }}" == "true" ]]; then
+            args+=(--force-rebuild)
+          fi
+          bash .github/scripts/prepare_ixcc_refresh.sh "${args[@]}"
+
+      - name: Write summary
+        env:
+          INPUT_REASON: ${{ github.event_name == 'workflow_dispatch' && inputs.reason || '' }}
+        run: |
+          {
+            echo "### IXCC refresh (${{ matrix.variant }})"
+            echo
+            echo "- root: \`${IXCC_ROOT}\`"
+            echo "- branch: \`origin/${IXCC_BRANCH}\`"
+            echo "- ixcc_commit: \`${{ steps.refresh.outputs.ixcc_commit || 'unknown' }}\`"
+            echo "- built: \`${{ steps.refresh.outputs.ixcc_built || 'false' }}\`"
+            if [[ -n "${{ steps.refresh.outputs.ixcc_skip_reason || '' }}" ]]; then
+              echo "- skip_reason: \`${{ steps.refresh.outputs.ixcc_skip_reason }}\`"
+            fi
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "- manual reason: \`${INPUT_REASON}\`"
+              echo "- force_rebuild: \`${{ inputs.force_rebuild }}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

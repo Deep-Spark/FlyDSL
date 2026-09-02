@@ -1,4 +1,27 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 FlyDSL Project Contributors
+#
+# Compatibility wrapper. Delegates to two smaller, single-responsibility
+# scripts so callers can migrate incrementally:
+#
+#   prepare_ixcc_refresh.sh   (IXCC working tree; own 30-min cron workflow)
+#   prepare_ixsdk_refresh.sh  (IXSDK working tree; daily cron workflow)
+#
+# The wrapper keeps the pre-split CLI + GitHub Actions outputs
+# (`ixcc_commit`, `ixsdk_commit`, `updated_today`) intact so
+# perf-daily-iluvatar.yml, which calls this script inline, continues to
+# work without changes. Once perf-daily migrates to the split scripts, this
+# wrapper can be deleted.
+#
+# Intentional differences from the pre-split behavior:
+#   - IXCC step now flocks its build with the same lock file used by the
+#     30-min ixcc-refresh.yaml cron and by wheel builds, so an inline
+#     refresh from perf-daily can safely run concurrently with the cron.
+#   - IXCC still uses the pre-split "always rebuild when HEAD differs"
+#     semantics; the MLIR-only gate is only enabled via the cron workflow,
+#     not from this wrapper. (Perf-daily wants the latest IXCC unconditionally.)
+
 set -euo pipefail
 
 usage() {
@@ -6,25 +29,27 @@ usage() {
 Usage:
   prepare_ix_toolchains_daily.sh [options]
 
-Options:
-  --ixcc-root <path>       IXCC working repository root.
-  --ixsdk-root <path>      IXSDK working repository root.
-  --state-file <path>      State file for daily build marker.
-                           Default: /var/tmp/flydsl-ix-toolchain-daily.state
-  --ixcc-build-marker <path>
-                           Marker file that must exist for IXCC build.
-                           Default: <ixcc-root>/build/lib/cmake/mlir/MLIRConfig.cmake
-  --ixsdk-install-marker <path>
-                           Optional marker file that must exist for IXSDK install.
-                           Default: empty (disabled)
-  --ixcc-commit-stamp <path>
-                           File that records IXCC commit last built locally.
-                           Default: <ixcc-root>/.flydsl_ixcc_build_commit
-  --ixsdk-commit-stamp <path>
-                           File that records IXSDK commit last installed locally.
-                           Default: <ixsdk-root>/.flydsl_ixsdk_install_commit
-  --force-rebuild          Force rebuild even if already latest.
-  -h, --help               Show help.
+Options preserved from the pre-split script:
+  --ixcc-root PATH             IXCC working repository root.
+  --ixsdk-root PATH            IXSDK working repository root.
+  --state-file PATH            Retained for CLI compat; unused by wrapper.
+  --ixcc-build-marker PATH     Passed through to prepare_ixcc_refresh.sh.
+  --ixsdk-install-marker PATH  Passed through to prepare_ixsdk_refresh.sh.
+  --ixcc-commit-stamp PATH     Passed through.
+  --ixsdk-commit-stamp PATH    Passed through.
+  --force-rebuild              Force both sub-scripts to rebuild.
+  -h, --help                   Show help.
+
+Env fallbacks (compat):
+  IXCC_WORKING_ROOT, IXSDK_WORKING_ROOT,
+  IX_TOOLCHAIN_DAILY_STATE_FILE (retained, unused),
+  IXCC_BUILD_MARKER, IXSDK_INSTALL_MARKER,
+  IXCC_COMMIT_STAMP, IXSDK_COMMIT_STAMP.
+
+Outputs (GitHub Actions):
+  ixcc_commit=<short>          Short SHA at end of IXCC step.
+  ixsdk_commit=<short>         Short SHA at end of IXSDK step.
+  updated_today=<true|false>   True iff either step actually rebuilt.
 EOF
 }
 
@@ -39,215 +64,74 @@ FORCE_REBUILD=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ixcc-root)
-      IXCC_ROOT="${2:?missing value for --ixcc-root}"
-      shift 2
-      ;;
-    --ixsdk-root)
-      IXSDK_ROOT="${2:?missing value for --ixsdk-root}"
-      shift 2
-      ;;
-    --state-file)
-      STATE_FILE="${2:?missing value for --state-file}"
-      shift 2
-      ;;
-    --ixcc-build-marker)
-      IXCC_BUILD_MARKER="${2:?missing value for --ixcc-build-marker}"
-      shift 2
-      ;;
-    --ixsdk-install-marker)
-      IXSDK_INSTALL_MARKER="${2:?missing value for --ixsdk-install-marker}"
-      shift 2
-      ;;
-    --ixcc-commit-stamp)
-      IXCC_COMMIT_STAMP="${2:?missing value for --ixcc-commit-stamp}"
-      shift 2
-      ;;
-    --ixsdk-commit-stamp)
-      IXSDK_COMMIT_STAMP="${2:?missing value for --ixsdk-commit-stamp}"
-      shift 2
-      ;;
-    --force-rebuild)
-      FORCE_REBUILD=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $1" >&2
-      usage
-      exit 2
-      ;;
+    --ixcc-root)             IXCC_ROOT="${2:?}"; shift 2 ;;
+    --ixsdk-root)            IXSDK_ROOT="${2:?}"; shift 2 ;;
+    --state-file)            STATE_FILE="${2:?}"; shift 2 ;;
+    --ixcc-build-marker)     IXCC_BUILD_MARKER="${2:?}"; shift 2 ;;
+    --ixsdk-install-marker)  IXSDK_INSTALL_MARKER="${2:?}"; shift 2 ;;
+    --ixcc-commit-stamp)     IXCC_COMMIT_STAMP="${2:?}"; shift 2 ;;
+    --ixsdk-commit-stamp)    IXSDK_COMMIT_STAMP="${2:?}"; shift 2 ;;
+    --force-rebuild)         FORCE_REBUILD=1; shift ;;
+    -h|--help)               usage; exit 0 ;;
+    *)  echo "::error::unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "::error::missing required command: $1"
-    exit 1
-  }
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IXCC_SCRIPT="${SELF_DIR}/prepare_ixcc_refresh.sh"
+IXSDK_SCRIPT="${SELF_DIR}/prepare_ixsdk_refresh.sh"
+[[ -x "${IXCC_SCRIPT}"  ]] || { echo "::error::${IXCC_SCRIPT} not executable" >&2; exit 1; }
+[[ -x "${IXSDK_SCRIPT}" ]] || { echo "::error::${IXSDK_SCRIPT} not executable" >&2; exit 1; }
+
+# Capture each sub-script's GITHUB_OUTPUT into a temp file so we can parse
+# it without leaking the sub-script's key names into the real workflow
+# outputs. The wrapper only re-publishes the pre-split contract.
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "${tmp_dir}"' EXIT
+ixcc_out="${tmp_dir}/ixcc.out"
+ixsdk_out="${tmp_dir}/ixsdk.out"
+: >"${ixcc_out}" >"${ixsdk_out}"
+
+# Build IXCC argv from wrapper CLI/env.
+ixcc_args=(--ixcc-root "${IXCC_ROOT}")
+[[ -n "${IXCC_BUILD_MARKER}"  ]] && ixcc_args+=(--ixcc-build-marker "${IXCC_BUILD_MARKER}")
+[[ -n "${IXCC_COMMIT_STAMP}"  ]] && ixcc_args+=(--ixcc-commit-stamp "${IXCC_COMMIT_STAMP}")
+[[ "${FORCE_REBUILD}" == "1"  ]] && ixcc_args+=(--force-rebuild)
+
+echo "[ix-toolchain] delegating IXCC step -> prepare_ixcc_refresh.sh"
+GITHUB_OUTPUT="${ixcc_out}" "${IXCC_SCRIPT}" "${ixcc_args[@]}"
+
+ixsdk_args=(--ixsdk-root "${IXSDK_ROOT}")
+[[ -n "${IXSDK_INSTALL_MARKER}" ]] && ixsdk_args+=(--ixsdk-install-marker "${IXSDK_INSTALL_MARKER}")
+[[ -n "${IXSDK_COMMIT_STAMP}"   ]] && ixsdk_args+=(--ixsdk-commit-stamp "${IXSDK_COMMIT_STAMP}")
+[[ "${FORCE_REBUILD}" == "1"    ]] && ixsdk_args+=(--force-rebuild)
+
+echo "[ix-toolchain] delegating IXSDK step -> prepare_ixsdk_refresh.sh"
+GITHUB_OUTPUT="${ixsdk_out}" "${IXSDK_SCRIPT}" "${ixsdk_args[@]}"
+
+read_kv() {
+  local file="$1" key="$2"
+  awk -F= -v k="${key}" '$1==k {sub(/^[^=]*=/,""); print; exit}' "${file}"
 }
 
-require_cmd git
+ixcc_commit="$(read_kv "${ixcc_out}" ixcc_commit)"
+ixcc_built="$(read_kv "${ixcc_out}" ixcc_built)"
+ixsdk_commit="$(read_kv "${ixsdk_out}" ixsdk_commit)"
+ixsdk_installed="$(read_kv "${ixsdk_out}" ixsdk_installed)"
 
-if [[ ! -d "${IXCC_ROOT}" ]]; then
-  echo "::error::IXCC root not found: ${IXCC_ROOT}"
-  exit 1
-fi
-if [[ ! -d "${IXSDK_ROOT}" ]]; then
-  echo "::error::IXSDK root not found: ${IXSDK_ROOT}"
-  exit 1
-fi
-if [[ ! -d "${IXCC_ROOT}/.git" ]]; then
-  echo "::error::IXCC root is not a git repository: ${IXCC_ROOT}"
-  exit 1
-fi
-if [[ ! -d "${IXSDK_ROOT}/.git" ]]; then
-  echo "::error::IXSDK root is not a git repository: ${IXSDK_ROOT}"
-  exit 1
-fi
+updated_today="false"
+[[ "${ixcc_built}" == "true" || "${ixsdk_installed}" == "true" ]] && updated_today="true"
 
-# IXCC build must run from sw_home root after sourcing enable.
-SW_HOME="$(cd "${IXCC_ROOT}/../.." && pwd)"
-if [[ ! -f "${SW_HOME}/enable" ]]; then
-  echo "::error::sw_home enable script not found: ${SW_HOME}/enable"
-  exit 1
-fi
-if [[ ! -x "${SW_HOME}/build.sh" ]]; then
-  echo "::error::sw_home build.sh not found or not executable: ${SW_HOME}/build.sh"
-  exit 1
-fi
-
-# Self-hosted runners can mount toolchain repos with ownership different from
-# the runner user. Mark them as safe to prevent "dubious ownership" failures.
-git config --global --add safe.directory "${IXCC_ROOT}" || true
-git config --global --add safe.directory "${IXSDK_ROOT}" || true
-
-if [[ -z "${IXCC_BUILD_MARKER}" ]]; then
-  IXCC_BUILD_MARKER="${IXCC_ROOT}/build/lib/cmake/mlir/MLIRConfig.cmake"
-fi
-if [[ -z "${IXCC_COMMIT_STAMP}" ]]; then
-  IXCC_COMMIT_STAMP="${IXCC_ROOT}/.flydsl_ixcc_build_commit"
-fi
-if [[ -z "${IXSDK_COMMIT_STAMP}" ]]; then
-  IXSDK_COMMIT_STAMP="${IXSDK_ROOT}/.flydsl_ixsdk_install_commit"
-fi
-
-read_commit_stamp() {
-  local path="$1"
-  if [[ -f "${path}" ]]; then
-    tr -d '[:space:]' < "${path}"
-  fi
-}
-
-write_commit_stamp() {
-  local path="$1"
-  local commit="$2"
-  mkdir -p "$(dirname "${path}")"
-  printf '%s\n' "${commit}" > "${path}"
-}
-
-has_local_artifact_for_commit() {
-  local commit="$1"
-  local stamp_path="$2"
-  local marker_path="${3:-}"
-  local stamp_commit
-  stamp_commit="$(read_commit_stamp "${stamp_path}")"
-  if [[ -z "${stamp_commit}" || "${stamp_commit}" != "${commit}" ]]; then
-    return 1
-  fi
-  if [[ -n "${marker_path}" && ! -e "${marker_path}" ]]; then
-    return 1
-  fi
-  return 0
-}
-
-write_state() {
-  local date_utc="$1"
-  local ixcc_commit="$2"
-  local ixsdk_commit="$3"
+# Retained for CLI compat -- some ops tooling reads this file. Fields match
+# the pre-split format.
+if [[ -n "${STATE_FILE}" ]]; then
   mkdir -p "$(dirname "${STATE_FILE}")"
   {
-    echo "date_utc=${date_utc}"
-    echo "ixcc_commit=${ixcc_commit}"
-    echo "ixsdk_commit=${ixsdk_commit}"
+    echo "date_utc=$(date -u +%Y-%m-%d)"
+    echo "ixcc_commit=${ixcc_commit:-unknown}"
+    echo "ixsdk_commit=${ixsdk_commit:-unknown}"
     echo "updated_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } > "${STATE_FILE}"
-}
-
-today_utc="$(date -u +%Y-%m-%d)"
-ixcc_commit=""
-ixsdk_commit=""
-updated_today="false"
-
-echo "[ix-toolchain] checking IXCC working @ ${IXCC_ROOT}"
-git -C "${IXCC_ROOT}" fetch origin working
-git -C "${IXCC_ROOT}" checkout working
-ixcc_local_head="$(git -C "${IXCC_ROOT}" rev-parse HEAD)"
-ixcc_remote_head="$(git -C "${IXCC_ROOT}" rev-parse origin/working)"
-ixcc_needs_build=0
-if [[ "${FORCE_REBUILD}" == "1" || "${ixcc_local_head}" != "${ixcc_remote_head}" ]]; then
-  ixcc_needs_build=1
-elif ! has_local_artifact_for_commit "${ixcc_local_head}" "${IXCC_COMMIT_STAMP}" "${IXCC_BUILD_MARKER}"; then
-  echo "[ix-toolchain] IXCC commit unchanged but local build marker/stamp missing; rebuilding"
-  ixcc_needs_build=1
-fi
-if [[ "${ixcc_needs_build}" == "1" ]]; then
-  echo "[ix-toolchain] IXCC rebuild required, syncing working branch"
-  git -C "${IXCC_ROOT}" pull --ff-only origin working
-  echo "[ix-toolchain] building IXCC from sw_home (source enable && ./build.sh -r ixcc --host)"
-  (
-    cd "${SW_HOME}"
-    # sw_home/enable expects interactive shell vars (e.g. PS1). In CI with
-    # `set -u`, temporarily relax nounset while sourcing.
-    set +u
-    # shellcheck disable=SC1091
-    source "${SW_HOME}/enable"
-    set -u
-    ./build.sh -r ixcc --host
-  )
-  ixcc_commit="$(git -C "${IXCC_ROOT}" rev-parse --short HEAD)"
-  write_commit_stamp "${IXCC_COMMIT_STAMP}" "${ixcc_commit}"
-  updated_today="true"
-else
-  echo "[ix-toolchain] IXCC already latest on working; skip build"
-  ixcc_commit="$(git -C "${IXCC_ROOT}" rev-parse --short HEAD)"
-fi
-
-echo "[ix-toolchain] checking IXSDK working @ ${IXSDK_ROOT}"
-git -C "${IXSDK_ROOT}" fetch origin working
-git -C "${IXSDK_ROOT}" checkout working
-ixsdk_local_head="$(git -C "${IXSDK_ROOT}" rev-parse HEAD)"
-ixsdk_remote_head="$(git -C "${IXSDK_ROOT}" rev-parse origin/working)"
-ixsdk_needs_install=0
-if [[ "${FORCE_REBUILD}" == "1" || "${ixsdk_local_head}" != "${ixsdk_remote_head}" ]]; then
-  ixsdk_needs_install=1
-elif ! has_local_artifact_for_commit "${ixsdk_local_head}" "${IXSDK_COMMIT_STAMP}" "${IXSDK_INSTALL_MARKER}"; then
-  echo "[ix-toolchain] IXSDK commit unchanged but local install marker/stamp missing; reinstalling"
-  ixsdk_needs_install=1
-fi
-if [[ "${ixsdk_needs_install}" == "1" ]]; then
-  echo "[ix-toolchain] IXSDK reinstall required, syncing working branch"
-  git -C "${IXSDK_ROOT}" pull --ff-only origin working
-  echo "[ix-toolchain] installing IXSDK (make install)"
-  (cd "${IXSDK_ROOT}" && make install)
-  ixsdk_commit="$(git -C "${IXSDK_ROOT}" rev-parse --short HEAD)"
-  write_commit_stamp "${IXSDK_COMMIT_STAMP}" "${ixsdk_commit}"
-  updated_today="true"
-else
-  echo "[ix-toolchain] IXSDK already latest on working; skip install"
-  ixsdk_commit="$(git -C "${IXSDK_ROOT}" rev-parse --short HEAD)"
-fi
-
-write_state "${today_utc}" "${ixcc_commit}" "${ixsdk_commit}"
-
-if [[ -z "${ixcc_commit}" ]]; then
-  ixcc_commit="$(git -C "${IXCC_ROOT}" rev-parse --short HEAD 2>/dev/null || true)"
-fi
-if [[ -z "${ixsdk_commit}" ]]; then
-  ixsdk_commit="$(git -C "${IXSDK_ROOT}" rev-parse --short HEAD 2>/dev/null || true)"
 fi
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then

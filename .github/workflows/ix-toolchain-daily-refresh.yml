@@ -1,0 +1,77 @@
+name: ix-toolchain-daily-refresh
+
+# Daily refresh of the IXSDK working tree on the runner.
+#
+# IXCC's refresh moved out of this workflow: it now runs every 30 min from
+# ixcc-refresh.yaml with an MLIR-only diff gate, because wheel builds need
+# to pick up MLIR changes promptly, while IXSDK changes are infrequent and
+# non-time-critical.
+#
+# The u2004 in-docker ixcc-release build that used to live here was
+# superseded by the fresh-container wheel flow in
+# .github/scripts/_build_wheel_fresh_body.sh (PR#129) and is not restored.
+
+on:
+  schedule:
+    # 03:00 Asia/Shanghai == 19:00 UTC (previous day). Kept from the
+    # pre-split workflow so downstream ops dashboards see the same cadence.
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force reinstall even if stamp already matches"
+        required: false
+        type: boolean
+        default: false
+      reason:
+        description: "Why manual run is requested"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ix-toolchain-daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh-ixsdk:
+    name: refresh-ixsdk-working
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 120
+    env:
+      IXSDK_WORKING_ROOT: ${{ vars.IXSDK_WORKING_ROOT || '/home/flydsl/sw_home/sdk/ixsdk' }}
+      IXSDK_INSTALL_MARKER: ${{ vars.IXSDK_INSTALL_MARKER || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refresh IXSDK working tree
+        id: refresh
+        run: |
+          set -euo pipefail
+          args=(--ixsdk-root "${IXSDK_WORKING_ROOT}")
+          if [[ -n "${IXSDK_INSTALL_MARKER}" ]]; then
+            args+=(--ixsdk-install-marker "${IXSDK_INSTALL_MARKER}")
+          fi
+          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || 'false' }}" == "true" ]]; then
+            args+=(--force-rebuild)
+          fi
+          bash .github/scripts/prepare_ixsdk_refresh.sh "${args[@]}"
+
+      - name: Write summary
+        env:
+          INPUT_REASON: ${{ github.event_name == 'workflow_dispatch' && inputs.reason || '' }}
+        run: |
+          {
+            echo "### IXSDK daily refresh"
+            echo
+            echo "- ixsdk_commit: \`${{ steps.refresh.outputs.ixsdk_commit || 'unknown' }}\`"
+            echo "- installed: \`${{ steps.refresh.outputs.ixsdk_installed || 'false' }}\`"
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "- manual reason: \`${INPUT_REASON}\`"
+              echo "- force_rebuild: \`${{ inputs.force_rebuild }}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
