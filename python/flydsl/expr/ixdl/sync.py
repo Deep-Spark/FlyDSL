@@ -10,8 +10,8 @@ CQ named barriers in the same kernel (and do not emit pipebar on CQ paths).
   :func:`cp_async_wait_group`. Shared by MR SME and CQ SMEX G2S.
 
 * Scheme B (MR pipeline barrier): :func:`sl_waitmem` /
-  :func:`sl_pipebar_arrive` / :func:`sl_pipebar_wait`. Requires ``pipe-bar``
-  (ivcore11 / MR). CQ has no pipebar -- keep these for MR kernels only.
+  :func:`sl_barrier_alu` / :func:`sl_pipebar_arrive` / :func:`sl_pipebar_wait`.
+  Requires ``pipe-bar`` (ivcore11 / MR).
 
 * Scheme C (CQ named barrier): :func:`nbarrier_reach` / :func:`nbarrier_wait` /
   :func:`nbarrier_sync`. Requires ``named-bar`` (CQ);
@@ -55,7 +55,7 @@ def cp_async_wait_group(n=0):
     return _llvm.call_intrinsic(None, "llvm.bi.cp.async.wait.group", [_const_i32(n)], [], [])
 
 
-# --- Scheme B: multi-stage pipeline (sl_waitmem + pipebar; MR / pipe-bar only) ---
+# --- Scheme B: multi-stage pipeline (sl_waitmem + sl_barrier_alu + pipebar; MR) ---
 
 # Layout of the ivcore11 ``sl.waitcnt`` bitfield. It is a packed structure holding,
 # in declaration order, a 1-bit enable flag per counter followed by each counter's
@@ -105,6 +105,16 @@ def sl_waitmem(**counters):
     threshold to wait down to. The GEMM pipeline uses ``sl_waitmem(g2s=stages - 1, lm=0)``.
     """
     return _llvm.call_intrinsic(None, "llvm.bi.sl.waitcnt", [_const_i64(_waitcnt_value(**counters))], [], [])
+
+
+def sl_barrier_alu():
+    """ALU-only CTA sync (``llvm.bi.sl.barrier.alu`` / ``__syncthreads_alu``).
+
+    ``fx.gpu.barrier`` lowers to ``sl_barrier``, which embeds a memory wait and
+    drains outstanding G2S. This intrinsic does not: on MR it becomes a pipebar
+    pair so a 2-stage SME pipeline can keep the next G2S in flight.
+    """
+    return _llvm.call_intrinsic(None, "llvm.bi.sl.barrier.alu", [], [], [])
 
 
 def sl_pipebar_arrive(value=0):
