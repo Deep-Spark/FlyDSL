@@ -1,0 +1,16 @@
+[Unit]
+Description=Fire ixcc-refresh dispatch every 30 min (SWCOMP-3177 GH cron backstop)
+
+[Timer]
+# 2 min after boot so gh network resolution has settled.
+OnBootSec=2min
+# Every 30 min after the last successful activation.
+OnUnitActiveSec=30min
+# Catch up on missed activations across sleeps or reboots.
+Persistent=true
+# 30 s slack so the timer is not phase-locked with any GH cron tick.
+AccuracySec=30s
+Unit=ixcc-refresh-dispatch.service
+
+[Install]
+WantedBy=default.target
