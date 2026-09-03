@@ -47,6 +47,15 @@ on:
           - weekly
           - ci
         default: weekly
+      ixcc_variant:
+        description: "IXCC tree to build against. Empty = per-channel default (ci->internal, weekly->external)"
+        type: choice
+        required: false
+        options:
+          - ""
+          - internal
+          - external
+        default: ""
       ixcc_ref:
         description: "u2004 fresh flow only: git ref inside ixcc.git (default xiang.zhang/ixcc-flydsl-release)"
         type: string
@@ -73,6 +82,7 @@ jobs:
       channel: ${{ steps.gate.outputs.channel }}
       test_suite: ${{ steps.gate.outputs.test_suite }}
       local_name: ${{ steps.gate.outputs.local_name }}
+      ixcc_variant: ${{ steps.gate.outputs.ixcc_variant }}
       build_matrix: ${{ steps.gate.outputs.build_matrix }}
     steps:
       - name: Resolve source ref
@@ -107,9 +117,6 @@ jobs:
         env:
           U2004_IMAGE: ${{ vars.FLYDSL_ILUVATAR_U2004_IMAGE || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
           U2404_IMAGE: ${{ vars.FLYDSL_ILUVATAR_U2404_IMAGE || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
-          IXCC_U2004_CP310_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_U2004_CP310_MLIR_CMAKE }}
-          IXCC_U2004_CP312_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_U2004_CP312_MLIR_CMAKE }}
-          IXCC_U2404_MLIR_CMAKE: ${{ vars.IXCC_RELEASE_MLIR_CMAKE }}
           U2004_PYTHON_VERSIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.u2004_python_versions || '3.12' }}
         run: |
           set -euo pipefail
@@ -127,15 +134,38 @@ jobs:
             echo "should_run=true" >> "${GITHUB_OUTPUT}"
             echo "reason=Scheduled or manual Iluvatar weekly wheel publish." >> "${GITHUB_OUTPUT}"
           fi
+          # ixcc_variant: dispatch input overrides; empty = per-channel default
+          # (ci -> internal for daily dev iteration; weekly -> external for release).
+          # local_name: derived from ixcc_variant so external always publishes to
+          # ${WHEEL_ROOT}/latest/ (external URL kept for downstream compat) and
+          # internal to ${WHEEL_ROOT}/internal/ (renamed from the old ${WHEEL_ROOT}/ci/).
+          requested_variant="${{ github.event_name == 'workflow_dispatch' && inputs.ixcc_variant || '' }}"
+          if [ -n "${requested_variant}" ]; then
+            ixcc_variant="${requested_variant}"
+          elif [ "${channel}" = "ci" ]; then
+            ixcc_variant=internal
+          else
+            ixcc_variant=external
+          fi
+          case "${ixcc_variant}" in
+            internal) local_name=internal ;;
+            external) local_name=latest   ;;
+          esac
+          echo "ixcc_variant=${ixcc_variant}" >> "${GITHUB_OUTPUT}"
+          echo "local_name=${local_name}" >> "${GITHUB_OUTPUT}"
           if [ "${channel}" = "ci" ]; then
             echo "channel=ci" >> "${GITHUB_OUTPUT}"
             echo "test_suite=smoke" >> "${GITHUB_OUTPUT}"
-            echo "local_name=ci" >> "${GITHUB_OUTPUT}"
           else
             echo "channel=weekly" >> "${GITHUB_OUTPUT}"
             echo "test_suite=full" >> "${GITHUB_OUTPUT}"
-            echo "local_name=latest" >> "${GITHUB_OUTPUT}"
           fi
+          # Build matrix: one entry per (image, python_version). ixcc_mlir_cmake
+          # is intentionally omitted; build-whl-iluvatar.yaml picks the tree from
+          # ixcc_variant (internal -> vars.IXCC_MLIR_CMAKE, external ->
+          # vars.IXCC_EXTERNAL_MLIR_CMAKE, with vars.IXCC_RELEASE_MLIR_CMAKE as a
+          # legacy external fallback). u2404 stays weekly-only for now because
+          # the smoke path has no dedicated u2404 GPU runner.
           CHANNEL="${channel}" python3 - <<'PY' >> "${GITHUB_OUTPUT}"
           import json
           import os
@@ -143,10 +173,6 @@ jobs:
           channel = os.environ["CHANNEL"]
           u2004_image = os.environ["U2004_IMAGE"]
           u2004_versions = [v.strip() for v in os.environ["U2004_PYTHON_VERSIONS"].split() if v.strip()]
-          ixcc_by_py = {
-              "3.10": os.environ.get("IXCC_U2004_CP310_MLIR_CMAKE", ""),
-              "3.12": os.environ.get("IXCC_U2004_CP312_MLIR_CMAKE", ""),
-          }
 
           matrix = []
           for ver in u2004_versions:
@@ -157,7 +183,6 @@ jobs:
                       "python_versions": ver,
                       "docker_image": u2004_image,
                       "test_suite": "smoke",
-                      "ixcc_mlir_cmake": ixcc_by_py.get(ver, ""),
                   }
               )
 
@@ -168,7 +193,6 @@ jobs:
                       "python_versions": "3.12",
                       "docker_image": os.environ["U2404_IMAGE"],
                       "test_suite": "full",
-                      "ixcc_mlir_cmake": os.environ.get("IXCC_U2404_MLIR_CMAKE", ""),
                   }
               )
 
@@ -205,9 +229,11 @@ jobs:
       docker_image: ${{ matrix.docker_image }}
       source_ref: ${{ needs.gate.outputs.source_ref }}
       artifact_name: flydsl-iluvatar-wheels-${{ matrix.id }}-${{ github.run_id }}
-      ixcc_mlir_cmake: ${{ matrix.ixcc_mlir_cmake }}
       ixcc_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ixcc_ref || 'origin/xiang.zhang/ixcc-flydsl-release' }}
-      local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.channel, matrix.id) || '' }}
+      ixcc_variant: ${{ needs.gate.outputs.ixcc_variant }}
+      # Incoming dir carries the variant instead of the channel so promote-local can pick the
+      # right on-disk channel dir without re-implementing the ixcc_variant -> local_name mapping.
+      local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.ixcc_variant, matrix.id) || '' }}
       cmake_build_type: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
     permissions:
       contents: read
@@ -247,20 +273,20 @@ jobs:
       - name: Promote incoming wheels to latest
         run: |
           set -euo pipefail
-          channel="${{ needs.gate.outputs.channel }}"
+          variant="${{ needs.gate.outputs.ixcc_variant }}"
           dest="${WHEEL_ROOT}/${{ needs.gate.outputs.local_name }}"
-          merge="${WHEEL_ROOT}/incoming-${channel}-merged"
+          merge="${WHEEL_ROOT}/incoming-${variant}-merged"
           shopt -s nullglob
-          dirs=("${WHEEL_ROOT}/incoming-${channel}-"*)
+          dirs=("${WHEEL_ROOT}/incoming-${variant}-"*)
           if [ "${#dirs[@]}" -eq 0 ]; then
-            echo "No incoming wheel dirs under ${WHEEL_ROOT}/incoming-${channel}-*" >&2
+            echo "No incoming wheel dirs under ${WHEEL_ROOT}/incoming-${variant}-*" >&2
             exit 1
           fi
           rm -rf "${merge}"
           mkdir -p "${merge}"
           for d in "${dirs[@]}"; do
             case "$(basename "${d}")" in
-              incoming-${channel}-merged) continue ;;
+              incoming-${variant}-merged) continue ;;
             esac
             cp -a "${d}/." "${merge}/"
           done
@@ -306,10 +332,12 @@ jobs:
       - name: Write publish summary
         run: |
           {
-            echo "### Iluvatar ${{ needs.gate.outputs.channel }} wheel"
+            echo "### Iluvatar ${{ needs.gate.outputs.channel }} wheel (${{ needs.gate.outputs.ixcc_variant }})"
             echo
             echo "- Source ref: \`${{ needs.gate.outputs.source_ref }}\`"
             echo "- Channel: \`${{ needs.gate.outputs.channel }}\`"
+            echo "- IXCC variant: \`${{ needs.gate.outputs.ixcc_variant }}\`"
+            echo "- Local nginx dir: \`${{ needs.gate.outputs.local_name }}/\`"
             echo "- URLs:"
             if [ "${{ needs.gate.outputs.channel }}" = "ci" ]; then
               echo "  - https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
