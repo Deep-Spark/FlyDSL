@@ -89,6 +89,7 @@ def main() -> int:
         "ixcc_commit": os.environ.get("IXCC_COMMIT", "").strip(),
         "ixcc_commit_short": os.environ.get("IXCC_COMMIT_SHORT", "").strip(),
         "ixcc_mlir_cmake": os.environ.get("IXCC_MLIR_CMAKE", "").strip(),
+        "ixcc_variant": os.environ.get("IXCC_VARIANT", "").strip(),
         "docker_image": os.environ.get("DOCKER_IMAGE", "").strip(),
         "python_versions": os.environ.get("PYTHON_VERSIONS", "").strip(),
         "github_run_id": run_id,
@@ -112,6 +113,7 @@ def main() -> int:
         f"- GitHub run id: `{manifest['github_run_id'] or '<unknown>'}`",
         f"- Artifact name: `{manifest['artifact_name'] or '<unknown>'}`",
         f"- Docker image: `{manifest['docker_image'] or '<unknown>'}`",
+        f"- IXCC variant: `{manifest['ixcc_variant'] or '<unknown>'}`",
         f"- MLIR cmake: `{manifest['ixcc_mlir_cmake'] or '<unknown>'}`",
     ]
     if run_url:

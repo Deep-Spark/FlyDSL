@@ -71,18 +71,21 @@ runner.
 | `IXCC_WORKING_ROOT`     | `/home/flydsl/sw_home/sdk/ixcc`               |
 | `IXCC_EXTERNAL_ROOT`    | `/home/flydsl/sw_home/sdk/ixcc-external`      |
 
-For the persistent-tree wheel path landing in PR-B, only the external
-counterpart of the existing `IXCC_MLIR_CMAKE` needs to be added; PR-B
-reuses `IXCC_MLIR_CMAKE` as the internal-channel CMake dir (already
-consumed by `ci-device.yml`, `perf-daily-iluvatar.yml`, and the
-`run_*_in_container.sh` scripts) rather than renaming it to
-`IXCC_INTERNAL_MLIR_CMAKE`, to avoid churning five files for a
-purely cosmetic symmetry with the new variable:
+The persistent-tree wheel path (build-whl-iluvatar.yaml, u2004 persistent
+step) picks the MLIR CMake dir from these two variables based on
+`ixcc_variant`. `IXCC_MLIR_CMAKE` already exists (consumed by
+`ci-device.yml`, `perf-daily-iluvatar.yml`, and `run_*_in_container.sh`)
+so PR-B reuses it as the internal-channel dir rather than renaming it
+to a hypothetical `IXCC_INTERNAL_MLIR_CMAKE`; only `IXCC_EXTERNAL_MLIR_CMAKE`
+is genuinely new. `IXCC_RELEASE_MLIR_CMAKE` (older name for the release /
+external tree) is still honoured as a fallback so existing runners keep
+working until they migrate.
 
-| variable                    | default                                                       |
-|-----------------------------|---------------------------------------------------------------|
-| `IXCC_MLIR_CMAKE`           | `/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir`          |
-| `IXCC_EXTERNAL_MLIR_CMAKE`  | `/home/flydsl/sw_home/sdk/ixcc-external/build/lib/cmake/mlir` |
+| variable                    | used by                        | default                                                       |
+|-----------------------------|--------------------------------|---------------------------------------------------------------|
+| `IXCC_MLIR_CMAKE`           | internal channel + ci-device   | `/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir`          |
+| `IXCC_EXTERNAL_MLIR_CMAKE`  | external channel               | `/home/flydsl/sw_home/sdk/ixcc-external/build/lib/cmake/mlir` |
+| `IXCC_RELEASE_MLIR_CMAKE`   | external channel (legacy alias) | (falls back to `IXCC_EXTERNAL_MLIR_CMAKE` default)            |
 
 ## Verifying the setup
 
