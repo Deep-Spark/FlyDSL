@@ -27,6 +27,17 @@ on:
         description: "u2004 fresh flow only: git ref inside ixcc.git"
         type: string
         default: "origin/xiang.zhang/ixcc-flydsl-release"
+      ixcc_variant:
+        description: "Which IXCC tree to build against (persistent path)"
+        type: choice
+        options:
+          - internal
+          - external
+        default: internal
+      use_fresh_ixcc:
+        description: "u2004 only: clone+build IXCC in container instead of consuming persistent tree"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
@@ -40,6 +51,8 @@ jobs:
       docker_image: ${{ inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
       cmake_build_type: ${{ inputs.cmake_build_type || 'Release' }}
       ixcc_ref: ${{ inputs.ixcc_ref || 'origin/xiang.zhang/ixcc-flydsl-release' }}
+      ixcc_variant: ${{ inputs.ixcc_variant || 'internal' }}
+      use_fresh_ixcc: ${{ inputs.use_fresh_ixcc || false }}
 
   test:
     needs: build
