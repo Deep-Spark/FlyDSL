@@ -22,7 +22,10 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  # actions: write is required by the canary step below so it can dispatch
+  # ixcc-refresh via GITHUB_TOKEN when the IXCC trees look stale. See
+  # SWCOMP-3177 for background (GH Actions has been dropping */30 ticks).
+  actions: write
 
 concurrency:
   group: perf-daily-iluvatar-iluvatar
@@ -57,6 +60,66 @@ jobs:
         with:
           ref: ${{ env.PERF_BRANCH }}
           clean: false
+
+      - name: Canary -- dispatch ixcc-refresh if IXCC .build.lock mtime is stale
+        # GitHub Actions has been dropping ixcc-refresh scheduled ticks for
+        # this repo (SWCOMP-3177). If either IXCC tree's .build.lock is older
+        # than STALE_THRESHOLD_MIN, dispatch ixcc-refresh so the external tree
+        # does not fall arbitrarily behind between the sporadic cron ticks
+        # that do land. Non-fatal on any failure.
+        #
+        # .build.lock mtime is bumped only when prepare_ixcc_refresh.sh
+        # actually rebuilds (open-for-write truncates the lock file); the
+        # MLIR-gate no-op path leaves mtime untouched. Consequence: on quiet
+        # MLIR days this canary always dispatches, which is fine -- the
+        # dispatched run itself will gate-no-op cheaply.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STALE_THRESHOLD_MIN: "90"
+        run: |
+          set -euo pipefail
+
+          internal="${IXCC_WORKING_ROOT:-/home/flydsl/sw_home/sdk/ixcc}"
+          if [[ "${internal}" == */ixcc ]]; then
+            external="${internal%/ixcc}/ixcc-external"
+          else
+            external="${internal}-external"
+          fi
+
+          need_dispatch=0
+          reasons=()
+          check_tree() {
+            local label="$1" root="$2"
+            local lock="${root}/.build.lock"
+            if [[ ! -e "${lock}" ]]; then
+              echo "canary(${label}): ${lock} does not exist -- treating as stale"
+              need_dispatch=1
+              reasons+=("${label}: no .build.lock")
+              return
+            fi
+            local now age_min lock_mtime
+            now="$(date +%s)"
+            lock_mtime="$(stat -c %Y "${lock}")"
+            age_min=$(( (now - lock_mtime) / 60 ))
+            echo "canary(${label}): ${lock} mtime age ${age_min} min (threshold ${STALE_THRESHOLD_MIN})"
+            if (( age_min > STALE_THRESHOLD_MIN )); then
+              need_dispatch=1
+              reasons+=("${label}: ${age_min} min old")
+            fi
+          }
+          check_tree internal "${internal}"
+          check_tree external "${external}"
+
+          if (( need_dispatch == 0 )); then
+            echo "canary: both IXCC trees refreshed within ${STALE_THRESHOLD_MIN} min -- nothing to dispatch"
+            exit 0
+          fi
+
+          reason_str="$(IFS=';'; echo "${reasons[*]}")"
+          echo "canary: dispatching ixcc-refresh due to: ${reason_str}"
+          gh workflow run -R "${GITHUB_REPOSITORY}" ixcc-refresh.yaml \
+            -f reason="perf-daily canary: ${reason_str}"
 
       - name: Daily update IXCC/IXSDK from working
         id: ix-toolchain
