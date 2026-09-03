@@ -1,6 +1,6 @@
 name: ixcc-refresh
 
-# 30-min IXCC working-tree refresh.
+# Hourly IXCC working-tree refresh.
 #
 # Two parallel variants:
 #   internal -> sw_home/sdk/ixcc         @ origin/working
@@ -19,11 +19,18 @@ name: ixcc-refresh
 # Concurrency is per-variant so internal and external refreshes never block
 # each other. Within a variant we set cancel-in-progress: false because a
 # long rebuild triggered by an MLIR change must not be killed by the next
-# 30-min tick -- the flock on the ixcc tree serialises concurrent writers.
+# hourly tick -- the flock on the ixcc tree serialises concurrent writers.
+#
+# Cron interval note: originally "*/30 * * * *", reduced to "0 * * * *"
+# because GitHub Actions was silently dropping 30-min ticks for this repo
+# (SWCOMP-3177: 0 scheduled runs delivered in the first 3h+ post-merge).
+# Hourly is easier for GH to deliver reliably; if we later confirm the
+# scheduler recovers we can push back to */30. The perf-daily canary step
+# is a separate daily-frequency backstop for the same problem.
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       force_rebuild:
