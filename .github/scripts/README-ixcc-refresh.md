@@ -1,6 +1,6 @@
 # IXCC refresh on self-hosted Iluvatar runners
 
-The 30-min workflow `.github/workflows/ixcc-refresh.yaml` assumes each
+The hourly workflow `.github/workflows/ixcc-refresh.yaml` assumes each
 Iluvatar runner already has:
 
 - an **internal** IXCC working tree tracking `origin/working`
@@ -71,18 +71,21 @@ runner.
 | `IXCC_WORKING_ROOT`     | `/home/flydsl/sw_home/sdk/ixcc`               |
 | `IXCC_EXTERNAL_ROOT`    | `/home/flydsl/sw_home/sdk/ixcc-external`      |
 
-For the persistent-tree wheel path landing in PR-B, only the external
-counterpart of the existing `IXCC_MLIR_CMAKE` needs to be added; PR-B
-reuses `IXCC_MLIR_CMAKE` as the internal-channel CMake dir (already
-consumed by `ci-device.yml`, `perf-daily-iluvatar.yml`, and the
-`run_*_in_container.sh` scripts) rather than renaming it to
-`IXCC_INTERNAL_MLIR_CMAKE`, to avoid churning five files for a
-purely cosmetic symmetry with the new variable:
+The persistent-tree wheel path (build-whl-iluvatar.yaml, u2004 persistent
+step) picks the MLIR CMake dir from these two variables based on
+`ixcc_variant`. `IXCC_MLIR_CMAKE` already exists (consumed by
+`ci-device.yml`, `perf-daily-iluvatar.yml`, and `run_*_in_container.sh`)
+so PR-B reuses it as the internal-channel dir rather than renaming it
+to a hypothetical `IXCC_INTERNAL_MLIR_CMAKE`; only `IXCC_EXTERNAL_MLIR_CMAKE`
+is genuinely new. `IXCC_RELEASE_MLIR_CMAKE` (older name for the release /
+external tree) is still honoured as a fallback so existing runners keep
+working until they migrate.
 
-| variable                    | default                                                       |
-|-----------------------------|---------------------------------------------------------------|
-| `IXCC_MLIR_CMAKE`           | `/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir`          |
-| `IXCC_EXTERNAL_MLIR_CMAKE`  | `/home/flydsl/sw_home/sdk/ixcc-external/build/lib/cmake/mlir` |
+| variable                    | used by                        | default                                                       |
+|-----------------------------|--------------------------------|---------------------------------------------------------------|
+| `IXCC_MLIR_CMAKE`           | internal channel + ci-device   | `/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir`          |
+| `IXCC_EXTERNAL_MLIR_CMAKE`  | external channel               | `/home/flydsl/sw_home/sdk/ixcc-external/build/lib/cmake/mlir` |
+| `IXCC_RELEASE_MLIR_CMAKE`   | external channel (legacy alias) | (falls back to `IXCC_EXTERNAL_MLIR_CMAKE` default)            |
 
 ## Verifying the setup
 
@@ -129,6 +132,24 @@ than reading half-linked `.so` files. Default lock file per tree:
 If a runner reboots mid-build, the flock evaporates with the process --
 no manual unlock is needed.
 
+## Cron reliability backstops
+
+GitHub Actions has been dropping scheduled ticks for this repo
+(SWCOMP-3177), so `ixcc-refresh.yaml` is fronted by two backstops that
+both dispatch the same workflow. All three paths share the gate logic in
+`prepare_ixcc_refresh.sh`; overlapping dispatches are cheap no-ops --
+the first tick after upstream advances rebuilds, the rest gate-skip.
+
+- **L1 runner-local systemd timer.** Every 30 min, fully bypasses GitHub
+  cron. See `.github/scripts/runner-timers/README.md` for the install
+  script and troubleshooting.
+- **L2 GitHub Actions cron.** Hourly on the hour
+  (`schedule: cron: '0 * * * *'` in `ixcc-refresh.yaml`). Delivery has
+  been unreliable -- treat as best-effort, not primary.
+- **L3 perf-daily canary.** `perf-daily-iluvatar.yml` checks each IXCC
+  tree's `.build.lock` mtime before its daily run and dispatches
+  `ixcc-refresh.yaml` if any tree hasn't been touched for 90 min.
+
 ## Escape hatches
 
 - **Force a rebuild anyway.** From the Actions tab, dispatch
@@ -142,13 +163,16 @@ no manual unlock is needed.
 
 ## Rollback
 
-If the 30-min cron misbehaves and you need to fall back to the pre-PR
+If the refresh flow misbehaves and you need to fall back to the pre-PR
 behavior:
 
 1. Disable `ixcc-refresh.yaml` in the Actions UI.
-2. `ix-toolchain-daily-refresh.yml` still runs daily and covers IXSDK;
-   IXCC just won't refresh automatically until the workflow is
-   re-enabled or a dispatcher is invoked.
+2. Stop the runner-local timer:
+   `systemctl --user disable --now ixcc-refresh-dispatch.timer`
+   (skips the L1 backstop; L3 canary still fires from `perf-daily`).
+3. `ix-toolchain-daily-refresh.yml` still runs daily and covers IXSDK;
+   IXCC just won't refresh automatically until the workflow + timer
+   are re-enabled or a dispatcher is invoked.
 
 There is no data migration or rollback of the trees themselves -- the
-30-min gate never rewrites history, only advances `origin/${branch}`.
+refresh gate never rewrites history, only advances `origin/${branch}`.
