@@ -361,6 +361,8 @@ jobs:
               MLIR_PREFIX="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
               # shellcheck disable=SC1091
               source /workspace/.github/scripts/u2004_conda_python.sh
+              # shellcheck disable=SC1091
+              source /workspace/.github/scripts/resolve_container_python.sh
               . /etc/os-release
               for ver in ${PYTHON_VERSIONS}; do
                 cmake_compiler_args=()
@@ -378,16 +380,7 @@ jobs:
                     export PATH="${user_bin}:${PATH}"
                   fi
                 else
-                  if [[ -x "/usr/local/conda/envs/py${ver}/bin/python" ]]; then
-                    py="/usr/local/conda/envs/py${ver}/bin/python"
-                  elif [[ -x "/opt/conda/envs/py${ver}/bin/python" ]]; then
-                    py="/opt/conda/envs/py${ver}/bin/python"
-                  elif command -v "python${ver}" >/dev/null 2>&1; then
-                    py="$(command -v "python${ver}")"
-                  else
-                    echo "cannot find python ${ver}" >&2
-                    exit 1
-                  fi
+                  py="$(resolve_container_python "${ver}")"
                   py_lib="$(cd "$(dirname "${py}")/../lib" && pwd)"
                   export LD_LIBRARY_PATH="${py_lib}:${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
                   build_python="${py}"
@@ -478,8 +471,10 @@ jobs:
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
+              # shellcheck disable=SC1091
+              source /flydsl-src/.github/scripts/resolve_container_python.sh
               for ver in ${PYTHON_VERSIONS}; do
-                py="/usr/local/conda/envs/py${ver}/bin/python"
+                py="$(resolve_container_python "${ver}")"
                 py_tag="cp${ver//./}"
                 shopt -s nullglob
                 wheels=(/flydsl-src/dist/*"${py_tag}"*.whl)
@@ -511,12 +506,14 @@ jobs:
               mkdir -p "${HOME:-/tmp/flydsl-u2004-home}"
               # shellcheck disable=SC1091
               source /workspace/.github/scripts/u2004_conda_python.sh
+              # shellcheck disable=SC1091
+              source /workspace/.github/scripts/resolve_container_python.sh
               . /etc/os-release
               for ver in ${PYTHON_VERSIONS}; do
                 if [[ "${VERSION_ID}" == "20.04" ]]; then
                   py="$(u2004_resolve_python "${ver}")"
                 else
-                  py="/usr/local/conda/envs/py${ver}/bin/python"
+                  py="$(resolve_container_python "${ver}")"
                 fi
                 py_tag="cp${ver//./}"
                 shopt -s nullglob
