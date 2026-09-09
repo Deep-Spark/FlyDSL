@@ -19,10 +19,12 @@
 #   - Order of operations is deliberate. `git fetch` happens first, then the
 #     MLIR-gate diff is computed against the last-built commit (stamp file)
 #     WITHOUT touching the working tree. Only if the gate says "rebuild" do
-#     we take the flock and do `git checkout && git pull && build.sh`.
-#     This preserves the tree/binary invariant when we skip: HEAD stays on
-#     the last-built commit, so ci-device / perf-daily still see a
-#     consistent source-vs-build pair.
+#     we take the flock and do `git checkout && git reset --hard origin/REF
+#     && build.sh`. The tree is a consumer of upstream, not a development
+#     clone: `reset --hard` accepts rebases/force-pushes on REF (the
+#     flydsl-release branch has rewritten SWCOMP-2739 commits). Skip path
+#     still leaves HEAD on the last-built commit so ci-device / perf-daily
+#     see a consistent source-vs-build pair.
 #   - `--mlir-gate GLOB1,GLOB2,...` narrows the "does this commit range
 #     matter" question. When unset, every commit triggers a rebuild
 #     (matches the pre-30-min behavior).
@@ -41,8 +43,8 @@ Required:
   --ixcc-root DIR          IXCC working repository root.
 
 Options:
-  --ixcc-branch REF        Remote branch to track; passed to `git fetch
-                           origin REF` and `git pull --ff-only origin REF`.
+  --ixcc-branch REF        Remote branch to track; fetched then
+                           `git reset --hard origin/REF` when rebuilding.
                            Default: working
   --mlir-gate GLOBS        Comma-separated pathspecs; skip build when the
                            commit range built-stamp..origin/REF touches
@@ -235,7 +237,7 @@ fi
 if [[ "${DRY_RUN}" == "1" ]]; then
   short_head="$(git -C "${IXCC_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   remote_short="${remote_head:0:12}"
-  echo "[ixcc-refresh] --dry-run: would checkout+pull ${IXCC_BRANCH} and run sw_home/build.sh; not touching tree"
+  echo "[ixcc-refresh] --dry-run: would checkout+reset --hard origin/${IXCC_BRANCH} and run sw_home/build.sh; not touching tree"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     {
       echo "ixcc_commit=${short_head}"
@@ -251,7 +253,10 @@ do_build() {
   # sw_home/enable to set CPATH/CMAKE_ARGS to the requested python, and
   # invoke the vendor build entry point.
   git -C "${IXCC_ROOT}" checkout "${IXCC_BRANCH}"
-  git -C "${IXCC_ROOT}" pull --ff-only origin "${IXCC_BRANCH}"
+  # Consumer tree: take origin/REF even when the remote was rebased.
+  # pull --ff-only aborts on diverge (run 34306872559: ixcc-external was
+  # 5 local / 32 remote after SWCOMP-2739 rewrite).
+  git -C "${IXCC_ROOT}" reset --hard "origin/${IXCC_BRANCH}"
   (
     cd "${SW_HOME}"
     set +u

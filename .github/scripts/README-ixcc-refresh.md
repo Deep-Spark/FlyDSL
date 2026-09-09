@@ -174,5 +174,7 @@ behavior:
    IXCC just won't refresh automatically until the workflow + timer
    are re-enabled or a dispatcher is invoked.
 
-There is no data migration or rollback of the trees themselves -- the
-refresh gate never rewrites history, only advances `origin/${branch}`.
+There is no data migration of the trees themselves. The script never
+pushes. On rebuild it `git reset --hard origin/${branch}` so the runner
+tree follows rebases on the tracked branch; skip ticks leave HEAD on
+the last-built commit.
