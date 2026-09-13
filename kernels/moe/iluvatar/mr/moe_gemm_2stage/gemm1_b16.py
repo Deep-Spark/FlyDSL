@@ -162,6 +162,8 @@ def compile_iluvatar_mr_moe_gemm1_b16(
         num_expert_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        # Nested grouped kernel has a valid-block early-exit; keep this
+        # launcher source in the JIT cache key when that guard changes.
         projection(
             Workspace,
             X,
