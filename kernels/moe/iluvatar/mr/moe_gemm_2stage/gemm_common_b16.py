@@ -207,7 +207,14 @@ def build_grouped_b16_kernel(
     #           rows and columns using the HGEMM pairwise shuffle mapping.
     #   Step 7: Optionally apply each route weight, convert to FP16/BF16, and
     #           scatter the result to Out[token, topk_slot, output_column].
-    @flyc.kernel(known_block_size=[threads, 1, 1])
+    dtype_tag = "fp16" if dtype == "f16" else "bf16"
+    kernel_name = (
+        f"moe_grouped_b16_{dtype_tag}_t{bm}x{bn}x{bk}"
+        f"{'_slots' if input_has_slots else ''}"
+        f"{'_wt' if apply_route_weight else ''}"
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=[threads, 1, 1])
     def grouped_b16_kernel(
         Out: fx.Tensor,
         X: fx.Tensor,
@@ -219,7 +226,8 @@ def build_grouped_b16_kernel(
         tokens_in: fx.Int32,
     ):
         # Step 1: Map this CTA and its warps to one Expert row group and one
-        # output-column tile.
+        # output-column tile. Extra Y blocks are launched from a host-constant
+        # upper bound; they must not read unsorted expert ids.
         tid = fx.thread_idx.x
         warp_id = tid // WARP_SIZE
         lane_id = fx.Int32(fx.lane_id)
@@ -228,6 +236,8 @@ def build_grouped_b16_kernel(
         n_base = fx.Int32(fx.block_idx.x) * fx.Int32(bn)
         expert_block = fx.Int32(fx.block_idx.y)
         m_base = expert_block * fx.Int32(bm)
+        if m_base >= fx.Int32(num_valid_ids[0]):
+            return
         expert = fx.Int32(sorted_expert_ids[expert_block])
         tokens = fx.Int32(tokens_in)
 
