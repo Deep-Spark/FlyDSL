@@ -413,6 +413,7 @@ jobs:
                   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
                   -DFLYDSL_BACKENDS=iluvatar \
                   -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
+                  -DLLVM_DIR="${MLIR_PREFIX}/build/lib/cmake/llvm" \
                   -DCUDAToolkit_ROOT="${COREX_ROOT}" \
                   -DPython3_EXECUTABLE="${build_python}" \
                   -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \

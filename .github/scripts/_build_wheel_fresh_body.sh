@@ -226,6 +226,7 @@ cmake -G Ninja \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     -DFLYDSL_BACKENDS=iluvatar \
     -DMLIR_DIR="${IXCC_BUILD}/lib/cmake/mlir" \
+    -DLLVM_DIR="${IXCC_BUILD}/lib/cmake/llvm" \
     -DCUDAToolkit_ROOT="${SW_HOME}/local/corex" \
     -DPython3_EXECUTABLE="$(command -v python3)" \
     -DCMAKE_SHARED_LINKER_FLAGS='-static-libstdc++ -static-libgcc' \

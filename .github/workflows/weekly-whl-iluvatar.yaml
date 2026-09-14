@@ -162,10 +162,11 @@ jobs:
           fi
           # Build matrix: one entry per (image, python_version). ixcc_mlir_cmake
           # is intentionally omitted; build-whl-iluvatar.yaml picks the tree from
-          # ixcc_variant (internal -> vars.IXCC_MLIR_CMAKE, external ->
-          # vars.IXCC_EXTERNAL_MLIR_CMAKE, with vars.IXCC_RELEASE_MLIR_CMAKE as a
-          # legacy external fallback). u2404 stays weekly-only for now because
-          # the smoke path has no dedicated u2404 GPU runner.
+          # ixcc_variant. u2004 always uses use_fresh_ixcc: the runner is Ubuntu
+          # 24.04, so the persistent IXCC tree's mlir-tblgen cannot run inside
+          # corex-base-20.04 (glibc mismatch, weekly run 34746418624). u2404
+          # stays weekly-only (no dedicated u2404 GPU runner for the smoke path)
+          # and consumes the host persistent tree.
           CHANNEL="${channel}" python3 - <<'PY' >> "${GITHUB_OUTPUT}"
           import json
           import os
@@ -183,6 +184,7 @@ jobs:
                       "python_versions": ver,
                       "docker_image": u2004_image,
                       "test_suite": "smoke",
+                      "use_fresh_ixcc": True,
                   }
               )
 
@@ -193,6 +195,7 @@ jobs:
                       "python_versions": "3.12",
                       "docker_image": os.environ["U2404_IMAGE"],
                       "test_suite": "full",
+                      "use_fresh_ixcc": False,
                   }
               )
 
@@ -231,6 +234,7 @@ jobs:
       artifact_name: flydsl-iluvatar-wheels-${{ matrix.id }}-${{ github.run_id }}
       ixcc_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ixcc_ref || 'origin/xiang.zhang/ixcc-flydsl-release' }}
       ixcc_variant: ${{ needs.gate.outputs.ixcc_variant }}
+      use_fresh_ixcc: ${{ matrix.use_fresh_ixcc }}
       # Incoming dir carries the variant instead of the channel so promote-local can pick the
       # right on-disk channel dir without re-implementing the ixcc_variant -> local_name mapping.
       local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.ixcc_variant, matrix.id) || '' }}
