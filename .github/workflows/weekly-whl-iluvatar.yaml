@@ -57,10 +57,10 @@ on:
           - external
         default: ""
       ixcc_ref:
-        description: "u2004 fresh flow only: git ref inside ixcc.git (default xiang.zhang/ixcc-flydsl-release)"
+        description: "u2004 fresh flow only: git ref inside ixcc.git (empty follows ixcc_variant)"
         type: string
         required: false
-        default: "origin/xiang.zhang/ixcc-flydsl-release"
+        default: ""
 
 permissions:
   contents: write
@@ -83,6 +83,7 @@ jobs:
       test_suite: ${{ steps.gate.outputs.test_suite }}
       local_name: ${{ steps.gate.outputs.local_name }}
       ixcc_variant: ${{ steps.gate.outputs.ixcc_variant }}
+      ixcc_ref: ${{ steps.gate.outputs.ixcc_ref }}
       build_matrix: ${{ steps.gate.outputs.build_matrix }}
     steps:
       - name: Resolve source ref
@@ -148,10 +149,27 @@ jobs:
             ixcc_variant=external
           fi
           case "${ixcc_variant}" in
-            internal) local_name=internal ;;
-            external) local_name=latest   ;;
+            internal)
+              local_name=internal
+              default_ixcc_ref=origin/working
+              ;;
+            external)
+              local_name=latest
+              default_ixcc_ref=origin/xiang.zhang/ixcc-flydsl-release
+              ;;
+            *)
+              echo "::error::unknown ixcc_variant=${ixcc_variant}"
+              exit 1
+              ;;
           esac
+          requested_ref="${{ github.event_name == 'workflow_dispatch' && inputs.ixcc_ref || '' }}"
+          if [ -n "${requested_ref}" ]; then
+            ixcc_ref="${requested_ref}"
+          else
+            ixcc_ref="${default_ixcc_ref}"
+          fi
           echo "ixcc_variant=${ixcc_variant}" >> "${GITHUB_OUTPUT}"
+          echo "ixcc_ref=${ixcc_ref}" >> "${GITHUB_OUTPUT}"
           echo "local_name=${local_name}" >> "${GITHUB_OUTPUT}"
           if [ "${channel}" = "ci" ]; then
             echo "channel=ci" >> "${GITHUB_OUTPUT}"
@@ -160,13 +178,13 @@ jobs:
             echo "channel=weekly" >> "${GITHUB_OUTPUT}"
             echo "test_suite=full" >> "${GITHUB_OUTPUT}"
           fi
-          # Build matrix: one entry per (image, python_version). ixcc_mlir_cmake
-          # is intentionally omitted; build-whl-iluvatar.yaml picks the tree from
-          # ixcc_variant. u2004 always uses use_fresh_ixcc: the runner is Ubuntu
-          # 24.04, so the persistent IXCC tree's mlir-tblgen cannot run inside
-          # corex-base-20.04 (glibc mismatch, weekly run 34746418624). u2404
-          # stays weekly-only (no dedicated u2404 GPU runner for the smoke path)
-          # and consumes the host persistent tree.
+          # Build matrix: one entry per (image, python_version).
+          # u2004 always uses use_fresh_ixcc (runner Ubuntu 24.04 vs corex-base
+          # 20.04 glibc mismatch, weekly run 34746418624). Fresh clones ixcc at
+          # ixcc_ref, which follows ixcc_variant (ci/internal -> origin/working,
+          # weekly/external -> origin/xiang.zhang/ixcc-flydsl-release) unless
+          # dispatch sets ixcc_ref. u2404 stays weekly-only and uses the host
+          # persistent tree.
           CHANNEL="${channel}" python3 - <<'PY' >> "${GITHUB_OUTPUT}"
           import json
           import os
@@ -232,7 +250,7 @@ jobs:
       docker_image: ${{ matrix.docker_image }}
       source_ref: ${{ needs.gate.outputs.source_ref }}
       artifact_name: flydsl-iluvatar-wheels-${{ matrix.id }}-${{ github.run_id }}
-      ixcc_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ixcc_ref || 'origin/xiang.zhang/ixcc-flydsl-release' }}
+      ixcc_ref: ${{ needs.gate.outputs.ixcc_ref }}
       ixcc_variant: ${{ needs.gate.outputs.ixcc_variant }}
       use_fresh_ixcc: ${{ matrix.use_fresh_ixcc }}
       # Incoming dir carries the variant instead of the channel so promote-local can pick the
