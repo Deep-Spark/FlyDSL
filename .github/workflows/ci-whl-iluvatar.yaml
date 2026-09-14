@@ -24,20 +24,20 @@ on:
           - Debug
         default: Release
       ixcc_ref:
-        description: "u2004 fresh flow only: git ref inside ixcc.git"
+        description: "u2004 fresh flow: git ref inside ixcc.git (empty follows ixcc_variant)"
         type: string
-        default: "origin/xiang.zhang/ixcc-flydsl-release"
+        default: ""
       ixcc_variant:
-        description: "Which IXCC tree to build against (persistent path)"
+        description: "Which IXCC tree to build against"
         type: choice
         options:
           - internal
           - external
         default: internal
       use_fresh_ixcc:
-        description: "u2004 only: clone+build IXCC in container instead of consuming persistent tree"
+        description: "u2004 only: clone+build IXCC in container (default true; host IXCC cannot run in corex-base-20.04)"
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
@@ -50,9 +50,9 @@ jobs:
       python_versions: ${{ inputs.python_versions || '3.12' }}
       docker_image: ${{ inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
       cmake_build_type: ${{ inputs.cmake_build_type || 'Release' }}
-      ixcc_ref: ${{ inputs.ixcc_ref || 'origin/xiang.zhang/ixcc-flydsl-release' }}
+      ixcc_ref: ${{ inputs.ixcc_ref || (inputs.ixcc_variant == 'external' && 'origin/xiang.zhang/ixcc-flydsl-release' || 'origin/working') }}
       ixcc_variant: ${{ inputs.ixcc_variant || 'internal' }}
-      use_fresh_ixcc: ${{ inputs.use_fresh_ixcc || false }}
+      use_fresh_ixcc: ${{ inputs.use_fresh_ixcc }}
 
   test:
     needs: build
