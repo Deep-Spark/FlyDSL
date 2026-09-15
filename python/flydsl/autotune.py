@@ -16,7 +16,10 @@ from .utils.file import atomic_write
 
 try:
     import torch
-except ImportError:
+except Exception:
+    # An installed torch whose CUDA runtime is unavailable raises ValueError or
+    # OSError, not ImportError, so catching ImportError alone would let a broken
+    # torch take down `import flydsl` entirely.
     torch = None
 
 
