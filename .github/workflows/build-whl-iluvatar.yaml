@@ -189,6 +189,26 @@ jobs:
             exit 1
           fi
 
+          # sw_home/build.sh builds IXCC inside a throwaway "<tree>-clone" directory, so the
+          # generated build-tree CMake package bakes that path into its include() lines. The
+          # clone is gone by the time we consume the tree, and -DLLVM_DIR only fixes the entry
+          # point, not the nested includes. Recover the baked prefix here so the build steps can
+          # bind-mount the live tree onto it.
+          IXCC_CMAKE_ALIAS=""
+          llvm_config="${IXCC_ROOT}/build/lib/cmake/llvm/LLVMConfig.cmake"
+          if [[ -f "${llvm_config}" ]]; then
+            baked="$(sed -n 's|^[[:space:]]*include("\(/.*\)/build/.*/LLVMExports\.cmake").*|\1|p' \
+              "${llvm_config}" | head -n 1)"
+            if [[ -n "${baked}" && "${baked}" != "${IXCC_ROOT}" ]]; then
+              if [[ -e "${baked}" ]]; then
+                echo "::notice::IXCC CMake package references ${baked}, which still exists; no alias needed."
+              else
+                IXCC_CMAKE_ALIAS="${baked}"
+                echo "::notice::IXCC CMake package references stale build dir ${baked}; will bind ${IXCC_ROOT} there."
+              fi
+            fi
+          fi
+
           FLYDSL_COMMIT="$(git rev-parse HEAD)"
           FLYDSL_COMMIT_SHORT="$(git rev-parse --short HEAD)"
           IXCC_COMMIT=""
@@ -201,6 +221,7 @@ jobs:
 
           {
             echo "ixcc_root=${IXCC_ROOT}"
+            echo "ixcc_cmake_alias=${IXCC_CMAKE_ALIAS}"
             echo "flydsl_commit=${FLYDSL_COMMIT}"
             echo "flydsl_commit_short=${FLYDSL_COMMIT_SHORT}"
             echo "ixcc_commit=${IXCC_COMMIT}"
@@ -290,6 +311,7 @@ jobs:
         if: ${{ env.IS_PERSISTENT_U2004 == 'true' }}
         env:
           IXCC_ROOT: ${{ steps.preflight.outputs.ixcc_root }}
+          IXCC_CMAKE_ALIAS: ${{ steps.preflight.outputs.ixcc_cmake_alias }}
         run: |
           set -euo pipefail
           mkdir -p dist "${CCACHE_DIR_HOST}"
@@ -297,6 +319,10 @@ jobs:
           # only for that one file (via a separate rw bind). The rest of the tree stays
           # read-only so a buggy container cannot corrupt the persistent build.
           touch "${IXCC_ROOT}/.build.lock" || true
+          alias_mount=()
+          if [[ -n "${IXCC_CMAKE_ALIAS}" ]]; then
+            alias_mount=(-v "${IXCC_ROOT}:${IXCC_CMAKE_ALIAS}:ro")
+          fi
           for ver in ${PYTHON_VERSIONS}; do
             echo "::group::Persistent build wheel for python ${ver} (variant=${IXCC_VARIANT})"
             docker run --rm \
@@ -318,6 +344,7 @@ jobs:
               -v "${CCACHE_DIR_HOST}:/root/.ccache" \
               -v "${IXCC_ROOT}:${IXCC_ROOT}:ro" \
               -v "${IXCC_ROOT}/.build.lock:${IXCC_ROOT}/.build.lock" \
+              "${alias_mount[@]}" \
               -w /home/build \
               "${DOCKER_IMAGE}" \
               bash /flydsl-src/.github/scripts/_build_wheel_persistent_body.sh
@@ -334,9 +361,14 @@ jobs:
         if: ${{ env.IS_U2004_IMG != 'true' }}
         env:
           IXCC_ROOT: ${{ steps.preflight.outputs.ixcc_root }}
+          IXCC_CMAKE_ALIAS: ${{ steps.preflight.outputs.ixcc_cmake_alias }}
         run: |
           set -euo pipefail
           mkdir -p dist
+          alias_mount=()
+          if [[ -n "${IXCC_CMAKE_ALIAS}" ]]; then
+            alias_mount=(-v "${IXCC_ROOT}:${IXCC_CMAKE_ALIAS}:ro")
+          fi
           docker run --rm \
             --network host \
             --ipc host \
@@ -347,6 +379,7 @@ jobs:
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
             -v "${IXCC_ROOT}:${IXCC_ROOT}:ro" \
             -v "${IXCC_MLIR_CMAKE}:${IXCC_MLIR_CMAKE}:ro" \
+            "${alias_mount[@]}" \
             -v "${U2004_CONDA_BASE}:${U2004_CONDA_BASE}" \
             -w /workspace \
             -e COREX_ROOT="${COREX_ROOT}" \
