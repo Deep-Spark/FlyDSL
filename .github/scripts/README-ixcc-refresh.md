@@ -132,6 +132,26 @@ than reading half-linked `.so` files. Default lock file per tree:
 If a runner reboots mid-build, the flock evaporates with the process --
 no manual unlock is needed.
 
+## Non-relocatable CMake package
+
+`sw_home/build.sh` configures IXCC inside a throwaway `<tree>-clone`
+directory, so the resulting build-tree CMake package hardcodes that path
+in its `include()` lines (`LLVMExports.cmake`,
+`llvm/cmake/modules/LLVM-Config.cmake`, ...). The clone is deleted once
+the build finishes, so a consumer that only sets `-DMLIR_DIR` /
+`-DLLVM_DIR` still fails: those variables pick the entry point, not the
+nested includes.
+
+The wheel workflow works around this instead of rebuilding the tree. Its
+preflight step reads the baked prefix out of `LLVMConfig.cmake`, and when
+that path no longer exists it bind-mounts the live tree onto it inside
+the build container. `ixcc` (internal) bakes its own real path, so the
+alias is a no-op there and only `ixcc-external` needs it today.
+
+Fixing this properly means making `sw_home/build.sh` build in place or
+emit a relocatable install prefix; until then, do not delete the
+preflight alias logic.
+
 ## Cron reliability backstops
 
 GitHub Actions has been dropping scheduled ticks for this repo
