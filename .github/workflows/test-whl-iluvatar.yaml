@@ -123,6 +123,38 @@ jobs:
             exit 1
           fi
 
+          # The stable image ships CoreX torch in /opt/venv but not OpenMPI/NUMA.
+          # libtorch*.so then fail to load (libnuma.so.1, then libmpi.so.40 and
+          # its closure). Bind the host copies for the full suite only -- smoke
+          # never imports torch, and mounting 24.04 OpenMPI into the u2004
+          # image would mix glibc ABIs. Do not bind libc/libm/libz from the host.
+          extra_mounts=()
+          if [ "${TEST_SUITE}" = "full" ]; then
+            for lib in \
+              libnuma.so.1 \
+              libmpi.so.40 \
+              libopen-rte.so.40 \
+              libopen-pal.so.40 \
+              libhwloc.so.15 \
+              libevent_core-2.1.so.7 \
+              libevent_pthreads-2.1.so.7
+            do
+              host=""
+              for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+                if [ -e "${d}/${lib}" ]; then
+                  host="$(readlink -f "${d}/${lib}")"
+                  break
+                fi
+              done
+              if [ -z "${host}" ]; then
+                echo "::error::host is missing ${lib}; full-suite torch import cannot succeed"
+                exit 1
+              fi
+              extra_mounts+=(-v "${host}:/lib/x86_64-linux-gnu/${lib}:ro")
+              extra_mounts+=(-v "${host}:/usr/lib/x86_64-linux-gnu/${lib}:ro")
+            done
+          fi
+
           docker run --rm \
             --network host \
             --ipc host \
@@ -131,6 +163,7 @@ jobs:
             ${RENDER_DEVICES} \
             -v "${PWD}:/workspace" \
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
+            "${extra_mounts[@]}" \
             -w /workspace \
             -e COREX_ROOT="${COREX_ROOT}" \
             -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
@@ -153,10 +186,20 @@ jobs:
               py_lib="$(cd "$(dirname "${py}")/../lib" && pwd)"
               export LD_LIBRARY_PATH="${py_lib}:${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
               "${py}" -m venv /tmp/flydsl-whl-test
+              # A venv created from /opt/venv has base_prefix=/usr, so
+              # --system-site-packages does not see the parent venv torch.
+              # Drop a .pth so full-suite tests can import that copy.
+              if [ "${TEST_SUITE}" = "full" ]; then
+                parent_site="$("${py}" -c "import site; print(site.getsitepackages()[0])")"
+                printf "%s\n" "${parent_site}" > "/tmp/flydsl-whl-test/lib/python${ver}/site-packages/_parent_venv.pth"
+              fi
               source /tmp/flydsl-whl-test/bin/activate
               python -m pip install -U pip setuptools
               python -m pip install numpy pytest
               python -m pip install dist/*.whl
+              if [ "${TEST_SUITE}" = "full" ]; then
+                python -c "import torch; print(\"torch:\", torch.__file__, torch.__version__)"
+              fi
               python -c "import flydsl; import flydsl._mlir.ir as ir; print(\"flydsl version:\", flydsl.__version__); print(\"import flydsl._mlir.ir: OK\")"
               python .github/scripts/verify_installed_flydsl_linkage.py
               FLYDSL_COMPILE_BACKEND=iluvatar \
