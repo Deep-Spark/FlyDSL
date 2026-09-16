@@ -364,7 +364,8 @@ jobs:
             if [ "${{ needs.gate.outputs.channel }}" = "ci" ]; then
               echo "  - https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
             else
-              echo "  - https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+              echo "  - u2004 (default): https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
+              echo "  - u2404: https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-u2404-cp312-manylinux_x86_64.whl"
               echo "  - (optional cp310 when built) https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp310-manylinux_x86_64.whl"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create/replace the Iluvatar weekly GitHub Release with a stable asset name.
+# Create/replace the Iluvatar weekly GitHub Release with stable asset names.
 set -euo pipefail
 
 DIST_DIR="${1:?usage: publish_iluvatar_weekly_release.sh <dist-dir> [source-ref] [channel]}"
@@ -12,6 +12,34 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 
+# GitHub Release asset names must be unique. u2004 (manylinux_2_31) and
+# u2404 (manylinux_2_38) are both cp312, so they cannot share
+# flydsl-iluvatar-cp312-manylinux_x86_64.whl. Keep that name as the u2004
+# default URL; give u2404 an explicit prefix.
+stable_alias_name() {
+  local base="$1"
+  local py=""
+  if [[ ! "${base}" =~ -cp([0-9]+)- ]]; then
+    return 1
+  fi
+  py="${BASH_REMATCH[1]}"
+  case "${base}" in
+    *manylinux_2_31_x86_64.whl)
+      printf 'flydsl-iluvatar-cp%s-manylinux_x86_64.whl\n' "${py}"
+      ;;
+    *manylinux_2_38_x86_64.whl)
+      printf 'flydsl-iluvatar-u2404-cp%s-manylinux_x86_64.whl\n' "${py}"
+      ;;
+    *)
+      if [[ "${base}" =~ -([A-Za-z0-9_]+)\.whl$ ]]; then
+        printf 'flydsl-iluvatar-cp%s-%s.whl\n' "${py}" "${BASH_REMATCH[1]}"
+      else
+        return 1
+      fi
+      ;;
+  esac
+}
+
 mapfile -t wheels < <(find "${DIST_DIR}" -type f -name 'flydsl-*.whl' ! -name 'flydsl-iluvatar-*-manylinux_x86_64.whl' | sort)
 if [[ ${#wheels[@]} -eq 0 ]]; then
   echo "No flydsl wheels found under ${DIST_DIR}" >&2
@@ -22,18 +50,25 @@ stable_dir="${DIST_DIR}/stable-alias"
 mkdir -p "${stable_dir}"
 assets=()
 stable_names=()
+declare -A seen_stable=()
 for whl in "${wheels[@]}"; do
   assets+=("${whl}")
   base="$(basename "${whl}")"
-  if [[ "${base}" =~ -cp([0-9]+)- ]]; then
-    stable_name="flydsl-iluvatar-cp${BASH_REMATCH[1]}-manylinux_x86_64.whl"
-    cp -f "${whl}" "${stable_dir}/${stable_name}"
-    assets+=("${stable_dir}/${stable_name}")
-    stable_names+=("${stable_name}")
+  if ! stable_name="$(stable_alias_name "${base}")"; then
+    echo "Could not derive a unique Release alias from wheel name: ${base}" >&2
+    exit 1
   fi
+  if [[ -n "${seen_stable[${stable_name}]+x}" ]]; then
+    echo "Release alias ${stable_name} is produced by both ${seen_stable[${stable_name}]} and ${base}" >&2
+    exit 1
+  fi
+  seen_stable["${stable_name}"]="${base}"
+  cp -f "${whl}" "${stable_dir}/${stable_name}"
+  assets+=("${stable_dir}/${stable_name}")
+  stable_names+=("${stable_name}")
 done
 if [[ ${#stable_names[@]} -eq 0 ]]; then
-  echo "Could not derive cp tag from wheel names: ${wheels[*]}" >&2
+  echo "Could not derive Release aliases from wheel names: ${wheels[*]}" >&2
   exit 1
 fi
 
