@@ -123,6 +123,16 @@ jobs:
             exit 1
           fi
 
+          selected_gpu=""
+          extra_run_args=()
+          if [ "${TEST_SUITE}" = "full" ]; then
+            # Device JIT needs the host CoreX linker (ld.lld) and kmd access.
+            extra_run_args+=(--privileged)
+            if [ -f .github/scripts/select_iluvatar_ci_gpu.sh ]; then
+              selected_gpu="$(bash .github/scripts/select_iluvatar_ci_gpu.sh)"
+            fi
+          fi
+
           # The stable image ships CoreX torch in /opt/venv but not OpenMPI/NUMA.
           # libtorch*.so then fail to load (libnuma.so.1, then libmpi.so.40 and
           # its closure). Bind the host copies for the full suite only -- smoke
@@ -161,17 +171,29 @@ jobs:
             --user "$(id -u):$(id -g)" \
             ${GPU_DEVICES} \
             ${RENDER_DEVICES} \
+            "${extra_run_args[@]}" \
             -v "${PWD}:/workspace" \
             -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
             "${extra_mounts[@]}" \
             -w /workspace \
             -e COREX_ROOT="${COREX_ROOT}" \
+            -e IXA_HOME="${COREX_ROOT}" \
+            -e IXA_ROOT="${COREX_ROOT}" \
+            -e CUDA_HOME="${COREX_ROOT}" \
+            -e CUDAToolkit_ROOT="${COREX_ROOT}" \
+            -e CUDA_VISIBLE_DEVICES="${selected_gpu}" \
+            -e ARCH="${ARCH:-ivcore11}" \
             -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
             -e TEST_SUITE="${TEST_SUITE}" \
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
+              export PATH="${COREX_ROOT}/bin:${PATH}"
               export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+              export IXA_HOME="${COREX_ROOT}"
+              export IXA_ROOT="${COREX_ROOT}"
+              export CUDA_HOME="${COREX_ROOT}"
+              export CUDAToolkit_ROOT="${COREX_ROOT}"
               ver="${PYTHON_VERSIONS%% *}"
               if [[ -x "/usr/local/conda/envs/py${ver}/bin/python" ]]; then
                 py="/usr/local/conda/envs/py${ver}/bin/python"
