@@ -90,6 +90,12 @@ jobs:
         id: wheel
         env:
           COREX_TORCH_WHEEL_URL: ${{ secrets.COREX_TORCH_WHEEL_URL }}
+          # Temporary pin: runner COREX userspace/kmd are still 5.0.0, so CI
+          # cannot take a newer torch that needs a newer libixccl. 20260915+
+          # fails import (ixcclGetLsaMultimemDevicePointer). Exit path is not
+          # to keep rolling this date back; upgrade torch, COREX userspace,
+          # and kmd together, then clear this default and vars.COREX_TORCH_WHEEL_PIN.
+          COREX_TORCH_WHEEL_PIN: ${{ vars.COREX_TORCH_WHEEL_PIN || 'torch-2.13.0+corex.5.1.0.20260913-cp312-cp312-linux_x86_64.whl' }}
         run: |
           set -euo pipefail
           retry_download() {
@@ -114,6 +120,12 @@ jobs:
             wheel_url="${input_url}"
             wheel_path="${wheel_url%%\?*}"
             wheel_name="${wheel_path##*/}"
+            if [[ -n "${COREX_TORCH_WHEEL_PIN}" && "${wheel_name}" != "${COREX_TORCH_WHEEL_PIN}" ]]; then
+              echo "::warning::wheel URL filename ${wheel_name} does not match COREX_TORCH_WHEEL_PIN=${COREX_TORCH_WHEEL_PIN}; fallback to previous successful image"
+              echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+              echo "fallback_reason=pinned_wheel_mismatch" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
           else
             base_url="${input_url}"
             if [[ "${base_url}" != */ ]]; then
@@ -132,23 +144,39 @@ jobs:
               | sort -r > /tmp/corex_wheel_candidates.txt || true
 
             wheel_name=""
-            for offset in 0 1 2 3 4 5 6; do
-              target_date="$(date -u -d "${offset} day ago" +%Y%m%d)"
-              candidate="$(awk -v d="${target_date}" '$1==d {print $2; exit}' /tmp/corex_wheel_candidates.txt || true)"
+            # Temporary: skip newest-dated selection until torch/userspace/kmd match.
+            if [[ -n "${COREX_TORCH_WHEEL_PIN}" ]]; then
+              candidate="$(awk -v n="${COREX_TORCH_WHEEL_PIN}" '$2==n {print $2; exit}' /tmp/corex_wheel_candidates.txt || true)"
               if [[ -n "${candidate}" ]]; then
                 wheel_name="${candidate}"
-                echo "selected wheel date=${target_date} (offset=${offset}d): ${wheel_name}"
-                break
+                echo "selected pinned wheel: ${wheel_name}"
+              else
+                echo "::warning::COREX_TORCH_WHEEL_PIN=${COREX_TORCH_WHEEL_PIN} is not on the index; fallback to previous successful image"
+                echo "recent candidates:"
+                head -n 20 /tmp/corex_wheel_candidates.txt || true
+                echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+                echo "fallback_reason=pinned_wheel_unavailable" >> "${GITHUB_OUTPUT}"
+                exit 0
               fi
-            done
+            else
+              for offset in 0 1 2 3 4 5 6; do
+                target_date="$(date -u -d "${offset} day ago" +%Y%m%d)"
+                candidate="$(awk -v d="${target_date}" '$1==d {print $2; exit}' /tmp/corex_wheel_candidates.txt || true)"
+                if [[ -n "${candidate}" ]]; then
+                  wheel_name="${candidate}"
+                  echo "selected wheel date=${target_date} (offset=${offset}d): ${wheel_name}"
+                  break
+                fi
+              done
 
-            if [[ -z "${wheel_name}" ]]; then
-              echo "::warning::no stable wheel found for today or past 7 days under base URL: ${base_url}; fallback to previous successful image"
-              echo "recent candidates:"
-              head -n 20 /tmp/corex_wheel_candidates.txt || true
-              echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
-              echo "fallback_reason=no_recent_wheel" >> "${GITHUB_OUTPUT}"
-              exit 0
+              if [[ -z "${wheel_name}" ]]; then
+                echo "::warning::no stable wheel found for today or past 7 days under base URL: ${base_url}; fallback to previous successful image"
+                echo "recent candidates:"
+                head -n 20 /tmp/corex_wheel_candidates.txt || true
+                echo "wheel_found=false" >> "${GITHUB_OUTPUT}"
+                echo "fallback_reason=no_recent_wheel" >> "${GITHUB_OUTPUT}"
+                exit 0
+              fi
             fi
             wheel_url="${base_url}${wheel_name}"
           fi
