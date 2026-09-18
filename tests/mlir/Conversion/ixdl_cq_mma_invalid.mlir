@@ -11,10 +11,20 @@ func.func @reject_illegal_mn(
 
 // -----
 
-// expected-error@+3 {{CQ MMA multiplicand type must be f16/bf16/i8/ui8/f8E4M3/f8E5M2, got ('f32', 'f32')}}
+// expected-error@+3 {{CQ MMA multiplicand type must be f16/bf16/i8/ui8/f8E4M3FN/f8E5M2, got ('f32', 'f32')}}
 // expected-error@+2 {{failed to parse Fly_MmaAtom parameter 'mmaOp'}}
 func.func @reject_unsupported_multiplicand(
     %atom: !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 16, (f32, f32) -> f32>>) {
+  return
+}
+
+// -----
+
+// PyTorch has no float8_e4m3; CQ MMA takes f8E4M3FN (torch.float8_e4m3fn).
+// expected-error@+3 {{CQ MMA multiplicand type must be f16/bf16/i8/ui8/f8E4M3FN/f8E5M2, got ('f8E4M3', 'f8E4M3')}}
+// expected-error@+2 {{failed to parse Fly_MmaAtom parameter 'mmaOp'}}
+func.func @reject_ieee_f8e4m3(
+    %atom: !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E4M3) -> f32>>) {
   return
 }
 
@@ -95,7 +105,7 @@ func.func @reject_u8_s32_accumulator(
 // expected-error@+3 {{CQ FP8 MMA requires K = 32, got 16}}
 // expected-error@+2 {{failed to parse Fly_MmaAtom parameter 'mmaOp'}}
 func.func @reject_fp8_wrong_k(
-    %atom: !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 16, (f8E4M3, f8E4M3) -> f32>>) {
+    %atom: !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 16, (f8E4M3FN, f8E4M3FN) -> f32>>) {
   return
 }
 
@@ -104,6 +114,6 @@ func.func @reject_fp8_wrong_k(
 // expected-error@+3 {{CQ FP8 MMA requires f32 or f16 accumulator, got 'i32'}}
 // expected-error@+2 {{failed to parse Fly_MmaAtom parameter 'mmaOp'}}
 func.func @reject_fp8_wrong_acc(
-    %atom: !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E4M3) -> i32>>) {
+    %atom: !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E4M3FN) -> i32>>) {
   return
 }

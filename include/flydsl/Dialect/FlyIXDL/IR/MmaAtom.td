@@ -30,8 +30,8 @@ def FlyIXDL_MmaOpMRMma : FlyIXDL_MmaOp<"MmaOpMRMma", "mr.mma"> {
 }
 
 // Iluvatar CQ (ivcore30) TCU matrix-multiply-accumulate atom.
-// Multiplicands: f16/bf16 (K=16->f32), s8/u8 (K=32->i32), f8E4M3/f8E5M2
-// (K=32->f32 or f16; A/B may mix).
+// Multiplicands: f16/bf16 (K=16->f32), s8/u8 (K=32->i32), f8E4M3FN/f8E5M2
+// (K=32->f32 or f16; A/B may mix). f8E4M3FN maps to IXDL f8e4m3.
 // (M,N) in {16x16, 32x32, 16x64, 64x16}; long-mtx keeps K.
 def FlyIXDL_MmaOpCQMma : FlyIXDL_MmaOp<"MmaOpCQMma", "cq.mma"> {
   let parameters = (ins "int32_t":$m, "int32_t":$n, "int32_t":$k, "Type":$elemTyA, "Type":$elemTyB,

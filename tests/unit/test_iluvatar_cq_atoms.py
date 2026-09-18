@@ -75,6 +75,12 @@ def test_cq_atom_factories_construct_and_wrap():
         s2r_atom = fx.make_copy_atom(s2r_ty, fx.Int8)
         assert "cq.mtx_loadn" in str(s2r_atom)
 
+        mma_fn = ixdl.CQMma(16, 16, 32, fx.Float8E4M3FN, fx.Float8E4M3FN, fx.Float32)
+        mma_fn_s = str(mma_fn)
+        assert "fly_ixdl.cq.mma" in mma_fn_s
+        assert "f8E4M3FN" in mma_fn_s
+        assert fx.make_mma_atom(mma_fn) is not None
+
 
 def test_cq_factories_reject_bad_args():
     """Factory argument validation fails fast without touching the GPU."""

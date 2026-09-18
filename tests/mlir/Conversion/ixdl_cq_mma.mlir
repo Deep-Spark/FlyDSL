@@ -6,7 +6,8 @@
 // Grouped by dtype; each group covers all legal (M,N) shapes.
 //   f16/bf16 -> f32, K=16
 //   i8/ui8   -> i32, K=32 (IXDL mmad s8/u8)
-//   FP8      -> f32|f16, K=32; A/B in {f8E4M3, f8E5M2} (matched or mixed)
+//   FP8      -> f32|f16, K=32; A/B in {f8E4M3FN, f8E5M2} (matched or mixed)
+//   f8E4M3FN maps to #ixdl.mmad_type<f8e4m3>
 // (M,N) in {16x16, 32x32, 16x64, 64x16}; long-mtx keeps K.
 
 
@@ -417,131 +418,131 @@ func.func @test_cq_mma_u8_64x16(
 }
 
 // ========================================================================
-// FP8 f8E4M3 x f8E4M3 -> f32  (K=32)
+// FP8 f8E4M3FN x f8E4M3FN -> f32  (K=32)
 // ========================================================================
 
 
 // --- 16x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f32_16x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<4xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 16, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<8xf8E4M3>, vector<4xf32>) -> vector<4xf32>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<8xf8E4M3FN>, vector<4xf32>) -> vector<4xf32>
 func.func @test_cq_mma_f8_e4m3_e4m3_f32_16x16(
     %d: !fly.memref<f32, register, 4:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f32, register, 4:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E4M3) -> f32>>,
-         !fly.memref<f32, register, 4:1>, !fly.memref<f8E4M3, register, 8:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f32, register, 4:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E4M3FN) -> f32>>,
+         !fly.memref<f32, register, 4:1>, !fly.memref<f8E4M3FN, register, 8:1>,
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f32, register, 4:1>) -> ()
   return
 }
 
 // --- 32x32x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f32_32x32
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 32, n = 32, k = 32>
-// CHECK-SAME: (vector<16xf8E4M3>, vector<16xf8E4M3>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<16xf8E4M3FN>, vector<16xf8E4M3FN>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e4m3_e4m3_f32_32x32(
     %d: !fly.memref<f32, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 16:1>,
-    %b: !fly.memref<f8E4M3, register, 16:1>,
+    %a: !fly.memref<f8E4M3FN, register, 16:1>,
+    %b: !fly.memref<f8E4M3FN, register, 16:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E4M3) -> f32>>,
-         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3, register, 16:1>,
-         !fly.memref<f8E4M3, register, 16:1>, !fly.memref<f32, register, 16:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E4M3FN) -> f32>>,
+         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3FN, register, 16:1>,
+         !fly.memref<f8E4M3FN, register, 16:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
 
 // --- 16x64x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f32_16x64
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 64, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<32xf8E4M3>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<32xf8E4M3FN>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e4m3_e4m3_f32_16x64(
     %d: !fly.memref<f32, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 32:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 32:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E4M3) -> f32>>,
-         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3, register, 8:1>,
-         !fly.memref<f8E4M3, register, 32:1>, !fly.memref<f32, register, 16:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E4M3FN) -> f32>>,
+         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3FN, register, 8:1>,
+         !fly.memref<f8E4M3FN, register, 32:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
 
 // --- 64x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f32_64x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 64, n = 16, k = 32>
-// CHECK-SAME: (vector<32xf8E4M3>, vector<8xf8E4M3>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<32xf8E4M3FN>, vector<8xf8E4M3FN>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e4m3_e4m3_f32_64x16(
     %d: !fly.memref<f32, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 32:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 32:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E4M3) -> f32>>,
-         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3, register, 32:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f32, register, 16:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E4M3FN) -> f32>>,
+         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3FN, register, 32:1>,
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
 
 // ========================================================================
-// FP8 f8E4M3 x f8E5M2 -> f32  (K=32)
+// FP8 f8E4M3FN x f8E5M2 -> f32  (K=32)
 // ========================================================================
 
 
 // --- 16x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f32_16x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<4xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 16, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<8xf8E5M2>, vector<4xf32>) -> vector<4xf32>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<8xf8E5M2>, vector<4xf32>) -> vector<4xf32>
 func.func @test_cq_mma_f8_e4m3_e5m2_f32_16x16(
     %d: !fly.memref<f32, register, 4:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
     %b: !fly.memref<f8E5M2, register, 8:1>,
     %c: !fly.memref<f32, register, 4:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E5M2) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E5M2) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E5M2) -> f32>>,
-         !fly.memref<f32, register, 4:1>, !fly.memref<f8E4M3, register, 8:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E5M2) -> f32>>,
+         !fly.memref<f32, register, 4:1>, !fly.memref<f8E4M3FN, register, 8:1>,
          !fly.memref<f8E5M2, register, 8:1>, !fly.memref<f32, register, 4:1>) -> ()
   return
 }
@@ -549,23 +550,23 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f32_16x16(
 // --- 32x32x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f32_32x32
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 32, n = 32, k = 32>
-// CHECK-SAME: (vector<16xf8E4M3>, vector<16xf8E5M2>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<16xf8E4M3FN>, vector<16xf8E5M2>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e4m3_e5m2_f32_32x32(
     %d: !fly.memref<f32, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 16:1>,
+    %a: !fly.memref<f8E4M3FN, register, 16:1>,
     %b: !fly.memref<f8E5M2, register, 16:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E5M2) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E5M2) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E5M2) -> f32>>,
-         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3, register, 16:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E5M2) -> f32>>,
+         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3FN, register, 16:1>,
          !fly.memref<f8E5M2, register, 16:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
@@ -573,23 +574,23 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f32_32x32(
 // --- 16x64x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f32_16x64
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 64, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<32xf8E5M2>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<32xf8E5M2>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e4m3_e5m2_f32_16x64(
     %d: !fly.memref<f32, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
     %b: !fly.memref<f8E5M2, register, 32:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E5M2) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E5M2) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E5M2) -> f32>>,
-         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3, register, 8:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E5M2) -> f32>>,
+         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3FN, register, 8:1>,
          !fly.memref<f8E5M2, register, 32:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
@@ -597,29 +598,29 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f32_16x64(
 // --- 64x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f32_64x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 64, n = 16, k = 32>
-// CHECK-SAME: (vector<32xf8E4M3>, vector<8xf8E5M2>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<32xf8E4M3FN>, vector<8xf8E5M2>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e4m3_e5m2_f32_64x16(
     %d: !fly.memref<f32, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 32:1>,
+    %a: !fly.memref<f8E4M3FN, register, 32:1>,
     %b: !fly.memref<f8E5M2, register, 8:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E5M2) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E5M2) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E5M2) -> f32>>,
-         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3, register, 32:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E5M2) -> f32>>,
+         !fly.memref<f32, register, 16:1>, !fly.memref<f8E4M3FN, register, 32:1>,
          !fly.memref<f8E5M2, register, 8:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
 
 // ========================================================================
-// FP8 f8E5M2 x f8E4M3 -> f32  (K=32)
+// FP8 f8E5M2 x f8E4M3FN -> f32  (K=32)
 // ========================================================================
 
 
@@ -627,23 +628,23 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f32_64x16(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f32_16x16
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<4xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 16, k = 32>
-// CHECK-SAME: (vector<8xf8E5M2>, vector<8xf8E4M3>, vector<4xf32>) -> vector<4xf32>
+// CHECK-SAME: (vector<8xf8E5M2>, vector<8xf8E4M3FN>, vector<4xf32>) -> vector<4xf32>
 func.func @test_cq_mma_f8_e5m2_e4m3_f32_16x16(
     %d: !fly.memref<f32, register, 4:1>,
     %a: !fly.memref<f8E5M2, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f32, register, 4:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3) -> f32>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3FN) -> f32>>,
          !fly.memref<f32, register, 4:1>, !fly.memref<f8E5M2, register, 8:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f32, register, 4:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f32, register, 4:1>) -> ()
   return
 }
 
@@ -651,23 +652,23 @@ func.func @test_cq_mma_f8_e5m2_e4m3_f32_16x16(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f32_32x32
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 32, n = 32, k = 32>
-// CHECK-SAME: (vector<16xf8E5M2>, vector<16xf8E4M3>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<16xf8E5M2>, vector<16xf8E4M3FN>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e5m2_e4m3_f32_32x32(
     %d: !fly.memref<f32, register, 16:1>,
     %a: !fly.memref<f8E5M2, register, 16:1>,
-    %b: !fly.memref<f8E4M3, register, 16:1>,
+    %b: !fly.memref<f8E4M3FN, register, 16:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3) -> f32>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3FN) -> f32>>,
          !fly.memref<f32, register, 16:1>, !fly.memref<f8E5M2, register, 16:1>,
-         !fly.memref<f8E4M3, register, 16:1>, !fly.memref<f32, register, 16:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 16:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
 
@@ -675,23 +676,23 @@ func.func @test_cq_mma_f8_e5m2_e4m3_f32_32x32(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f32_16x64
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 64, k = 32>
-// CHECK-SAME: (vector<8xf8E5M2>, vector<32xf8E4M3>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<8xf8E5M2>, vector<32xf8E4M3FN>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e5m2_e4m3_f32_16x64(
     %d: !fly.memref<f32, register, 16:1>,
     %a: !fly.memref<f8E5M2, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 32:1>,
+    %b: !fly.memref<f8E4M3FN, register, 32:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3) -> f32>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3FN) -> f32>>,
          !fly.memref<f32, register, 16:1>, !fly.memref<f8E5M2, register, 8:1>,
-         !fly.memref<f8E4M3, register, 32:1>, !fly.memref<f32, register, 16:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 32:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
 
@@ -699,23 +700,23 @@ func.func @test_cq_mma_f8_e5m2_e4m3_f32_16x64(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f32_64x16
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf32>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 64, n = 16, k = 32>
-// CHECK-SAME: (vector<32xf8E5M2>, vector<8xf8E4M3>, vector<16xf32>) -> vector<16xf32>
+// CHECK-SAME: (vector<32xf8E5M2>, vector<8xf8E4M3FN>, vector<16xf32>) -> vector<16xf32>
 func.func @test_cq_mma_f8_e5m2_e4m3_f32_64x16(
     %d: !fly.memref<f32, register, 16:1>,
     %a: !fly.memref<f8E5M2, register, 32:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f32, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3) -> f32>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3FN) -> f32>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3) -> f32>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3FN) -> f32>>,
          !fly.memref<f32, register, 16:1>, !fly.memref<f8E5M2, register, 32:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f32, register, 16:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f32, register, 16:1>) -> ()
   return
 }
 
@@ -821,131 +822,131 @@ func.func @test_cq_mma_f8_e5m2_e5m2_f32_64x16(
 }
 
 // ========================================================================
-// FP8 f8E4M3 x f8E4M3 -> f16  (K=32)
+// FP8 f8E4M3FN x f8E4M3FN -> f16  (K=32)
 // ========================================================================
 
 
 // --- 16x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f16_16x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<4xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 16, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<8xf8E4M3>, vector<4xf16>) -> vector<4xf16>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<8xf8E4M3FN>, vector<4xf16>) -> vector<4xf16>
 func.func @test_cq_mma_f8_e4m3_e4m3_f16_16x16(
     %d: !fly.memref<f16, register, 4:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f16, register, 4:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E4M3) -> f16>>,
-         !fly.memref<f16, register, 4:1>, !fly.memref<f8E4M3, register, 8:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f16, register, 4:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E4M3FN) -> f16>>,
+         !fly.memref<f16, register, 4:1>, !fly.memref<f8E4M3FN, register, 8:1>,
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f16, register, 4:1>) -> ()
   return
 }
 
 // --- 32x32x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f16_32x32
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 32, n = 32, k = 32>
-// CHECK-SAME: (vector<16xf8E4M3>, vector<16xf8E4M3>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<16xf8E4M3FN>, vector<16xf8E4M3FN>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e4m3_e4m3_f16_32x32(
     %d: !fly.memref<f16, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 16:1>,
-    %b: !fly.memref<f8E4M3, register, 16:1>,
+    %a: !fly.memref<f8E4M3FN, register, 16:1>,
+    %b: !fly.memref<f8E4M3FN, register, 16:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E4M3) -> f16>>,
-         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3, register, 16:1>,
-         !fly.memref<f8E4M3, register, 16:1>, !fly.memref<f16, register, 16:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E4M3FN) -> f16>>,
+         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3FN, register, 16:1>,
+         !fly.memref<f8E4M3FN, register, 16:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
 
 // --- 16x64x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f16_16x64
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 64, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<32xf8E4M3>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<32xf8E4M3FN>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e4m3_e4m3_f16_16x64(
     %d: !fly.memref<f16, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 32:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 32:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E4M3) -> f16>>,
-         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3, register, 8:1>,
-         !fly.memref<f8E4M3, register, 32:1>, !fly.memref<f16, register, 16:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E4M3FN) -> f16>>,
+         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3FN, register, 8:1>,
+         !fly.memref<f8E4M3FN, register, 32:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
 
 // --- 64x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e4m3_f16_64x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 64, n = 16, k = 32>
-// CHECK-SAME: (vector<32xf8E4M3>, vector<8xf8E4M3>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<32xf8E4M3FN>, vector<8xf8E4M3FN>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e4m3_e4m3_f16_64x16(
     %d: !fly.memref<f16, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 32:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 32:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E4M3) -> f16>>,
-         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3, register, 32:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f16, register, 16:1>) -> ()
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E4M3FN) -> f16>>,
+         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3FN, register, 32:1>,
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
 
 // ========================================================================
-// FP8 f8E4M3 x f8E5M2 -> f16  (K=32)
+// FP8 f8E4M3FN x f8E5M2 -> f16  (K=32)
 // ========================================================================
 
 
 // --- 16x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f16_16x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<4xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 16, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<8xf8E5M2>, vector<4xf16>) -> vector<4xf16>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<8xf8E5M2>, vector<4xf16>) -> vector<4xf16>
 func.func @test_cq_mma_f8_e4m3_e5m2_f16_16x16(
     %d: !fly.memref<f16, register, 4:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
     %b: !fly.memref<f8E5M2, register, 8:1>,
     %c: !fly.memref<f16, register, 4:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E5M2) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E5M2) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3, f8E5M2) -> f16>>,
-         !fly.memref<f16, register, 4:1>, !fly.memref<f8E4M3, register, 8:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E4M3FN, f8E5M2) -> f16>>,
+         !fly.memref<f16, register, 4:1>, !fly.memref<f8E4M3FN, register, 8:1>,
          !fly.memref<f8E5M2, register, 8:1>, !fly.memref<f16, register, 4:1>) -> ()
   return
 }
@@ -953,23 +954,23 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f16_16x16(
 // --- 32x32x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f16_32x32
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 32, n = 32, k = 32>
-// CHECK-SAME: (vector<16xf8E4M3>, vector<16xf8E5M2>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<16xf8E4M3FN>, vector<16xf8E5M2>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e4m3_e5m2_f16_32x32(
     %d: !fly.memref<f16, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 16:1>,
+    %a: !fly.memref<f8E4M3FN, register, 16:1>,
     %b: !fly.memref<f8E5M2, register, 16:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E5M2) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E5M2) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3, f8E5M2) -> f16>>,
-         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3, register, 16:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E4M3FN, f8E5M2) -> f16>>,
+         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3FN, register, 16:1>,
          !fly.memref<f8E5M2, register, 16:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
@@ -977,23 +978,23 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f16_32x32(
 // --- 16x64x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f16_16x64
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 64, k = 32>
-// CHECK-SAME: (vector<8xf8E4M3>, vector<32xf8E5M2>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<8xf8E4M3FN>, vector<32xf8E5M2>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e4m3_e5m2_f16_16x64(
     %d: !fly.memref<f16, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 8:1>,
+    %a: !fly.memref<f8E4M3FN, register, 8:1>,
     %b: !fly.memref<f8E5M2, register, 32:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E5M2) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E5M2) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3, f8E5M2) -> f16>>,
-         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3, register, 8:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E4M3FN, f8E5M2) -> f16>>,
+         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3FN, register, 8:1>,
          !fly.memref<f8E5M2, register, 32:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
@@ -1001,29 +1002,29 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f16_16x64(
 // --- 64x16x32 ---
 
 // CHECK-LABEL: @test_cq_mma_f8_e4m3_e5m2_f16_64x16
-// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
+// CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
 // CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: shape = #ixdl.shape<m = 64, n = 16, k = 32>
-// CHECK-SAME: (vector<32xf8E4M3>, vector<8xf8E5M2>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<32xf8E4M3FN>, vector<8xf8E5M2>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e4m3_e5m2_f16_64x16(
     %d: !fly.memref<f16, register, 16:1>,
-    %a: !fly.memref<f8E4M3, register, 32:1>,
+    %a: !fly.memref<f8E4M3FN, register, 32:1>,
     %b: !fly.memref<f8E5M2, register, 8:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E5M2) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E5M2) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3, f8E5M2) -> f16>>,
-         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3, register, 32:1>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E4M3FN, f8E5M2) -> f16>>,
+         !fly.memref<f16, register, 16:1>, !fly.memref<f8E4M3FN, register, 32:1>,
          !fly.memref<f8E5M2, register, 8:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
 
 // ========================================================================
-// FP8 f8E5M2 x f8E4M3 -> f16  (K=32)
+// FP8 f8E5M2 x f8E4M3FN -> f16  (K=32)
 // ========================================================================
 
 
@@ -1031,23 +1032,23 @@ func.func @test_cq_mma_f8_e4m3_e5m2_f16_64x16(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f16_16x16
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<4xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 16, k = 32>
-// CHECK-SAME: (vector<8xf8E5M2>, vector<8xf8E4M3>, vector<4xf16>) -> vector<4xf16>
+// CHECK-SAME: (vector<8xf8E5M2>, vector<8xf8E4M3FN>, vector<4xf16>) -> vector<4xf16>
 func.func @test_cq_mma_f8_e5m2_e4m3_f16_16x16(
     %d: !fly.memref<f16, register, 4:1>,
     %a: !fly.memref<f8E5M2, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f16, register, 4:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3) -> f16>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 16, 32, (f8E5M2, f8E4M3FN) -> f16>>,
          !fly.memref<f16, register, 4:1>, !fly.memref<f8E5M2, register, 8:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f16, register, 4:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f16, register, 4:1>) -> ()
   return
 }
 
@@ -1055,23 +1056,23 @@ func.func @test_cq_mma_f8_e5m2_e4m3_f16_16x16(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f16_32x32
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 32, n = 32, k = 32>
-// CHECK-SAME: (vector<16xf8E5M2>, vector<16xf8E4M3>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<16xf8E5M2>, vector<16xf8E4M3FN>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e5m2_e4m3_f16_32x32(
     %d: !fly.memref<f16, register, 16:1>,
     %a: !fly.memref<f8E5M2, register, 16:1>,
-    %b: !fly.memref<f8E4M3, register, 16:1>,
+    %b: !fly.memref<f8E4M3FN, register, 16:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3) -> f16>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<32, 32, 32, (f8E5M2, f8E4M3FN) -> f16>>,
          !fly.memref<f16, register, 16:1>, !fly.memref<f8E5M2, register, 16:1>,
-         !fly.memref<f8E4M3, register, 16:1>, !fly.memref<f16, register, 16:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 16:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
 
@@ -1079,23 +1080,23 @@ func.func @test_cq_mma_f8_e5m2_e4m3_f16_32x32(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f16_16x64
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 16, n = 64, k = 32>
-// CHECK-SAME: (vector<8xf8E5M2>, vector<32xf8E4M3>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<8xf8E5M2>, vector<32xf8E4M3FN>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e5m2_e4m3_f16_16x64(
     %d: !fly.memref<f16, register, 16:1>,
     %a: !fly.memref<f8E5M2, register, 8:1>,
-    %b: !fly.memref<f8E4M3, register, 32:1>,
+    %b: !fly.memref<f8E4M3FN, register, 32:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3) -> f16>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<16, 64, 32, (f8E5M2, f8E4M3FN) -> f16>>,
          !fly.memref<f16, register, 16:1>, !fly.memref<f8E5M2, register, 8:1>,
-         !fly.memref<f8E4M3, register, 32:1>, !fly.memref<f16, register, 16:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 32:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
 
@@ -1103,23 +1104,23 @@ func.func @test_cq_mma_f8_e5m2_e4m3_f16_16x64(
 
 // CHECK-LABEL: @test_cq_mma_f8_e5m2_e4m3_f16_64x16
 // CHECK: %[[AV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<32xf8E5M2>
-// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3>
+// CHECK: %[[BV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<8xf8E4M3FN>
 // CHECK: %[[CV:.*]] = llvm.load %{{.*}} : !llvm.ptr<5> -> vector<16xf16>
 // CHECK: ixdl.mmad
 // CHECK-SAME: multiplicandAType = #ixdl.mmad_type<f8e5m2>
 // CHECK-SAME: multiplicandBType = #ixdl.mmad_type<f8e4m3>
 // CHECK-SAME: shape = #ixdl.shape<m = 64, n = 16, k = 32>
-// CHECK-SAME: (vector<32xf8E5M2>, vector<8xf8E4M3>, vector<16xf16>) -> vector<16xf16>
+// CHECK-SAME: (vector<32xf8E5M2>, vector<8xf8E4M3FN>, vector<16xf16>) -> vector<16xf16>
 func.func @test_cq_mma_f8_e5m2_e4m3_f16_64x16(
     %d: !fly.memref<f16, register, 16:1>,
     %a: !fly.memref<f8E5M2, register, 32:1>,
-    %b: !fly.memref<f8E4M3, register, 8:1>,
+    %b: !fly.memref<f8E4M3FN, register, 8:1>,
     %c: !fly.memref<f16, register, 16:1>) {
-  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3) -> f16>>
+  %atom = fly.make_mma_atom : !fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3FN) -> f16>>
   fly.mma_atom_call(%atom, %d, %a, %b, %c)
-      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3) -> f16>>,
+      : (!fly.mma_atom<!fly_ixdl.cq.mma<64, 16, 32, (f8E5M2, f8E4M3FN) -> f16>>,
          !fly.memref<f16, register, 16:1>, !fly.memref<f8E5M2, register, 32:1>,
-         !fly.memref<f8E4M3, register, 8:1>, !fly.memref<f16, register, 16:1>) -> ()
+         !fly.memref<f8E4M3FN, register, 8:1>, !fly.memref<f16, register, 16:1>) -> ()
   return
 }
 

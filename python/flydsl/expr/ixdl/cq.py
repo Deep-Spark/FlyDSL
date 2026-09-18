@@ -58,7 +58,8 @@ def CQMma(m, n, k, elem_ty_a, elem_ty_b, elem_ty_acc):
 
     - f16/bf16 -> f32, ``K=16``; A and B must match.
     - i8/ui8 -> i32, ``K=32``; A and B must match signedness.
-    - f8E4M3/f8E5M2 -> f32 or f16, ``K=32``; A and B may mix the two f8 formats.
+    - f8E4M3FN/f8E5M2 -> f32 or f16, ``K=32``; A and B may mix the two f8
+      formats. ``f8E4M3FN`` maps to IXDL ``#ixdl.mmad_type<f8e4m3>``.
 
     Register fragments are consumed by ``CQMtxLoadn`` (row gather -> A, column
     gather -> B) when the operands come from a ``CQSmexCp(layout="mtx")`` tile.
