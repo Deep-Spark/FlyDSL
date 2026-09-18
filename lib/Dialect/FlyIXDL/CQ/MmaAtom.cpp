@@ -20,6 +20,8 @@ namespace {
 
 // CQ TCU multiplicand type -> IXDL MMAD element type.
 // f16/bf16/s8/u8/f8e4m3/f8e5m2. Signless/signed i8 -> s8; unsigned i8 -> u8.
+// PyTorch has float8_e4m3fn only (no float8_e4m3), so Fly uses Float8E4M3FN
+// and maps it to IXDL f8e4m3. IEEE Float8E4M3 is not a CQ MMA dtype.
 std::optional<IXDL::MMADTypes> mmadMultiplicandType(Type t) {
   if (t.isF16())
     return IXDL::MMADTypes::f16;
@@ -27,7 +29,7 @@ std::optional<IXDL::MMADTypes> mmadMultiplicandType(Type t) {
     return IXDL::MMADTypes::bf16;
   if (t.isInteger(8))
     return t.isUnsignedInteger(8) ? IXDL::MMADTypes::u8 : IXDL::MMADTypes::s8;
-  if (isa<Float8E4M3Type>(t))
+  if (isa<Float8E4M3FNType>(t))
     return IXDL::MMADTypes::f8e4m3;
   if (isa<Float8E5M2Type>(t))
     return IXDL::MMADTypes::f8e5m2;
@@ -40,7 +42,7 @@ bool isFloat16Multiplicand(Type t) { return t.isF16() || t.isBF16(); }
 
 bool isInt8Multiplicand(Type t) { return t.isInteger(8); }
 
-bool isFp8Multiplicand(Type t) { return isa<Float8E4M3Type, Float8E5M2Type>(t); }
+bool isFp8Multiplicand(Type t) { return isa<Float8E4M3FNType, Float8E5M2Type>(t); }
 
 bool isInt32Accumulator(Type t, IXDL::MMADTypes multiplicandType) {
   auto intTy = dyn_cast<IntegerType>(t);
@@ -112,8 +114,9 @@ LogicalResult MmaOpCQMmaType::verify(function_ref<InFlightDiagnostic()> emitErro
     return emitError() << "CQ MMA requires (M,N) in {(16,16),(32,32),(16,64),(64,16)}, got " << m
                        << "x" << n;
   if (!isSupportedMultiplicand(elemTyA) || !isSupportedMultiplicand(elemTyB))
-    return emitError() << "CQ MMA multiplicand type must be f16/bf16/i8/ui8/f8E4M3/f8E5M2, got ("
-                       << elemTyA << ", " << elemTyB << ")";
+    return emitError()
+           << "CQ MMA multiplicand type must be f16/bf16/i8/ui8/f8E4M3FN/f8E5M2, got ("
+           << elemTyA << ", " << elemTyB << ")";
 
   if (isFloat16Multiplicand(elemTyA) || isFloat16Multiplicand(elemTyB)) {
     if (elemTyA != elemTyB)
