@@ -12,10 +12,11 @@
 #     the correct conda env AND resets `CPATH` / `CMAKE_ARGS` / `_COREX_PY_INC`
 #     to point at python${PYTHON_VERSION}. See docs/ixcc-py312-segfault/ for
 #     the 32-byte drift that a non-fresh flow can hit.
-#   - IXCC LLVM/MLIR is fresh-cloned per invocation, then compiled with
-#     ccache. The compiler-object cache is the only state that persists
-#     across invocations (via CCACHE_DIR mount). A cold cache costs ~35min;
-#     a warm cache costs ~8-12min.
+#   - IXCC LLVM/MLIR is cloned and built under IXCC_FRESH_ROOT, a host
+#     bind-mount on /home (not the docker overlay on the root disk). The
+#     compiler-object cache also persists via CCACHE_DIR. Reusing the same
+#     checkout lets ninja increment when IXCC_REF has not moved. A cold cache
+#     costs ~35min; a warm cache costs ~8-12min.
 #   - Python packages are strictly pinned to the same set the u2004 build has
 #     been validated against; do not loosen without re-testing wheel import.
 #
@@ -23,6 +24,7 @@
 #   PYTHON_VERSION      -- e.g. 3.12; must map to a py${VER} conda env in image
 #   IXCC_REF            -- git ref inside the ixcc repo (e.g.
 #                          origin/xiang.zhang/ixcc-flydsl-release)
+#   IXCC_FRESH_ROOT     -- bind-mount of host /home/.../ixcc-fresh-u2004
 #   FLYDSL_VERSION_LOCAL_SUFFIX -- setup.py `dev1+<suffix>` local marker
 #   CMAKE_BUILD_TYPE    -- Release / Debug (default Release)
 #   HOST_UID / HOST_GID -- ownership for /output/*.whl
@@ -32,11 +34,13 @@
 #   /flydsl-src (ro) -- runner's actions/checkout tree of FlyDSL
 #   /output   (rw)  -- where the final .whl gets copied
 #   /root/.ccache (rw) -- ccache dir persisted on runner
+#   /ixcc-fresh (rw) -- IXCC source + build-flydsl on runner /home
 
 set -euo pipefail
 
 : "${PYTHON_VERSION:?PYTHON_VERSION required (e.g. 3.12)}"
 : "${IXCC_REF:?IXCC_REF required (e.g. origin/xiang.zhang/ixcc-flydsl-release)}"
+: "${IXCC_FRESH_ROOT:?IXCC_FRESH_ROOT required (host bind-mount for IXCC source+build)}"
 : "${HOST_UID:?HOST_UID required}"
 : "${HOST_GID:?HOST_GID required}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
@@ -45,6 +49,7 @@ FLYDSL_VERSION_LOCAL_SUFFIX="${FLYDSL_VERSION_LOCAL_SUFFIX:-local}"
 echo "::group::Fresh-build inputs"
 echo "PYTHON_VERSION            = ${PYTHON_VERSION}"
 echo "IXCC_REF                  = ${IXCC_REF}"
+echo "IXCC_FRESH_ROOT           = ${IXCC_FRESH_ROOT}"
 echo "CMAKE_BUILD_TYPE          = ${CMAKE_BUILD_TYPE}"
 echo "FLYDSL_VERSION_LOCAL_SUFFIX = ${FLYDSL_VERSION_LOCAL_SUFFIX}"
 echo "HOST_UID:HOST_GID         = ${HOST_UID}:${HOST_GID}"
@@ -113,14 +118,21 @@ echo "::group::repo-manager download ixdriver ixcc ixsdk"
 repo-manager download ixdriver ixcc ixsdk
 echo "::endgroup::"
 
-# ---- 5. IXCC source: fresh-clone at requested ref -------------------------
+# ---- 5. IXCC source: checkout at requested ref on the /home mount ---------
 IXCC_REPO='ssh://git@bitbucket.iluvatar.ai:7999/csys/ixcc.git'
-IXCC_SOURCE="${SW_HOME}/sdk/ixcc"
-echo "::group::Fresh-clone ixcc @ ${IXCC_REF}"
-# repo-manager may have laid down an ixcc worktree; we want ours.
-rm -rf "${IXCC_SOURCE}"
-git clone "${IXCC_REPO}" "${IXCC_SOURCE}"
-git -C "${IXCC_SOURCE}" checkout --detach "${IXCC_REF}"
+IXCC_SOURCE="${IXCC_FRESH_ROOT}"
+if [[ ! -d "${IXCC_SOURCE}" ]]; then
+    echo "::error::IXCC_FRESH_ROOT is not a directory: ${IXCC_SOURCE}" >&2
+    exit 1
+fi
+echo "::group::Checkout ixcc @ ${IXCC_REF} in ${IXCC_SOURCE}"
+if [[ -d "${IXCC_SOURCE}/.git" ]]; then
+    git -C "${IXCC_SOURCE}" fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+else
+    find "${IXCC_SOURCE}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    git clone "${IXCC_REPO}" "${IXCC_SOURCE}"
+fi
+git -C "${IXCC_SOURCE}" checkout --force --detach "${IXCC_REF}"
 git -C "${IXCC_SOURCE}" log -1 --format='ixcc @ %h %ci  %s'
 echo "::endgroup::"
 
@@ -266,9 +278,8 @@ if (( ${#wheels[@]} == 0 )); then
     exit 1
 fi
 cp -v "${wheels[@]}" /output/
-# The outer workflow's manifest step needs the ixcc + flydsl commits. flydsl
-# is on the runner, but ixcc is fresh-cloned in here -- write the stamps to
-# /output so the runner can pick them up.
+# The outer workflow's manifest step needs the ixcc + flydsl commits.
+# Write the stamps to /output so the runner can pick them up.
 git -C "${IXCC_SOURCE}"  rev-parse HEAD         > /output/ixcc_commit.txt
 git -C "${IXCC_SOURCE}"  rev-parse --short HEAD > /output/ixcc_commit_short.txt
 git -C "${FLYDSL_SOURCE}" rev-parse HEAD         > /output/flydsl_commit.txt
