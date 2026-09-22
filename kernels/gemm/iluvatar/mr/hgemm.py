@@ -14,6 +14,9 @@ Tuning:
     Geometry / SME / S2R are shared; only MRMma multiplicand type differs.
   epilogue no_c_read (default) -- D = A @ B.T, f16/bf16 out, acc zeroed. epilogue_store: shfl (default) or tiled.
   epilogue read_c_accum -- C = A @ B.T + C, fp32 out, load C before MMA.
+  epilogue write_c_fp32 -- D = A @ B.T, fp32 out, acc zeroed, no C load.
+  crop_m -- when set, A stays M rows (pad) and C is crop_m x N; the store
+    writes only those rows. Requires M == bm and no_c_read or write_c_fp32.
 
   major_pattern -- BLAS layout tags nn/nt/tn (default)/tt on logical A(m,k)/B(n,k); see GemmLayout.
     Default tn: both k-major, PyTorch (m,k)/(n,k) need no host transpose.
@@ -35,6 +38,7 @@ from kernels.gemm.iluvatar.common import (
     parse_major_pattern,
 )
 from kernels.gemm.iluvatar.epilogue import (
+    mr_hgemm_epilogue_store_fp32_stp,
     mr_hgemm_epilogue_store_read_c_accum,
     mr_hgemm_epilogue_store_shfl,
     mr_hgemm_epilogue_store_tiled,
@@ -57,6 +61,7 @@ K_LOOP_UNROLL = 1
 
 EPILOGUE_NO_C_READ = "no_c_read"
 EPILOGUE_READ_C_ACCUM = "read_c_accum"
+EPILOGUE_WRITE_C_FP32 = "write_c_fp32"
 DEFAULT_EPILOGUE = EPILOGUE_NO_C_READ
 
 EPILOGUE_STORE_TILED = "tiled"
@@ -73,6 +78,10 @@ def _validate_elem_dtype(elem_dtype):
         names = ", ".join(t.__name__ for t in SUPPORTED_ELEM_DTYPES)
         raise ValueError(f"elem_dtype must be one of {{{names}}}, got {elem_dtype!r}")
     return elem_dtype
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 class SwizzleCtaPreset(NamedTuple):
@@ -135,15 +144,28 @@ def _build_swizzle_kernel(
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
     elem_dtype=DEFAULT_ELEM_DTYPE,
+    crop_m=None,
+    k_loop_unroll: int = K_LOOP_UNROLL,
+    n_first: bool = False,
+    lda=None,
+    ldc=None,
+    batch: int = 1,
+    a_batch_stride: int = 0,
+    b_batch_stride: int = 0,
+    c_batch_stride: int = 0,
 ):
     elem_dtype = _validate_elem_dtype(elem_dtype)
     gemm_layout = parse_major_pattern(major_pattern)
+    crop_m = int(crop_m) if crop_m else None
+    batch = int(batch)
+    if batch < 1:
+        raise ValueError(f"batch must be >= 1, got {batch}")
     a_mn_major = gemm_layout.a_mn_major
     b_mn_major = gemm_layout.b_mn_major
     load_c = epilogue == EPILOGUE_READ_C_ACCUM
     out_b16 = epilogue == EPILOGUE_NO_C_READ
-    no_c_read_shfl_store = out_b16 and epilogue_store == EPILOGUE_STORE_SHFL
-    no_c_read_tiled_store = out_b16 and not no_c_read_shfl_store
+    no_c_read_shfl_store = out_b16 and epilogue_store == EPILOGUE_STORE_SHFL and crop_m is None
+    no_c_read_tiled_store = out_b16 and not no_c_read_shfl_store and crop_m is None
     warp_m = ATOM_M * warp_atoms_m
     warp_n = ATOM_N * warp_atoms_n
     bm = warp_m * warps_m
@@ -156,6 +178,30 @@ def _build_swizzle_kernel(
     assert k % bk == 0
     assert m % bm == 0 and n % bn == 0
     assert bk % vpr == 0
+    a_ld = int(lda) if lda is not None else k
+    c_ld = int(ldc) if ldc is not None else n
+    if a_ld < k:
+        raise ValueError(f"lda must be >= K ({k}), got {a_ld}")
+    if c_ld < n:
+        raise ValueError(f"ldc must be >= N ({n}), got {c_ld}")
+    if a_mn_major and a_ld != k:
+        raise ValueError("lda != K is only valid for k-major A")
+    if (not a_mn_major) and a_ld != k and a_ld % 32 != 0:
+        raise ValueError(f"lda must be a multiple of 32 for SME G2S, got {a_ld}")
+    if batch > 1:
+        if a_batch_stride <= 0 or b_batch_stride <= 0 or c_batch_stride <= 0:
+            raise ValueError("batch>1 requires positive A/B/C batch strides")
+    use_crop = crop_m is not None
+    if use_crop:
+        if m != bm:
+            raise ValueError(f"crop_m requires M == bm ({bm}), got M={m}")
+        if not (1 <= crop_m < m):
+            raise ValueError(f"crop_m must be in [1, {m}), got {crop_m}")
+        if epilogue not in (EPILOGUE_WRITE_C_FP32, EPILOGUE_NO_C_READ):
+            raise ValueError("crop_m requires epilogue=no_c_read or write_c_fp32")
+    c_store_elems = crop_m * bn if use_crop else 0
+    c_store_iters = _ceil_div(c_store_elems, threads) if use_crop else 0
+    c_smem_dtype = fx.Float32 if epilogue == EPILOGUE_WRITE_C_FP32 else elem_dtype
 
     cta_atoms_m = bm // SMEM_ROWS
     cta_atoms_n = bn // SMEM_ROWS
@@ -170,41 +216,82 @@ def _build_swizzle_kernel(
     stage_stride = stage_elems
     k_tiles_const = k // bk
     main_k_trip = max(0, k_tiles_const - 2)
-    main_k_full = (main_k_trip // K_LOOP_UNROLL) * K_LOOP_UNROLL
+    unroll = int(k_loop_unroll)
+    if unroll < 1:
+        raise ValueError(f"k_loop_unroll must be >= 1, got {unroll}")
+    main_k_full = (main_k_trip // unroll) * unroll
     main_k_remainder = main_k_trip - main_k_full
 
-    @flyc.kernel(known_block_size=[threads, 1, 1])
+    elem_tag = "bf16" if elem_dtype is fx.BFloat16 else "fp16"
+    store_tag = ""
+    if epilogue == EPILOGUE_NO_C_READ and epilogue_store != DEFAULT_EPILOGUE_STORE:
+        store_tag = f"_{epilogue_store}"
+    kname = (
+        f"mr_hgemm_{elem_tag}_t{warps_m}x{warps_n}"
+        f"_a{warp_atoms_m}x{warp_atoms_n}_k{k_atoms}_{epilogue}{store_tag}"
+        + (f"_crop{crop_m}" if crop_m else "")
+        + ("_nfirst" if n_first else "")
+        + (f"_b{batch}" if batch > 1 else "")
+        + (f"_lda{a_ld}" if a_ld != k else "")
+        + (f"_ldc{c_ld}" if c_ld != n else "")
+    )
+
+    @flyc.kernel(name=kname, known_block_size=[threads, 1, 1])
     def mr_hgemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
         tid = fx.thread_idx.x
-        bid_x, bid_y, _ = fx.block_idx
+        bid_x, bid_y, bid_z = fx.block_idx
+        tile_m = bid_y if fx.const_expr(n_first) else bid_x
+        tile_n = bid_x if fx.const_expr(n_first) else bid_y
         warp_id = tid // WARP_SIZE
-        lane_id = fx.Int32(fx.lane_id)  # tid % WARP_SIZE
+        lane_id = fx.Int32(fx.lane_id)
         warp_m_id = warp_id // warps_n
         warp_n_id = warp_id % warps_n
+
+        a_ptr = fx.get_iter(A)
+        b_ptr = fx.get_iter(B)
+        c_ptr = fx.get_iter(C)
+        if fx.const_expr(batch > 1):
+            a_ptr = fx.add_offset(a_ptr, fx.make_int_tuple(bid_z * fx.Int32(a_batch_stride)))
+            b_ptr = fx.add_offset(b_ptr, fx.make_int_tuple(bid_z * fx.Int32(b_batch_stride)))
+            c_ptr = fx.add_offset(c_ptr, fx.make_int_tuple(bid_z * fx.Int32(c_batch_stride)))
 
         if fx.const_expr(a_mn_major):
             a_logical_stride = (1, m)
         else:
-            a_logical_stride = (k, 1)
-        a_logical = fx.make_view(fx.get_iter(A), fx.make_layout((m, k), a_logical_stride))
-        gA = fx.slice(fx.flat_divide(a_logical, (bm, bk)), (None, None, bid_x, None))
+            a_logical_stride = (a_ld, 1)
+        a_logical = fx.make_view(a_ptr, fx.make_layout((m, k), a_logical_stride))
+        gA = fx.slice(fx.flat_divide(a_logical, (bm, bk)), (None, None, tile_m, None))
 
         if fx.const_expr(b_mn_major):
             b_logical_stride = (1, n)
         else:
             b_logical_stride = (k, 1)
-        b_logical = fx.make_view(fx.get_iter(B), fx.make_layout((n, k), b_logical_stride))
-        gB = fx.slice(fx.flat_divide(b_logical, (bn, bk)), (None, None, bid_y, None))
-
-        gC = fx.slice(fx.flat_divide(C, (bm, bn)), (None, None, bid_x, bid_y))
+        b_logical = fx.make_view(b_ptr, fx.make_layout((n, k), b_logical_stride))
+        gB = fx.slice(fx.flat_divide(b_logical, (bn, bk)), (None, None, tile_n, None))
 
         # Contiguous static shared memory so stage pick can stay branchless XOR.
         # Split s0/s1 Array symbols cannot XOR element offsets across banks.
-        @fx.struct
-        class MrPipelineSmem:
-            buf: fx.Array[elem_dtype, stage_elems * STAGES]
+        if fx.const_expr(use_crop):
 
-        smem_ab_base = fx.SharedAllocator(static=True).allocate(MrPipelineSmem).peek().buf.ptr
+            @fx.struct
+            class MrPipelineSmem:
+                buf: fx.Array[elem_dtype, stage_elems * STAGES]
+                c: fx.Array[c_smem_dtype, bm * bn]
+
+            smem = fx.SharedAllocator(static=True).allocate(MrPipelineSmem).peek()
+            smem_ab_base = smem.buf.ptr
+            smem_c_view = smem.c.view(fx.make_layout((bm, bn), (bn, 1)))
+            gC = smem_c_view
+        else:
+
+            @fx.struct
+            class MrPipelineSmem:
+                buf: fx.Array[elem_dtype, stage_elems * STAGES]
+
+            smem_ab_base = fx.SharedAllocator(static=True).allocate(MrPipelineSmem).peek().buf.ptr
+            c_logical = fx.make_view(c_ptr, fx.make_layout((m, n), (c_ld, 1)))
+            gC = fx.slice(fx.flat_divide(c_logical, (bm, bn)), (None, None, tile_m, tile_n))
+            smem_c_view = None
 
         mma_atom = fx.make_mma_atom(ixdl.MRMma(ATOM_M, ATOM_N, ATOM_K_B16, elem_dtype, elem_dtype, fx.Float32))
         tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
@@ -267,7 +354,7 @@ def _build_swizzle_kernel(
                 if fx.const_expr(a_mn_major):
                     a_leading = m
                 else:
-                    a_leading = k
+                    a_leading = a_ld
                 if fx.const_expr(b_mn_major):
                     b_leading = n
                 else:
@@ -364,8 +451,8 @@ def _build_swizzle_kernel(
 
             # ROCm-style K-loop: outer scf.for + inner range_constexpr partial unroll.
             if fx.const_expr(main_k_full > 0):
-                for k_base in fx.range(0, main_k_full, K_LOOP_UNROLL):
-                    for u in fx.range_constexpr(K_LOOP_UNROLL):
+                for k_base in fx.range(0, main_k_full, unroll):
+                    for u in fx.range_constexpr(unroll):
                         _k_iter_body(k_base + u)
 
             if fx.const_expr(main_k_remainder > 0):
@@ -387,12 +474,31 @@ def _build_swizzle_kernel(
             fx.flat_divide(gC, (warp_m, warp_n)),
             (None, None, warp_m_id, warp_n_id),
         )
-        if fx.const_expr(no_c_read_shfl_store):
+        if fx.const_expr(use_crop and out_b16):
+            mr_hgemm_epilogue_store_tiled(
+                lane_id=lane_id,
+                accs=accs,
+                gC_warp=gC_warp,
+                tiled_mma=tiled_mma,
+                warp_atoms_m=warp_atoms_m,
+                warp_atoms_n=warp_atoms_n,
+                out_dtype=elem_dtype,
+            )
+            fx.gpu.barrier()
+            c_out = fx.make_view(c_ptr, fx.make_layout((crop_m, n), (c_ld, 1)))
+            gC_n = fx.slice(fx.flat_divide(c_out, (crop_m, bn)), (None, None, 0, tile_n))
+            for i in fx.range_constexpr(c_store_iters):
+                idx = fx.Int32(i) * fx.Int32(threads) + tid
+                if idx < fx.Int32(c_store_elems):
+                    row = idx // fx.Int32(bn)
+                    col = idx % fx.Int32(bn)
+                    gC_n[row, col] = smem_c_view[row, col]
+        elif fx.const_expr(no_c_read_shfl_store):
             mr_hgemm_epilogue_store_shfl(
                 lane_id=lane_id,
                 accs=accs,
                 gC_warp=gC_warp,
-                c_global_n=n,
+                c_global_n=c_ld,
                 warp_atoms_m=warp_atoms_m,
                 warp_atoms_n=warp_atoms_n,
                 out_dtype=elem_dtype,
@@ -407,6 +513,37 @@ def _build_swizzle_kernel(
                 warp_atoms_n=warp_atoms_n,
                 out_dtype=elem_dtype,
             )
+        elif fx.const_expr(epilogue == EPILOGUE_WRITE_C_FP32):
+            if fx.const_expr(use_crop):
+                mr_hgemm_epilogue_store_read_c_accum(
+                    lane_id=lane_id,
+                    accs=accs,
+                    gC_warp=gC_warp,
+                    tiled_mma=tiled_mma,
+                    warp_atoms_m=warp_atoms_m,
+                    warp_atoms_n=warp_atoms_n,
+                )
+                fx.gpu.barrier()
+                c_out = fx.make_view(c_ptr, fx.make_layout((crop_m, n), (c_ld, 1)))
+                gC_n = fx.slice(
+                    fx.flat_divide(c_out, (crop_m, bn)),
+                    (None, None, 0, tile_n),
+                )
+                for i in fx.range_constexpr(c_store_iters):
+                    idx = fx.Int32(i) * fx.Int32(threads) + tid
+                    if idx < fx.Int32(c_store_elems):
+                        row = idx // fx.Int32(bn)
+                        col = idx % fx.Int32(bn)
+                        gC_n[row, col] = smem_c_view[row, col]
+            else:
+                mr_hgemm_epilogue_store_fp32_stp(
+                    lane_id=lane_id,
+                    accs=accs,
+                    gC_warp=gC_warp,
+                    c_global_n=c_ld,
+                    warp_atoms_m=warp_atoms_m,
+                    warp_atoms_n=warp_atoms_n,
+                )
         else:
             mr_hgemm_epilogue_store_read_c_accum(
                 lane_id=lane_id,
@@ -435,6 +572,15 @@ def compile_iluvatar_mr_hgemm(
     epilogue_store: str = DEFAULT_EPILOGUE_STORE,
     major_pattern: str = DEFAULT_MAJOR_PATTERN,
     elem_dtype=DEFAULT_ELEM_DTYPE,
+    crop_m=None,
+    k_loop_unroll: int = K_LOOP_UNROLL,
+    n_first: bool = False,
+    lda=None,
+    ldc=None,
+    batch: int = 1,
+    a_batch_stride: int = 0,
+    b_batch_stride: int = 0,
+    c_batch_stride: int = 0,
 ):
     """Build and return a JIT launch wrapper for the Iluvatar MR HGEMM.
 
@@ -443,10 +589,12 @@ def compile_iluvatar_mr_hgemm(
     M/N/K must be multiples of derived bm/bn/bk or ValueError is raised.
     bm = ATOM_M * warp_atoms_m * warps_m, bn = ATOM_N * warp_atoms_n * warps_n,
     bk = ATOM_K_B16 * k_atoms. See module doc for epilogue and major_pattern.
+    lda/ldc are element row strides of k-major A and C (default K / N).
+    batch>1 walks A/B/C by the given element batch strides on grid.z.
     """
     elem_dtype = _validate_elem_dtype(elem_dtype)
     parse_major_pattern(major_pattern)
-    if epilogue not in (EPILOGUE_NO_C_READ, EPILOGUE_READ_C_ACCUM):
+    if epilogue not in (EPILOGUE_NO_C_READ, EPILOGUE_READ_C_ACCUM, EPILOGUE_WRITE_C_FP32):
         raise ValueError(f"unknown epilogue: {epilogue}")
 
     bm, bn, bk, threads, smem_bytes = _swizzle_cta_shape(
@@ -484,8 +632,18 @@ def compile_iluvatar_mr_hgemm(
         epilogue_store,
         major_pattern,
         elem_dtype,
+        crop_m=crop_m,
+        k_loop_unroll=k_loop_unroll,
+        n_first=n_first,
+        lda=lda,
+        ldc=ldc,
+        batch=batch,
+        a_batch_stride=a_batch_stride,
+        b_batch_stride=b_batch_stride,
+        c_batch_stride=c_batch_stride,
     )
-    grid = (M // bm, N // bn, 1)
+    grid_z = int(batch)
+    grid = (N // bn, M // bm, grid_z) if n_first else (M // bm, N // bn, grid_z)
     block = (threads, 1, 1)
 
     @flyc.jit
@@ -505,6 +663,7 @@ __all__ = [
     "DEFAULT_SWIZZLE_CTA",
     "EPILOGUE_READ_C_ACCUM",
     "EPILOGUE_NO_C_READ",
+    "EPILOGUE_WRITE_C_FP32",
     "EPILOGUE_STORE_SHFL",
     "EPILOGUE_STORE_TILED",
     "MAJOR_PATTERN_CHOICES",
