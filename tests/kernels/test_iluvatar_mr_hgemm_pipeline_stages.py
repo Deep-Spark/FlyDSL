@@ -16,6 +16,8 @@ This file exercises the production ``compile_iluvatar_mr_hgemm`` launch wrapper 
 * ``major_pattern`` (nn / tn / nt / tt)
 * ``k_atoms`` (BK = 16 * k_atoms, i.e. 32 and 64)
 * ``epilogue_store`` (shfl / tiled for ``no_c_read``)
+* ``write_c_fp32`` (fp32 write-only store, optional ``n_first``)
+* ``crop_m`` on ``write_c_fp32`` and batched ``no_c_read`` with ``ldc``
 * single-CTA (256 x 256 x 64, grid 1 x 1) and multi-CTA (512 x 512 x 128, grid 2 x 2)
 
 """
@@ -55,6 +57,17 @@ from tests.unit.iluvatar_mr_hgemm_test_common import (  # noqa: E402
 _SINGLE_CTA_SHAPE = (STAGED_BRICK_M, STAGED_BRICK_N, 64)
 _MULTI_CTA_SHAPE = (STAGED_BRICK_M * 2, STAGED_BRICK_N * 2, 128)
 _LARGE_SHAPE = (1024, 1024, 1024)
+# crop_m requires M == bm. vpr=32 so BK=32 yields one A brick; one warp in M.
+_CROP_M = 8
+_CROP_BM = 16
+_CROP_N = 128
+_CROP_K = 64
+_CROP_WARPS_M = 1
+_CROP_WARPS_N = 1
+_CROP_WARP_ATOMS_M = 1
+_CROP_WARP_ATOMS_N = 8
+_CROP_BATCH = 2
+_CROP_LDC = 160
 
 
 def _require_torch():
@@ -82,8 +95,10 @@ def _require_hgemm_kernel():
         import flydsl.expr as fx
         from kernels.gemm.iluvatar.mr.hgemm import (
             EPILOGUE_NO_C_READ,
+            EPILOGUE_READ_C_ACCUM,
             EPILOGUE_STORE_SHFL,
             EPILOGUE_STORE_TILED,
+            EPILOGUE_WRITE_C_FP32,
             WARP_SIZE,
             compile_iluvatar_mr_hgemm,
         )
@@ -91,8 +106,10 @@ def _require_hgemm_kernel():
         pytest.fail(f"failed to import kernels.gemm.iluvatar.mr.hgemm: {exc}")
     return {
         "EPILOGUE_NO_C_READ": EPILOGUE_NO_C_READ,
+        "EPILOGUE_READ_C_ACCUM": EPILOGUE_READ_C_ACCUM,
         "EPILOGUE_STORE_SHFL": EPILOGUE_STORE_SHFL,
         "EPILOGUE_STORE_TILED": EPILOGUE_STORE_TILED,
+        "EPILOGUE_WRITE_C_FP32": EPILOGUE_WRITE_C_FP32,
         "WARP_SIZE": WARP_SIZE,
         "compile_iluvatar_mr_hgemm": compile_iluvatar_mr_hgemm,
         "fx": fx,
@@ -110,13 +127,15 @@ def _fx_elem_dtype(fx, fx_dtype_name: str):
 def _make_c_tensor(torch, m: int, n: int, epilogue: str, hgemm, torch_dtype, *, seed: int):
     if epilogue == hgemm["EPILOGUE_NO_C_READ"]:
         return torch.zeros(m, n, dtype=torch_dtype, device="cuda")
+    if epilogue == hgemm["EPILOGUE_WRITE_C_FP32"]:
+        return torch.empty(m, n, dtype=torch.float32, device="cuda")
     torch.manual_seed(seed)
     return torch.randn(m, n, dtype=torch.float32, device="cuda")
 
 
 def _expected_result(torch, A, B, C_in, epilogue: str, hgemm):
     expected = A.to(torch.float32) @ B.to(torch.float32).T
-    if epilogue != hgemm["EPILOGUE_NO_C_READ"]:
+    if epilogue == hgemm["EPILOGUE_READ_C_ACCUM"]:
         expected = expected + C_in.to(torch.float32)
     return expected
 
@@ -155,6 +174,7 @@ def _check_hgemm_pipeline(
     torch_dtype_name: str,
     fx_dtype_name: str,
     seed: int = 0,
+    n_first: bool = False,
 ) -> bool:
     m, n, k = shape
     torch_dtype = _torch_dtype(torch, torch_dtype_name)
@@ -178,6 +198,7 @@ def _check_hgemm_pipeline(
         epilogue_store=epilogue_store,
         major_pattern=major_pattern,
         elem_dtype=elem_dtype,
+        n_first=n_first,
     )
     a_dev, b_dev = remap_gemm_tensors(A, B, major_pattern)
     stream = torch.cuda.Stream()
@@ -185,7 +206,7 @@ def _check_hgemm_pipeline(
     torch.cuda.synchronize()
 
     expected = _expected_result(torch, A, B, C_in, epilogue, hgemm)
-    got = C.to(torch.float32) if epilogue == hgemm["EPILOGUE_NO_C_READ"] else C
+    got = C if epilogue != hgemm["EPILOGUE_NO_C_READ"] else C.to(torch.float32)
     diff = (got - expected).abs()
     atol = _compare_atol(k, k_atoms, torch_dtype_name)
     ok = torch.allclose(got, expected, atol=atol, rtol=2e-2)
@@ -280,3 +301,97 @@ def test_iluvatar_mr_hgemm_large_multi_cta_pipeline(
         torch_dtype_name=torch_dtype_name,
         fx_dtype_name=fx_dtype_name,
     )
+
+
+@pytest.mark.parametrize("n_first", (False, True))
+def test_iluvatar_mr_hgemm_write_c_fp32_single_cta(n_first, monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    hgemm = _require_hgemm_kernel()
+
+    assert _check_hgemm_pipeline(
+        torch,
+        hgemm,
+        shape=_SINGLE_CTA_SHAPE,
+        major_pattern="tn",
+        epilogue=hgemm["EPILOGUE_WRITE_C_FP32"],
+        epilogue_store="tiled",
+        k_atoms=2,
+        torch_dtype_name="bfloat16",
+        fx_dtype_name="BFloat16",
+        n_first=n_first,
+    )
+
+
+def test_iluvatar_mr_hgemm_write_c_fp32_crop_m(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    hgemm = _require_hgemm_kernel()
+    fx = hgemm["fx"]
+    torch.manual_seed(0)
+    a = torch.randn(_CROP_BM, _CROP_K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(_CROP_N, _CROP_K, dtype=torch.bfloat16, device="cuda")
+    c = torch.empty(_CROP_M, _CROP_N, dtype=torch.float32, device="cuda")
+    expected = (a.float() @ b.float().T)[:_CROP_M]
+
+    launch = hgemm["compile_iluvatar_mr_hgemm"](
+        M=_CROP_BM,
+        N=_CROP_N,
+        K=_CROP_K,
+        warps_m=_CROP_WARPS_M,
+        warps_n=_CROP_WARPS_N,
+        k_atoms=2,
+        warp_atoms_m=_CROP_WARP_ATOMS_M,
+        warp_atoms_n=_CROP_WARP_ATOMS_N,
+        epilogue=hgemm["EPILOGUE_WRITE_C_FP32"],
+        elem_dtype=fx.BFloat16,
+        crop_m=_CROP_M,
+    )
+    launch(a, b, c)
+    torch.cuda.synchronize()
+    atol = _compare_atol(_CROP_K, 2, "bfloat16")
+    assert torch.isfinite(c).all()
+    assert torch.allclose(c, expected, atol=atol, rtol=2e-2)
+
+
+def test_iluvatar_mr_hgemm_no_c_read_crop_batched_ldc(monkeypatch):
+    torch = _require_torch()
+    _configure_iluvatar_env(monkeypatch)
+    hgemm = _require_hgemm_kernel()
+    fx = hgemm["fx"]
+    torch.manual_seed(1)
+    a = torch.randn(_CROP_BATCH, _CROP_BM, _CROP_K, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(_CROP_BATCH, _CROP_N, _CROP_K, dtype=torch.bfloat16, device="cuda")
+    c = torch.zeros(_CROP_BATCH, _CROP_M, _CROP_LDC, dtype=torch.bfloat16, device="cuda")
+
+    launch = hgemm["compile_iluvatar_mr_hgemm"](
+        M=_CROP_BM,
+        N=_CROP_N,
+        K=_CROP_K,
+        warps_m=_CROP_WARPS_M,
+        warps_n=_CROP_WARPS_N,
+        k_atoms=2,
+        warp_atoms_m=_CROP_WARP_ATOMS_M,
+        warp_atoms_n=_CROP_WARP_ATOMS_N,
+        epilogue=hgemm["EPILOGUE_NO_C_READ"],
+        elem_dtype=fx.BFloat16,
+        crop_m=_CROP_M,
+        ldc=_CROP_LDC,
+        batch=_CROP_BATCH,
+        a_batch_stride=_CROP_BM * _CROP_K,
+        b_batch_stride=_CROP_N * _CROP_K,
+        c_batch_stride=_CROP_M * _CROP_LDC,
+    )
+    launch(
+        a.reshape(_CROP_BATCH * _CROP_BM, _CROP_K),
+        b.reshape(_CROP_BATCH * _CROP_N, _CROP_K),
+        c.reshape(_CROP_BATCH * _CROP_M, _CROP_LDC),
+    )
+    torch.cuda.synchronize()
+    atol = _compare_atol(_CROP_K, 2, "bfloat16")
+    for batch_id in range(_CROP_BATCH):
+        expected = (a[batch_id].float() @ b[batch_id].float().T)[:_CROP_M]
+        got = c[batch_id, :, :_CROP_N].float()
+        assert torch.isfinite(got).all()
+        assert torch.allclose(got, expected, atol=atol, rtol=2e-2)
+        assert c[batch_id, :, _CROP_N:].abs().max().item() == 0.0
