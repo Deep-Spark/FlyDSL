@@ -6,6 +6,7 @@
   mr_hgemm_epilogue_store_shfl -- f16/bf16 via warp shuffle + packed i32 store
   mr_hgemm_epilogue_store_tiled -- f16/bf16 via trunc_f + make_tiled_copy_C
   mr_hgemm_epilogue_store_read_c_accum -- fp32 make_tiled_copy_C
+  mr_hgemm_epilogue_store_fp32_stp -- fp32 write-only store via stp_vs
   mr_igemm_epilogue_store_i32 -- int32 direct store
   mr_igemm_epilogue_store_i8_packed -- int8 packed store (no quant scale)
   mr_igemm_epilogue_store_scaled -- dequant (+ optional bias) -> f16/bf16
@@ -316,6 +317,30 @@ def mr_igemm_epilogue_store_i32(
             for jn in fx.range_constexpr(warp_atoms_n):
                 soffset = row_soffset + fx.Int32(jn * ATOM_N * 4)
                 stp_vs_b32(loaded[jn][ei], c_warp_ptr, voffset, soffset)
+
+
+def mr_hgemm_epilogue_store_fp32_stp(
+    *,
+    lane_id,
+    accs,
+    gC_warp,
+    c_global_n: int,
+    warp_atoms_m: int,
+    warp_atoms_n: int,
+):
+    """fp32 store via ``stp_vs_b32`` (same addressing as the i32 epilogue)."""
+    lane_row = lane_id.shrui(fx.Int32(4))
+    lane_col = lane_id & fx.Int32(TCU_LANE_COLS - 1)
+    voffset = (lane_row * fx.Int32(c_global_n) + lane_col) * fx.Int32(4)
+    c_warp_ptr = fx.get_iter(gC_warp)
+    for im in fx.range_constexpr(warp_atoms_m):
+        loaded = [Vec(accs[im][jn].load()) for jn in range(warp_atoms_n)]
+        for ei in fx.range_constexpr(4):
+            row_soffset = fx.Int32((im * ATOM_M + ei * 4) * c_global_n * 4)
+            for jn in fx.range_constexpr(warp_atoms_n):
+                soffset = row_soffset + fx.Int32(jn * ATOM_N * 4)
+                word = Vec.from_elements([loaded[jn][ei]], fx.Float32).bitcast(fx.Int32)[0]
+                stp_vs_b32(word, c_warp_ptr, voffset, soffset)
 
 
 def mr_igemm_epilogue_store_scaled(
