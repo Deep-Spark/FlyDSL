@@ -125,6 +125,9 @@ if [[ ! -d "${IXCC_SOURCE}" ]]; then
     echo "::error::IXCC_FRESH_ROOT is not a directory: ${IXCC_SOURCE}" >&2
     exit 1
 fi
+# Host mkdir owns the bind-mount as the runner uid; this container is root.
+# Git then refuses fetch/checkout (dubious ownership) after clone into that dir.
+git config --global --add safe.directory "${IXCC_SOURCE}" || true
 echo "::group::Checkout ixcc @ ${IXCC_REF} in ${IXCC_SOURCE}"
 if [[ -d "${IXCC_SOURCE}/.git" ]]; then
     git -C "${IXCC_SOURCE}" fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
