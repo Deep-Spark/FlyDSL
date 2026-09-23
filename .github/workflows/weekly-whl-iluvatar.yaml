@@ -3,7 +3,7 @@ name: Publish Wheels (Iluvatar A-track)
 # Two channels:
 # - ci: push to iluvatar (ci-device path filters). Smoke tests only.
 #   Ubuntu 20.04 cp312 by default (ixaite / glibc 2.31).
-# - weekly: Sunday / dispatch. Fuller device tests; GitHub "latest".
+# - weekly: Sunday / dispatch. Fuller device tests.
 #   Ubuntu 20.04 (optional cp310/cp312, default cp312) and Ubuntu 24.04 cp312.
 # Optional local copies use vars.FLYDSL_ILUVATAR_WHEEL_DIR (unset skips staging).
 
@@ -63,7 +63,7 @@ on:
         default: ""
 
 permissions:
-  contents: write
+  contents: read
   actions: read
   packages: read
 
@@ -323,49 +323,3 @@ jobs:
           else
             echo "skip artifact HTTP publish: ${FLYDSL_ILUVATAR_WHEEL_ARTIFACT_DIR} does not exist"
           fi
-
-  publish:
-    needs: [gate, build, test]
-    if: ${{ always() && !cancelled() && needs.gate.outputs.should_run == 'true' && needs.test.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout workflow scripts
-        uses: actions/checkout@v4
-
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: flydsl-iluvatar-wheels-*-${{ github.run_id }}
-          merge-multiple: true
-          path: dist
-
-      - name: Publish weekly GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          find dist -type f | sort
-          bash .github/scripts/publish_iluvatar_weekly_release.sh dist \
-            "${{ needs.gate.outputs.source_ref }}" \
-            "${{ needs.gate.outputs.channel }}"
-
-      - name: Write publish summary
-        run: |
-          {
-            echo "### Iluvatar ${{ needs.gate.outputs.channel }} wheel (${{ needs.gate.outputs.ixcc_variant }})"
-            echo
-            echo "- Source ref: \`${{ needs.gate.outputs.source_ref }}\`"
-            echo "- Channel: \`${{ needs.gate.outputs.channel }}\`"
-            echo "- IXCC variant: \`${{ needs.gate.outputs.ixcc_variant }}\`"
-            echo "- Local nginx dir: \`${{ needs.gate.outputs.local_name }}/\`"
-            echo "- URLs:"
-            if [ "${{ needs.gate.outputs.channel }}" = "ci" ]; then
-              echo "  - https://github.com/${{ github.repository }}/releases/download/iluvatar-ci/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
-            else
-              echo "  - u2004 (default): https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp312-manylinux_x86_64.whl"
-              echo "  - u2404: https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-u2404-cp312-manylinux_x86_64.whl"
-              echo "  - (optional cp310 when built) https://github.com/${{ github.repository }}/releases/latest/download/flydsl-iluvatar-cp310-manylinux_x86_64.whl"
-            fi
-          } >> "${GITHUB_STEP_SUMMARY}"
