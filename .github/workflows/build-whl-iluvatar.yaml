@@ -19,7 +19,7 @@ on:
         required: false
         default: ""
       local_wheel_dir:
-        description: "If set, stage a stable-named copy here on this runner after upload (incoming, not latest)"
+        description: "Runner directory for the staged wheel. The test job reads this path. Empty skips staging."
         type: string
         required: false
         default: ""
@@ -29,7 +29,7 @@ on:
         required: false
         default: "Release"
       artifact_name:
-        description: "Artifact name for uploaded wheels (empty uses flydsl-iluvatar-wheels-<run_id>)"
+        description: "Label recorded in the build manifest (empty uses flydsl-iluvatar-wheels-<run_id>)"
         type: string
         required: false
         default: ""
@@ -58,7 +58,7 @@ on:
         description: "Space-separated built wheel filenames"
         value: ${{ jobs.build.outputs.wheel_names }}
       artifact_name:
-        description: "Uploaded artifact name (includes github.run_id)"
+        description: "Wheel label recorded in the build manifest"
         value: ${{ jobs.build.outputs.artifact_name }}
   workflow_dispatch:
     inputs:
@@ -591,22 +591,9 @@ jobs:
           echo "wheel_names=${WHEELS}" >> "${GITHUB_OUTPUT}"
           echo "artifact_name=${WHEEL_ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
           echo "Built wheels: ${WHEELS}"
-          echo "Artifact name: ${WHEEL_ARTIFACT_NAME}"
+          echo "Wheel label: ${WHEEL_ARTIFACT_NAME}"
 
-      - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.WHEEL_ARTIFACT_NAME }}
-          path: |
-            dist/*.whl
-            dist/build-manifest.json
-            dist/build-summary.md
-            dist/wheel-payload-summary.json
-          retention-days: 3
-          if-no-files-found: error
-
-      # Stage onto this runner at upload time. Weekly promote to latest happens
-      # only after tests pass.
+      # Weekly promote to latest happens only after tests pass.
       - name: Stage a local incoming wheel copy
         if: ${{ inputs.local_wheel_dir != '' }}
         env:

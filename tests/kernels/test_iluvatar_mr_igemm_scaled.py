@@ -130,6 +130,10 @@ def test_iluvatar_mr_igemm_scaled_dynamic_m(monkeypatch):
         C = torch.zeros(launcher.m_ceil, n, dtype=torch.bfloat16, device="cuda")
         a_dev, b_dev = remap(A, B, "tn")
         grid_m = (m + launcher.bm - 1) // launcher.bm
+        # Fills and the output memset are ordered on the current stream.
+        # The launch stream has to wait, or the next iteration's memset
+        # can complete after this kernel and wipe C.
+        stream.wait_stream(torch.cuda.current_stream())
         launcher(a_dev, b_dev, scale_a, scale_b, C, bias, m, grid_m, stream=stream)
         torch.cuda.synchronize()
         expected = _reference(torch, A, B, scale_a, scale_b, bias).to("cuda")
@@ -156,6 +160,7 @@ def test_iluvatar_mr_igemm_scaled_allow_dynamic_m_tt(monkeypatch):
     C = torch.zeros(launcher.m_ceil, n, dtype=torch.bfloat16, device="cuda")
     a_dev, b_dev = remap(A, B, "tt")
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     launcher(a_dev, b_dev, scale_a, scale_b, C, bias, stream=stream)
     torch.cuda.synchronize()
     expected = _reference(torch, A, B, scale_a, scale_b, bias).to("cuda")

@@ -5,7 +5,9 @@ name: Publish Wheels (Iluvatar A-track)
 #   Ubuntu 20.04 cp312 by default (ixaite / glibc 2.31).
 # - weekly: Sunday / dispatch. Fuller device tests.
 #   Ubuntu 20.04 (optional cp310/cp312, default cp312) and Ubuntu 24.04 cp312.
-# Optional local copies use vars.FLYDSL_ILUVATAR_WHEEL_DIR (unset skips staging).
+# Wheels stay on this runner. Tests install the staged copy.
+# vars.FLYDSL_ILUVATAR_WHEEL_DIR selects the directory that promote updates
+# after tests pass. Unset keeps a run-scoped copy and skips promote.
 
 on:
   push:
@@ -64,7 +66,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
   packages: read
 
 concurrency:
@@ -255,7 +256,7 @@ jobs:
       use_fresh_ixcc: ${{ matrix.use_fresh_ixcc }}
       # Incoming dir carries the variant instead of the channel so promote-local can pick the
       # right on-disk channel dir without re-implementing the ixcc_variant -> local_name mapping.
-      local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.ixcc_variant, matrix.id) || '' }}
+      local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.ixcc_variant, matrix.id) || format('/home/flydsl/sw_home/local/flydsl-wheels/iluvatar/incoming-run-{0}-{1}', github.run_id, matrix.id) }}
       cmake_build_type: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
     permissions:
       contents: read
@@ -272,12 +273,11 @@ jobs:
     with:
       docker_image: ${{ matrix.docker_image }}
       python_versions: ${{ matrix.python_versions }}
-      wheel_artifact_name: flydsl-iluvatar-wheels-${{ matrix.id }}-${{ github.run_id }}
+      local_wheel_dir: ${{ vars.FLYDSL_ILUVATAR_WHEEL_DIR != '' && format('{0}/incoming-{1}-{2}', vars.FLYDSL_ILUVATAR_WHEEL_DIR, needs.gate.outputs.ixcc_variant, matrix.id) || format('/home/flydsl/sw_home/local/flydsl-wheels/iluvatar/incoming-run-{0}-{1}', github.run_id, matrix.id) }}
       source_ref: ${{ needs.gate.outputs.source_ref }}
       suite: ${{ matrix.test_suite }}
     permissions:
       contents: read
-      actions: read
       packages: read
 
   promote-local:
