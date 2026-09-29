@@ -185,9 +185,10 @@ object. This is separate from JIT cache pre-warming:
    compiled = flyc.compile(launch, *specialization_args)
    compiled.export_to_c(output, "my_kernel")
 
-The output directory receives ``my_kernel.o``, ``my_kernel.h``, and the FlyDSL
-runtime shared library required by the object. The generated header contains a
-typed inline call helper and the module lifecycle entry points. On a build host
+The output directory receives ``my_kernel.o`` and ``my_kernel.h``. The object
+embeds its FlyDSL backend adapter; the generated header lists the backend
+system libraries needed when linking the final binary, along with typed inline
+call helpers and module lifecycle entry points. On a build host
 without a visible GPU, select the architecture explicitly (for example,
 ``ARCH=gfx950``) and compile with null pointer or non-device tensor
 placeholders. See :doc:`api/compiler` for the API contract and supported

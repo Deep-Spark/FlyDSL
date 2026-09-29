@@ -290,11 +290,11 @@ GPU runtime when the target architecture is specified explicitly.
 rewrites a fresh copy of the already-lowered module for standalone linkage. It:
 
 1. namespaces and internalizes the module's definitions;
-2. attaches backend-specific module lifecycle handlers;
+2. selects the backend GPU object and attaches the AOT module handler;
 3. emits a packed `int32_t entry(void **args)` wrapper and ABI metadata;
 4. emits a position-independent host object and matching C header; and
-5. copies the backend runtime shared libraries required by the object into the
-   output directory.
+5. embeds the backend AOT runtime archive into the host object. Only backend
+   system libraries remain as link-time dependencies.
 
 This export path reuses the same GPU binary as the compiled specialization; it
 does not retrace the Python launcher. Backend-specific implementation hooks and

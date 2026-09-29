@@ -82,6 +82,41 @@ On first call, ``@flyc.jit`` runs the following pipeline:
    (``~/.flydsl/cache/``) keyed by the compiler toolchain hash and kernel
    type signature.
 
+Ahead-of-time C export
+-----------------------
+
+``CompiledFunction.export_to_c(file_path, file_name, function_prefix="")``
+writes a target-specific object file and a C/C++ header. The object contains
+the GPU binary and a small backend adapter, so the deployed executable or
+shared library does not need FlyDSL or Python. The generated header records the
+backend and system link flags; for ROCm these are
+``-lamdhip64 -pthread -ldl``. The linker must also be able to find the HIP SDK
+library. For a nonstandard ROCm installation,
+add its library directory, for example::
+
+   cc -shared -o libkernel.so kernel.o -L/path/to/rocm/lib -lamdhip64 -pthread -ldl
+
+The metadata records ``libamdhip64.so`` as a link-time name. The versioned
+runtime dependency (the ELF ``DT_NEEDED`` name) is determined by the library
+selected when the final executable or shared library is linked. The deployed
+system's dynamic loader must be able to find that versioned HIP library.
+
+The header exposes two calling styles:
+
+* ``<symbol>__module_init``, ``<symbol>__module_load`` and
+  ``<symbol>__module_unload`` provide explicit lifecycle and device control.
+  After loading, ``<symbol>_call`` provides a typed wrapper around the packed
+  entry point.
+* ``<symbol>_call_auto`` is the simple path. It idempotently initializes the
+  module and loads it on the current device before each call. It intentionally
+  does not unload automatically, so asynchronous launches remain safe.
+
+The current exporter targets 64-bit little-endian Linux ELF hosts and uses
+GNU-compatible relocatable linking and ``objcopy`` tools. The ROCm adapter
+requires HIP and pthread. Exported objects are tied to the host ABI and GPU
+target used during compilation. They can be moved and linked independently,
+but must run on a compatible backend and GPU architecture.
+
 Tensor arguments
 -----------------
 
@@ -128,9 +163,10 @@ host object with a generated C header:
        function_prefix="flydsl_vector_add",
    )
 
-``export_to_c`` writes ``vector_add.o``, ``vector_add.h``, and the required
-FlyDSL runtime shared library into the existing output directory. The generated
-header declares the packed entry point, a typed inline call helper, module
+``export_to_c`` writes ``vector_add.o`` and ``vector_add.h`` into the existing
+output directory. The object embeds the FlyDSL backend adapter; link the final
+binary against the backend system libraries listed in the header. The header
+declares the packed entry point, typed inline call helpers, module
 initialization/load/unload functions, and embedded ABI metadata. When
 ``function_prefix`` is omitted, ``file_name`` is also used as the exported C
 symbol.
