@@ -24,17 +24,24 @@ def _key(jit_fn, *args):
     return jit_fn._resolve_and_make_cache_key(bound.arguments)
 
 
-def test_env_var_drift_changes_cache_key(monkeypatch):
+@pytest.mark.parametrize(
+    ("name", "before", "after"),
+    [
+        ("FLYDSL_COMPILE_OPT_LEVEL", "2", "0"),
+        ("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", "0", "1"),
+    ],
+)
+def test_env_var_drift_changes_cache_key(monkeypatch, name, before, after):
     @flyc.jit
     def k(A: fx.Tensor):
         pass
 
     A = torch.zeros(8, dtype=torch.float32)
 
-    monkeypatch.setenv("FLYDSL_COMPILE_OPT_LEVEL", "2")
+    monkeypatch.setenv(name, before)
     k1 = _key(k, A)
 
-    monkeypatch.setenv("FLYDSL_COMPILE_OPT_LEVEL", "0")
+    monkeypatch.setenv(name, after)
     k2 = _key(k, A)
 
     assert k1 != k2, "cache key must change when whitelisted env var changes"

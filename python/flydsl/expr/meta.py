@@ -76,8 +76,12 @@ def capture_user_location() -> ir.Location:
 
     Walks up from the op-building site, skips DSL-library frames, and records
     every user frame from the innermost (where the op is written) up to the
-    tracing boundary.
+    tracing boundary. Returns an unknown location without inspecting frames
+    when debug info is disabled.
     """
+    if not env.debug.enable_debug_info:
+        return ir.Location.unknown()
+
     stack = getattr(_tls, "stack", None)
     boundary = stack[-1] if stack else None
     max_depth = env.debug.max_loc_depth
@@ -131,10 +135,10 @@ def dsl_loc_tracing(fn: "Callable[_P, _R]") -> "Callable[_P, _R]":
 
     Location policy (single source of truth for the whole ``expr`` layer):
 
-    * The location is the **full user call-site chain** -- a ``CallSiteLoc``
+    * With debug info enabled, the location is the **full user call-site chain** -- a ``CallSiteLoc``
       from the innermost user frame (where the op is written) up to the
       boundary, each frame a ``FileLineColLoc`` (line + column).  A lone user
-      frame collapses to a plain ``FileLineColLoc``.
+      frame collapses to a plain ``FileLineColLoc``. Otherwise it is unknown.
     * It is captured **once** and entered as a dynamic ``with loc:`` scope, so
       every op the decorated function builds inherits it via
       ``Location.current``.

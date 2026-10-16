@@ -116,7 +116,8 @@ cmake_args=(
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DMLIR_DIR="${MLIR_PATH}/lib/cmake/mlir"
   -DPython3_EXECUTABLE="$(which python3)"
-  -DHIP_PLATFORM="${HIP_PLATFORM}"
+  #-DHIP_PLATFORM="${HIP_PLATFORM}"
+  -DFLYDSL_BACKENDS="iluvatar"
 )
 if [ -n "${NANOBIND_DIR}" ]; then
   cmake_args+=(-Dnanobind_DIR="${NANOBIND_DIR}")
