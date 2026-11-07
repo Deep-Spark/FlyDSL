@@ -1,0 +1,12 @@
+[Unit]
+Description=Dispatch GitHub Actions ixcc-refresh workflow (SWCOMP-3177 GH cron backstop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+ExecStart=%h/.local/bin/dispatch-ixcc-refresh.sh
+StandardOutput=journal
+StandardError=journal

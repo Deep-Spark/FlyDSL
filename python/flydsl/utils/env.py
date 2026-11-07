@@ -261,7 +261,9 @@ class DebugEnvManager(EnvManager):
     # MLIR pass manager options
     print_origin_ir = OptBool(False, description="Print origin IR")
     print_after_all = OptBool(False, description="Print IR after each MLIR pass")
-    enable_debug_info = OptBool(False, description="Generate debug info in compiled code")
+    enable_debug_info = OptBool(
+        False, description="Capture detailed source locations and generate debug info on supported backends"
+    )
     enable_verifier = OptBool(True, description="Verify IR module")
 
     show_stacktrace = OptBool(
@@ -297,6 +299,14 @@ class RuntimeEnvManager(EnvManager):
     run_only = OptBool(
         False,
         description=("Skip JIT compilation; only load AOT cache. " "Raise RuntimeError on cache miss."),
+    )
+    flex_fa_fastpath = OptBool(
+        True,
+        env_var="FLYDSL_FLEX_FA_FASTPATH",
+        description=(
+            "Route vanilla flydsl_flex_attn_func (no score/mask mods, bf16, "
+            "D in {128,256}, no explicit tile_config) to flash_attn_varlen_func"
+        ),
     )
 
 

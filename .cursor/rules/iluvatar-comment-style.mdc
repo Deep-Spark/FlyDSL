@@ -1,0 +1,93 @@
+---
+description: Iluvatar/IXDL comments and docs stay ASCII-only, self-contained, and free of PR/plan process narrative
+alwaysApply: true
+---
+
+# Iluvatar / IXDL comment style
+
+When writing or editing comments, docstrings, and Iluvatar-facing docs
+(`README_Iluvatar.md`, `kernels/**/iluvatar/**`, `lib/Dialect/FlyIXDL/**`,
+`lib/Conversion/FlyToIXDL/**`, `python/flydsl/expr/ixdl/**`, related examples /
+tests), keep prose **self-contained and ASCII-only**. Do not change code
+behavior in a comment-only cleanup.
+
+## ASCII-only glyphs
+
+Prefer ASCII replacements over Unicode math / typography:
+
+| Avoid | Prefer |
+|-------|--------|
+| `→` / `⇒` | `->` / `=>` |
+| `—` / `–` | `--` |
+| `…` | `...` |
+| `×` | `x` or `*` |
+| `∈` | `in` |
+| `≥` / `≤` / `≠` / `≈` | `>=` / `<=` / `!=` / `~=` |
+| `§` | `section` |
+
+```text
+# ❌ BAD
+# Score mods (plan §2.3): S *= sm_scale → softcap → masks
+
+# ✅ GOOD
+# Score mods: S *= sm_scale -> softcap -> masks
+```
+
+Leave a space when substituting words into formulas (`lane in [0,64)`, not
+`lanein[0,64)`).
+
+## Self-contained; no external source-path crutches
+
+Comments should explain FlyDSL / IXDL behavior on their own. Do **not** point
+readers at external implementation files as the way to understand the code
+(e.g. `ixcc/.../MmadShapeUtils.h`, `cutlass/include/cute/...` paths, or
+"see LONG_MMA_DESC").
+
+**Concept names are fine.** Keep `CuTe`, `CuTe-style`, `CUTLASS`, and similar
+when they name a known layout / MMA convention. Do **not** rewrite those to
+`FlyDSL` just to avoid saying CuTe.
+
+```text
+# ❌ BAD — external path as the authority
+# ThrVal layout matches cutlass/include/cute/atom/mma_traits_ix30.hpp
+
+# ✅ GOOD — concept name, local meaning
+# CuTe-style column-major TV codomain (M inner, N outer)
+
+# ❌ BAD — renaming a concept for no reason
+# FlyDSL TV composition ...
+
+# ✅ GOOD — leave the concept name
+# CuTe TV composition ...
+```
+
+## No PR / plan process narrative
+
+Do not encode staging, ticket, or plan history in lasting comments:
+
+- `PR-1a` / `PR-2c` / `this PR` / `landed in PR-...`
+- `plan §2.3` / `plan Q10` / `before X lands in PR-Y`
+- `bring-up` / `initial correctness pass` as a substitute for describing
+  current behavior
+
+Describe the **current** contract, algorithm, or constraint instead.
+
+```python
+# ❌ BAD
+# PR-1b uses range_constexpr so m_running propagates as Python-scope lists.
+
+# ✅ GOOD
+# range_constexpr lets m_running propagate as Python-scope lists of DSL scalars.
+```
+
+## Scope / migration
+
+- **New Iluvatar / IXDL comments**: follow this rule from the first line.
+- **Files already being edited**: fix opportunistic ASCII / process-narrative /
+  external-path issues in the touched comments.
+- **Pure drive-by sweeps** of unrelated files: do not touch unless the user
+  asks for a comment-style cleanup.
+- **Non-Iluvatar / non-IXDL** trees: out of scope for this rule.
+
+This rule is about comment *content*. Do not restate it as a source comment
+(see `no-rule-echo-comments.mdc`).

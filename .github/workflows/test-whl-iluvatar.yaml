@@ -1,0 +1,242 @@
+name: Test Wheels (Iluvatar A-track)
+
+on:
+  workflow_call:
+    inputs:
+      docker_image:
+        description: "Iluvatar test image"
+        type: string
+        required: false
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      python_versions:
+        description: "Python version used to create the test venv"
+        type: string
+        required: false
+        default: "3.12"
+      wheel_artifact_name:
+        description: "Artifact name produced by build job"
+        type: string
+        required: false
+        default: "flydsl-iluvatar-wheels"
+      build_run_id:
+        description: "Optional workflow run id that produced wheel artifacts"
+        type: string
+        required: false
+        default: ""
+      source_ref:
+        description: "Git ref to check out for tests (empty uses the caller SHA)"
+        type: string
+        required: false
+        default: ""
+      suite:
+        description: "smoke: import/link/compile-only. full: also run must-pass device tests"
+        type: string
+        required: false
+        default: "smoke"
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: "Iluvatar test image"
+        type: string
+        required: false
+        default: "ghcr.io/deep-spark/flydsl-iluvatar-ci:stable"
+      wheel_artifact_name:
+        description: "Artifact name produced by build job"
+        type: string
+        required: false
+        default: "flydsl-iluvatar-wheels"
+      build_run_id:
+        description: "Optional workflow run id that produced wheel artifacts"
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 120
+    env:
+      COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Download wheel artifacts (current run)
+        if: ${{ (inputs.build_run_id || '') == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.wheel_artifact_name || 'flydsl-iluvatar-wheels' }}
+          path: dist
+
+      - name: Download wheel artifacts (specific build run)
+        if: ${{ (inputs.build_run_id || '') != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.wheel_artifact_name || 'flydsl-iluvatar-wheels' }}
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install wheel and run Iluvatar smoke tests
+        env:
+          DOCKER_IMAGE: ${{ inputs.docker_image || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+          PYTHON_VERSIONS: ${{ inputs.python_versions || '3.12' }}
+          TEST_SUITE: ${{ inputs.suite || 'smoke' }}
+        run: |
+          set -euo pipefail
+          GPU_DEVICES=""
+          RETRY_SECONDS=120
+          RETRY_INTERVAL=5
+          elapsed=0
+          while [ "${elapsed}" -le "${RETRY_SECONDS}" ]; do
+            GPU_DEVICES=""
+            if ls /dev/iluvatar* >/dev/null 2>&1; then
+              for dev in /dev/iluvatar*; do
+                [ -e "${dev}" ] || continue
+                GPU_DEVICES="${GPU_DEVICES} --device=${dev}"
+              done
+            fi
+            if [ -n "${GPU_DEVICES}" ]; then
+              break
+            fi
+            if [ "${elapsed}" -eq "${RETRY_SECONDS}" ]; then
+              break
+            fi
+            echo "Waiting for /dev/iluvatar* nodes (${elapsed}/${RETRY_SECONDS}s)..."
+            sleep "${RETRY_INTERVAL}"
+            elapsed=$((elapsed + RETRY_INTERVAL))
+          done
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            RENDER_DEVICES="$(cat /etc/podinfo/gha-render-devices)"
+          elif [ -e /dev/dri ]; then
+            RENDER_DEVICES="--device /dev/dri"
+          else
+            RENDER_DEVICES=""
+          fi
+
+          if [ -z "${GPU_DEVICES}" ]; then
+            echo "::error::No /dev/iluvatar* nodes found after ${RETRY_SECONDS}s retry window"
+            exit 1
+          fi
+
+          selected_gpu=""
+          extra_run_args=()
+          if [ "${TEST_SUITE}" = "full" ]; then
+            # Device JIT needs the host CoreX linker (ld.lld) and kmd access.
+            extra_run_args+=(--privileged)
+            if [ -f .github/scripts/select_iluvatar_ci_gpu.sh ]; then
+              selected_gpu="$(bash .github/scripts/select_iluvatar_ci_gpu.sh)"
+            fi
+          fi
+
+          # The stable image ships CoreX torch in /opt/venv but not OpenMPI/NUMA.
+          # libtorch*.so then fail to load (libnuma.so.1, then libmpi.so.40 and
+          # its closure). Bind the host copies for the full suite only -- smoke
+          # never imports torch, and mounting 24.04 OpenMPI into the u2004
+          # image would mix glibc ABIs. Do not bind libc/libm/libz from the host.
+          extra_mounts=()
+          if [ "${TEST_SUITE}" = "full" ]; then
+            for lib in \
+              libnuma.so.1 \
+              libmpi.so.40 \
+              libopen-rte.so.40 \
+              libopen-pal.so.40 \
+              libhwloc.so.15 \
+              libevent_core-2.1.so.7 \
+              libevent_pthreads-2.1.so.7
+            do
+              host=""
+              for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+                if [ -e "${d}/${lib}" ]; then
+                  host="$(readlink -f "${d}/${lib}")"
+                  break
+                fi
+              done
+              if [ -z "${host}" ]; then
+                echo "::error::host is missing ${lib}; full-suite torch import cannot succeed"
+                exit 1
+              fi
+              extra_mounts+=(-v "${host}:/lib/x86_64-linux-gnu/${lib}:ro")
+              extra_mounts+=(-v "${host}:/usr/lib/x86_64-linux-gnu/${lib}:ro")
+            done
+          fi
+
+          docker run --rm \
+            --network host \
+            --ipc host \
+            --user "$(id -u):$(id -g)" \
+            ${GPU_DEVICES} \
+            ${RENDER_DEVICES} \
+            "${extra_run_args[@]}" \
+            -v "${PWD}:/workspace" \
+            -v "${COREX_ROOT}:${COREX_ROOT}:ro" \
+            "${extra_mounts[@]}" \
+            -w /workspace \
+            -e COREX_ROOT="${COREX_ROOT}" \
+            -e IXA_HOME="${COREX_ROOT}" \
+            -e IXA_ROOT="${COREX_ROOT}" \
+            -e CUDA_HOME="${COREX_ROOT}" \
+            -e CUDAToolkit_ROOT="${COREX_ROOT}" \
+            -e CUDA_VISIBLE_DEVICES="${selected_gpu}" \
+            -e ARCH="${ARCH:-ivcore11}" \
+            -e PYTHON_VERSIONS="${PYTHON_VERSIONS}" \
+            -e TEST_SUITE="${TEST_SUITE}" \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              export PATH="${COREX_ROOT}/bin:${PATH}"
+              export LD_LIBRARY_PATH="${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+              export IXA_HOME="${COREX_ROOT}"
+              export IXA_ROOT="${COREX_ROOT}"
+              export CUDA_HOME="${COREX_ROOT}"
+              export CUDAToolkit_ROOT="${COREX_ROOT}"
+              ver="${PYTHON_VERSIONS%% *}"
+              if [[ -x "/usr/local/conda/envs/py${ver}/bin/python" ]]; then
+                py="/usr/local/conda/envs/py${ver}/bin/python"
+              elif [[ -x "/opt/conda/envs/py${ver}/bin/python" ]]; then
+                py="/opt/conda/envs/py${ver}/bin/python"
+              elif command -v "python${ver}" >/dev/null 2>&1; then
+                py="$(command -v "python${ver}")"
+              else
+                echo "cannot find python ${ver}" >&2
+                exit 1
+              fi
+              py_lib="$(cd "$(dirname "${py}")/../lib" && pwd)"
+              export LD_LIBRARY_PATH="${py_lib}:${COREX_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+              "${py}" -m venv /tmp/flydsl-whl-test
+              # A venv created from /opt/venv has base_prefix=/usr, so
+              # --system-site-packages does not see the parent venv torch.
+              # Drop a .pth so full-suite tests can import that copy.
+              if [ "${TEST_SUITE}" = "full" ]; then
+                parent_site="$("${py}" -c "import site; print(site.getsitepackages()[0])")"
+                printf "%s\n" "${parent_site}" > "/tmp/flydsl-whl-test/lib/python${ver}/site-packages/_parent_venv.pth"
+              fi
+              source /tmp/flydsl-whl-test/bin/activate
+              python -m pip install -U pip setuptools
+              python -m pip install numpy pytest
+              python -m pip install dist/*.whl
+              if [ "${TEST_SUITE}" = "full" ]; then
+                python -c "import torch; print(\"torch:\", torch.__file__, torch.__version__)"
+              fi
+              python -c "import flydsl; import flydsl._mlir.ir as ir; print(\"flydsl version:\", flydsl.__version__); print(\"import flydsl._mlir.ir: OK\")"
+              python .github/scripts/verify_installed_flydsl_linkage.py
+              FLYDSL_COMPILE_BACKEND=iluvatar \
+              FLYDSL_RUNTIME_KIND=iluvatar \
+              COMPILE_ONLY=1 \
+              python -m pytest tests/unit/test_iluvatar_compile_backend.py -v
+              if [ "${TEST_SUITE}" = "full" ]; then
+                FLYDSL_COMPILE_BACKEND=iluvatar \
+                FLYDSL_RUNTIME_KIND=iluvatar \
+                python -m pytest \
+                  tests/unit/test_iluvatar_binary_pipeline_smoke.py \
+                  tests/unit/test_iluvatar_compile_backend.py \
+                  tests/unit/test_iluvatar_jit_launch_smoke.py \
+                  tests/unit/test_iluvatar_jit_runtime_resolution.py \
+                  tests/kernels/test_iluvatar_*.py \
+                  -m iluvatar_lower -v
+              fi
+            '

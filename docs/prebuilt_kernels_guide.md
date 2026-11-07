@@ -372,6 +372,39 @@ python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --warmup 3 --iters 3
 python3 tests/kernels/test_flash_attn_fwd.py --dtype fp8 --compare --warmup 10 --iters 50
 ```
 
+### 3c. Iluvatar varlen and KV-cache attention
+
+The Iluvatar inference-forward APIs are:
+
+- `kernels.attention.iluvatar.flash_attn_varlen.flash_attn_varlen_func`
+- `kernels.attention.iluvatar.flash_attn_kvcache.flash_attn_with_kvcache`
+
+The varlen path supports bf16, `head_dim` in `{128, 256}`, packed queries,
+dense packed K/V or paged HND/NHD caches, GQA/MQA, and bottom-right causal
+masking. The KV-cache API supports bf16/f16 scalar paths plus bf16
+`head_dim` in `{128, 256}` MMA/SIMT decode paths, dense or paged caches,
+cache update, rotary embedding, split-KV, and the documented layout override.
+Unsupported ALiBi and softmax-LSE options raise `NotImplementedError`.
+Backend/runtime selection must be configured by the caller or CI; importing
+these modules does not change process environment.
+
+Vanilla `flydsl_flex_attn_func` (no `score_mod` / `mask_mod` / BlockMask /
+ALiBi / `score_bias` / SWA / softcap, bf16, `D in {128, 256}`, no explicit
+`tile_config`) dispatches to `flash_attn_varlen_func`. Set
+`FLYDSL_FLEX_FA_FASTPATH=0` to keep the generic flex kernel.
+
+For Iluvatar JIT compilation, point `IXA_ROOT` at a CoreX tree that contains
+`nvvm/libdevice` before the first kernel launch. The IXDL linker resolves
+device-library functions (including `__nv_exp2f` used by attention softmax)
+relative to this root:
+
+```bash
+export IXA_ROOT=/path/to/corex
+export FLYDSL_COMPILE_BACKEND=iluvatar
+export FLYDSL_RUNTIME_KIND=iluvatar
+export ARCH=ivcore11
+```
+
 ---
 
 ## 4. Shared utilities

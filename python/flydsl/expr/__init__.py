@@ -14,6 +14,15 @@ from .struct import *
 from .arith import *
 from .math import *
 from .llvm import *
+from .trace_mod import (
+    MASK_MOD_PARAMS as MASK_MOD_PARAMS,
+    SCORE_MOD_PARAMS as SCORE_MOD_PARAMS,
+    TracedMaskMod as TracedMaskMod,
+    TracedScoreMod as TracedScoreMod,
+    trace_mask_mod as trace_mask_mod,
+    trace_score_mod as trace_score_mod,
+    where as where,
+)
 
 from . import utils as utils
 from . import arith as arith
