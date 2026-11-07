@@ -1,0 +1,35 @@
+---
+description: Iluvatar GPU runs must use the repo CI GPU selector helper
+alwaysApply: true
+---
+
+# Iluvatar CI GPU selection
+
+When CI or an agent run needs a **real GPU** (Iluvatar device tests, perf,
+kernel smoke), do **not** hardcode a device index in workflows, comments, or
+ad-hoc commands. Use the repo helper so selection stays in one place:
+
+```bash
+export CUDA_VISIBLE_DEVICES="$(bash .github/scripts/select_iluvatar_ci_gpu.sh)"
+```
+
+Optional override: `FLYDSL_CI_GPU_POOL` (see the helper script). If
+`CUDA_VISIBLE_DEVICES` is already set to a pool member, the helper keeps it.
+
+## CI wiring
+
+- `run_ci_device_in_container.sh` and `run_perf_trend_in_container.sh` call the
+  helper and pass `CUDA_VISIBLE_DEVICES` into the container.
+- Do not pin `CUDA_VISIBLE_DEVICES` in new Iluvatar GPU workflows unless the
+  user explicitly asks to pin a device.
+
+## Agent local runs
+
+Before device `pytest` / examples:
+
+```bash
+export CUDA_VISIBLE_DEVICES="$(bash .github/scripts/select_iluvatar_ci_gpu.sh)"
+```
+
+Pool membership and defaults live only in `.github/scripts/select_iluvatar_ci_gpu.sh`
+— do not restate them in commit messages, PR text, or other comments.

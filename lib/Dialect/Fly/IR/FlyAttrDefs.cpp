@@ -72,6 +72,12 @@ bool SwizzleAttr::isTrivialSwizzle() const { return getMask() == 0; }
 SwizzleAttr SwizzleAttr::getTrivialSwizzle(MLIRContext *context) { return get(context, 0, 0, 0); }
 
 //===----------------------------------------------------------------------===//
+// ModSwizzleAttr
+//===----------------------------------------------------------------------===//
+
+bool ModSwizzleAttr::isTrivialModSwizzle() const { return getMask() == 0; }
+
+//===----------------------------------------------------------------------===//
 // CoordSwizzleAttr
 //===----------------------------------------------------------------------===//
 
@@ -264,6 +270,8 @@ bool ComposedLayoutAttr::isStaticInner() const {
   } else if (auto layout = dyn_cast<LayoutAttr>(getInner())) {
     return layout.isStatic();
   } else if (auto basis = dyn_cast<SwizzleAttr>(getInner())) {
+    return true;
+  } else if (auto modSwizzle = dyn_cast<ModSwizzleAttr>(getInner())) {
     return true;
   } else if (auto coordSwizzle = dyn_cast<CoordSwizzleAttr>(getInner())) {
     return true;
@@ -642,6 +650,9 @@ static void printComposedFlat(::mlir::AsmPrinter &odsPrinter, ComposedLayoutAttr
     if (auto swizzle = dyn_cast<SwizzleAttr>(inner)) {
       odsPrinter << "S<" << swizzle.getMask() << "," << swizzle.getBase() << ","
                  << swizzle.getShift() << ">";
+    } else if (auto modSwizzle = dyn_cast<ModSwizzleAttr>(inner)) {
+      odsPrinter << "MS<" << modSwizzle.getMask() << "," << modSwizzle.getBase() << ","
+                 << modSwizzle.getShift() << ">";
     } else if (auto coordSwizzle = dyn_cast<CoordSwizzleAttr>(inner)) {
       coordSwizzle.print(odsPrinter);
     } else if (auto layout = dyn_cast<LayoutAttr>(inner)) {
@@ -672,6 +683,13 @@ static void printComposedFlat(::mlir::AsmPrinter &odsPrinter, ComposedLayoutAttr
         odsParser.parseGreater())
       return {};
     inner = SwizzleAttr::get(ctx, mask, base, shift);
+  } else if (odsParser.parseOptionalKeyword("MS").succeeded()) {
+    int32_t mask, base, shift;
+    if (odsParser.parseLess() || odsParser.parseInteger(mask) || odsParser.parseComma() ||
+        odsParser.parseInteger(base) || odsParser.parseComma() || odsParser.parseInteger(shift) ||
+        odsParser.parseGreater())
+      return {};
+    inner = ModSwizzleAttr::get(ctx, mask, base, shift);
   } else if (odsParser.parseOptionalKeyword("CS").succeeded()) {
     inner = parseCoordSwizzleBody(odsParser, ctx);
     if (!inner)

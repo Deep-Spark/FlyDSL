@@ -1,0 +1,36 @@
+# VCS / metadata
+.git
+.gitignore
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*id_rsa*
+*id_ed25519*
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Build outputs
+build/
+build-*/
+dist/
+*.egg-info/
+
+# Large or local-only artifacts
+logs/
+reports/
+test-results*.txt
+*.patch
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/

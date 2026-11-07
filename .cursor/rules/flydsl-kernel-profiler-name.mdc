@@ -1,0 +1,104 @@
+---
+description: GPU kernel Python names and optional name= must be profiler-unique
+alwaysApply: true
+---
+
+# FlyDSL kernel names visible in the profiler
+
+Iluvatar / CUDA profiles show the `gpu.func` symbol, not the ixaite op id
+and not the `@flyc.jit` launcher. Unless `name=` is set, that symbol is
+`{decorated_function.__name__}_{kernel_id}` with `kernel_id` starting at 0
+**per JIT module**. One kernel per module (the usual op pattern) therefore
+always ends in `_0`. Generic inner names (`_kernel`, `kernel`, `_kernel_body`
+on the `@flyc.kernel` itself) make every op look like `_kernel_0`.
+
+## Scope
+
+- **In:** new or substantively edited `@flyc.kernel` in ixaite
+  (`src/ixaite/ops/**`) and FlyDSL (`kernels/**`).
+- **Out:** `@flyc.jit` launchers (host); nested helpers that are not the
+  decorated kernel; ROCm-only trees you are not editing; drive-by renames
+  unless a sweep is explicitly requested.
+
+Do not restate this rule as a source comment.
+
+## 1. The `def` after `@flyc.kernel` is a real name
+
+Use a stable identifier for that kernel family: `{op}_{path}` in snake_case.
+
+```python
+# BAD -- every op compiles to _kernel_0
+@flyc.kernel
+def _kernel(x: fx.Tensor, out: fx.Tensor):
+    ...
+
+# GOOD -- no live variants; def name is the profiler name (+ _0)
+@flyc.kernel
+def silu_and_mul_scalar(x: fx.Tensor, out: fx.Tensor):
+    ...
+```
+
+Forbidden on the decorated kernel: `_kernel`, `kernel`, `_kernel_body`,
+`fn`, `f`, or any name that does not name the op.
+
+## 2. Variants need explicit `name=`
+
+Renaming `def` is **not** enough when one builder compiles several
+specializations (`@cache` on dtype, tile, D, tail guard, crop, kernel_id,
+...). Each specialization is its own module, so they all become
+`{def_name}_0` and collapse in the profile.
+
+Set `name=` to a unique MLIR identifier that encodes the **binary-changing**
+keys you need to attribute. `name=` **replaces** `{def}_{id}` (no extra `_0`).
+
+```python
+# GOOD -- family name on def; variant keys in name=
+dtype_tag = "bf16"
+@flyc.kernel(
+    name=f"silu_and_mul_scalar_{dtype_tag}_d{d}{'_tail' if guard_tail else ''}",
+    known_block_size=[256, 1, 1],
+)
+def silu_and_mul_scalar(x: fx.Tensor, out: fx.Tensor, output_elements: fx.Int64):
+    ...
+```
+
+`name=` is required when two compiled binaries from the same family can be
+live in one process. It is optional when this kernel has a single binary and
+the `def` name already uniquely identifies the op.
+
+## 3. `name=` spelling
+
+- ASCII MLIR identifier: `[A-Za-z_][A-Za-z0-9_]*` (no `.`, `-`, `<`, spaces).
+- Pattern: `{op}_{path}_{variant_keys}` matching the `def` family prefix.
+- Include keys that change the cubin (dtype, tile `t{M}x{N}x{K}`, D, flags
+  like `crop` / `tail` / `g2r`). Omit host-only details (stream, pointer
+  addresses).
+- Keep it short enough to read in a profiler; do not dump the full config
+  struct.
+
+### Canonical dtype spelling
+
+A profiler groups by symbol, so `..._f16_...` and `..._fp16_...` read as two
+unrelated families. Use exactly these tags:
+
+| dtype | tag |
+|---|---|
+| `torch.float16` / `fx.Float16` | `fp16` |
+| `torch.bfloat16` / `fx.BFloat16` | `bf16` |
+| `torch.float32` / `fx.Float32` | `fp32` |
+| `torch.float8_e4m3fn` / `fx.Float8E4M3FN` | `fp8_e4m3` |
+| `torch.float8_e5m2` / `fx.Float8E5M2` | `fp8_e5m2` |
+| `torch.int8` / `fx.Int8` | `i8` |
+| `torch.int32` / `fx.Int32` | `i32` |
+| `torch.int64` / `fx.Int64` | `i64` |
+
+Never `f16` / `float16` / `FP16` / `half` in a kernel name. Once a second call
+site needs the mapping, put it in `kernels/kernels_common.py` rather than a
+second local `_DTYPE_TAG` dict.
+
+## 4. Migration
+
+- **New kernels:** follow from the first line.
+- **Existing files you are already editing:** fold the rename in.
+- **No drive-by sweep** unless the user asks.
+---

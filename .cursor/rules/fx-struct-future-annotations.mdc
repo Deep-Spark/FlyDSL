@@ -1,0 +1,70 @@
+---
+description: FlyDSL @fx.struct must not coexist with `from __future__ import annotations`
+alwaysApply: true
+---
+
+# `@fx.struct` incompatible with `from __future__ import annotations`
+
+## Symptom
+
+Kernel compilation raises, with a **Python-variable literal preserved** in the
+type name (e.g. `E`, `NUM_WARPS + 1`):
+
+```text
+TypeError: Cannot compute layout for schema <name>: field '<f>' has type
+'fx.Array[fx.Int32, E]' which does not implement the Storable protocol.
+```
+
+## Root cause
+
+PEP 563 (`from __future__ import annotations`) stores every class annotation as a
+**string** rather than evaluating the expression at class-body time.
+`@fx.struct` reads `klass.__annotations__` via `_normalize_decorator_fields` in
+`python/flydsl/expr/struct.py` and passes each `type_spec` straight into
+`dsl_size_of(...)`; a string never implements the Storable protocol, and the
+LDS layout cannot be computed.
+
+## Fix
+
+**Do not put `from __future__ import annotations` at the top of any file that
+uses `@fx.struct`.** Remove it. Reference: every existing kernel in
+`kernels/**/*.py` that uses `@fx.struct` (`kernels/norm/iluvatar/rmsnorm_kernel.py`,
+`kernels/moe/topk_gating_softmax_kernel.py`, `kernels/gemm/preshuffle_gemm.py`,
+`kernels/attention/pa_decode_fp8.py`, ...) omits this import — treat that as
+the required template.
+
+```python
+# ❌ BAD — E survives as the literal string "E" in the annotation,
+# @fx.struct fails at kernel build time.
+from __future__ import annotations
+import flydsl.expr as fx
+
+def build_kernel(*, num_experts: int):
+    E = int(num_experts)
+
+    @fx.struct
+    class _Smem:
+        count: fx.Array[fx.Int32, E]
+    ...
+```
+
+```python
+# ✅ GOOD — annotations are evaluated eagerly, E is bound to its int value.
+import flydsl.expr as fx
+
+def build_kernel(*, num_experts: int):
+    E = int(num_experts)
+
+    @fx.struct
+    class _Smem:
+        count: fx.Array[fx.Int32, E]
+    ...
+```
+
+## Quick self-check when adding `@fx.struct`
+
+1. Confirm the file has **no** `from __future__ import annotations`.
+2. Compile a tiny end-to-end case immediately (do not stack up more code first).
+3. If you see the `Storable protocol` error above with a **variable name**
+   showing up inside the reported type, this rule is the cause — remove the
+   `__future__` import, don't try to work around it inside the struct body.

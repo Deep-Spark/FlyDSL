@@ -6,6 +6,7 @@
 from .device_runtime import (
     COMPILE_BACKEND_TO_RUNTIME_KIND,
     DeviceRuntime,
+    IluvatarDeviceRuntime,
     RocmDeviceRuntime,
     ensure_compile_runtime_compatible,
     ensure_compile_runtime_pairing_from_env,
@@ -17,6 +18,7 @@ from .device_runtime import (
 __all__ = [
     "COMPILE_BACKEND_TO_RUNTIME_KIND",
     "DeviceRuntime",
+    "IluvatarDeviceRuntime",
     "RocmDeviceRuntime",
     "ensure_compile_runtime_compatible",
     "ensure_compile_runtime_pairing_from_env",

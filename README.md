@@ -105,7 +105,7 @@ python -m pip install -e .
 If you already have an MLIR build with Python bindings enabled, point to it instead:
 
 ```bash
-python -m pip install nanobind numpy pybind11  # build.sh does not install these
+python -m pip install 'nanobind>=2.9,<3' numpy pybind11  # build.sh does not install these
 export MLIR_PATH=/path/to/llvm-project/build-flydsl/mlir_install
 MLIR_PATH=$MLIR_PATH bash scripts/build.sh -j64
 python -m pip install -e .
@@ -391,6 +391,12 @@ See `examples/` for more examples including tiled copy (`02-tiledCopy.py`), tile
 
 *   AMD MI300X/MI308X (gfx942), AMD MI350/MI355X (gfx950), gfx1250, Radeon AI PRO R9700 (gfx1201)
 *   Linux / ROCm 6.x and 7.x. Hardware coverage varies by CI runner and revision; consult the current workflow results for validation status.
+
+## Iluvatar backend
+
+FlyDSL also targets Iluvatar GPUs through the **FlyIXDL** backend (ivcore11).
+. Features, build flags, examples, and HGEMM performance notes are in
+[**README_Iluvatar.md**](README_Iluvatar.md).
 
 ## 🙏 Acknowledgements
 

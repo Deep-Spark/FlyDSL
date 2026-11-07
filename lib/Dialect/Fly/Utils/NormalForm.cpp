@@ -45,6 +45,8 @@ bool isNormalForm(TypedValue<ComposedLayoutType> value) {
       return isNormalForm(composedTyped);
     } else if (auto swizzleTyped = dyn_cast<TypedValue<SwizzleType>>(inner)) {
       return true;
+    } else if (auto modSwizzleTyped = dyn_cast<TypedValue<ModSwizzleType>>(inner)) {
+      return true;
     } else if (auto coordSwizzleTyped = dyn_cast<TypedValue<CoordSwizzleType>>(inner)) {
       return true;
     }

@@ -3,6 +3,7 @@
 
 """CMake backend default and dependency guardrails."""
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,8 +19,6 @@ def test_cmake_default_backend_stays_rocdl():
     text = (_REPO_ROOT / "cmake" / "FlyDSLBackends.cmake").read_text()
 
     assert 'set(FLYDSL_BACKENDS "rocdl"' in text
-    assert "set_property(CACHE FLYDSL_BACKENDS PROPERTY STRINGS rocdl)" in text
-    assert "set(_FLYDSL_BACKENDS_ALLOWED rocdl)" in text
 
 
 def test_rocm_runtime_is_only_added_for_rocdl_backend():
@@ -49,13 +48,15 @@ def test_future_backend_descriptor_is_opt_in(tmp_path):
     backend_dir.mkdir(parents=True)
 
     text = (_REPO_ROOT / "cmake" / "FlyDSLBackends.cmake").read_text()
-    text = text.replace(
-        "set_property(CACHE FLYDSL_BACKENDS PROPERTY STRINGS rocdl)",
-        "set_property(CACHE FLYDSL_BACKENDS PROPERTY STRINGS rocdl dummy)",
+    text = re.sub(
+        r"set_property\(CACHE FLYDSL_BACKENDS PROPERTY STRINGS ([^)]+)\)",
+        r"set_property(CACHE FLYDSL_BACKENDS PROPERTY STRINGS \1 dummy)",
+        text,
     )
-    text = text.replace(
-        "set(_FLYDSL_BACKENDS_ALLOWED rocdl)",
-        "set(_FLYDSL_BACKENDS_ALLOWED rocdl dummy)",
+    text = re.sub(
+        r"set\(_FLYDSL_BACKENDS_ALLOWED ([^)]+)\)",
+        r"set(_FLYDSL_BACKENDS_ALLOWED \1 dummy)",
+        text,
     )
     (cmake_dir / "FlyDSLBackends.cmake").write_text(text)
 
