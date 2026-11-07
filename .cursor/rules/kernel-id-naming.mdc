@@ -1,0 +1,76 @@
+---
+description: Warp-scoped ID variables in FlyDSL kernel code must use `lane_id` / `warp_id` (not bare `lane` / `warp`)
+alwaysApply: true
+---
+
+# Warp-scoped ID naming in FlyDSL kernel code
+
+**Always use `lane_id`, `warp_id` for the per-thread integer indices inside a
+warp / block.** Never use bare `lane` / `warp` — they are ambiguous (an object?
+an ID? a per-warp array?).
+
+For Iluvatar (the primary backend on this branch) and any new kernel work,
+**prefer `warp_id`** over `wave_id`. The `wave` spelling is an AMD/CDNA
+legacy carry-over; only use `wave_id` (never bare `wave`) when you are editing
+pre-existing kernels that already use that term — never introduce it into new
+Iluvatar code.
+
+## Scope
+
+Applies to **integer-valued index variables**:
+
+- lane index within a warp: `tid % WARP_SIZE` → **`lane_id`**
+- warp index within a block: `tid // WARP_SIZE` → **`warp_id`** (Iluvatar
+  default). Legacy AMD/CDNA files may keep `wave_id`; migrate only when the
+  file is being substantively edited (see below).
+
+**Not affected** — these are already unambiguous and keep their conventional
+names (examples drawn from `kernels/**/iluvatar/**`):
+
+- `tid` (thread_idx.x), `bid` (block_idx.x) — universal abbreviations
+- `WARP_SIZE` (constant, in `kernels/gemm/iluvatar/common.py`), `num_warps`,
+  `warps_m`, `warps_n` — block-config aggregates, describe **counts** not indices
+- Compound names that describe **data** (offsets / bases / accumulators),
+  not an index — e.g. `warp_base` in `kernels/gemm/iluvatar/epilogue.py`
+
+## Example
+
+```python
+# ❌ BAD — bare `lane` / `warp` as an ID variable
+lane = tid % WARP_SIZE
+warp = tid // WARP_SIZE
+if lane == 0:
+    fx.memref_store(warp_sum, s_warp_sums, warp)
+
+# ✅ GOOD — explicit `_id` suffix (Iluvatar default, and preferred everywhere)
+lane_id = tid % WARP_SIZE
+warp_id = tid // WARP_SIZE
+if lane_id == 0:
+    fx.memref_store(warp_sum, s_warp_sums, warp_id)
+```
+
+When editing pre-existing AMD/CDNA/RDNA code that already uses the `wave` term,
+keep it but **stay wave-consistent** — pair `wave_id` with `WAVE_SIZE`, never
+with `WARP_SIZE`, so the constant, aggregate, and index all agree:
+
+```python
+# ✅ ACCEPTABLE — legacy AMD/CDNA/RDNA files only; do not introduce in new code
+lane_id = fx.Int32(fx.lane_id)   # same intrinsic everywhere (see kernel-lane-id-intrinsic.mdc)
+wave_id = tid // WAVE_SIZE       # matches WAVE_SIZE / NUM_WAVES constants
+```
+
+Reference: `kernels/gemm/rdna_f16_gemm.py`, `kernels/gemm/rdna_fp8_preshuffle_gemm.py`,
+`kernels/gemm/wmma_gemm_gfx1250.py`, `kernels/gemm/gemm_fp8fp4_gfx1250.py`,
+`kernels/moe/moe_gemm_2stage_common_gfx1250.py` all define `WAVE_SIZE` alongside
+`wave_id`. The mixed `wave_id = tid // WARP_SIZE` pattern that appears in
+`kernels/attention/flash_attn_*.py` (CDNA/gfx9 flash_attn family) is internally
+inconsistent legacy — do not copy it as a template.
+
+## When to migrate existing code
+
+- **New code**: MUST follow this rule from the first line.
+- **Files being substantively edited** for the same task: rename opportunistically
+  is fine.
+- **Pure drive-by rename** in unrelated files: do **not** touch — this rule was
+  introduced after many kernels were already written. Wait until the file is
+  being edited for another reason, or until the user explicitly requests a sweep.

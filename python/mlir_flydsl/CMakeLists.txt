@@ -36,6 +36,17 @@ declare_mlir_dialect_python_bindings(
   DIALECT_NAME fly_ktrace
 )
 
+if(FLYDSL_HAS_ILUVATAR)
+  declare_mlir_dialect_python_bindings(
+    ADD_TO_PARENT FlyPythonSources
+    ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/"
+    TD_FILE dialects/FlyIXDL.td
+    SOURCES
+      dialects/fly_ixdl.py
+    DIALECT_NAME fly_ixdl
+  )
+endif()
+
 # NOTE: Do NOT link MLIRFlyDialect/MLIRFlyROCDLDialect here via PRIVATE_LINK_LIBS.
 # These symbols are already provided by FlyPythonCAPI.so (via MLIRCPIFly's transitive
 # dependencies in EMBED_CAPI_LINK_LIBS). Statically linking them here creates DUPLICATE
@@ -68,11 +79,24 @@ if(FLYDSL_HAS_ROCDL)
   )
 endif()
 
+if(FLYDSL_HAS_ILUVATAR)
+  declare_mlir_python_extension(FlyPythonSources.Core.fly_ixdl
+    MODULE_NAME _mlirDialectsFlyIXDL
+    ADD_TO_PARENT FlyPythonSources
+    ROOT_DIR "${PROJECT_SOURCE_DIR}/lib/Bindings/Python"
+    PYTHON_BINDINGS_LIBRARY nanobind
+    SOURCES
+      FlyIXDLExtension.cpp
+    PRIVATE_LINK_LIBS
+      LLVMSupport
+  )
+endif()
+
 # NOTE: Do NOT link MLIRFlyToROCDL or other C++ libs via PRIVATE_LINK_LIBS.
 # Doing so statically embeds a copy of MLIRPass (and its pass registry) into
 # _mlirRegisterEverything.so. Passes registered via registerFlyPasses() then
 # go into that LOCAL registry, while PassManager.parse() queries the GLOBAL
-# registry in FlyPythonCAPI.so → "does not refer to a registered pass".
+# registry in FlyPythonCAPI.so -> "does not refer to a registered pass".
 #
 # Instead, pass registration is done through CAPI functions
 # (mlirRegisterFlyPasses, mlirRegisterConvertROCDLFastMathOpsPass,
@@ -180,8 +204,8 @@ endif()
 # (libamd_comgr.so).
 #
 # Strategy:
-#   1. -fvisibility=hidden  — hide symbols compiled by FlyDSL itself
-#   2. Version script       — controls the FINAL exported symbol set:
+#   1. -fvisibility=hidden  -- hide symbols compiled by FlyDSL itself
+#   2. Version script       -- controls the FINAL exported symbol set:
 #                             exports mlir C API + mlir:: C++ symbols
 #                             (needed by _mlirDialectsFly.so, _mlir.so, etc.),
 #                             hides everything else (llvm::, LLVM C API).
@@ -189,7 +213,7 @@ endif()
 # NOTE: Triton uses --exclude-libs,ALL because it ships a single
 # libtriton.so with no downstream consumers.  FlyDSL cannot use
 # --exclude-libs,ALL because GNU ld's --exclude-libs forces symbols
-# to LOCAL *before* the version script is evaluated — wildcard patterns
+# to LOCAL *before* the version script is evaluated -- wildcard patterns
 # in the version script cannot re-export them.  The version script
 # alone is sufficient: its `local: *;` catch-all hides LLVM internals.
 # ---------------------------------------------------------------------------
@@ -281,6 +305,12 @@ if(WIN32)
   )
 else()
 # Unindented so the quoted bash script keeps its bytes.
+#
+# Stub generation is best effort. The .pyi files are editor type hints only:
+# they are picked up by a package_data glob, so a build without them still
+# produces a working wheel. Importing the MLIR bindings under python 3.12
+# currently segfaults inside module init on the Iluvatar toolchain, which
+# would otherwise take down the whole wheel build over optional metadata.
 add_custom_command(
   OUTPUT "${_STUB_MARKER_FILE}"
   COMMAND /bin/bash -c "\
@@ -288,7 +318,8 @@ add_custom_command(
     if '${Python3_EXECUTABLE}' -c 'import nanobind.stubgen' >/dev/null 2>&1; then \
       '${Python3_EXECUTABLE}' -m nanobind.stubgen \
         -q -r${_flydsl_stubgen_m_flags} \
-        -O '${_MLIR_LIBS_DIR}'; \
+        -O '${_MLIR_LIBS_DIR}' \
+      || echo 'Warning: nanobind.stubgen failed -- .pyi type stubs omitted from this build'; \
     else \
       echo 'Warning: nanobind.stubgen not available -- skipping stub generation'; \
     fi"
@@ -314,6 +345,16 @@ if(FLYDSL_HAS_ROCDL)
   )
 else()
   set(_FLY_COPY_ROCDL_TABLEGEN "")
+endif()
+
+if(FLYDSL_HAS_ILUVATAR)
+  set(_FLY_COPY_IXDL_TABLEGEN
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_ixdl_ops_gen.py"
+      "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_ixdl_ops_gen.py"
+  )
+else()
+  set(_FLY_COPY_IXDL_TABLEGEN "")
 endif()
 
 # The JIT asks for the C runner utils by an unversioned name. Windows keeps the
@@ -345,6 +386,7 @@ add_custom_target(CopyFlyPythonSources ALL
     "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_ktrace_ops_gen.py"
     "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_ktrace_ops_gen.py"
   ${_FLY_COPY_ROCDL_TABLEGEN}
+  ${_FLY_COPY_IXDL_TABLEGEN}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "$<TARGET_FILE:mlir_c_runner_utils>"
     "${_MLIR_LIBS_DIR}/${_FLY_C_RUNNER_UTILS_NAME}"
@@ -373,6 +415,12 @@ if(TARGET FlyRocmAotRuntime)
   set_target_properties(FlyRocmAotRuntime PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}")
   add_dependencies(FlyPythonCAPI FlyRocmAotRuntime)
+endif()
+
+if(TARGET FlyIluvatarJitRuntime)
+  set_target_properties(FlyIluvatarJitRuntime PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}")
+  add_dependencies(FlyPythonCAPI FlyIluvatarJitRuntime)
 endif()
 
 # Windows: the AOT runtime's bitcode (lib/Runtime/ROCm) becomes LLVM-dialect IR,
@@ -411,7 +459,7 @@ add_custom_target(FlyNativeDigest ALL
   VERBATIM
 )
 add_dependencies(FlyNativeDigest CopyFlyPythonSources FlyPythonModules FlyPythonCAPI)
-foreach(_runtime_target IN ITEMS FlyJitRuntime FlyRocmAotRuntime FlyRocmAotRuntimeIR)
+foreach(_runtime_target IN ITEMS FlyJitRuntime FlyIluvatarJitRuntime FlyRocmAotRuntime FlyRocmAotRuntimeIR)
   if(TARGET ${_runtime_target})
     add_dependencies(FlyNativeDigest ${_runtime_target})
   endif()

@@ -112,10 +112,12 @@ cd "${BUILD_DIR}"
 # so it cannot auto-detect the platform and relies on HIP_PLATFORM being
 # provided as a CMake cache variable or environment variable.
 HIP_PLATFORM="${HIP_PLATFORM:-amd}"
+CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 
 cmake_args=(
   -G "${GENERATOR}"
   "${REPO_ROOT}"
+  -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   -DMLIR_DIR="${MLIR_PATH}/lib/cmake/mlir"
   "${FLY_PYTHON_CMAKE_ARGS[@]}"
   -DHIP_PLATFORM="${HIP_PLATFORM}"

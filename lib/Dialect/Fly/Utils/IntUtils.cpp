@@ -3,6 +3,8 @@
 
 #include "flydsl/Dialect/Fly/Utils/IntUtils.h"
 
+#include <algorithm>
+
 namespace mlir::fly {
 
 IntAttr operator+(IntAttr lhs, IntAttr rhs) {
@@ -248,6 +250,27 @@ IntAttr intApplySwizzle(IntAttr v, SwizzleAttr swizzle) {
   }
   return IntAttr::getDynamic(ctx, v.getWidth(),
                              utils::divisibilityApplySwizzle(v.getDivisibility(), swizzle));
+}
+
+IntAttr intApplyModSwizzle(IntAttr v, ModSwizzleAttr swizzle) {
+  auto *ctx = v.getContext();
+  if (swizzle.isTrivialModSwizzle()) {
+    return v;
+  }
+  auto applyStatic = [&](int32_t val) {
+    int32_t mask = (1 << swizzle.getMask()) - 1;
+    int32_t shift = swizzle.getShift();
+    int32_t yyy = mask << (swizzle.getBase() + std::max(0, shift));
+    int32_t zb = (1 << (swizzle.getMask() + swizzle.getBase())) - 1;
+    int32_t nzb = ~zb;
+    int32_t shifted = shift >= 0 ? ((val & yyy) >> shift) : ((val & yyy) << -shift);
+    return (val & nzb) | ((val + shifted) & zb);
+  };
+  if (v.isStatic()) {
+    return IntAttr::getStatic(ctx, applyStatic(v.getValue()));
+  }
+  return IntAttr::getDynamic(ctx, v.getWidth(),
+                             utils::divisibilityApplyModSwizzle(v.getDivisibility(), swizzle));
 }
 
 IntAttr intApplyCoordSwizzle(IntAttr row, IntAttr col, CoordSwizzleAttr swizzle) {

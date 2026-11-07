@@ -1,0 +1,42 @@
+---
+description: Never restate a workspace rule as a code comment
+alwaysApply: true
+---
+
+# Don't echo rules into code comments
+
+A constraint that lives in `.cursor/rules/*.mdc`, `CLAUDE.md`, or `AGENTS.md` is
+already enforced for every agent session. Repeating it as a comment in a source
+file adds nothing for a human reader and rots the moment the rule changes.
+
+```python
+# ❌ BAD — restates .cursor/rules/fx-struct-future-annotations.mdc
+# NOTE: do NOT add ``from __future__ import annotations`` (@fx.struct).
+
+import flydsl.compiler as flyc
+```
+
+```python
+# ✅ GOOD — the rule already covers it; the file just complies
+import flydsl.compiler as flyc
+```
+
+This includes paraphrases and "self-check" leftovers: `# per the lane_id rule`,
+`# keep wave_id to match WAVE_SIZE`, `# helpers go in kernels_common.py`,
+`# expr/ must stay target-neutral`.
+
+## What is still a legitimate comment
+
+Comments that state a constraint **specific to this code** and not derivable
+from a rule — a hardware quirk, a non-obvious ordering requirement, a workaround
+for an upstream bug. The test: would this comment be identical if pasted into
+any other file the rule covers? If yes, delete it.
+
+## Existing occurrences
+
+Several pre-existing files still carry `# NOTE: do NOT add
+``from __future__ import annotations``` headers (e.g.
+`kernels/attention/qk_norm_rope_quant.py`,
+`kernels/attention/mla_fwd_decode_m16x8_fp8_fp8.py`). Do **not** treat them as
+precedent to copy into new files, and do not drive-by delete them either —
+remove one only when editing that file for another reason.

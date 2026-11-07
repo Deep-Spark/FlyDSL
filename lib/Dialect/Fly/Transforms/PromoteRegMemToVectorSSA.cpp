@@ -28,6 +28,15 @@ using namespace mlir::fly;
 namespace llvm {
 
 template <> struct DenseMapInfo<mlir::fly::MakePtrOp> {
+  // This full specialization replaces the generic Op one. LLVM 22 DenseMap
+  // calls getEmptyKey and getTombstoneKey; LLVM 24 does not. Defining them
+  // is valid on both.
+  static mlir::fly::MakePtrOp getEmptyKey() {
+    return mlir::fly::MakePtrOp::getFromOpaquePointer(DenseMapInfo<void *>::getEmptyKey());
+  }
+  static mlir::fly::MakePtrOp getTombstoneKey() {
+    return mlir::fly::MakePtrOp::getFromOpaquePointer(DenseMapInfo<void *>::getTombstoneKey());
+  }
   static unsigned getHashValue(mlir::fly::MakePtrOp op) {
     return DenseMapInfo<void *>::getHashValue(op.getAsOpaquePointer());
   }

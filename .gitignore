@@ -3,9 +3,17 @@ build/
 build_*/
 build-*/
 cmake-build-*/
+**/.ninja_deps
+**/.ninja_log
 
 # GPU core dumps
 gpucore.*
+
+# IR dumps
+my_ir_dumps*/
+
+# Perf-daily materialised suite configs (FLYDSL_PERF_CONFIG_PATH)
+.perf/
 
 # git 
 *.log
@@ -30,6 +38,8 @@ venv/
 .venv/
 .venv*/
 .venvs/
+.conda-rel/
+.conda-home/
 
 # C++
 .cache/
@@ -40,7 +50,9 @@ venv/
 
 # IDE
 .vscode/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/*
 .idea/
 *.swp
 *.swo

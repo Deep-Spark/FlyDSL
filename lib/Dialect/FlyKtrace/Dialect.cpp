@@ -2,6 +2,9 @@
 // Copyright (c) 2025 FlyDSL Project Contributors
 
 #include "mlir/IR/DialectImplementation.h"
+// Generated type printer uses TypeSwitch. LLVM 24 includes it from
+// DialectImplementation.h; ixcc's LLVM 22 does not.
+#include "llvm/ADT/TypeSwitch.h"
 
 #include "flydsl/Dialect/FlyKtrace/IR/Dialect.h"
 

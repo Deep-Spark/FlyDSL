@@ -6,6 +6,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/Config/llvm-config.h"
 
 #include "flydsl/Dialect/Fly/IR/FlyDialect.h"
 #include "flydsl/Dialect/Fly/Utils/IntTupleUtils.h"
@@ -86,6 +87,8 @@ std::pair<LayoutAttr, IntTupleAttr> decomposeComposedLayoutAttr(LayoutBuilder<La
   IntTupleAttr currentOffset;
   if (auto swizzleInner = dyn_cast<SwizzleAttr>(inner))
     currentOffset = builder.applySwizzle(inputOffset, swizzleInner);
+  else if (auto modSwizzleInner = dyn_cast<ModSwizzleAttr>(inner))
+    currentOffset = builder.applyModSwizzle(inputOffset, modSwizzleInner);
   else if (auto coordSwizzleInner = dyn_cast<CoordSwizzleAttr>(inner))
     currentOffset = builder.applyCoordSwizzle(inputOffset, coordSwizzleInner);
   else
@@ -188,11 +191,21 @@ Type applyOffsetOnTensorLike(LayoutBuilder<LayoutAttr> &builder, Type tensorLike
 
 } // namespace
 
+// ixcc is LLVM 22: mlir-tblgen declares this parameter as OpaqueProperties.
+// FlyDSL's LLVM 24 renamed that type to PropertyRef. The macro does not read
+// the value; the type only has to match the declaration for this build.
+#if LLVM_VERSION_MAJOR >= 24
+#define FLY_INFER_PROPERTIES_TY mlir::PropertyRef
+#else
+#define FLY_INFER_PROPERTIES_TY mlir::OpaqueProperties
+#endif
+
 #define FLY_INFER_RETURN_TYPES(OP)                                                                 \
   llvm::LogicalResult OP::inferReturnTypes(                                                        \
       mlir::MLIRContext *context, std::optional<::mlir::Location> location,                        \
-      mlir::ValueRange operands, mlir::DictionaryAttr attributes, mlir::PropertyRef properties,    \
-      mlir::RegionRange regions, llvm::SmallVectorImpl<mlir::Type> &inferredReturnTypes)
+      mlir::ValueRange operands, mlir::DictionaryAttr attributes,                                  \
+      FLY_INFER_PROPERTIES_TY properties, mlir::RegionRange regions,                               \
+      llvm::SmallVectorImpl<mlir::Type> &inferredReturnTypes)
 
 //===----------------------------------------------------------------------===//
 // Constructors
@@ -263,12 +276,15 @@ FLY_INFER_RETURN_TYPES(MakeComposedLayoutOp) {
     innerAttr = innerComposedTy.getAttr();
   } else if (auto innerSwizzleTy = dyn_cast<SwizzleType>(operands[0].getType())) {
     innerAttr = innerSwizzleTy.getAttr();
+  } else if (auto innerModSwizzleTy = dyn_cast<ModSwizzleType>(operands[0].getType())) {
+    innerAttr = innerModSwizzleTy.getAttr();
   } else if (auto innerCoordSwizzleTy = dyn_cast<CoordSwizzleType>(operands[0].getType())) {
     innerAttr = innerCoordSwizzleTy.getAttr();
   } else {
     return emitOptionalError(
         location,
-        "MakeComposedLayoutOp: expected Layout/ComposedLayout/Swizzle/CoordSwizzle for inner, got ",
+        "MakeComposedLayoutOp: expected Layout/ComposedLayout/Swizzle/ModSwizzle/CoordSwizzle for "
+        "inner, got ",
         operands[0].getType());
   }
   auto composedAttr = ComposedLayoutAttr::get(context, innerAttr, offsetTy.getAttr(), outerAttr);
@@ -478,6 +494,9 @@ FLY_INFER_RETURN_TYPES(ComposedGetInnerOp) {
   auto innerAttr = inputTy.getAttr().getInner();
   if (auto swizzleAttr = dyn_cast<SwizzleAttr>(innerAttr)) {
     inferredReturnTypes.assign({SwizzleType::get(context, swizzleAttr)});
+    return success();
+  } else if (auto modSwizzleAttr = dyn_cast<ModSwizzleAttr>(innerAttr)) {
+    inferredReturnTypes.assign({ModSwizzleType::get(context, modSwizzleAttr)});
     return success();
   } else if (auto coordSwizzleAttr = dyn_cast<CoordSwizzleAttr>(innerAttr)) {
     inferredReturnTypes.assign({CoordSwizzleType::get(context, coordSwizzleAttr)});
@@ -1020,6 +1039,10 @@ FLY_INFER_RETURN_TYPES(Crd2IdxOp) {
     IntTupleAttr result = builder.applySwizzle(coordAttr, swizzleTy.getAttr());
     inferredReturnTypes.assign({IntTupleType::get(result)});
     return success();
+  } else if (auto modSwizzleTy = dyn_cast<ModSwizzleType>(operands[1].getType())) {
+    IntTupleAttr result = builder.applyModSwizzle(coordAttr, modSwizzleTy.getAttr());
+    inferredReturnTypes.assign({IntTupleType::get(result)});
+    return success();
   } else if (auto coordSwizzleTy = dyn_cast<CoordSwizzleType>(operands[1].getType())) {
     IntTupleAttr result = builder.applyCoordSwizzle(coordAttr, coordSwizzleTy.getAttr());
     inferredReturnTypes.assign({IntTupleType::get(result)});
@@ -1027,8 +1050,8 @@ FLY_INFER_RETURN_TYPES(Crd2IdxOp) {
   }
 
   return emitOptionalError(location,
-                           "Crd2IdxOp: expected LayoutType, ComposedLayoutType, SwizzleType or "
-                           "CoordSwizzleType for layout, got ",
+                           "Crd2IdxOp: expected LayoutType, ComposedLayoutType, SwizzleType, "
+                           "ModSwizzleType or CoordSwizzleType for layout, got ",
                            operands[1].getType());
 }
 

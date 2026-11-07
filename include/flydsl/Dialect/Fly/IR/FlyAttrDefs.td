@@ -147,6 +147,15 @@ def Fly_SwizzleAttr : Fly_Attr<"Swizzle", "swizzle", []> {
   }];
 }
 
+def Fly_ModSwizzleAttr : Fly_Attr<"ModSwizzle", "mod_swizzle", []> {
+  let parameters = (ins "int32_t":$mask, "int32_t":$base, "int32_t":$shift);
+  let assemblyFormat = "`` `MS` `` `<` $mask `` `,` `` $base `` `,` `` $shift `` `>`";
+
+  let extraClassDeclaration = [{
+    bool isTrivialModSwizzle() const;
+  }];
+}
+
 def Fly_CoordSwizzleAttr : Fly_Attr<"CoordSwizzle", "coord_swizzle", []> {
   let parameters = (ins
     "int32_t":$mask,

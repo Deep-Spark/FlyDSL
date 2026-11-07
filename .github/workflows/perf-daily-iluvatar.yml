@@ -1,0 +1,253 @@
+name: perf-daily-iluvatar
+
+on:
+  schedule:
+    # 02:00 Asia/Shanghai == 18:00 UTC (previous day)
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this manual run is requested"
+        required: false
+        type: string
+        default: ""
+      cmake_build_type:
+        description: "FlyDSL CMake build type"
+        required: false
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+
+permissions:
+  contents: read
+  # actions: write is required by the canary step below so it can dispatch
+  # ixcc-refresh via GITHUB_TOKEN when the IXCC trees look stale. See
+  # SWCOMP-3177 for background (GH Actions has been dropping */30 ticks).
+  actions: write
+
+concurrency:
+  group: perf-daily-iluvatar-iluvatar
+  cancel-in-progress: false
+
+jobs:
+  trend:
+    name: perf-trend (working only)
+    runs-on: [self-hosted, linux, x64, gpu-iluvatar]
+    timeout-minutes: 240
+    env:
+      PERF_BRANCH: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'iluvatar' }}
+      PERF_SUITE_FILE: .ci-utils/.github/perf-kernels-iluvatar.json
+      PERF_DELTA_FLAT_PCT: "3"
+      PERF_METRICS_ARTIFACT: perf-metrics
+      # Leave unset so run_perf_trend_in_container.sh picks an idle GPU via the selector helper.
+      COREX_ROOT: ${{ vars.COREX_ROOT || '/home/flydsl/sw_home/local/corex' }}
+      IXCC_MLIR_CMAKE: ${{ vars.IXCC_MLIR_CMAKE || '/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir' }}
+      CI_DEVICE_IMAGE: ${{ vars.CI_DEVICE_IMAGE_REF || 'ghcr.io/deep-spark/flydsl-iluvatar-ci:stable' }}
+      IXCC_WORKING_ROOT: ${{ vars.IXCC_WORKING_ROOT || '' }}
+      IXSDK_WORKING_ROOT: ${{ vars.IXSDK_WORKING_ROOT || '' }}
+      IX_TOOLCHAIN_DAILY_STATE_FILE: ${{ vars.IX_TOOLCHAIN_DAILY_STATE_FILE || '' }}
+      CMAKE_BUILD_TYPE: ${{ github.event_name == 'workflow_dispatch' && inputs.cmake_build_type || 'Release' }}
+    steps:
+      - name: Checkout CI utils (workflow ref)
+        uses: actions/checkout@v4
+        with:
+          path: .ci-utils
+
+      - name: Checkout benchmark source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PERF_BRANCH }}
+          clean: false
+
+      - name: Canary -- dispatch ixcc-refresh if IXCC .build.lock mtime is stale
+        # GitHub Actions has been dropping ixcc-refresh scheduled ticks for
+        # this repo (SWCOMP-3177). If either IXCC tree's .build.lock is older
+        # than STALE_THRESHOLD_MIN, dispatch ixcc-refresh so the external tree
+        # does not fall arbitrarily behind between the sporadic cron ticks
+        # that do land. Non-fatal on any failure.
+        #
+        # .build.lock mtime is bumped only when prepare_ixcc_refresh.sh
+        # actually rebuilds (open-for-write truncates the lock file); the
+        # MLIR-gate no-op path leaves mtime untouched. Consequence: on quiet
+        # MLIR days this canary always dispatches, which is fine -- the
+        # dispatched run itself will gate-no-op cheaply.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STALE_THRESHOLD_MIN: "90"
+        run: |
+          set -euo pipefail
+
+          internal="${IXCC_WORKING_ROOT:-/home/flydsl/sw_home/sdk/ixcc}"
+          if [[ "${internal}" == */ixcc ]]; then
+            external="${internal%/ixcc}/ixcc-external"
+          else
+            external="${internal}-external"
+          fi
+
+          need_dispatch=0
+          reasons=()
+          check_tree() {
+            local label="$1" root="$2"
+            local lock="${root}/.build.lock"
+            if [[ ! -e "${lock}" ]]; then
+              echo "canary(${label}): ${lock} does not exist -- treating as stale"
+              need_dispatch=1
+              reasons+=("${label}: no .build.lock")
+              return
+            fi
+            local now age_min lock_mtime
+            now="$(date +%s)"
+            lock_mtime="$(stat -c %Y "${lock}")"
+            age_min=$(( (now - lock_mtime) / 60 ))
+            echo "canary(${label}): ${lock} mtime age ${age_min} min (threshold ${STALE_THRESHOLD_MIN})"
+            if (( age_min > STALE_THRESHOLD_MIN )); then
+              need_dispatch=1
+              reasons+=("${label}: ${age_min} min old")
+            fi
+          }
+          check_tree internal "${internal}"
+          check_tree external "${external}"
+
+          if (( need_dispatch == 0 )); then
+            echo "canary: both IXCC trees refreshed within ${STALE_THRESHOLD_MIN} min -- nothing to dispatch"
+            exit 0
+          fi
+
+          reason_str="$(IFS=';'; echo "${reasons[*]}")"
+          echo "canary: dispatching ixcc-refresh due to: ${reason_str}"
+          gh workflow run -R "${GITHUB_REPOSITORY}" ixcc-refresh.yaml \
+            -f reason="perf-daily canary: ${reason_str}"
+
+      - name: Daily update IXCC/IXSDK from working
+        id: ix-toolchain
+        continue-on-error: true
+        run: |
+          args=()
+          if [[ -n "${IXCC_WORKING_ROOT}" ]]; then
+            args+=(--ixcc-root "${IXCC_WORKING_ROOT}")
+          fi
+          if [[ -n "${IXSDK_WORKING_ROOT}" ]]; then
+            args+=(--ixsdk-root "${IXSDK_WORKING_ROOT}")
+          fi
+          if [[ -n "${IX_TOOLCHAIN_DAILY_STATE_FILE}" ]]; then
+            args+=(--state-file "${IX_TOOLCHAIN_DAILY_STATE_FILE}")
+          fi
+          bash .github/scripts/prepare_ix_toolchains_daily.sh "${args[@]}"
+
+      - name: Fetch previous perf metrics artifact
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERF_WORKFLOW_FILE: perf-daily-iluvatar.yml
+        run: |
+          python3 .ci-utils/.github/scripts/fetch_previous_perf_metrics.py
+
+      - name: Login to GHCR (best effort)
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-pull CI device image (timeout + retry)
+        env:
+          CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}
+        run: |
+          set -euo pipefail
+          resolve_script=".ci-utils/.github/scripts/resolve_local_ci_device_image.sh"
+          record_script=".ci-utils/.github/scripts/record_local_ci_device_image.sh"
+
+          # Prefer local content match (exact ref, recorded map, or config digest).
+          if resolved="$(bash "${resolve_script}" "${CI_DEVICE_IMAGE}")"; then
+            echo "local image content hit: ${CI_DEVICE_IMAGE} -> ${resolved}"
+            echo "CI_DEVICE_IMAGE_LOCAL=${resolved}" >> "${GITHUB_ENV}"
+            bash "${record_script}" "${CI_DEVICE_IMAGE}" "${resolved}" || true
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            echo "pull attempt ${attempt}: ${CI_DEVICE_IMAGE}"
+            if timeout 900 docker pull "${CI_DEVICE_IMAGE}"; then
+              echo "CI_DEVICE_IMAGE_LOCAL=${CI_DEVICE_IMAGE}" >> "${GITHUB_ENV}"
+              bash "${record_script}" "${CI_DEVICE_IMAGE}" "${CI_DEVICE_IMAGE}" || true
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::failed to pull CI_DEVICE_IMAGE after 3 attempts: ${CI_DEVICE_IMAGE}"
+              exit 1
+            fi
+            sleep $((attempt * 30))
+          done
+
+      - name: Rebuild FlyDSL in perf container
+        env:
+          CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}
+          COREX_ROOT: ${{ env.COREX_ROOT }}
+          IXCC_MLIR_CMAKE: ${{ env.IXCC_MLIR_CMAKE }}
+        run: |
+          bash .ci-utils/.github/scripts/run_perf_trend_in_container.sh -- bash -lc '
+            set -euo pipefail
+            if ! command -v patchelf >/dev/null 2>&1; then
+              echo "::error::patchelf is required but not found in PATH"
+              exit 1
+            fi
+            rm -rf /workspace/build-fly
+            cmake -S /workspace -B /workspace/build-fly -G Ninja \
+              -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
+              -DFLYDSL_BACKENDS=iluvatar \
+              -DMLIR_DIR="${IXCC_MLIR_CMAKE}" \
+              -DCUDAToolkit_ROOT="${COREX_ROOT}" \
+              -DPython3_EXECUTABLE="$(command -v python3)"
+            cmake --build /workspace/build-fly -j"$(nproc)"
+          '
+
+      - name: Run perf suite
+        env:
+          IX_TOOLCHAIN_OUTCOME: ${{ steps.ix-toolchain.outcome }}
+          IXCC_COMMIT: ${{ steps.ix-toolchain.outputs.ixcc_commit }}
+          IXSDK_COMMIT: ${{ steps.ix-toolchain.outputs.ixsdk_commit }}
+          CI_DEVICE_IMAGE: ${{ env.CI_DEVICE_IMAGE }}
+          IXCC_MLIR_CMAKE: ${{ env.IXCC_MLIR_CMAKE }}
+        run: |
+          python3 .ci-utils/.github/scripts/run_perf_suite.py \
+            --suite "${PERF_SUITE_FILE}" \
+            --container-runner .ci-utils/.github/scripts/run_perf_trend_in_container.sh
+
+      - name: Write performance summary
+        if: always()
+        env:
+          INPUT_REASON: ${{ github.event_name == 'workflow_dispatch' && inputs.reason || '' }}
+        run: |
+          python3 .ci-utils/.github/scripts/render_perf_summary.py
+
+      - name: Upload perf metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PERF_METRICS_ARTIFACT }}
+          path: .perf/result.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce valid perf sample
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result_path = Path(".perf/result.json")
+          if not result_path.exists():
+              raise SystemExit("missing .perf/result.json")
+
+          result = json.loads(result_path.read_text(encoding="utf-8"))
+          status = result.get("status")
+          if status != "ok":
+              reason = result.get("invalid_reason", "")
+              print(f"invalid perf sample: status={status} reason={reason}")
+              raise SystemExit(1)
+          print("perf result status is ok")
+          PY

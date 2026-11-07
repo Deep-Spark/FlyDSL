@@ -53,6 +53,32 @@ def _short_note(text: str, max_len: int = _MAX_NOTE_CHARS) -> str:
     return note if len(note) <= max_len else note[: max_len - 1] + "…"
 
 
+_TYPED_LOCATIONS = hasattr(ir, "CallSiteLoc")
+
+
+def _location_chain_by_predicate(loc) -> List[SourceFrame]:
+    """``location_chain`` for MLIR bindings that predate the typed Location subclasses."""
+    try:
+        if loc.is_a_callsite():
+            return location_chain(loc.callee) + location_chain(loc.caller)
+        if loc.is_a_name():
+            return location_chain(loc.child_loc)
+        if loc.is_a_fused():
+            out: List[SourceFrame] = []
+            for child in loc.locations:
+                out.extend(location_chain(child))
+            return out
+        if loc.is_a_file():
+            filename, line = loc.filename, loc.start_line
+            if not filename or filename.startswith("<") or not line:
+                return []  # synthetic source we cannot point a user at
+            end_col = getattr(loc, "end_col", 0) or 0
+            return [SourceFrame(filename, line, getattr(loc, "start_col", 0) or 0, end_col or None)]
+    except Exception:
+        return []
+    return []  # unknown / opaque location: nothing locatable
+
+
 def location_chain(loc) -> List[SourceFrame]:
     """Flatten an MLIR ``Location`` into ``[innermost, ..., outermost]`` frames.
 
@@ -62,6 +88,8 @@ def location_chain(loc) -> List[SourceFrame]:
     """
     if loc is None:
         return []
+    if not _TYPED_LOCATIONS:
+        return _location_chain_by_predicate(loc)
     # Diagnostics carried by an MLIRError hold a plain Location; rebuild it as its typed subclass.
     loc = ir.Location.from_attr(loc.attr, loc.context)
     if isinstance(loc, ir.CallSiteLoc):

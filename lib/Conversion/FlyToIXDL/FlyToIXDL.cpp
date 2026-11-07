@@ -1,0 +1,1128 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2025 FlyDSL Project Contributors
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/IXDLDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/MathExtras.h"
+
+#include "flydsl/Conversion/FlyToIXDL/FlyToIXDL.h"
+#include "flydsl/Dialect/Fly/IR/FlyDialect.h"
+#include "flydsl/Dialect/Fly/Utils/IntTupleUtils.h"
+#include "flydsl/Dialect/Fly/Utils/LayoutUtils.h"
+#include "flydsl/Dialect/Fly/Utils/PointerUtils.h"
+#include "flydsl/Dialect/FlyIXDL/IR/Dialect.h"
+#include "flydsl/Dialect/FlyIXDL/Utils/SmeGmemFatPtr.h"
+
+namespace mlir {
+#define GEN_PASS_DEF_FLYTOIXDLCONVERSIONPASS
+#include "flydsl/Conversion/FlyToIXDL/Passes.h.inc"
+} // namespace mlir
+
+using namespace mlir;
+using namespace mlir::fly;
+using namespace mlir::fly_ixdl;
+
+namespace {
+
+unsigned mapToLLVMAddressSpace(AddressSpace addrSpace) {
+  switch (addrSpace) {
+  case AddressSpace::Generic:
+    return 0;
+  case AddressSpace::Global:
+    return 1;
+  case AddressSpace::Shared:
+    return 3;
+  case AddressSpace::Register:
+    return 5;
+  }
+  llvm_unreachable("unsupported address space");
+}
+
+unsigned mapAttrToLLVMAddressSpace(Attribute attr) {
+  if (auto e = dyn_cast<AddressSpaceAttr>(attr))
+    return mapToLLVMAddressSpace(e.getValue());
+  if (isTargetAddressSpace<SmeGmemAddressAttr>(attr))
+    return 1; // underlying global pointer lives in addrspace 1
+  return 0;   // default to generic address space
+}
+
+// Create a freshly named shared-memory global of `[nbytes x i8]` in
+// `addrSpace`, inserted at the start of `moduleOp`. Backs the static shared
+// `make_ptr` lowering (mirrors the static-shared global in FlyToROCDL).
+static LLVM::GlobalOp createSharedMemoryGlobal(ConversionPatternRewriter &rewriter,
+                                               gpu::GPUModuleOp moduleOp, Location loc,
+                                               StringRef prefix, int64_t nbytes, int64_t align,
+                                               unsigned addrSpace) {
+  llvm::StringSet<> existingNames;
+  for (auto globalOp : moduleOp.getBody()->getOps<LLVM::GlobalOp>())
+    existingNames.insert(globalOp.getSymName());
+
+  unsigned counter = 0;
+  SmallString<128> symName = SymbolTable::generateSymbolName<128>(
+      prefix, [&](StringRef candidate) { return existingNames.contains(candidate); }, counter);
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(moduleOp.getBody());
+
+  auto arrayTy = LLVM::LLVMArrayType::get(IntegerType::get(rewriter.getContext(), 8), nbytes);
+  auto globalOp = LLVM::GlobalOp::create(rewriter, loc, arrayTy,
+                                         /*isConstant=*/false, LLVM::Linkage::External, symName,
+                                         /*value=*/Attribute(),
+                                         /*alignment=*/align, addrSpace);
+  globalOp.setDsoLocal(true);
+  return globalOp;
+}
+
+class MakePtrOpLowering : public OpConversionPattern<MakePtrOp> {
+public:
+  MakePtrOpLowering(const TypeConverter &typeConverter, MLIRContext *context)
+      : OpConversionPattern<MakePtrOp>(typeConverter, context) {}
+
+  LogicalResult matchAndRewrite(MakePtrOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto flyPtrTy = dyn_cast<fly::PointerType>(op.getResult().getType());
+    if (!flyPtrTy)
+      return failure();
+
+    Location loc = op.getLoc();
+    Attribute addrSpaceAttr = flyPtrTy.getAddressSpace();
+
+    if (isGenericAddressSpace<AddressSpace::Register>(addrSpaceAttr)) {
+      auto dictAttrs = op.getDictAttrs();
+      if (!dictAttrs)
+        return rewriter.notifyMatchFailure(op, "register make_ptr requires dictAttrs");
+      auto allocSize = dictAttrs->getAs<IntegerAttr>("allocaSize");
+      if (!allocSize)
+        return rewriter.notifyMatchFailure(op, "register make_ptr requires allocSize in ptrAttrs");
+      unsigned llvmAS = mapToLLVMAddressSpace(AddressSpace::Register);
+      auto llvmPtrTy = LLVM::LLVMPointerType::get(rewriter.getContext(), llvmAS);
+      Value nElems = arith::ConstantIntOp::create(rewriter, loc, allocSize.getInt(), 64);
+      Type elemTy = projectToLLVMCompatibleElemTy(flyPtrTy.getElemTy());
+      Value ptr = LLVM::AllocaOp::create(rewriter, loc, llvmPtrTy, elemTy, nElems, 0);
+      rewriter.replaceOp(op, ptr);
+      return success();
+    } else if (isTargetAddressSpace<SmeGmemAddressAttr>(addrSpaceAttr)) {
+      // sme_gmem make_ptr takes 2 positional args: [base_global_ptr, leading_stride].
+      // Assumption (design doc section 6 #1): the second arg is the leading (outermost)
+      // stride in *element* units; stride_byte = leading_stride * elemBytes.
+      auto args = adaptor.getArgs();
+      if (args.size() != 2)
+        return rewriter.notifyMatchFailure(
+            op, "sme_gmem make_ptr expects 2 args: base, leading_stride");
+
+      Value base = args[0];
+      Value strideElems = args[1];
+
+      // Normalize the stride to i32 (element units).
+      Type i32Ty = rewriter.getI32Type();
+      if (strideElems.getType() != i32Ty) {
+        if (strideElems.getType().isIndex())
+          strideElems = arith::IndexCastOp::create(rewriter, loc, i32Ty, strideElems);
+        else if (strideElems.getType().getIntOrFloatBitWidth() < 32)
+          strideElems = arith::ExtSIOp::create(rewriter, loc, i32Ty, strideElems);
+        else if (strideElems.getType().getIntOrFloatBitWidth() > 32)
+          strideElems = arith::TruncIOp::create(rewriter, loc, i32Ty, strideElems);
+      }
+
+      int64_t elemBits = flyPtrTy.getElemTy().getIntOrFloatBitWidth();
+      Value strideByte;
+      if (elemBits % 8 == 0) {
+        Value elemBytes = arith::ConstantIntOp::create(rewriter, loc, elemBits / 8, 32);
+        strideByte = arith::MulIOp::create(rewriter, loc, strideElems, elemBytes);
+      } else {
+        // Sub-byte element types: stride_byte = (stride * elemBits) / 8.
+        Value bits = arith::ConstantIntOp::create(rewriter, loc, elemBits, 32);
+        Value scaled = arith::MulIOp::create(rewriter, loc, strideElems, bits);
+        Value eight = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+        strideByte = arith::DivUIOp::create(rewriter, loc, scaled, eight);
+      }
+
+      rewriter.replaceOp(op, fly_ixdl::SmeGmemFatPtr::pack(rewriter, loc, base, strideByte));
+      return success();
+    } else if (isGenericAddressSpace<AddressSpace::Shared>(addrSpaceAttr)) {
+      auto dictAttrs = op.getDictAttrs();
+      if (!dictAttrs)
+        return rewriter.notifyMatchFailure(
+            op, "shared make_ptr requires dictAttrs={allocBytes, allocAlign}");
+      auto allocBytesAttr = dictAttrs->getAs<IntegerAttr>("allocBytes");
+      auto allocAlignAttr = dictAttrs->getAs<IntegerAttr>("allocAlign");
+      if (!allocBytesAttr || !allocAlignAttr)
+        return rewriter.notifyMatchFailure(
+            op, "shared make_ptr requires allocBytes, allocAlign in dictAttrs");
+
+      auto moduleOp = op->getParentOfType<gpu::GPUModuleOp>();
+      if (!moduleOp)
+        return op->emitError("shared make_ptr must be inside a gpu.module");
+
+      LLVM::GlobalOp global = createSharedMemoryGlobal(rewriter, moduleOp, loc, "__shared_alloc",
+                                                       allocBytesAttr.getInt(),
+                                                       allocAlignAttr.getInt(), /*addrSpace=*/3);
+      rewriter.replaceOpWithNewOp<LLVM::AddressOfOp>(op, global);
+      return success();
+    }
+
+    return rewriter.notifyMatchFailure(op, "unsupported make_ptr address space");
+  }
+};
+
+class GetDynSharedOpLowering : public OpConversionPattern<GetDynSharedOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(GetDynSharedOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto flyPtrTy = cast<fly::PointerType>(op.getResult().getType());
+    unsigned addrSpace = mapAttrToLLVMAddressSpace(flyPtrTy.getAddressSpace());
+
+    auto moduleOp = op->getParentOfType<gpu::GPUModuleOp>();
+    if (!moduleOp)
+      return op->emitError("get_dyn_shared must be inside a gpu.module");
+
+    LLVM::GlobalOp sharedGlobal = getOrCreateDynSharedGlobal(rewriter, moduleOp, loc, addrSpace);
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(op);
+
+    auto basePtr = LLVM::AddressOfOp::create(rewriter, loc, sharedGlobal);
+    Type ptrType = basePtr->getResultTypes()[0];
+
+    auto i8Ty = IntegerType::get(rewriter.getContext(), 8);
+    Value sharedPtr =
+        LLVM::GEPOp::create(rewriter, loc, ptrType, i8Ty, basePtr, ArrayRef<LLVM::GEPArg>{0});
+
+    rewriter.replaceOp(op, sharedPtr);
+    return success();
+  }
+
+private:
+  static LLVM::GlobalOp getOrCreateDynSharedGlobal(ConversionPatternRewriter &rewriter,
+                                                   gpu::GPUModuleOp moduleOp, Location loc,
+                                                   unsigned addrSpace) {
+    llvm::StringSet<> existingNames;
+    for (auto globalOp : moduleOp.getBody()->getOps<LLVM::GlobalOp>()) {
+      existingNames.insert(globalOp.getSymName());
+      if (auto arrayType = dyn_cast<LLVM::LLVMArrayType>(globalOp.getType())) {
+        if (globalOp.getAddrSpace() == addrSpace && arrayType.getNumElements() == 0 &&
+            globalOp.getAlignment().value_or(0) == 1024)
+          return globalOp;
+      }
+    }
+
+    unsigned counter = 0;
+    SmallString<128> symName = SymbolTable::generateSymbolName<128>(
+        "__dynamic_shared_", [&](StringRef candidate) { return existingNames.contains(candidate); },
+        counter);
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(moduleOp.getBody());
+
+    auto zeroArrayTy = LLVM::LLVMArrayType::get(IntegerType::get(rewriter.getContext(), 8), 0);
+
+    auto globalOp = LLVM::GlobalOp::create(rewriter, loc, zeroArrayTy,
+                                           /*isConstant=*/false, LLVM::Linkage::External, symName,
+                                           /*value=*/Attribute(),
+                                           /*alignment=*/1024, addrSpace);
+    globalOp.setDsoLocal(true);
+    return globalOp;
+  }
+};
+
+class IntToPtrOpLowering : public OpConversionPattern<IntToPtrOp> {
+public:
+  IntToPtrOpLowering(const TypeConverter &typeConverter, MLIRContext *context)
+      : OpConversionPattern<IntToPtrOp>(typeConverter, context) {}
+
+  LogicalResult matchAndRewrite(IntToPtrOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto flyPtrTy = dyn_cast<fly::PointerType>(op.getResult().getType());
+    if (!flyPtrTy)
+      return failure();
+
+    auto resultTy = dyn_cast<LLVM::LLVMPointerType>(getTypeConverter()->convertType(flyPtrTy));
+    if (!resultTy)
+      return failure();
+
+    rewriter.replaceOpWithNewOp<LLVM::IntToPtrOp>(op, resultTy, adaptor.getSrc());
+    return success();
+  }
+};
+
+class PtrToIntOpLowering : public OpConversionPattern<PtrToIntOp> {
+public:
+  PtrToIntOpLowering(const TypeConverter &typeConverter, MLIRContext *context)
+      : OpConversionPattern<PtrToIntOp>(typeConverter, context) {}
+
+  LogicalResult matchAndRewrite(PtrToIntOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type resultTy = getTypeConverter()->convertType(op.getResult().getType());
+    if (!resultTy)
+      return failure();
+
+    rewriter.replaceOpWithNewOp<LLVM::PtrToIntOp>(op, resultTy, adaptor.getPtr());
+    return success();
+  }
+};
+
+class ApplySwizzleOpLowering : public OpConversionPattern<ApplySwizzleOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(ApplySwizzleOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getPtr());
+    return success();
+  }
+};
+
+class RecastIterOpLowering : public OpConversionPattern<RecastIterOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(RecastIterOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getSrc());
+    return success();
+  }
+};
+
+class AddOffsetOpLowering : public OpConversionPattern<AddOffsetOp> {
+public:
+  AddOffsetOpLowering(const TypeConverter &typeConverter, MLIRContext *context)
+      : OpConversionPattern<AddOffsetOp>(typeConverter, context) {}
+
+  LogicalResult matchAndRewrite(AddOffsetOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value base = adaptor.getPtr();
+    Value offset = adaptor.getOffset();
+
+    auto flyPtrTy = dyn_cast<fly::PointerType>(op.getPtr().getType());
+    if (!flyPtrTy)
+      return failure();
+
+    auto offsetTy = dyn_cast<fly::IntTupleType>(offset.getType());
+    IntTupleAttr offsetAttr = offsetTy.getAttr();
+    if (!offsetAttr.isLeaf())
+      return rewriter.notifyMatchFailure(op, "offset must be a leaf int tuple");
+
+    Value offsetVal;
+    auto offsetInt = offsetAttr.extractIntFromLeaf();
+    bool isSmeGmem =
+        isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace());
+    if (offsetInt.isStatic()) {
+      int64_t staticOffset = offsetInt.getValue();
+      unsigned bitWidth = !isSmeGmem && !llvm::isInt<32>(staticOffset) ? 64 : 32;
+      offsetVal = arith::ConstantIntOp::create(rewriter, loc, staticOffset, bitWidth);
+    } else {
+      Operation *defOp = offset.getDefiningOp();
+      offsetVal = defOp->getOperand(0);
+      Type i32Ty = rewriter.getI32Type();
+      if (isSmeGmem && offsetVal.getType().isIndex())
+        offsetVal = arith::IndexCastOp::create(rewriter, loc, i32Ty, offsetVal);
+      else if (isSmeGmem && offsetVal.getType() != i32Ty) {
+        unsigned bw = offsetVal.getType().getIntOrFloatBitWidth();
+        if (bw < 32)
+          offsetVal = arith::ExtSIOp::create(rewriter, loc, i32Ty, offsetVal);
+        else if (bw > 32)
+          offsetVal = arith::TruncIOp::create(rewriter, loc, i32Ty, offsetVal);
+      } else if (!isSmeGmem && offsetVal.getType().isIndex()) {
+        offsetVal = arith::IndexCastOp::create(rewriter, loc, rewriter.getI64Type(), offsetVal);
+      } else if (!isSmeGmem && offsetVal.getType().getIntOrFloatBitWidth() < 32) {
+        offsetVal = arith::ExtSIOp::create(rewriter, loc, i32Ty, offsetVal);
+      }
+    }
+
+    if (isSmeGmem) {
+      // The offset is an element-index delta; convert to a byte delta before
+      // accumulating into the fat pointer's byte_offset field.
+      int64_t elemBits = flyPtrTy.getElemTy().getIntOrFloatBitWidth();
+      Value deltaBytes;
+      if (elemBits % 8 == 0) {
+        Value elemBytes = arith::ConstantIntOp::create(rewriter, loc, elemBits / 8, 32);
+        deltaBytes = arith::MulIOp::create(rewriter, loc, offsetVal, elemBytes);
+      } else {
+        Value bits = arith::ConstantIntOp::create(rewriter, loc, elemBits, 32);
+        Value scaled = arith::MulIOp::create(rewriter, loc, offsetVal, bits);
+        Value eight = arith::ConstantIntOp::create(rewriter, loc, 8, 32);
+        deltaBytes = arith::DivUIOp::create(rewriter, loc, scaled, eight);
+      }
+      fly_ixdl::SmeGmemFatPtr fp(flyPtrTy, base);
+      rewriter.replaceOp(op, fp.addByteOffset(rewriter, loc, deltaBytes));
+      return success();
+    }
+
+    auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(base.getType());
+    if (!ptrTy)
+      return failure();
+
+    Type flyElemTy = flyPtrTy.getElemTy();
+    Type elemTy = projectToLLVMCompatibleElemTy(flyElemTy);
+
+    // On Iluvatar an element-typed GEP into global memory lowers to a scaled,
+    // sign-extended index. Compiler-backend has no zoom encoding for a scaled
+    // signed moffset, so it cannot fold such an index into the descriptor-based
+    // store and falls back to 64-bit absolute addressing (ml_lsa_store_a64_*),
+    // which costs an addo/addc address computation per store. Emitting a byte
+    // (i8) GEP with an explicit byte offset keeps the index a plain
+    // sign-extended i32 with no scale, which the backend matches to the
+    // descriptor store (ml_lsa_store_*_U). Only worthwhile for >8-bit elements;
+    // an i8 element GEP already uses byte addressing.
+    if (isGenericAddressSpace<AddressSpace::Global>(flyPtrTy.getAddressSpace()) &&
+        flyElemTy.isIntOrFloat()) {
+      int64_t elemBits = flyElemTy.getIntOrFloatBitWidth();
+      // TODO(sub-byte): packed sub-byte / non-byte-multiple elements (e.g. i4,
+      // fp4) are not handled here. A whole-element GEP on such a type strides by
+      // the rounded-up byte alloc size (1 byte for i4), mis-addressing the
+      // packed array, and the byte rewrite below only covers whole-byte
+      // elements. Supporting them needs bit-granular offset math
+      // (offset * elemBits / 8, as the sme_gmem path above does) plus an
+      // even-element-count guarantee. Assert for now so the gap surfaces
+      // instead of silently emitting a wrong-stride store.
+      assert(elemBits % 8 == 0 &&
+             "add_offset: byte-GEP store optimization does not yet handle "
+             "sub-byte / non-byte-multiple global element types (e.g. i4/fp4)");
+      if (elemBits > 8 && elemBits % 8 == 0) {
+        auto offsetIntTy = cast<IntegerType>(offsetVal.getType());
+        Value elemBytes =
+            arith::ConstantIntOp::create(rewriter, loc, offsetIntTy, elemBits / 8);
+        offsetVal = arith::MulIOp::create(rewriter, loc, offsetVal, elemBytes);
+        elemTy = rewriter.getI8Type();
+      }
+    }
+
+    Value gep = LLVM::GEPOp::create(rewriter, loc, ptrTy, elemTy, base, ValueRange{offsetVal});
+    rewriter.replaceOp(op, gep);
+    return success();
+  }
+};
+
+class MakeViewOpLowering : public OpConversionPattern<MakeViewOp> {
+public:
+  MakeViewOpLowering(const TypeConverter &typeConverter, MLIRContext *context)
+      : OpConversionPattern<MakeViewOp>(typeConverter, context) {}
+
+  LogicalResult matchAndRewrite(MakeViewOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    if (isa<fly::CoordTensorType>(op.getResult().getType())) {
+      if (!op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(op, "coord_tensor result should have no uses");
+      rewriter.eraseOp(op);
+      return success();
+    } else {
+      Value base = adaptor.getIter();
+      rewriter.replaceOp(op, base);
+      return success();
+    }
+  }
+};
+
+class PtrLoadOpLowering : public OpConversionPattern<PtrLoadOp> {
+public:
+  using OpConversionPattern<PtrLoadOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(PtrLoadOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value ptr = adaptor.getPtr();
+
+    auto flyPtrTy = dyn_cast<fly::PointerType>(op.getPtr().getType());
+    if (!flyPtrTy)
+      return failure();
+
+    Type loadTy = getTypeConverter()->convertType(op.getResult().getType());
+    if (!loadTy)
+      return failure();
+
+    if (auto vecTy = dyn_cast<VectorType>(op.getResult().getType())) {
+      auto swizzle = flyPtrTy.getSwizzle();
+      if (!swizzle.isTrivialSwizzle()) {
+        int64_t vecBytes =
+            vecTy.getNumElements() * vecTy.getElementType().getIntOrFloatBitWidth() / 8;
+        int64_t baseBytes = int64_t{1} << swizzle.getBase();
+        if (baseBytes % vecBytes != 0)
+          return rewriter.notifyMatchFailure(
+              op, "vector ptr.load byte size must divide swizzle base granularity");
+      }
+    }
+
+    ptr = applySwizzleOnPtr(rewriter, loc, cast<TypedValue<LLVM::LLVMPointerType>>(ptr),
+                            flyPtrTy.getSwizzle());
+    Value loaded = LLVM::LoadOp::create(rewriter, loc, loadTy, ptr);
+    rewriter.replaceOp(op, loaded);
+    return success();
+  }
+};
+
+class PtrStoreOpLowering : public OpConversionPattern<PtrStoreOp> {
+public:
+  using OpConversionPattern<PtrStoreOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(PtrStoreOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value ptr = adaptor.getPtr();
+    Value value = adaptor.getValue();
+
+    auto flyPtrTy = dyn_cast<fly::PointerType>(op.getPtr().getType());
+    if (!flyPtrTy)
+      return failure();
+
+    if (auto vecTy = dyn_cast<VectorType>(op.getValue().getType())) {
+      auto swizzle = flyPtrTy.getSwizzle();
+      if (!swizzle.isTrivialSwizzle()) {
+        int64_t vecBytes =
+            vecTy.getNumElements() * vecTy.getElementType().getIntOrFloatBitWidth() / 8;
+        int64_t baseBytes = int64_t{1} << swizzle.getBase();
+        if (baseBytes % vecBytes != 0)
+          return rewriter.notifyMatchFailure(
+              op, "vector ptr.store byte size must divide swizzle base granularity");
+      }
+    }
+
+    ptr = applySwizzleOnPtr(rewriter, loc, cast<TypedValue<LLVM::LLVMPointerType>>(ptr),
+                            flyPtrTy.getSwizzle());
+    LLVM::StoreOp::create(rewriter, loc, value, ptr);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class MakeCopyAtomOpLowering : public OpConversionPattern<MakeCopyAtomOp> {
+public:
+  using OpConversionPattern<MakeCopyAtomOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(MakeCopyAtomOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto copyAtomTy = dyn_cast<CopyAtomType>(op.getResult().getType());
+    if (!copyAtomTy)
+      return rewriter.notifyMatchFailure(op, "not a CopyAtomType");
+    Type convertedTy = getTypeConverter()->convertType(copyAtomTy);
+
+    auto statefulOp = dyn_cast<StatefulOpTypeInterface>(copyAtomTy.getCopyOp());
+    if (statefulOp) {
+      Value state = statefulOp.getDefaultState(rewriter, op.getLoc());
+      rewriter.replaceOp(op, state);
+    } else {
+      rewriter.replaceOpWithNewOp<LLVM::UndefOp>(op, convertedTy);
+    }
+    return success();
+  }
+};
+
+class MakeMmaAtomOpLowering : public OpConversionPattern<MakeMmaAtomOp> {
+public:
+  using OpConversionPattern<MakeMmaAtomOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(MakeMmaAtomOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto mmaAtomTy = dyn_cast<MmaAtomType>(op.getResult().getType());
+    if (!mmaAtomTy)
+      return rewriter.notifyMatchFailure(op, "not a MmaAtomType");
+    Type convertedTy = getTypeConverter()->convertType(mmaAtomTy);
+    auto statefulOp = dyn_cast<StatefulOpTypeInterface>(mmaAtomTy.getMmaOp());
+    if (statefulOp) {
+      Value state = statefulOp.getDefaultState(rewriter, op.getLoc());
+      rewriter.replaceOp(op, state);
+    } else {
+      rewriter.replaceOpWithNewOp<LLVM::UndefOp>(op, convertedTy);
+    }
+    return success();
+  }
+};
+
+class MakeTiledCopyOpLowering : public OpConversionPattern<MakeTiledCopyOp> {
+public:
+  using OpConversionPattern<MakeTiledCopyOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(MakeTiledCopyOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getCopyAtom());
+    return success();
+  }
+};
+
+class MakeTiledMmaOpLowering : public OpConversionPattern<MakeTiledMmaOp> {
+public:
+  using OpConversionPattern<MakeTiledMmaOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(MakeTiledMmaOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getMmaAtom());
+    return success();
+  }
+};
+
+class AtomSetValueOpLowering : public OpConversionPattern<AtomSetValueOp> {
+public:
+  using OpConversionPattern<AtomSetValueOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(AtomSetValueOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type origAtomTy = op.getAtom().getType();
+    StringAttr fieldAttr = op.getFieldAttr();
+    Location loc = op.getLoc();
+
+    Value structVal = adaptor.getAtom();
+    Value fieldVal = adaptor.getValue();
+    Value result;
+
+    if (auto copyAtomTy = dyn_cast<CopyAtomType>(origAtomTy)) {
+      if (!copyAtomTy.isStateful())
+        return rewriter.notifyMatchFailure(op, "CopyAtom is not stateful");
+      result = copyAtomTy.setAtomState(rewriter, loc, structVal, fieldAttr, fieldVal);
+    } else if (auto mmaAtomTy = dyn_cast<MmaAtomType>(origAtomTy)) {
+      if (!mmaAtomTy.isStateful())
+        return rewriter.notifyMatchFailure(op, "MmaAtom is not stateful");
+      result = mmaAtomTy.setAtomState(rewriter, loc, structVal, fieldAttr, fieldVal);
+    } else {
+      return rewriter.notifyMatchFailure(op, "atom is not CopyAtomType or MmaAtomType");
+    }
+
+    if (!result)
+      return rewriter.notifyMatchFailure(op, "setAtomState failed");
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class CopyAtomCallLowering : public OpConversionPattern<CopyAtomCall> {
+public:
+  using OpConversionPattern<CopyAtomCall>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(CopyAtomCall op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type copyAtomType = op.getCopyAtom().getType();
+    auto copyAtom = dyn_cast<CopyAtomType>(copyAtomType);
+    if (!copyAtom)
+      return rewriter.notifyMatchFailure(op, "copyAtom is not CopyAtomType");
+
+    Value copyAtomVal = adaptor.getCopyAtom();
+    Value src = adaptor.getSrc();
+    Value dst = adaptor.getDst();
+    Value pred = adaptor.getPred();
+
+    auto srcMemTy = dyn_cast<fly::MemRefType>(op.getSrc().getType());
+    auto dstMemTy = dyn_cast<fly::MemRefType>(op.getDst().getType());
+
+    if (!srcMemTy || !dstMemTy)
+      return rewriter.notifyMatchFailure(op, "expected MemRef types on original op");
+    if (srcMemTy.getElemTy() != dstMemTy.getElemTy())
+      return rewriter.notifyMatchFailure(op, "src/dst element types mismatch");
+
+    Location loc = op.getLoc();
+
+    Type predMemTy = nullptr;
+    if (pred) {
+      predMemTy = dyn_cast<fly::MemRefType>(op.getPred().getType());
+      if (!predMemTy)
+        return rewriter.notifyMatchFailure(op, "pred is not a MemRef type");
+    }
+
+    if (pred) {
+      if (failed(copyAtom.emitAtomCall(rewriter, loc, copyAtomType, srcMemTy, dstMemTy, predMemTy,
+                                       copyAtomVal, src, dst, pred)))
+        return failure();
+    } else {
+      if (failed(copyAtom.emitAtomCall(rewriter, loc, copyAtomType, srcMemTy, dstMemTy, copyAtomVal,
+                                       src, dst)))
+        return failure();
+    }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class CopyAtomCallSSALowering : public OpConversionPattern<CopyAtomCallSSA> {
+public:
+  using OpConversionPattern<CopyAtomCallSSA>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(CopyAtomCallSSA op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Type copyAtomType = op.getCopyAtom().getType();
+    auto copyAtom = dyn_cast<CopyAtomType>(copyAtomType);
+    if (!copyAtom)
+      return rewriter.notifyMatchFailure(op, "copyAtom is not CopyAtomType");
+
+    Location loc = op.getLoc();
+    bool hasResult = op.getResults().size() > 0;
+    Type srcTy = op.getSrc().getType();
+    Value pred = adaptor.getPred();
+
+    Type resultTy = hasResult ? op.getResult(0).getType() : Type{};
+    Type dstTy = op.getDst() ? op.getDst().getType() : Type{};
+
+    FailureOr<Value> result;
+    if (pred) {
+      result = copyAtom.emitAtomCallSSA(rewriter, loc, resultTy, copyAtomType, srcTy, dstTy,
+                                        op.getPred().getType(), adaptor.getCopyAtom(),
+                                        adaptor.getSrc(), adaptor.getDst(), pred);
+    } else {
+      result = copyAtom.emitAtomCallSSA(rewriter, loc, resultTy, copyAtomType, srcTy, dstTy,
+                                        adaptor.getCopyAtom(), adaptor.getSrc(), adaptor.getDst());
+    }
+    if (failed(result))
+      return failure();
+
+    if (hasResult)
+      rewriter.replaceOp(op, *result);
+    else
+      rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class MmaAtomCallLowering : public OpConversionPattern<MmaAtomCall> {
+public:
+  using OpConversionPattern<MmaAtomCall>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(MmaAtomCall op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto mmaAtomTy = dyn_cast<MmaAtomType>(op.getMmaAtom().getType());
+    if (!mmaAtomTy)
+      return rewriter.notifyMatchFailure(op, "expected MmaAtomType for mmaAtom operand");
+
+    Location loc = op.getLoc();
+
+    Value dPtr = adaptor.getD();
+    ValueRange aPtrs = adaptor.getA();
+    ValueRange bPtrs = adaptor.getB();
+    Value cPtr = adaptor.getC();
+    if (aPtrs.size() != 1 || bPtrs.size() != 1)
+      return rewriter.notifyMatchFailure(op, "expected a single A and B operand");
+
+    if (!isa<LLVM::LLVMPointerType>(dPtr.getType()) ||
+        !isa<LLVM::LLVMPointerType>(aPtrs.front().getType()) ||
+        !isa<LLVM::LLVMPointerType>(bPtrs.front().getType()) ||
+        !isa<LLVM::LLVMPointerType>(cPtr.getType()))
+      return rewriter.notifyMatchFailure(op, "expected llvm.ptr operands after type conversion");
+
+    auto dMemTy = dyn_cast<fly::MemRefType>(op.getD().getType());
+    TypeRange aMemTy = op.getA().getTypes();
+    TypeRange bMemTy = op.getB().getTypes();
+    auto cMemTy = dyn_cast<fly::MemRefType>(op.getC().getType());
+    if (!dMemTy || aMemTy.size() != 1 || !isa<fly::MemRefType>(aMemTy.front()) ||
+        bMemTy.size() != 1 || !isa<fly::MemRefType>(bMemTy.front()) || !cMemTy)
+      return rewriter.notifyMatchFailure(op, "expected Fly memref types on original op");
+
+    if (failed(mmaAtomTy.emitAtomCall(rewriter, loc, mmaAtomTy, dMemTy, aMemTy, bMemTy, cMemTy,
+                                      adaptor.getMmaAtom(), dPtr, aPtrs, bPtrs, cPtr)))
+      return failure();
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class MmaAtomCallSSALowering : public OpConversionPattern<MmaAtomCallSSA> {
+public:
+  using OpConversionPattern<MmaAtomCallSSA>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(MmaAtomCallSSA op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto mmaAtomTy = dyn_cast<MmaAtomType>(op.getMmaAtom().getType());
+    if (!mmaAtomTy)
+      return rewriter.notifyMatchFailure(op, "expected MmaAtomType for mmaAtom operand");
+
+    Location loc = op.getLoc();
+    bool hasResult = op.getResults().size() > 0;
+
+    Type resultTy = hasResult ? op.getResult(0).getType() : Type{};
+    Type dTy = op.getD() ? op.getD().getType() : Type{};
+    Value dPtr = hasResult ? Value{} : adaptor.getD();
+
+    auto result =
+        mmaAtomTy.emitAtomCallSSA(rewriter, loc, resultTy, mmaAtomTy, dTy, op.getA().getTypes(),
+                                  op.getB().getTypes(), op.getC().getType(), adaptor.getMmaAtom(),
+                                  dPtr, adaptor.getA(), adaptor.getB(), adaptor.getC());
+    if (failed(result))
+      return failure();
+
+    if (hasResult)
+      rewriter.replaceOp(op, *result);
+    else
+      rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// Lower `gpu.launch_func` kernel operands so that any `!fly.memref` values are
+/// replaced by their type-converted builtin `memref` values. This prevents
+/// `unrealized_conversion_cast` materializations from remaining live after
+/// partial conversion (e.g., when the surrounding `func.func` signature has
+/// been converted to builtin memrefs).
+class GpuLaunchFuncOpLowering : public OpConversionPattern<gpu::LaunchFuncOp> {
+public:
+  using OpConversionPattern<gpu::LaunchFuncOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(gpu::LaunchFuncOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto kernelRef = adaptor.getKernel();
+
+    auto grid =
+        gpu::KernelDim3{adaptor.getGridSizeX(), adaptor.getGridSizeY(), adaptor.getGridSizeZ()};
+    auto block =
+        gpu::KernelDim3{adaptor.getBlockSizeX(), adaptor.getBlockSizeY(), adaptor.getBlockSizeZ()};
+
+    std::optional<gpu::KernelDim3> clusterSize = std::nullopt;
+    if (adaptor.getClusterSizeX() && adaptor.getClusterSizeY() && adaptor.getClusterSizeZ()) {
+      clusterSize = gpu::KernelDim3{adaptor.getClusterSizeX(), adaptor.getClusterSizeY(),
+                                    adaptor.getClusterSizeZ()};
+    }
+
+    Type asyncTokenType = nullptr;
+    if (Value tok = op.getAsyncToken())
+      asyncTokenType = tok.getType();
+
+    if (Value asyncObj = adaptor.getAsyncObject()) {
+      if (!adaptor.getAsyncDependencies().empty())
+        return rewriter.notifyMatchFailure(
+            op, "launch_func has both asyncObject and asyncDependencies");
+
+      rewriter.replaceOpWithNewOp<gpu::LaunchFuncOp>(
+          op, kernelRef, grid, block, adaptor.getDynamicSharedMemorySize(),
+          adaptor.getKernelOperands(), asyncObj, clusterSize);
+      return success();
+    }
+
+    rewriter.replaceOpWithNewOp<gpu::LaunchFuncOp>(
+        op, kernelRef, grid, block, adaptor.getDynamicSharedMemorySize(),
+        adaptor.getKernelOperands(), asyncTokenType, adaptor.getAsyncDependencies(), clusterSize);
+    return success();
+  }
+};
+
+class FlyTypeConverter : public TypeConverter {
+public:
+  FlyTypeConverter() {
+    addConversion([](Type type) { return type; });
+
+    addConversion([&](FloatType floatTy) -> std::optional<Type> {
+      if (floatTy.getWidth() < 16)
+        return IntegerType::get(floatTy.getContext(), floatTy.getWidth());
+      return std::nullopt;
+    });
+    addConversion([&](VectorType vecTy) -> std::optional<Type> {
+      Type convertedElem = convertType(vecTy.getElementType());
+      if (!convertedElem || convertedElem == vecTy.getElementType())
+        return std::nullopt;
+      return VectorType::get(vecTy.getShape(), convertedElem, vecTy.getScalableDims());
+    });
+    addConversion([&](fly::MemRefType flyMemRefTy) -> Type {
+      if (isTargetAddressSpace<SmeGmemAddressAttr>(flyMemRefTy.getAddressSpace()))
+        return SmeGmemFatPtr::getType(flyMemRefTy.getContext());
+      unsigned as = mapAttrToLLVMAddressSpace(flyMemRefTy.getAddressSpace());
+      return LLVM::LLVMPointerType::get(flyMemRefTy.getContext(), as);
+    });
+    addConversion([&](fly::PointerType flyPtrTy) -> Type {
+      if (isTargetAddressSpace<SmeGmemAddressAttr>(flyPtrTy.getAddressSpace()))
+        return SmeGmemFatPtr::getType(flyPtrTy.getContext());
+      unsigned as = mapAttrToLLVMAddressSpace(flyPtrTy.getAddressSpace());
+      return LLVM::LLVMPointerType::get(flyPtrTy.getContext(), as);
+    });
+    addConversion([&](fly::CopyAtomType atomTy) -> Type {
+      if (atomTy.isStateful())
+        return atomTy.getConvertedType(atomTy.getContext());
+      return LLVM::LLVMStructType::getLiteral(atomTy.getContext(), {});
+    });
+    addConversion([&](fly::MmaAtomType atomTy) -> Type {
+      if (atomTy.isStateful())
+        return atomTy.getConvertedType(atomTy.getContext());
+      return LLVM::LLVMStructType::getLiteral(atomTy.getContext(), {});
+    });
+    addConversion(
+        [&](fly::TiledCopyType tiledTy) -> Type { return convertType(tiledTy.getCopyAtom()); });
+    addConversion(
+        [&](fly::TiledMmaType tiledTy) -> Type { return convertType(tiledTy.getMmaAtom()); });
+  }
+};
+
+class ExtractAlignedPointerAsIndexLowering
+    : public OpConversionPattern<ExtractAlignedPointerAsIndexOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult matchAndRewrite(ExtractAlignedPointerAsIndexOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Value src = adaptor.getSource();
+    Type resultType = getTypeConverter()->convertType(op.getResult().getType());
+    if (!resultType)
+      resultType = op.getResult().getType();
+    if (src.getType() != resultType)
+      src = LLVM::AddrSpaceCastOp::create(rewriter, op.getLoc(), resultType, src);
+    rewriter.replaceOp(op, src);
+    return success();
+  }
+};
+
+/// True when ``ty`` is ``vector<nxi8>`` (1-D).
+static bool isI8Vector(Type ty, int64_t n) {
+  auto vecTy = dyn_cast<VectorType>(ty);
+  return vecTy && vecTy.getRank() == 1 && vecTy.getNumElements() == n &&
+         vecTy.getElementType().isInteger(8);
+}
+
+/// True when ``attr`` is the single-element array ``[value]``.
+static bool isSingleIntArrayAttr(ArrayAttr attr, int64_t value) {
+  if (attr.size() != 1)
+    return false;
+  auto intAttr = dyn_cast<IntegerAttr>(attr[0]);
+  return intAttr && intAttr.getInt() == value;
+}
+
+/// Match ``insert_strided_slice(bitcast(%i32 : vector<4xi8>), %dest, offset)``
+/// with ``%dest : vector<8xi8>`` and unit stride; returns the i32 source.
+static Value matchI8x4InsertFromI32(vector::InsertStridedSliceOp op, int64_t offset) {
+  if (!isI8Vector(op.getType(), 8) || !isI8Vector(op.getValueToStore().getType(), 4))
+    return {};
+  if (!isSingleIntArrayAttr(op.getOffsets(), offset) || !isSingleIntArrayAttr(op.getStrides(), 1))
+    return {};
+  auto bitcast = op.getValueToStore().getDefiningOp<LLVM::BitcastOp>();
+  if (!bitcast || !bitcast.getArg().getType().isInteger(32))
+    return {};
+  return bitcast.getArg();
+}
+
+/// The i8 S2R fragment build: ``vector<8xi8>`` assembled from two
+/// ``i32 -> vector<4xi8>`` bitcasts inserted at offsets 0 and 4.
+struct I8x8ConcatOfTwoI32 {
+  /// Outer insert (offset 4); defines the ``vector<8xi8>`` fragment.
+  vector::InsertStridedSliceOp hiInsert;
+  /// Inner insert (offset 0); dead once the fragment is rebuilt.
+  vector::InsertStridedSliceOp loInsert;
+  Value loI32;
+  Value hiI32;
+};
+
+/// Match the outer insert of an ``I8x8ConcatOfTwoI32`` chain.
+///
+/// Exactly two pieces, because ``vector<8xi8>`` is the per-lane A/B fragment of
+/// one i8 MMA atom (m16n16k32 over 64 lanes) and the S2R atom is fixed at
+/// ``UniversalCopy32b``; k_rep / BK only change how many such fragments exist.
+static std::optional<I8x8ConcatOfTwoI32>
+matchI8x8ConcatOfTwoI32(vector::InsertStridedSliceOp hiInsert) {
+  Value hiI32 = matchI8x4InsertFromI32(hiInsert, 4);
+  if (!hiI32)
+    return std::nullopt;
+  auto loInsert = hiInsert.getDest().getDefiningOp<vector::InsertStridedSliceOp>();
+  if (!loInsert)
+    return std::nullopt;
+  Value loI32 = matchI8x4InsertFromI32(loInsert, 0);
+  if (!loI32)
+    return std::nullopt;
+  return I8x8ConcatOfTwoI32{hiInsert, loInsert, loI32, hiI32};
+}
+
+/// True when ``op`` is a shared (AS 3) load of ``vector<4xi8>``, i.e. the
+/// i8 S2R ``UniversalCopy32b`` atom. Wider / narrower i8 vector loads have no
+/// producer today and are left alone.
+static bool isSharedI8x4Load(LLVM::LoadOp op) {
+  if (!isI8Vector(op.getType(), 4))
+    return false;
+  auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(op.getAddr().getType());
+  return ptrTy && ptrTy.getAddressSpace() == mapToLLVMAddressSpace(AddressSpace::Shared);
+}
+
+/// Rewrite shared ``llvm.load`` of ``vector<4xi8>`` to ``load i32`` +
+/// ``bitcast``. UniversalCopy / PtrLoad stay generic; this Iluvatar-only
+/// peephole prefers a wide integer shared load over a byte-granular vector
+/// load. Runs before ``foldI8x8ConcatsOfTwoI32`` so the bitcasts exist for that
+/// fold. Walk-based (no greedy DCE).
+static void rewriteSharedI8x4LoadsAsI32(Operation *root) {
+  SmallVector<LLVM::LoadOp> candidates;
+  root->walk([&](LLVM::LoadOp op) {
+    if (isSharedI8x4Load(op))
+      candidates.push_back(op);
+  });
+
+  for (LLVM::LoadOp op : candidates) {
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+    Value loaded = LLVM::LoadOp::create(b, loc, b.getI32Type(), op.getAddr());
+    Value casted = LLVM::BitcastOp::create(b, loc, op.getType(), loaded);
+    op.replaceAllUsesWith(casted);
+    op.erase();
+  }
+}
+
+/// Fold ``vector<8xi8>`` rebuild from two ``i32 -> vector<4xi8>`` bitcasts into
+/// a permute-free ``vector<2xi32>`` bitcast (same little-endian layout).
+///
+/// Without this fold, ``convert-vector-to-llvm`` turns the insert_strided_slice
+/// chain into a byte-granular ``shufflevector`` that ISel lowers to an
+/// expensive byte-permute.
+static void foldI8x8ConcatsOfTwoI32(Operation *root) {
+  SmallVector<I8x8ConcatOfTwoI32> candidates;
+  root->walk([&](vector::InsertStridedSliceOp op) {
+    if (auto concat = matchI8x8ConcatOfTwoI32(op))
+      candidates.push_back(*concat);
+  });
+
+  for (I8x8ConcatOfTwoI32 concat : candidates) {
+    vector::InsertStridedSliceOp hiInsert = concat.hiInsert;
+    OpBuilder rewriter(hiInsert);
+    Location loc = hiInsert.getLoc();
+    Type i32Ty = rewriter.getI32Type();
+    auto v2i32 = VectorType::get({2}, i32Ty);
+    Value poison = LLVM::PoisonOp::create(rewriter, loc, v2i32);
+    Value c0 = LLVM::ConstantOp::create(rewriter, loc, i32Ty, 0);
+    Value c1 = LLVM::ConstantOp::create(rewriter, loc, i32Ty, 1);
+    Value loIns = LLVM::InsertElementOp::create(rewriter, loc, v2i32, poison, concat.loI32, c0);
+    Value hiIns = LLVM::InsertElementOp::create(rewriter, loc, v2i32, loIns, concat.hiI32, c1);
+    Value out = LLVM::BitcastOp::create(rewriter, loc, hiInsert.getType(), hiIns);
+    hiInsert.replaceAllUsesWith(out);
+    hiInsert.erase();
+    if (concat.loInsert->use_empty())
+      concat.loInsert.erase();
+  }
+}
+
+/// True when ``llvm.bi.stp.vs[.pred].*`` arg[1] is ``inttoptr(ptrtoint(p))``
+/// with matching pointer types (foldable after fly.ptr -> llvm.ptr).
+static bool isFoldableStpVsPtrRoundtrip(LLVM::CallIntrinsicOp op) {
+  if (!op.getIntrin().starts_with("llvm.bi.stp.vs."))
+    return false;
+  // Unpredicated: (val, ptr, voffset, soffset, kop)
+  // Predicated:    (val, ptr, voffset, soffset, kop, pred)
+  size_t nArgs = op.getArgs().size();
+  if (nArgs != 5 && nArgs != 6)
+    return false;
+  Value ptrArg = op.getArgs()[1];
+  auto intToPtr = ptrArg.getDefiningOp<LLVM::IntToPtrOp>();
+  if (!intToPtr)
+    return false;
+  auto ptrToInt = intToPtr.getArg().getDefiningOp<LLVM::PtrToIntOp>();
+  if (!ptrToInt)
+    return false;
+  return ptrToInt.getArg().getType() == ptrArg.getType();
+}
+
+/// Fold ``inttoptr(ptrtoint(p))`` on the base of every foldable
+/// ``llvm.bi.stp.vs[.pred].*`` under ``root`` back to ``p``.
+///
+/// Root cause is the ``!fly.ptr`` / ``!llvm.ptr`` mismatch: the Python helpers
+/// must feed ``llvm.call_intrinsic`` a ``!llvm.ptr``, but tracing only has
+/// ``!fly.ptr``. Crossing via ``fly.ptrtoint`` + ``llvm.inttoptr`` avoids an
+/// ``unrealized_conversion_cast`` deadlock at trace time. Once the main
+/// conversion has rewritten ``fly.ptr`` to ``llvm.ptr``, the round-trip is
+/// redundant and is folded so Iluvatar ISel sees a clean descriptor base (not
+/// an inttoptr-derived pointer). Covers unpredicated (5 args) and predicated
+/// (6 args) forms for i8 / i16 / i32 / i64 / v4i32.
+///
+/// Must run after the main conversion (so ``fly.ptrtoint`` is already
+/// ``llvm.ptrtoint``). This is a trivial local peephole: rewrite each base
+/// operand in place and erase the now-dead round-trip. Done with a plain walk
+/// rather than the greedy driver (which whole-module DCEs unrelated unused Pure
+/// results) or a second dialect conversion (heavyweight, and makes operand
+/// erasure depend on fragile staged-use bookkeeping).
+static void foldStpVsPtrRoundtrips(Operation *root) {
+  // Collect first, then rewrite, to avoid mutating IR mid-walk.
+  SmallVector<LLVM::CallIntrinsicOp> stpVsCalls;
+  root->walk([&](LLVM::CallIntrinsicOp op) {
+    if (isFoldableStpVsPtrRoundtrip(op))
+      stpVsCalls.push_back(op);
+  });
+  for (LLVM::CallIntrinsicOp op : stpVsCalls) {
+    auto intToPtr = op.getArgs()[1].getDefiningOp<LLVM::IntToPtrOp>();
+    auto ptrToInt = intToPtr.getArg().getDefiningOp<LLVM::PtrToIntOp>();
+    op->setOperand(1, ptrToInt.getArg());
+    if (intToPtr->use_empty())
+      intToPtr->erase();
+    if (ptrToInt->use_empty())
+      ptrToInt->erase();
+  }
+}
+
+class FlyToIXDLConversionPass
+    : public mlir::impl::FlyToIXDLConversionPassBase<FlyToIXDLConversionPass> {
+public:
+  using mlir::impl::FlyToIXDLConversionPassBase<
+      FlyToIXDLConversionPass>::FlyToIXDLConversionPassBase;
+
+  void runOnOperation() override {
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+
+    ConversionTarget target(getContext());
+
+    target.addLegalDialect<arith::ArithDialect, scf::SCFDialect, vector::VectorDialect,
+                           gpu::GPUDialect, func::FuncDialect, LLVM::LLVMDialect,
+                           IXDL::IXDLDialect>();
+    target.addIllegalDialect<fly::FlyDialect, fly_ixdl::FlyIXDLDialect>();
+
+    // Constructors
+    target.addLegalOp<StaticOp, MakeIntTupleOp, MakeLayoutOp, MakeComposedLayoutOp>();
+
+    FlyTypeConverter typeConverter;
+
+    target.addDynamicallyLegalOp<func::FuncOp>(
+        [&](func::FuncOp op) { return typeConverter.isSignatureLegal(op.getFunctionType()); });
+    target.addDynamicallyLegalOp<gpu::GPUFuncOp>(
+        [&](gpu::GPUFuncOp op) { return typeConverter.isSignatureLegal(op.getFunctionType()); });
+
+    target.addDynamicallyLegalOp<gpu::LaunchFuncOp>([&](gpu::LaunchFuncOp op) {
+      auto isValueLegal = [&](Value v) {
+        if (!v)
+          return true;
+        return typeConverter.isLegal(v.getType());
+      };
+
+      for (Value v : op.getKernelOperands())
+        if (!isValueLegal(v))
+          return false;
+
+      if (!isValueLegal(op.getDynamicSharedMemorySize()))
+        return false;
+
+      for (Value dep : op.getAsyncDependencies())
+        if (!isValueLegal(dep))
+          return false;
+      if (!isValueLegal(op.getAsyncObject()))
+        return false;
+
+      return true;
+    });
+
+    patterns.add<MakePtrOpLowering, GetDynSharedOpLowering>(typeConverter, context);
+    patterns.add<IntToPtrOpLowering, PtrToIntOpLowering>(typeConverter, context);
+    patterns.add<ApplySwizzleOpLowering, RecastIterOpLowering>(typeConverter, context);
+    patterns.add<AddOffsetOpLowering>(typeConverter, context);
+    patterns.add<MakeViewOpLowering>(typeConverter, context);
+    patterns.add<PtrLoadOpLowering, PtrStoreOpLowering>(typeConverter, context);
+    patterns.add<MakeCopyAtomOpLowering, MakeMmaAtomOpLowering>(typeConverter, context);
+    patterns.add<MakeTiledCopyOpLowering, MakeTiledMmaOpLowering>(typeConverter, context);
+    patterns.add<AtomSetValueOpLowering>(typeConverter, context);
+    patterns.add<CopyAtomCallLowering, MmaAtomCallLowering>(typeConverter, context);
+    patterns.add<CopyAtomCallSSALowering, MmaAtomCallSSALowering>(typeConverter, context);
+    patterns.add<GpuLaunchFuncOpLowering>(typeConverter, context);
+
+    // TODO: deprecated in the future
+    patterns.add<ExtractAlignedPointerAsIndexLowering>(typeConverter, context);
+
+    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns, typeConverter);
+    populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(patterns, typeConverter);
+    scf::populateSCFStructuralTypeConversionsAndLegality(typeConverter, patterns, target);
+
+    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
+      signalPassFailure();
+
+    // Post-conversion peep-holes (walk-based; do not use greedy DCE).
+    rewriteSharedI8x4LoadsAsI32(getOperation());
+    foldI8x8ConcatsOfTwoI32(getOperation());
+    foldStpVsPtrRoundtrips(getOperation());
+  }
+};
+
+} // namespace
