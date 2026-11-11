@@ -116,14 +116,25 @@ notes="$(mktemp)"
   echo '```'
 } > "${notes}"
 
+# Replace any prior release for this moving tag. Do not use --cleanup-tag:
+# if the release exists but the git tag was already removed, cleanup-tag
+# returns HTTP 422 "Reference does not exist" and aborts before recreate.
 if gh release view "${tag}" --repo "${REPO}" >/dev/null 2>&1; then
-  gh release delete "${tag}" --repo "${REPO}" --yes --cleanup-tag
+  gh release delete "${tag}" --repo "${REPO}" --yes
+fi
+gh api --method DELETE "repos/${REPO}/git/refs/tags/${tag}" >/dev/null 2>&1 || true
+
+# Pin the new tag to this workflow commit (not just default-branch tip).
+target_flags=()
+if [[ -n "${GITHUB_SHA:-}" ]]; then
+  target_flags=(--target "${GITHUB_SHA}")
 fi
 
 gh release create "${tag}" \
   --repo "${REPO}" \
   --title "${title}" \
   --notes-file "${notes}" \
+  "${target_flags[@]}" \
   "${extra_flags[@]}" \
   "${assets[@]}"
 
