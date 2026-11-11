@@ -1,6 +1,7 @@
 name: FlyDSL CI Wheels (Iluvatar A-track)
 
 # Manual-only: do not schedule nightlies. Dispatch when a release wheel is needed.
+# Runner paths/images/refs come from repo vars (same contract as build-whl-iluvatar).
 on:
   workflow_dispatch:
     inputs:
@@ -13,9 +14,9 @@ on:
         type: string
         default: "3.12"
       docker_image:
-        description: "Iluvatar build/test image"
+        description: "Iluvatar build/test image (empty uses vars.FLYDSL_ILUVATAR_U2004_IMAGE)"
         type: string
-        default: "10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest"
+        default: ""
       cmake_build_type:
         description: "FlyDSL CMake build type"
         type: choice
@@ -24,16 +25,13 @@ on:
           - Debug
         default: Release
       ixcc_ref:
-        description: "u2004 fresh flow: git ref inside ixcc.git (empty follows ixcc_variant)"
+        description: "u2004 fresh flow: git ref inside ixcc.git (empty uses vars.IXCC_CI_REF or vars.IXCC_REF)"
         type: string
         default: ""
-      ixcc_variant:
-        description: "Which IXCC tree to build against"
-        type: choice
-        options:
-          - internal
-          - external
-        default: internal
+      ixcc_mlir_cmake:
+        description: "Host MLIRConfig.cmake dir for persistent path (empty uses vars.IXCC_CI_MLIR_CMAKE or vars.IXCC_MLIR_CMAKE)"
+        type: string
+        default: ""
       use_fresh_ixcc:
         description: "u2004 only: clone+build IXCC in container (default true; host IXCC cannot run in corex-base-20.04)"
         type: boolean
@@ -48,10 +46,10 @@ jobs:
     uses: ./.github/workflows/build-whl-iluvatar.yaml
     with:
       python_versions: ${{ inputs.python_versions || '3.12' }}
-      docker_image: ${{ inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
+      docker_image: ${{ inputs.docker_image || vars.FLYDSL_ILUVATAR_U2004_IMAGE }}
       cmake_build_type: ${{ inputs.cmake_build_type || 'Release' }}
-      ixcc_ref: ${{ inputs.ixcc_ref || (inputs.ixcc_variant == 'external' && 'origin/xiang.zhang/ixcc-flydsl-release' || 'origin/working') }}
-      ixcc_variant: ${{ inputs.ixcc_variant || 'internal' }}
+      ixcc_ref: ${{ inputs.ixcc_ref || vars.IXCC_CI_REF || vars.IXCC_REF }}
+      ixcc_mlir_cmake: ${{ inputs.ixcc_mlir_cmake || vars.IXCC_CI_MLIR_CMAKE || vars.IXCC_MLIR_CMAKE }}
       use_fresh_ixcc: ${{ inputs.use_fresh_ixcc }}
 
   test:
@@ -59,5 +57,5 @@ jobs:
     if: ${{ !(inputs.skip_tests || false) }}
     uses: ./.github/workflows/test-whl-iluvatar.yaml
     with:
-      docker_image: ${{ inputs.docker_image || '10.150.9.98:80/infra/corex_base/ubuntu:20.04-latest' }}
+      docker_image: ${{ inputs.docker_image || vars.FLYDSL_ILUVATAR_U2004_IMAGE }}
       wheel_artifact_name: ${{ needs.build.outputs.artifact_name }}
