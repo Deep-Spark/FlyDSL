@@ -39,7 +39,6 @@
 #   IXCC_MLIR_CMAKE     -- path INSIDE the container to the MLIR CMake config
 #                          directory, e.g. /ixcc-mlir/lib/cmake/mlir (mounted
 #                          from runner's <ixcc-root>/build/lib/cmake/mlir)
-#   IXCC_VARIANT        -- internal | external, for logging + manifest only
 #   FLYDSL_VERSION_LOCAL_SUFFIX -- setup.py `dev1+<suffix>` local marker
 #   CMAKE_BUILD_TYPE    -- Release / Debug (default Release)
 #   HOST_UID / HOST_GID -- ownership for /output/*.whl
@@ -59,7 +58,6 @@ set -euo pipefail
 
 : "${PYTHON_VERSION:?PYTHON_VERSION required (e.g. 3.12)}"
 : "${IXCC_MLIR_CMAKE:?IXCC_MLIR_CMAKE required (in-container path to build/lib/cmake/mlir)}"
-: "${IXCC_VARIANT:?IXCC_VARIANT required (internal|external)}"
 : "${HOST_UID:?HOST_UID required}"
 : "${HOST_GID:?HOST_GID required}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
@@ -71,7 +69,6 @@ IXCC_ROOT_IN_CONTAINER="$(cd "${IXCC_MLIR_CMAKE}/../../../.." && pwd)"
 
 echo "::group::Persistent-build inputs"
 echo "PYTHON_VERSION              = ${PYTHON_VERSION}"
-echo "IXCC_VARIANT                = ${IXCC_VARIANT}"
 echo "IXCC_MLIR_CMAKE             = ${IXCC_MLIR_CMAKE}"
 echo "IXCC_ROOT_IN_CONTAINER      = ${IXCC_ROOT_IN_CONTAINER}"
 echo "CMAKE_BUILD_TYPE            = ${CMAKE_BUILD_TYPE}"
@@ -121,7 +118,7 @@ done
 if [[ "${matched}" != "1" ]]; then
     echo "::error::IXCC MLIR bindings were built for a different Python."
     echo "::error::target=${py_tag_expected}, found=[${mlir_so_files[*]}]"
-    echo "::error::rebuild the ${IXCC_VARIANT} IXCC tree with PYTHON_VERSION=${PYTHON_VERSION}."
+    echo "::error::rebuild the IXCC tree at ${IXCC_ROOT_IN_CONTAINER} with PYTHON_VERSION=${PYTHON_VERSION}."
     exit 1
 fi
 echo "IXCC bindings ABI tag ${py_tag_expected} matches PYTHON_VERSION ${PYTHON_VERSION}"

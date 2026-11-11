@@ -124,7 +124,9 @@ jobs:
           [[ -n "${DOCKER_IMAGE:-}" ]] || missing+=(DOCKER_IMAGE/vars.FLYDSL_ILUVATAR_U2004_IMAGE)
           [[ -n "${COREX_ROOT:-}" ]] || missing+=(vars.COREX_ROOT)
           [[ -n "${SW_HOME:-}" ]] || missing+=(vars.SW_HOME)
-          if [[ "${USE_FRESH_IXCC}" != "true" ]]; then
+          if [[ "${USE_FRESH_IXCC}" == "true" ]]; then
+            [[ -n "${IXCC_REF:-}" ]] || missing+=(IXCC_REF/vars.IXCC_REF)
+          else
             [[ -n "${IXCC_MLIR_CMAKE:-}" ]] || missing+=(vars.IXCC_MLIR_CMAKE)
           fi
           if ((${#missing[@]})); then

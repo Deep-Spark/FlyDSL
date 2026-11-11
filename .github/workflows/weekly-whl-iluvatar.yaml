@@ -159,6 +159,16 @@ jobs:
           else
             ixcc_ref="${default_ixcc_ref}"
           fi
+          # u2004 matrix entries always use_fresh_ixcc; fail here so an empty
+          # IXCC_REF does not wait for the in-container : "${IXCC_REF:?...}".
+          if [ -z "${ixcc_ref}" ]; then
+            if [ "${channel}" = "ci" ]; then
+              echo "::error::IXCC ref empty: set inputs.ixcc_ref or vars.IXCC_CI_REF / vars.IXCC_REF"
+            else
+              echo "::error::IXCC ref empty: set inputs.ixcc_ref or vars.IXCC_REF"
+            fi
+            exit 1
+          fi
           echo "ixcc_ref=${ixcc_ref}" >> "${GITHUB_OUTPUT}"
           echo "ixcc_mlir_cmake=${ixcc_mlir_cmake}" >> "${GITHUB_OUTPUT}"
           echo "local_name=${local_name}" >> "${GITHUB_OUTPUT}"
