@@ -71,21 +71,18 @@ runner.
 | `IXCC_WORKING_ROOT`     | `/home/flydsl/sw_home/sdk/ixcc`               |
 | `IXCC_EXTERNAL_ROOT`    | `/home/flydsl/sw_home/sdk/ixcc-external`      |
 
-The persistent-tree wheel path (build-whl-iluvatar.yaml, u2004 persistent
-step) picks the MLIR CMake dir from these two variables based on
-`ixcc_variant`. `IXCC_MLIR_CMAKE` already exists (consumed by
-`ci-device.yml`, `perf-daily-iluvatar.yml`, and `run_*_in_container.sh`)
-so PR-B reuses it as the internal-channel dir rather than renaming it
-to a hypothetical `IXCC_INTERNAL_MLIR_CMAKE`; only `IXCC_EXTERNAL_MLIR_CMAKE`
-is genuinely new. `IXCC_RELEASE_MLIR_CMAKE` (older name for the release /
-external tree) is still honoured as a fallback so existing runners keep
-working until they migrate.
+Wheel workflows pick the host MLIR CMake dir from repo vars (no
+in-workflow path defaults):
 
-| variable                    | used by                        | default                                                       |
-|-----------------------------|--------------------------------|---------------------------------------------------------------|
-| `IXCC_MLIR_CMAKE`           | internal channel + ci-device   | `/home/flydsl/sw_home/sdk/ixcc/build/lib/cmake/mlir`          |
-| `IXCC_EXTERNAL_MLIR_CMAKE`  | external channel               | `/home/flydsl/sw_home/sdk/ixcc-external/build/lib/cmake/mlir` |
-| `IXCC_RELEASE_MLIR_CMAKE`   | external channel (legacy alias) | (falls back to `IXCC_EXTERNAL_MLIR_CMAKE` default)            |
+| variable                    | used by                                      |
+|-----------------------------|----------------------------------------------|
+| `IXCC_MLIR_CMAKE`           | weekly / default host tree; ci-device / perf |
+| `IXCC_CI_MLIR_CMAKE`        | ci channel override (falls back to above)    |
+| `IXCC_REF` / `IXCC_CI_REF`  | u2004 fresh checkout refs                    |
+
+`IXCC_EXTERNAL_MLIR_CMAKE` / `IXCC_RELEASE_MLIR_CMAKE` remain useful for
+ixcc-refresh / older runners but are no longer consulted by
+`build-whl-iluvatar.yaml` / `weekly-whl-iluvatar.yaml`.
 
 ## Verifying the setup
 
