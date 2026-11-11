@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Atomically replace the local channel wheel dir after tests pass. The channel
-# is whatever subdir of ${WHEEL_ROOT} the caller chose: `internal`, `latest`,
-# and the legacy `ci` are all valid. This script does not decide the channel
-# name; publishers do (weekly-whl-iluvatar.yaml derives it from ixcc_variant).
+# is whatever subdir of ${WHEEL_ROOT} the caller chose (e.g. `ci`, `latest`).
+# This script does not decide the channel name; publishers do
+# (weekly-whl-iluvatar.yaml maps channel -> local_name).
 #
 # The parent-level index.html is regenerated from whatever subdirs actually
 # exist under ${WHEEL_ROOT}, so channels appear as they are populated -- no
@@ -41,7 +41,7 @@ bash "${script_dir}/write_iluvatar_wheel_http_index.sh" "${DEST_DIR}"
 
 # Regenerate the parent index by scanning for populated channel dirs. Anything
 # with a CURRENT.txt is treated as a wheel channel. Ordering: `latest` first
-# (external release), then everything else alphabetically, so the most-used
+# (weekly release), then everything else alphabetically, so the most-used
 # public URL stays at the top of the page.
 {
   echo '<!doctype html><meta charset="utf-8"><title>flydsl iluvatar wheels</title><ul>'
