@@ -423,6 +423,12 @@ if(TARGET FlyIluvatarJitRuntime)
   add_dependencies(FlyPythonCAPI FlyIluvatarJitRuntime)
 endif()
 
+if(TARGET FlyIluvatarAotRuntime)
+  set_target_properties(FlyIluvatarAotRuntime PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${_MLIR_LIBS_DIR}")
+  add_dependencies(FlyPythonCAPI FlyIluvatarAotRuntime)
+endif()
+
 # Windows: the AOT runtime's bitcode (lib/Runtime/ROCm) becomes LLVM-dialect IR,
 # which compiler/_aot.py merges into each exported module. The same MLIR reads
 # it back, so only this build step depends on the compiler's bitcode version.
@@ -459,7 +465,8 @@ add_custom_target(FlyNativeDigest ALL
   VERBATIM
 )
 add_dependencies(FlyNativeDigest CopyFlyPythonSources FlyPythonModules FlyPythonCAPI)
-foreach(_runtime_target IN ITEMS FlyJitRuntime FlyIluvatarJitRuntime FlyRocmAotRuntime FlyRocmAotRuntimeIR)
+foreach(_runtime_target IN ITEMS FlyJitRuntime FlyIluvatarJitRuntime FlyIluvatarAotRuntime
+                                FlyRocmAotRuntime FlyRocmAotRuntimeIR)
   if(TARGET ${_runtime_target})
     add_dependencies(FlyNativeDigest ${_runtime_target})
   endif()

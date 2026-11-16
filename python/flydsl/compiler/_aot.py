@@ -344,6 +344,20 @@ def _linkage(name: str) -> ir.Attribute:
     return ir.Attribute.parse(f"#llvm.linkage<{name}>")
 
 
+def _llvm_func_type(result: ir.Type, params: List[ir.Type]) -> ir.Type:
+    """``!llvm.func<result (params)>``, built textually where the binding is absent."""
+    if hasattr(llvm, "FunctionType"):
+        return llvm.FunctionType.get(result, params)
+    return ir.Type.parse(f"!llvm.func<{result} ({', '.join(str(p) for p in params)})>")
+
+
+def _llvm_array_type(element: ir.Type, count: int) -> ir.Type:
+    """``!llvm.array<count x element>``, built textually where the binding is absent."""
+    if hasattr(llvm, "ArrayType"):
+        return llvm.ArrayType.get(element, count)
+    return ir.Type.parse(f"!llvm.array<{count} x {element}>")
+
+
 def _is_definition(op) -> bool:
     """Return whether a top-level symbol op is a definition."""
     name = op.name
@@ -385,8 +399,8 @@ def _add_entry_wrapper(module: ir.Module, symbol: str, target: str, abi, take_er
     i32 = ir.IntegerType.get_signless(32)
     with ir.InsertionPoint(module.body), ir.Location.unknown():
         if take_error not in table:
-            llvm.LLVMFuncOp(take_error, ir.TypeAttr.get(llvm.FunctionType.get(i32, [])))
-        wrapper = llvm.LLVMFuncOp(symbol, ir.TypeAttr.get(llvm.FunctionType.get(i32, [ptr])))
+            llvm.LLVMFuncOp(take_error, ir.TypeAttr.get(_llvm_func_type(i32, [])))
+        wrapper = llvm.LLVMFuncOp(symbol, ir.TypeAttr.get(_llvm_func_type(i32, [ptr])))
         block = wrapper.body.blocks.append(ptr)
         with ir.InsertionPoint(block):
             # Drop errors left by earlier calls on this thread so the status is ours.
@@ -404,7 +418,7 @@ def _add_entry_wrapper(module: ir.Module, symbol: str, target: str, abi, take_er
 def _add_metadata_global(module: ir.Module, symbol: str, metadata: bytes) -> None:
     """Define ``const char symbol[]`` holding ``metadata`` plus a NUL terminator."""
     data = metadata + b"\0"
-    array = llvm.ArrayType.get(ir.IntegerType.get_signless(8), len(data))
+    array = _llvm_array_type(ir.IntegerType.get_signless(8), len(data))
     with ir.InsertionPoint(module.body), ir.Location.unknown():
         llvm.GlobalOp(array, symbol, _linkage("external"), constant=True, value=ir.StringAttr.get(data))
 

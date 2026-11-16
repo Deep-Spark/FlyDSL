@@ -4,7 +4,7 @@
 from typing import List
 
 from ...utils import env
-from .base import BaseBackend, GPUTarget
+from .base import AOTRuntimeConfig, BaseBackend, GPUTarget
 
 # Python-side default when ARCH is omitted. IXDL target attributes and passes
 # still receive an explicit chip value.
@@ -79,3 +79,11 @@ class IluvatarBackend(BaseBackend):
             "libfly_iluvatar_jit_runtime.so",
             "libmlir_c_runner_utils.so",
         ]
+
+    @classmethod
+    def aot_runtime_config(cls) -> AOTRuntimeConfig:
+        return AOTRuntimeConfig(
+            archive_basename="libfly_iluvatar_aot_runtime.a",
+            runtime_libraries=("libcuda.so",),
+            linker_flags=("-lcuda", "-pthread", "-ldl"),
+        )
